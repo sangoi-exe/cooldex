@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_thread_store::LoadRolloutTailParams;
 use codex_thread_store::RecallRolloutSourceIssueKind;
 use codex_thread_store::StoredRecallRolloutTail;

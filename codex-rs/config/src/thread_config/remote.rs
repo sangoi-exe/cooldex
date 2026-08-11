@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use codex_model_provider_info::CursorAgentServiceProviderInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -160,7 +159,6 @@ fn model_provider_from_proto(
     let id = provider.id;
     let wire_api = match proto::WireApi::try_from(provider.wire_api) {
         Ok(proto::WireApi::Responses) => WireApi::Responses,
-        Ok(proto::WireApi::CursorAgentService) => WireApi::CursorAgentService,
         Ok(proto::WireApi::Unspecified) => {
             return Err(parse_error("remote thread config omitted wire_api"));
         }
@@ -193,16 +191,7 @@ fn model_provider_from_proto(
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
         supports_standalone_web_search: provider.supports_standalone_web_search,
-        cursor_agent_service: provider
-            .cursor_agent_service
-            .map(cursor_agent_service_provider_from_proto)
-            .transpose()?,
     };
-    info.validate().map_err(|error| {
-        parse_error(format!(
-            "remote thread config returned invalid model provider: {error}"
-        ))
-    })?;
     Ok((id, info))
 }
 
@@ -230,7 +219,6 @@ fn model_provider_to_proto(
         requires_openai_auth,
         supports_websockets,
         supports_standalone_web_search,
-        cursor_agent_service,
     } = provider;
 
     proto::ModelProvider {
@@ -252,44 +240,6 @@ fn model_provider_to_proto(
         requires_openai_auth,
         supports_websockets,
         supports_standalone_web_search,
-        cursor_agent_service: cursor_agent_service.map(cursor_agent_service_provider_to_proto),
-    }
-}
-
-fn cursor_agent_service_provider_from_proto(
-    provider: proto::CursorAgentServiceProviderInfo,
-) -> Result<CursorAgentServiceProviderInfo, ThreadConfigLoadError> {
-    let max_pending_tool_actions = usize::try_from(provider.max_pending_tool_actions).map_err(
-        |_| {
-            parse_error(format!(
-                "remote thread config returned max_pending_tool_actions outside the supported range: {}",
-                provider.max_pending_tool_actions
-            ))
-        },
-    )?;
-
-    Ok(CursorAgentServiceProviderInfo {
-        expected_user_id: provider.expected_user_id,
-        expected_team_id: provider.expected_team_id,
-        expected_service_origin: provider.expected_service_origin,
-        context_window_tokens: provider.context_window_tokens,
-        effective_context_window_percent: provider.effective_context_window_percent,
-        max_pending_tool_actions,
-    })
-}
-
-#[cfg(test)]
-fn cursor_agent_service_provider_to_proto(
-    provider: CursorAgentServiceProviderInfo,
-) -> proto::CursorAgentServiceProviderInfo {
-    proto::CursorAgentServiceProviderInfo {
-        expected_user_id: provider.expected_user_id,
-        expected_team_id: provider.expected_team_id,
-        expected_service_origin: provider.expected_service_origin,
-        context_window_tokens: provider.context_window_tokens,
-        effective_context_window_percent: provider.effective_context_window_percent,
-        max_pending_tool_actions: u64::try_from(provider.max_pending_tool_actions)
-            .expect("max_pending_tool_actions must fit in the remote thread config protocol"),
     }
 }
 
@@ -342,7 +292,6 @@ fn proto_string_map(values: HashMap<String, String>) -> proto::StringMap {
 fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
     match wire_api {
         WireApi::Responses => proto::WireApi::Responses,
-        WireApi::CursorAgentService => proto::WireApi::CursorAgentService,
     }
 }
 
@@ -360,7 +309,6 @@ mod tests {
     use std::collections::HashMap;
     use std::num::NonZeroU64;
 
-    use codex_model_provider_info::CursorAgentServiceProviderInfo;
     use codex_model_provider_info::ModelProviderInfo;
     use codex_model_provider_info::WireApi;
     use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -484,41 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_agent_service_provider_proto_roundtrips_through_domain_type() {
-        let expected = cursor_agent_service_provider();
-        let proto = model_provider_to_proto("cursor-corporate", expected.clone());
-        assert_eq!(proto.wire_api, proto::WireApi::CursorAgentService as i32);
-        assert_eq!(
-            proto.cursor_agent_service,
-            Some(proto::CursorAgentServiceProviderInfo {
-                expected_user_id: 390777501,
-                expected_team_id: 12565657,
-                expected_service_origin: "https://agentn.global.api5.cursor.sh".to_string(),
-                context_window_tokens: 65_536,
-                effective_context_window_percent: 75,
-                max_pending_tool_actions: 8,
-            })
-        );
-
-        let (id, actual) = model_provider_from_proto(proto).expect("Cursor provider from proto");
-
-        assert_eq!(id, "cursor-corporate");
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn cursor_agent_service_provider_proto_rejects_missing_nested_config() {
-        let mut proto =
-            model_provider_to_proto("cursor-corporate", cursor_agent_service_provider());
-        proto.cursor_agent_service = None;
-
-        assert_eq!(
-            model_provider_from_proto(proto).unwrap_err().to_string(),
-            "remote thread config returned invalid model provider: wire_api cursor_agent_service requires cursor_agent_service configuration"
-        );
-    }
-
-    #[test]
     fn model_provider_proto_defaults_standalone_web_search_to_false() {
         let expected = ModelProviderInfo {
             supports_standalone_web_search: false,
@@ -579,7 +492,6 @@ mod tests {
                             requires_openai_auth: false,
                             supports_websockets: true,
                             supports_standalone_web_search: true,
-                            cursor_agent_service: None,
                         }],
                         features: HashMap::from([
                             ("plugins".to_string(), false),
@@ -645,23 +557,6 @@ mod tests {
             supports_websockets: true,
             supports_standalone_web_search: true,
             aws: None,
-            cursor_agent_service: None,
-        }
-    }
-
-    fn cursor_agent_service_provider() -> ModelProviderInfo {
-        ModelProviderInfo {
-            name: "Cursor Corporate".to_string(),
-            wire_api: WireApi::CursorAgentService,
-            cursor_agent_service: Some(CursorAgentServiceProviderInfo {
-                expected_user_id: 390777501,
-                expected_team_id: 12565657,
-                expected_service_origin: "https://agentn.global.api5.cursor.sh".to_string(),
-                context_window_tokens: 65_536,
-                effective_context_window_percent: 75,
-                max_pending_tool_actions: 8,
-            }),
-            ..ModelProviderInfo::default()
         }
     }
 

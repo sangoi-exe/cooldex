@@ -5,9 +5,13 @@ use crate::config;
 use crate::credential_broker::BROKERED_CREDENTIALS_ENV_KEY;
 use crate::credential_broker::CREDENTIAL_BROKER_ACTIVE_ENV_KEY;
 use crate::http_proxy;
+use crate::network_policy::NetworkDecision;
+use crate::network_policy::NetworkDecisionSource;
 use crate::network_policy::NetworkPolicyDecider;
 use crate::runtime::BlockedRequestObserver;
 use crate::runtime::ConfigState;
+use crate::runtime::HostBlockDecision;
+use crate::runtime::HostBlockReason;
 use crate::runtime::unix_socket_permissions_supported;
 use crate::socks5;
 use crate::state::NetworkProxyState;
@@ -197,9 +201,15 @@ impl NetworkProxyBuilder {
             .await;
         let current_cfg = state.current_cfg().await?;
         #[cfg(target_os = "windows")]
-        let runtime_settings = NetworkProxyRuntimeSettings::from_config(&current_cfg)?;
-        #[cfg(target_os = "windows")]
-        let mut windows_ingress = None;
+        let (current_cfg, runtime_settings, mut windows_ingress) = {
+            let current_cfg = config::NetworkProxyConfig {
+                dangerously_allow_all_unix_sockets: false,
+                unix_sockets: None,
+                ..current_cfg
+            };
+            let runtime_settings = NetworkProxyRuntimeSettings::from_config(&current_cfg)?;
+            (current_cfg, runtime_settings, None)
+        };
         let (requested_http_addr, requested_socks_addr, reserved_listeners) = if self
             .managed_by_codex
         {
@@ -386,8 +396,13 @@ impl NetworkProxyRuntimeSettings {
         };
         Ok(Self {
             allow_local_binding: config.allow_local_binding,
-            allow_unix_sockets: config.allow_unix_sockets().into(),
-            dangerously_allow_all_unix_sockets: config.dangerously_allow_all_unix_sockets,
+            allow_unix_sockets: if cfg!(target_os = "windows") {
+                Arc::default()
+            } else {
+                config.allow_unix_sockets().into()
+            },
+            dangerously_allow_all_unix_sockets: !cfg!(target_os = "windows")
+                && config.dangerously_allow_all_unix_sockets,
             mitm_ca_trust_bundle,
         })
     }
@@ -831,7 +846,55 @@ impl NetworkProxy {
             audit_metadata: self.state.audit_metadata().clone(),
             environment_id,
             execution_id,
+            policy_decision_timeout_ms: None,
         })
+    }
+
+    /// Returns the policy decider with trusted execution attribution restored.
+    pub fn remote_policy_decider(&self) -> Option<Arc<dyn NetworkPolicyDecider>> {
+        let scope = self.execution_scope.as_ref()?;
+        self.state.for_execution_token(&scope.attribution_token)?;
+        let decider = Arc::clone(self.policy_decider.as_ref()?);
+        let state = Arc::clone(&self.state);
+        let environment_id = scope.environment_id.clone();
+        let execution_id = scope.execution_id.clone();
+        let execution_lifetime = scope.lifetime_tx.subscribe();
+        Some(Arc::new(move |mut request: crate::NetworkPolicyRequest| {
+            let decider = Arc::clone(&decider);
+            let state = Arc::clone(&state);
+            let mut execution_lifetime = execution_lifetime.clone();
+            request.environment_id = Some(environment_id.clone());
+            request.execution_id = Some(execution_id.clone());
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = execution_lifetime.changed() => {
+                        crate::NetworkDecision::deny(crate::reasons::REASON_NOT_ALLOWED)
+                    }
+                    decision = async {
+                        match state.host_blocked(&request.host, request.port).await {
+                            Ok(HostBlockDecision::Allowed) => NetworkDecision::Allow,
+                            Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowed)) => {
+                                decider.decide(request).await
+                            }
+                            Ok(HostBlockDecision::Blocked(reason)) => {
+                                NetworkDecision::deny_with_source(
+                                    reason.as_str(),
+                                    NetworkDecisionSource::BaselinePolicy,
+                                )
+                            }
+                            Err(err) => {
+                                warn!("failed to evaluate controller network policy: {err}");
+                                NetworkDecision::deny_with_source(
+                                    crate::reasons::REASON_NOT_ALLOWED,
+                                    NetworkDecisionSource::BaselinePolicy,
+                                )
+                            }
+                        }
+                    } => decision,
+                }
+            }
+        }))
     }
 
     pub async fn add_allowed_domain(&self, host: &str) -> Result<()> {
@@ -1216,7 +1279,7 @@ impl NetworkProxy {
             return Ok(NetworkProxyHandle::noop());
         }
 
-        if !unix_socket_permissions_supported() {
+        if !cfg!(target_os = "windows") && !unix_socket_permissions_supported() {
             warn!(
                 "allowUnixSockets and dangerouslyAllowAllUnixSockets are macOS-only; requests will be rejected on this platform"
             );
@@ -1481,6 +1544,206 @@ mod tests {
     #[cfg(target_os = "windows")]
     static WINDOWS_INGRESS_TEST_LOCK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
+    fn https_request(host: &str) -> crate::NetworkPolicyRequest {
+        crate::NetworkPolicyRequest::new(crate::NetworkPolicyRequestArgs {
+            protocol: crate::NetworkProtocol::HttpsConnect,
+            host: host.to_string(),
+            port: 443,
+            environment_id: None,
+            client_addr: None,
+            method: None,
+            command: None,
+            exec_policy_hint: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn proxy_startup_ignores_macos_unix_socket_permissions_on_windows() -> Result<()> {
+        let unix_sockets = crate::config::NetworkUnixSocketPermissions {
+            entries: [
+                (
+                    "/tmp/allowed.sock".to_string(),
+                    crate::config::NetworkUnixSocketPermission::Allow,
+                ),
+                (
+                    "/tmp/denied.sock".to_string(),
+                    crate::config::NetworkUnixSocketPermission::Deny,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let config = NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://0.0.0.0:3128".to_string(),
+            socks_url: "http://0.0.0.0:8081".to_string(),
+            dangerously_allow_non_loopback_proxy: true,
+            dangerously_allow_all_unix_sockets: true,
+            unix_sockets: Some(unix_sockets.clone()),
+            ..NetworkProxyConfig::default()
+        };
+        let state = Arc::new(network_proxy_state_for_policy(config.clone()));
+
+        let (result, events) = crate::network_policy::test_support::capture_events(|| async {
+            NetworkProxy::builder()
+                .state(state)
+                .managed_by_codex(/*managed_by_codex*/ false)
+                .build()
+                .await
+        })
+        .await;
+        let proxy = result?;
+        let expected_bind_host = if cfg!(target_os = "windows") {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
+
+        assert_eq!(
+            (proxy.http_addr, proxy.socks_addr),
+            (
+                format!("{expected_bind_host}:3128").parse::<SocketAddr>()?,
+                format!("{expected_bind_host}:8081").parse::<SocketAddr>()?,
+            )
+        );
+        let replacement = crate::state::build_config_state(config.clone(), Default::default())?;
+        proxy.replace_config_state(replacement).await?;
+        let expected_unix_sockets = if cfg!(target_os = "windows") {
+            Vec::new()
+        } else {
+            vec!["/tmp/allowed.sock".to_string()]
+        };
+        assert_eq!(
+            proxy.allow_unix_sockets().as_ref(),
+            expected_unix_sockets.as_slice()
+        );
+        assert_eq!(
+            proxy.dangerously_allow_all_unix_sockets(),
+            !cfg!(target_os = "windows")
+        );
+        assert_eq!(proxy.current_cfg().await?, config);
+
+        let remote = proxy.remote_launch_config().await?;
+        assert_eq!(
+            (
+                remote.proxy.unix_sockets,
+                remote.proxy.dangerously_allow_all_unix_sockets,
+            ),
+            (Some(unix_sockets), true)
+        );
+        let emitted_unix_socket_warning = events.iter().any(|event| {
+            event.field("message").is_some_and(|message| {
+                message.contains("unix socket proxying is enabled")
+                    || message.contains("allowUnixSockets")
+            })
+        });
+        assert_eq!(emitted_unix_socket_warning, !cfg!(target_os = "windows"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_policy_decider_rechecks_live_policy_and_restores_attribution() -> Result<()> {
+        let captured = Arc::new(Mutex::new(None));
+        let captured_request = Arc::clone(&captured);
+        let config = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        };
+        let proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(config)))
+            .policy_decider(move |request: crate::NetworkPolicyRequest| {
+                let captured = Arc::clone(&captured_request);
+                async move {
+                    *captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((request.host, request.environment_id, request.execution_id));
+                    crate::NetworkDecision::Allow
+                }
+            })
+            .managed_by_codex(/*managed_by_codex*/ false)
+            .build()
+            .await?;
+        let scoped = proxy.for_execution("remote", "execution-1", "token-1".to_string())?;
+        let decider = scoped
+            .remote_policy_decider()
+            .expect("execution-scoped proxy should expose its policy decider");
+        let mut request = https_request("allowed.example");
+        request.environment_id = Some("forged-environment".to_string());
+        request.execution_id = Some("forged-execution".to_string());
+
+        assert_eq!(decider.decide(request).await, crate::NetworkDecision::Allow);
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some((
+                "allowed.example".to_string(),
+                Some("remote".to_string()),
+                Some("execution-1".to_string())
+            ))
+        );
+
+        scoped.add_denied_domain("denied.example").await?;
+        assert_eq!(
+            decider.decide(https_request("denied.example")).await,
+            crate::NetworkDecision::deny_with_source(
+                crate::reasons::REASON_DENIED,
+                crate::NetworkDecisionSource::BaselinePolicy,
+            )
+        );
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some((
+                "allowed.example".to_string(),
+                Some("remote".to_string()),
+                Some("execution-1".to_string())
+            ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_policy_decider_stops_with_execution_scope() -> Result<()> {
+        let decision_started = Arc::new(tokio::sync::Notify::new());
+        let decision_started_for_decider = Arc::clone(&decision_started);
+        let config = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        };
+        let proxy = NetworkProxy::builder()
+            .state(Arc::new(network_proxy_state_for_policy(config)))
+            .policy_decider(move |_request: crate::NetworkPolicyRequest| {
+                let decision_started = Arc::clone(&decision_started_for_decider);
+                async move {
+                    decision_started.notify_one();
+                    std::future::pending::<crate::NetworkDecision>().await
+                }
+            })
+            .managed_by_codex(/*managed_by_codex*/ false)
+            .build()
+            .await?;
+        let scoped = proxy.for_execution("remote", "execution-1", "token-1".to_string())?;
+        let decider = scoped
+            .remote_policy_decider()
+            .expect("execution-scoped proxy should expose its policy decider");
+        let request = https_request("pending.example");
+        let decision = tokio::spawn(async move { decider.decide(request).await });
+
+        decision_started.notified().await;
+        drop(scoped);
+
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(1), decision).await??;
+        assert_eq!(
+            decision,
+            crate::NetworkDecision::deny(crate::reasons::REASON_NOT_ALLOWED)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn managed_proxy_builder_uses_loopback_ports() {
         #[cfg(target_os = "windows")]
@@ -1518,7 +1781,15 @@ mod tests {
             assert_eq!(proxy.http_addr, http_addr);
             assert_eq!(proxy.socks_addr, socks_addr);
             assert_eq!(proxy.network_proxy_restricting_sid(None), None);
-            let handle = proxy.run().await.expect("start stable ingress route");
+            let (result, events) =
+                crate::network_policy::test_support::capture_events(|| async { proxy.run().await })
+                    .await;
+            let handle = result.expect("start stable ingress route");
+            assert!(!events.iter().any(|event| {
+                event
+                    .field("message")
+                    .is_some_and(|message| message.contains("allowUnixSockets"))
+            }));
             let second_state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
                 enabled: true,
                 proxy_url: format!("http://{http_addr}"),

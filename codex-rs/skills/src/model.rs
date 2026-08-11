@@ -16,6 +16,7 @@ pub struct SkillMetadata {
     pub path_to_skills_md: AbsolutePathBuf,
     pub scope: SkillScope,
     pub plugin_id: Option<String>,
+    pub remote_plugin_id: Option<String>,
 }
 
 impl SkillMetadata {
@@ -89,23 +90,6 @@ pub struct SkillToolDependency {
     pub transport: Option<String>,
     pub command: Option<String>,
     pub url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum SkillConfigRuleSelector {
-    Name(String),
-    Path(AbsolutePathBuf),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SkillConfigRule {
-    pub selector: SkillConfigRuleSelector,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct SkillConfigRules {
-    pub entries: Vec<SkillConfigRule>,
 }
 
 fn matches_product_restriction(

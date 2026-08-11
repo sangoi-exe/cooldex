@@ -7,7 +7,6 @@
 
 use codex_api::Provider as ApiProvider;
 use codex_api::RetryConfig as ApiRetryConfig;
-use codex_api::is_azure_responses_provider;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::error::CodexErr;
@@ -31,10 +30,6 @@ pub const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
-const CURSOR_AGENT_SERVICE_MAX_CONTEXT_WINDOW_TOKENS: i64 = 65_536;
-const CURSOR_AGENT_SERVICE_MAX_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 75;
-const CURSOR_AGENT_SERVICE_MAX_PENDING_TOOL_ACTIONS: usize = 8;
-pub const CURSOR_AGENT_SERVICE_ORIGIN: &str = "https://agentn.global.api5.cursor.sh";
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
@@ -62,16 +57,12 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
-    /// Cursor's private bidirectional `AgentService.Run` protocol.
-    #[serde(rename = "cursor_agent_service")]
-    CursorAgentService,
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
-            Self::CursorAgentService => "cursor_agent_service",
         };
         f.write_str(value)
     }
@@ -85,12 +76,8 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
-            "cursor_agent_service" => Ok(Self::CursorAgentService),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(
-                &value,
-                &["responses", "cursor_agent_service"],
-            )),
+            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
         }
     }
 }
@@ -118,8 +105,6 @@ pub struct ModelProviderInfo {
     pub auth: Option<ModelProviderAuthInfo>,
     /// AWS SigV4 auth configuration for this provider.
     pub aws: Option<ModelProviderAwsAuthInfo>,
-    /// Cursor AgentService-specific configuration.
-    pub cursor_agent_service: Option<CursorAgentServiceProviderInfo>,
     /// Which wire protocol this provider expects.
     #[serde(default)]
     pub wire_api: WireApi,
@@ -167,81 +152,8 @@ pub struct ModelProviderAwsAuthInfo {
     pub region: Option<String>,
 }
 
-/// Configuration for the fork-owned Cursor AgentService provider.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[schemars(deny_unknown_fields)]
-pub struct CursorAgentServiceProviderInfo {
-    pub expected_user_id: u64,
-    pub expected_team_id: u64,
-    pub expected_service_origin: String,
-    pub context_window_tokens: i64,
-    pub effective_context_window_percent: i64,
-    pub max_pending_tool_actions: usize,
-}
-
-impl CursorAgentServiceProviderInfo {
-    fn validate(&self) -> std::result::Result<(), String> {
-        if self.expected_user_id == 0 {
-            return Err("expected_user_id must be greater than zero".to_string());
-        }
-        if self.expected_team_id == 0 {
-            return Err("expected_team_id must be greater than zero".to_string());
-        }
-        if self.expected_service_origin != CURSOR_AGENT_SERVICE_ORIGIN {
-            return Err(format!(
-                "expected_service_origin must equal {CURSOR_AGENT_SERVICE_ORIGIN}"
-            ));
-        }
-        if self.context_window_tokens <= 0 {
-            return Err("context_window_tokens must be greater than zero".to_string());
-        }
-        if self.context_window_tokens > CURSOR_AGENT_SERVICE_MAX_CONTEXT_WINDOW_TOKENS {
-            return Err(format!(
-                "context_window_tokens must be at most {CURSOR_AGENT_SERVICE_MAX_CONTEXT_WINDOW_TOKENS}"
-            ));
-        }
-        if !(1..=CURSOR_AGENT_SERVICE_MAX_EFFECTIVE_CONTEXT_WINDOW_PERCENT)
-            .contains(&self.effective_context_window_percent)
-        {
-            return Err(format!(
-                "effective_context_window_percent must be between 1 and {CURSOR_AGENT_SERVICE_MAX_EFFECTIVE_CONTEXT_WINDOW_PERCENT}"
-            ));
-        }
-        if self.max_pending_tool_actions == 0 {
-            return Err("max_pending_tool_actions must be greater than zero".to_string());
-        }
-        if self.max_pending_tool_actions > CURSOR_AGENT_SERVICE_MAX_PENDING_TOOL_ACTIONS {
-            return Err(format!(
-                "max_pending_tool_actions must be at most {CURSOR_AGENT_SERVICE_MAX_PENDING_TOOL_ACTIONS}"
-            ));
-        }
-        Ok(())
-    }
-}
-
 impl ModelProviderInfo {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.wire_api == WireApi::CursorAgentService {
-            let cursor_agent_service = self.cursor_agent_service.as_ref().ok_or_else(|| {
-                "wire_api cursor_agent_service requires cursor_agent_service configuration"
-                    .to_string()
-            })?;
-            if let Some(conflict) = self.cursor_agent_service_conflict() {
-                return Err(format!(
-                    "provider cursor_agent_service cannot be combined with {conflict}"
-                ));
-            }
-            return cursor_agent_service
-                .validate()
-                .map_err(|error| format!("cursor_agent_service.{error}"));
-        }
-        if self.cursor_agent_service.is_some() {
-            return Err(
-                "cursor_agent_service configuration requires wire_api cursor_agent_service"
-                    .to_string(),
-            );
-        }
-
         if self.aws.is_some() {
             if self.supports_websockets {
                 // TODO(celia-oai): Support AWS SigV4 signing for WebSocket
@@ -301,40 +213,6 @@ impl ModelProviderInfo {
         }
     }
 
-    fn cursor_agent_service_conflict(&self) -> Option<&'static str> {
-        if self.base_url.is_some() {
-            Some("base_url")
-        } else if self.env_key.is_some() {
-            Some("env_key")
-        } else if self.env_key_instructions.is_some() {
-            Some("env_key_instructions")
-        } else if self.experimental_bearer_token.is_some() {
-            Some("experimental_bearer_token")
-        } else if self.auth.is_some() {
-            Some("auth")
-        } else if self.aws.is_some() {
-            Some("aws")
-        } else if self.query_params.is_some() {
-            Some("query_params")
-        } else if self.http_headers.is_some() {
-            Some("http_headers")
-        } else if self.env_http_headers.is_some() {
-            Some("env_http_headers")
-        } else if self.requires_openai_auth {
-            Some("requires_openai_auth")
-        } else if self.supports_websockets {
-            Some("supports_websockets")
-        } else if self.supports_standalone_web_search {
-            Some("supports_standalone_web_search")
-        } else if self.request_max_retries.is_some_and(|retries| retries != 0) {
-            Some("request_max_retries")
-        } else if self.stream_max_retries.is_some_and(|retries| retries != 0) {
-            Some("stream_max_retries")
-        } else {
-            None
-        }
-    }
-
     fn build_header_map(&self) -> CodexResult<HeaderMap> {
         let capacity = self.http_headers.as_ref().map_or(0, HashMap::len)
             + self.env_http_headers.as_ref().map_or(0, HashMap::len);
@@ -363,12 +241,6 @@ impl ModelProviderInfo {
     }
 
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        if self.wire_api == WireApi::CursorAgentService {
-            return Err(CodexErr::InvalidRequest(
-                "cursor_agent_service providers do not use the OpenAI-compatible API client"
-                    .to_string(),
-            ));
-        }
         let default_base_url = if matches!(
             auth_mode,
             Some(
@@ -430,9 +302,6 @@ impl ModelProviderInfo {
 
     /// Effective maximum number of request retries for this provider.
     pub fn request_max_retries(&self) -> u64 {
-        if self.wire_api == WireApi::CursorAgentService {
-            return 0;
-        }
         self.request_max_retries
             .unwrap_or(DEFAULT_REQUEST_MAX_RETRIES)
             .min(MAX_REQUEST_MAX_RETRIES)
@@ -440,9 +309,6 @@ impl ModelProviderInfo {
 
     /// Effective maximum number of stream reconnection attempts for this provider.
     pub fn stream_max_retries(&self) -> u64 {
-        if self.wire_api == WireApi::CursorAgentService {
-            return 0;
-        }
         self.stream_max_retries
             .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)
             .min(MAX_STREAM_MAX_RETRIES)
@@ -471,7 +337,6 @@ impl ModelProviderInfo {
             experimental_bearer_token: None,
             auth: None,
             aws: None,
-            cursor_agent_service: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: Some(
@@ -518,7 +383,6 @@ impl ModelProviderInfo {
                 profile: None,
                 region: None,
             })),
-            cursor_agent_service: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: Some(HashMap::from([(
@@ -552,10 +416,6 @@ impl ModelProviderInfo {
 
     pub fn is_amazon_bedrock(&self) -> bool {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
-    }
-
-    pub fn supports_remote_compaction(&self) -> bool {
-        self.is_openai() || is_azure_responses_provider(&self.name, self.base_url.as_deref())
     }
 
     pub fn has_command_auth(&self) -> bool {
@@ -635,13 +495,6 @@ provider fields are not supported"
                 }
             }
         } else {
-            if provider.wire_api == WireApi::CursorAgentService
-                || provider.cursor_agent_service.is_some()
-            {
-                provider
-                    .validate()
-                    .map_err(|error| format!("model_providers.{key}: {error}"))?;
-            }
             model_providers.entry(key).or_insert(provider);
         }
     }
@@ -677,7 +530,6 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         experimental_bearer_token: None,
         auth: None,
         aws: None,
-        cursor_agent_service: None,
         wire_api,
         query_params: None,
         http_headers: None,

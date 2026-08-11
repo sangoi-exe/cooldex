@@ -39,6 +39,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ScheduledTaskSchedule;
 use codex_app_server_protocol::ScheduledTaskSummary;
 use codex_app_server_protocol::ScheduledTaskWeekday;
+use codex_app_server_protocol::SkillInterface;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
@@ -575,7 +576,9 @@ async fn plugin_read_includes_share_url_for_admin_disabled_remote_plugin() -> Re
         "plugin_release_skill_id": "skill-1",
         "interface": {
           "display_name": "Plan Work",
-          "short_description": "Create a plan from issues"
+          "short_description": "Create a plan from issues",
+          "icon_small_url": "https://example.com/plan-work-small.svg",
+          "icon_large_url": "https://example.com/plan-work-large.png"
         }
       }
     ]
@@ -703,6 +706,19 @@ async fn plugin_read_includes_share_url_for_admin_disabled_remote_plugin() -> Re
     assert_eq!(response.plugin.skills[0].name, "plan-work");
     assert_eq!(response.plugin.skills[0].path, None);
     assert_eq!(response.plugin.skills[0].enabled, false);
+    assert_eq!(
+        response.plugin.skills[0].interface,
+        Some(SkillInterface {
+            display_name: Some("Plan Work".to_string()),
+            short_description: Some("Create a plan from issues".to_string()),
+            icon_small: None,
+            icon_large: None,
+            icon_small_url: Some("https://example.com/plan-work-small.svg".to_string()),
+            icon_large_url: Some("https://example.com/plan-work-large.png".to_string()),
+            brand_color: None,
+            default_prompt: None,
+        })
+    );
     assert_eq!(response.plugin.apps.len(), 0);
     assert_eq!(
         response.plugin.app_templates,
@@ -1353,6 +1369,67 @@ async fn plugin_read_fails_on_malformed_share_mapping() -> Result<()> {
 }
 
 #[tokio::test]
+async fn plugin_read_agent_plugin_excludes_nested_skills() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let repo_root = TempDir::new()?;
+    let plugin_root = repo_root.path().join("plugins/demo-plugin");
+    write_plugins_enabled_config(&codex_home)?;
+    write_plugin_marketplace(
+        repo_root.path(),
+        "codex-curated",
+        "demo-plugin",
+        "./plugins/demo-plugin",
+    )?;
+    std::fs::create_dir_all(plugin_root.join("skills/direct"))?;
+    std::fs::create_dir_all(plugin_root.join("skills/group/nested"))?;
+    std::fs::write(
+        plugin_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"demo-plugin"}"#,
+    )?;
+    let direct_skill_path = plugin_root.join("skills/direct/SKILL.md");
+    std::fs::write(
+        &direct_skill_path,
+        "---\nname: direct\ndescription: Direct skill\n---\n",
+    )?;
+    std::fs::write(
+        plugin_root.join("skills/group/nested/SKILL.md"),
+        "---\nname: nested\ndescription: Nested skill\n---\n",
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let request_id = mcp
+        .send_plugin_read_request(PluginReadParams {
+            marketplace_path: Some(AbsolutePathBuf::try_from(
+                repo_root.path().join(".agents/plugins/marketplace.json"),
+            )?),
+            remote_marketplace_name: None,
+            plugin_name: "demo-plugin".to_string(),
+        })
+        .await?;
+    let response: PluginReadResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+
+    assert_eq!(
+        response.plugin.skills,
+        vec![codex_app_server_protocol::SkillSummary {
+            name: "demo-plugin:direct".to_string(),
+            description: "Direct skill".to_string(),
+            short_description: None,
+            interface: None,
+            path: Some(AbsolutePathBuf::try_from(std::fs::canonicalize(
+                direct_skill_path
+            )?)?),
+            enabled: true,
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn plugin_read_returns_plugin_details_with_bundle_contents() -> Result<()> {
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
@@ -1801,6 +1878,7 @@ async fn plugin_read_stops_batching_after_app_metadata_failure() -> Result<()> {
     let request_id = mcp
         .send_apps_read_request(AppsReadParams {
             app_ids: vec!["app-000".to_string(), "app-100".to_string()],
+            thread_id: None,
             include_tools: false,
         })
         .await?;

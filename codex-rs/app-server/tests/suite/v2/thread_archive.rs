@@ -9,6 +9,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -25,12 +26,87 @@ use codex_core::find_thread_path_by_id_str;
 use codex_protocol::ThreadId;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_state::StateRuntime;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
+use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
+use super::analytics::mount_analytics_capture;
+use super::analytics::wait_for_matching_analytics_event;
+
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[tokio::test]
+async fn thread_archive_rejects_owned_unmaterialized_paginated_descendant() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let parent_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-01T00-00-00",
+        "2025-01-01T00:00:00Z",
+        "parent",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let parent_thread_id = ThreadId::from_string(&parent_id)?;
+    let mut owner = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread: child, .. } = owner
+        .start_thread(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let child_thread_id = ThreadId::from_string(&child.id)?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
+    state_db
+        .upsert_thread_spawn_edge(
+            parent_thread_id,
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Open,
+        )
+        .await?;
+
+    let mut other = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let request_id = other
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: parent_id.clone(),
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        other.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        format!("thread {} already has an active writer", child.id)
+    );
+    timeout(DEFAULT_READ_TIMEOUT, owner.shutdown_gracefully()).await??;
+    let _: ThreadArchiveResponse = other
+        .request(|request_id| ClientRequest::ThreadArchive {
+            request_id,
+            params: ThreadArchiveParams {
+                thread_id: parent_id,
+            },
+        })
+        .await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn thread_archive_requires_materialized_rollout() -> Result<()> {
@@ -186,8 +262,11 @@ async fn thread_archive_archives_spawned_descendants() -> Result<()> {
     let parent_thread_id = ThreadId::from_string(&parent_id)?;
     let child_thread_id = ThreadId::from_string(&child_id)?;
     let grandchild_thread_id = ThreadId::from_string(&grandchild_id)?;
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
     state_db
         .mark_backfill_complete(/*last_watermark*/ None)
         .await?;
@@ -262,7 +341,10 @@ async fn thread_archive_archives_spawned_descendants() -> Result<()> {
 async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!(r#"chatgpt_base_url = "{}""#, server.uri()))
+        .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let parent_id = create_fake_rollout(
         codex_home.path(),
@@ -292,8 +374,11 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
     let parent_thread_id = ThreadId::from_string(&parent_id)?;
     let child_thread_id = ThreadId::from_string(&child_id)?;
     let grandchild_thread_id = ThreadId::from_string(&grandchild_id)?;
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
     state_db
         .mark_backfill_complete(/*last_watermark*/ None)
         .await?;
@@ -346,7 +431,7 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         .await??;
         archived_ids.push(archived_notification.thread_id);
     }
-    assert_eq!(archived_ids, vec![parent_id, grandchild_id]);
+    assert_eq!(archived_ids, vec![parent_id.clone(), grandchild_id.clone()]);
 
     assert!(
         timeout(
@@ -388,6 +473,88 @@ async fn thread_archive_succeeds_when_descendant_archive_fails() -> Result<()> {
         );
     }
 
+    let repeated_archive_id = mcp
+        .send_thread_archive_request(ThreadArchiveParams {
+            thread_id: parent_id.clone(),
+        })
+        .await?;
+    let _: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(repeated_archive_id)),
+    )
+    .await??;
+
+    let _: ThreadUnarchiveResponse = mcp
+        .request(|request_id| ClientRequest::ThreadUnarchive {
+            request_id,
+            params: ThreadUnarchiveParams {
+                thread_id: parent_id.clone(),
+            },
+        })
+        .await?;
+    wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+        event["event_type"] == "codex_thread_archive_event"
+            && event["event_params"]["thread_id"] == parent_id
+            && event["event_params"]["action"] == "unarchived"
+    })
+    .await?;
+
+    let requests = server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("wiremock did not record requests"))?;
+    let mut archive_events = Vec::new();
+    for request in requests {
+        if request.url.path() != "/codex/analytics-events/events" {
+            continue;
+        }
+        let payload: Value = serde_json::from_slice(&request.body)?;
+        let events = payload["events"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("analytics payload missing events array"))?;
+        for event in events
+            .iter()
+            .filter(|event| event["event_type"] == "codex_thread_archive_event")
+        {
+            for (header, expected) in [
+                ("authorization", "Bearer chatgpt-token"),
+                ("chatgpt-account-id", "account-123"),
+            ] {
+                assert_eq!(
+                    request
+                        .headers
+                        .get(header)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(expected)
+                );
+            }
+            archive_events.push(event.clone());
+        }
+    }
+
+    let expected = [
+        (parent_id.as_str(), "archived"),
+        (grandchild_id.as_str(), "archived"),
+        (parent_id.as_str(), "unarchived"),
+    ];
+    assert_eq!(archive_events.len(), expected.len());
+    for (event, (thread_id, action)) in archive_events.iter().zip(expected) {
+        let occurred_at_ms = event["event_params"]["occurred_at_ms"]
+            .as_u64()
+            .expect("thread archive analytics must include its producer timestamp");
+        assert_eq!(
+            event,
+            &json!({
+                "event_type": "codex_thread_archive_event",
+                "event_params": {
+                    "thread_id": thread_id,
+                    "action": action,
+                    "occurred_at_ms": occurred_at_ms,
+                },
+            })
+        );
+    }
+
     Ok(())
 }
 
@@ -408,8 +575,11 @@ async fn thread_archive_succeeds_when_spawned_descendant_is_missing() -> Result<
     let parent_thread_id = ThreadId::from_string(&parent_id)?;
     let missing_child_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000901")?;
 
-    let state_db =
-        StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
+    let state_db = StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "mock_provider".into(),
+    )
+    .await?;
     state_db
         .mark_backfill_complete(/*last_watermark*/ None)
         .await?;

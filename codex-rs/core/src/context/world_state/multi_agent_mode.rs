@@ -1,5 +1,7 @@
 use super::PreviousSectionState;
+use super::WorldStateHash;
 use super::WorldStateSection;
+use super::multi_agent_usage_hint::MultiAgentUsageHintState;
 use crate::context::ContextualUserFragment;
 use crate::context::multi_agent_mode_instructions::MultiAgentModeInstructions;
 use crate::context::multi_agent_mode_instructions::bounded_mode_and_explanation;
@@ -24,6 +26,8 @@ impl EffectiveMultiAgentMode {
 pub(crate) struct MultiAgentModeState {
     mode: Option<MultiAgentMode>,
     explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage_hint_hash: Option<WorldStateHash>,
 }
 
 impl MultiAgentModeState {
@@ -32,6 +36,7 @@ impl MultiAgentModeState {
             return Self {
                 mode: None,
                 explanation: None,
+                usage_hint_hash: None,
             };
         };
         let (mode, explanation) =
@@ -39,7 +44,13 @@ impl MultiAgentModeState {
         Self {
             mode: Some(mode),
             explanation,
+            usage_hint_hash: None,
         }
+    }
+
+    pub(crate) fn with_usage_hint(mut self, usage_hint: &MultiAgentUsageHintState) -> Self {
+        self.usage_hint_hash = Some(usage_hint.snapshot());
+        self
     }
 }
 
@@ -70,7 +81,8 @@ impl WorldStateSection for MultiAgentModeState {
         let (mode, explanation) = match (&self.mode, previous) {
             (Some(mode), PreviousSectionState::Known(previous))
                 if previous.mode.as_ref() == Some(mode)
-                    && previous.explanation == self.explanation =>
+                    && previous.explanation == self.explanation
+                    && previous.usage_hint_hash == self.usage_hint_hash =>
             {
                 return None;
             }

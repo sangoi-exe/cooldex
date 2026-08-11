@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::RolloutItem;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::append_thread_name;
 use codex_rollout::find_archived_thread_path_by_id_str;
@@ -264,7 +264,7 @@ async fn apply_metadata_update(
     let sqlite_write_result: ThreadStoreResult<()> = if let Some(state_db) = state_db.as_ref() {
         let patch = patch.clone();
         async {
-            let mut existing =
+            let existing =
                 state_db
                     .get_thread(thread_id)
                     .await
@@ -276,30 +276,6 @@ async fn apply_metadata_update(
                 let resolved = resolve_rollout_path(store, thread_id, include_archived).await?;
                 rollout_path_archived = resolved.archived;
                 rollout_path = Some(resolved.path);
-            }
-            if existing.is_none()
-                && patch.is_pinned.is_some()
-                && let Some(path) = rollout_path.as_deref()
-                && let Some(existing_rollout_path) =
-                    codex_rollout::existing_rollout_path(path).await
-            {
-                codex_rollout::state_db::reconcile_rollout(
-                    Some(state_db.as_ref()),
-                    existing_rollout_path.as_path(),
-                    store.config.default_model_provider_id.as_str(),
-                    /*builder*/ None,
-                    &[],
-                    /*archived_only*/ Some(rollout_path_archived),
-                    /*new_thread_memory_mode*/ None,
-                )
-                .await;
-                existing = state_db.get_thread(thread_id).await.map_err(|err| {
-                    ThreadStoreError::Internal {
-                        message: format!(
-                            "failed to read reconciled thread metadata for {thread_id}: {err}"
-                        ),
-                    }
-                })?;
             }
             let mut metadata = match existing.clone() {
                 Some(metadata) => metadata,
@@ -389,9 +365,6 @@ async fn apply_metadata_update(
             if let Some(first_user_message) = patch.first_user_message {
                 metadata.first_user_message = Some(first_user_message);
             }
-            if let Some(is_pinned) = patch.is_pinned {
-                metadata.is_pinned = is_pinned;
-            }
             if let Some(git_info) = patch.git_info {
                 let existing_git_info = git_info_from_parts(
                     metadata.git_sha.clone(),
@@ -409,23 +382,6 @@ async fn apply_metadata_update(
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to update thread metadata for {thread_id}: {err}"),
                 })?;
-            if let Some(is_pinned) = patch.is_pinned {
-                let updated = state_db
-                    .update_thread_pin(thread_id, is_pinned)
-                    .await
-                    .map_err(|err| ThreadStoreError::Internal {
-                        message: format!(
-                            "failed to update pin state for thread {thread_id}: {err}"
-                        ),
-                    })?;
-                if !updated {
-                    return Err(ThreadStoreError::Internal {
-                        message: format!(
-                            "thread metadata unavailable before pin update: {thread_id}"
-                        ),
-                    });
-                }
-            }
             if let Some(name) = patch.name.as_ref() {
                 let history_mode = history_mode.ok_or_else(|| ThreadStoreError::Internal {
                     message: format!(
@@ -590,9 +546,8 @@ fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // transcript-derived metadata, thread names, and memory-mode indexing were log-only. Keep that
     // failure isolation so a corrupted optional state DB does not make JSONL transcript durability
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
-    // the existing SQLite value to preserve unspecified fields. User-selected pin state is
-    // SQLite-only, so losing its write must also fail the explicit metadata update.
-    patch.is_pinned.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
+    // the existing SQLite value to preserve unspecified fields.
+    patch.git_info.is_some() && !has_observed_metadata_facts(patch)
 }
 
 fn sqlite_write_error_is_best_effort(err: &ThreadStoreError) -> bool {
@@ -842,6 +797,7 @@ mod tests {
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
@@ -851,6 +807,7 @@ mod tests {
     use super::*;
     use crate::GitInfoPatch;
     use crate::ListThreadsParams;
+    use crate::MoveThreadToSectionParams;
     use crate::ResumeThreadParams;
     use crate::SortDirection;
     use crate::ThreadMetadataPatch;
@@ -891,7 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_only_metadata_updates_persist_in_sqlite_without_changing_the_rollout() {
+    async fn section_moves_persist_in_sqlite_without_changing_the_rollout() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let uuid = Uuid::from_u128(320);
@@ -900,32 +857,62 @@ mod tests {
             write_session_file(home.path(), "2025-01-03T14-20-00", uuid).expect("session file");
         let original_rollout = std::fs::read_to_string(&rollout_path).expect("read rollout");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
         .expect("state db should initialize");
         let store = LocalThreadStore::new(config, Some(runtime.clone()));
 
-        let pinned = store
-            .update_thread_metadata(UpdateThreadMetadataParams {
+        codex_rollout::state_db::reconcile_rollout(
+            Some(runtime.as_ref()),
+            rollout_path.as_path(),
+            "test-provider",
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+        store
+            .move_thread_to_section(MoveThreadToSectionParams {
                 thread_id,
-                patch: ThreadMetadataPatch {
-                    is_pinned: Some(true),
-                    ..Default::default()
-                },
-                include_archived: false,
+                section: Some(codex_state::PINNED_THREAD_SECTION_ID.to_string()),
+                before_thread_id: None,
             })
             .await
             .expect("pin thread");
 
-        assert!(pinned.is_pinned);
+        let pinned = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read pinned thread");
+
+        assert_eq!(
+            pinned.section,
+            Some(codex_state::ThreadSection {
+                id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+                name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
+            })
+        );
         let pinned_metadata = runtime
             .get_thread(thread_id)
             .await
             .expect("read pinned metadata")
             .expect("pinned metadata");
-        assert!(pinned_metadata.is_pinned);
+        assert_eq!(
+            pinned_metadata.section,
+            Some(codex_state::ThreadSection {
+                id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+                name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
+            })
+        );
         assert_eq!(pinned_metadata.preview.as_deref(), Some("Hello from user"));
         assert_eq!(pinned_metadata.source, "cli");
         let pinned_page = store
@@ -937,7 +924,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: None,
                 cwd_filters: None,
-                is_pinned: Some(true),
+                section: Some(Some(codex_state::PINNED_THREAD_SECTION_ID.to_string())),
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -961,32 +948,46 @@ mod tests {
             )
             .await
             .expect("read pinned thread by rollout path");
-        assert!(read_by_path.is_pinned);
+        assert_eq!(
+            read_by_path.section,
+            Some(codex_state::ThreadSection {
+                id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+                name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+                appearance: None,
+            })
+        );
         assert_eq!(
             std::fs::read_to_string(&rollout_path).expect("read rollout"),
             original_rollout
         );
 
-        let unpinned = store
-            .update_thread_metadata(UpdateThreadMetadataParams {
+        store
+            .move_thread_to_section(MoveThreadToSectionParams {
                 thread_id,
-                patch: ThreadMetadataPatch {
-                    is_pinned: Some(false),
-                    ..Default::default()
-                },
-                include_archived: false,
+                section: None,
+                before_thread_id: None,
             })
             .await
-            .expect("unpin thread");
+            .expect("clear thread section");
 
-        assert!(!unpinned.is_pinned);
-        assert!(
-            !runtime
+        let unpinned = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read unpinned thread");
+
+        assert_eq!(unpinned.section, None);
+        assert_eq!(
+            runtime
                 .get_thread(thread_id)
                 .await
-                .expect("read unpinned metadata")
-                .expect("unpinned metadata")
-                .is_pinned
+                .expect("read cleared metadata")
+                .expect("cleared metadata")
+                .section,
+            None
         );
         assert_eq!(
             std::fs::read_to_string(&rollout_path).expect("read rollout"),
@@ -1009,7 +1010,7 @@ mod tests {
         .expect("session file");
         let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1101,7 +1102,7 @@ mod tests {
         let path =
             write_session_file(home.path(), "2025-01-03T14-30-00", uuid).expect("session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1147,7 +1148,7 @@ mod tests {
         .expect("session file");
         let original_rollout = std::fs::read_to_string(&path).expect("read rollout");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1244,7 +1245,7 @@ mod tests {
         let path =
             write_session_file(home.path(), "2025-01-03T18-30-00", uuid).expect("session file");
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1349,7 +1350,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1392,7 +1393,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1447,7 +1448,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1505,7 +1506,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite.home().to_path_buf(),
+            config.sqlite.clone(),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1708,7 +1709,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1796,20 +1797,12 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn sqlite_failures_block_for_explicit_pin_updates() {
-        assert!(sqlite_write_failure_should_block(&ThreadMetadataPatch {
-            is_pinned: Some(false),
-            ..Default::default()
-        }));
-    }
-
     #[tokio::test]
     async fn metadata_patch_applies_title_over_existing_name() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1852,7 +1845,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1910,7 +1903,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1957,7 +1950,7 @@ mod tests {
         )
         .expect("session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -1997,7 +1990,7 @@ mod tests {
         write_archived_session_file(home.path(), "2025-01-03T19-30-00", uuid)
             .expect("archived session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -2033,7 +2026,7 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -2077,7 +2070,7 @@ mod tests {
                 allowed_sources: Vec::new(),
                 model_providers: Some(Vec::new()),
                 cwd_filters: Some(vec![workspace]),
-                is_pinned: None,
+                section: None,
                 archived: false,
                 search_term: None,
                 relation_filter: None,
@@ -2103,7 +2096,7 @@ mod tests {
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T16-00-00", uuid)
             .expect("archived session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -2166,7 +2159,7 @@ mod tests {
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T16-30-00", uuid)
             .expect("archived session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await

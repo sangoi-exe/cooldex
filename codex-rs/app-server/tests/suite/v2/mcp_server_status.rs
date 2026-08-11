@@ -112,6 +112,7 @@ async fn mcp_server_status_list_returns_raw_server_and_tool_names() -> Result<()
     assert_eq!(response.data.len(), 1);
     let status = &response.data[0];
     assert_eq!(status.name, "some-server");
+    assert_eq!(status.plugin_id, None);
     assert_eq!(
         status.tools.keys().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from(["look-up.raw".to_string()])
@@ -313,11 +314,7 @@ impl ServerHandler for McpStatusServer {
         );
         tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
-        Ok(ListToolsResult {
-            tools: vec![tool],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![tool]))
     }
 }
 
@@ -354,11 +351,7 @@ impl ServerHandler for SlowInventoryServer {
         );
         tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
-        Ok(ListToolsResult {
-            tools: vec![tool],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![tool]))
     }
 
     async fn list_resources(
@@ -367,11 +360,7 @@ impl ServerHandler for SlowInventoryServer {
         _context: RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListResourcesResult, rmcp::ErrorData> {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        Ok(ListResourcesResult {
-            resources: Vec::new(),
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(Vec::new()))
     }
 
     async fn list_resource_templates(
@@ -380,11 +369,7 @@ impl ServerHandler for SlowInventoryServer {
         _context: RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListResourceTemplatesResult, rmcp::ErrorData> {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        Ok(ListResourceTemplatesResult {
-            resource_templates: Vec::new(),
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()))
     }
 }
 

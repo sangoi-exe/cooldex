@@ -5,7 +5,7 @@ use std::io::SeekFrom;
 
 use serde::de::DeserializeOwned;
 
-const READ_CHUNK_SIZE: usize = 8 * 1024;
+const READ_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum ScanOutcome<T> {
@@ -27,6 +27,8 @@ pub struct ReverseJsonlScanner<R> {
     bytes_read: u64,
     reached_start: bool,
     last_record_start_offset: Option<u64>,
+    max_record_bytes: Option<usize>,
+    discarding_oversized_record: bool,
 }
 
 impl<R> ReverseJsonlScanner<R>
@@ -83,6 +85,8 @@ where
             bytes_read: 0,
             reached_start: end_byte_offset == 0,
             last_record_start_offset: None,
+            max_record_bytes: None,
+            discarding_oversized_record: false,
         })
     }
 
@@ -101,6 +105,12 @@ where
         self.last_record_start_offset
     }
 
+    /// Skips records larger than the configured limit without buffering or parsing them.
+    pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
+        self.max_record_bytes = Some(max_record_bytes);
+        self
+    }
+
     /// Scans the next nonblank record.
     ///
     /// I/O failures are returned as [`Err`]. Invalid JSON records are returned as
@@ -111,21 +121,46 @@ where
     {
         loop {
             let Some(byte) = self.read_previous_byte()? else {
-                if self.reached_start {
-                    return Ok(self.finish_record(/*record_start_offset*/ 0));
+                if !self.reached_start {
+                    self.record_reversed.clear();
+                    self.discarding_oversized_record = false;
+                    return Ok(None);
                 }
-                self.record_reversed.clear();
+                if self.discarding_oversized_record {
+                    self.record_reversed.clear();
+                    self.discarding_oversized_record = false;
+                    return Ok(None);
+                }
+                if let Some(outcome) = self.finish_record(/*record_start_offset*/ 0) {
+                    return Ok(Some(outcome));
+                }
                 return Ok(None);
             };
 
-            if byte != b'\n' {
-                self.record_reversed.push(byte);
+            if byte == b'\n' {
+                let record_start_offset = self.next_chunk_end + self.chunk_position as u64 + 1;
+                if self.discarding_oversized_record {
+                    self.record_reversed.clear();
+                    self.discarding_oversized_record = false;
+                    continue;
+                }
+                if let Some(outcome) = self.finish_record(record_start_offset) {
+                    return Ok(Some(outcome));
+                }
                 continue;
             }
 
-            let record_start_offset = self.next_chunk_end + self.chunk_position as u64 + 1;
-            if let Some(outcome) = self.finish_record(record_start_offset) {
-                return Ok(Some(outcome));
+            if self.discarding_oversized_record {
+                continue;
+            }
+            if self
+                .max_record_bytes
+                .is_some_and(|max| self.record_reversed.len().saturating_add(1) > max)
+            {
+                self.record_reversed.clear();
+                self.discarding_oversized_record = true;
+            } else {
+                self.record_reversed.push(byte);
             }
         }
     }

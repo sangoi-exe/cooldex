@@ -1,6 +1,3 @@
-use codex_rollout::find_archived_thread_path_by_id_str;
-use codex_rollout::rollout_date_parts;
-
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
 use super::helpers::scoped_rollout_path;
@@ -10,12 +7,15 @@ use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use codex_rollout::find_archived_thread_path_by_id_str;
+use codex_rollout::rollout_date_parts;
 
 pub(super) async fn unarchive_thread(
     store: &LocalThreadStore,
     params: ArchiveThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
+    let _lifecycle_guard = store.live_writer_locks.lock_lifecycle(thread_id).await;
     let state_db_ctx = store.state_db().await;
     let archived_path = find_archived_thread_path_by_id_str(
         store.config.codex_home.as_path(),
@@ -94,6 +94,7 @@ mod tests {
     use chrono::Utc;
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::SessionSource;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -143,7 +144,7 @@ mod tests {
         let archived_path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid)
             .expect("archived session file");
         let runtime = codex_state::StateRuntime::init(
-            home.path().to_path_buf(),
+            codex_state::SqliteConfig::new_for_testing(home.path().abs()),
             config.default_model_provider_id.clone(),
         )
         .await
@@ -164,7 +165,11 @@ mod tests {
         builder.cli_version = Some("test_version".to_string());
         let mut metadata = builder.build(config.default_model_provider_id.as_str());
         metadata.archived_at = Some(metadata.updated_at);
-        metadata.is_pinned = true;
+        metadata.section = Some(codex_state::ThreadSection {
+            id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
+            name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
+            appearance: None,
+        });
         runtime
             .upsert_thread(&metadata)
             .await
@@ -174,7 +179,7 @@ mod tests {
             .unarchive_thread(ArchiveThreadParams { thread_id })
             .await
             .expect("unarchive thread");
-        assert!(unarchived.is_pinned);
+        assert_eq!(unarchived.section, metadata.section);
 
         let restored_path = home
             .path()
@@ -188,6 +193,6 @@ mod tests {
         assert_eq!(updated.rollout_path, restored_path);
         assert_eq!(updated.archived_at, None);
         assert_eq!(updated.recency_at, metadata.recency_at);
-        assert!(updated.is_pinned);
+        assert_eq!(updated.section, metadata.section);
     }
 }

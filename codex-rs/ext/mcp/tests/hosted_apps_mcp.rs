@@ -4,7 +4,7 @@ use codex_config::McpServerTransportConfig;
 use codex_core::McpManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
-use codex_core_plugins::PluginsManager;
+use codex_core::plugins_manager_for_config;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
@@ -33,8 +33,8 @@ async fn contributes_hosted_plugin_runtime_without_an_executor() -> TestResult {
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("hosted plugin runtime should be contributed as a configured server")?;
+        .ok_or("hosted plugin runtime should be contributed as a configured server")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
         panic!("hosted plugin runtime should use streamable HTTP");
     };
@@ -87,15 +87,13 @@ async fn default_fallback_overwrites_reserved_config_without_an_extension() -> T
         .build()
         .await?;
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let manager = McpManager::new(Arc::new(PluginsManager::new(
-        config.codex_home.to_path_buf(),
-    )));
+    let manager = McpManager::new(Arc::new(plugins_manager_for_config(&config)));
 
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("default Apps MCP should be present")?;
+        .ok_or("default Apps MCP should be present")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
         panic!("default Apps MCP should use streamable HTTP");
     };
@@ -118,7 +116,7 @@ async fn later_extension_can_remove_same_name_registration() -> TestResult {
     codex_mcp_extension::install(&mut builder);
     builder.mcp_server_contributor(Arc::new(RemoveCodexApps));
     let manager = McpManager::new_with_extensions(
-        Arc::new(PluginsManager::new(config.codex_home.to_path_buf())),
+        Arc::new(plugins_manager_for_config(&config)),
         Arc::new(builder.build()),
         codex_core::CodexAppsToolsCache::default(),
     );
@@ -164,9 +162,7 @@ async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResu
         .await?;
     let managers = [
         installed_manager(&config),
-        McpManager::new(Arc::new(PluginsManager::new(
-            config.codex_home.to_path_buf(),
-        ))),
+        McpManager::new(Arc::new(plugins_manager_for_config(&config))),
     ];
     for manager in managers {
         let servers = manager.runtime_servers(&config).await;
@@ -179,7 +175,7 @@ fn installed_manager(config: &Config) -> McpManager {
     let mut builder = ExtensionRegistryBuilder::new();
     codex_mcp_extension::install(&mut builder);
     McpManager::new_with_extensions(
-        Arc::new(PluginsManager::new(config.codex_home.to_path_buf())),
+        Arc::new(plugins_manager_for_config(config)),
         Arc::new(builder.build()),
         codex_core::CodexAppsToolsCache::default(),
     )

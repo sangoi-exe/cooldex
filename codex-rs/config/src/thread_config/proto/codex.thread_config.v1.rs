@@ -77,8 +77,6 @@ pub struct ModelProvider {
     pub supports_websockets: bool,
     #[prost(bool, tag = "18")]
     pub supports_standalone_web_search: bool,
-    #[prost(message, optional, tag = "19")]
-    pub cursor_agent_service: ::core::option::Option<CursorAgentServiceProviderInfo>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StringMap {
@@ -99,27 +97,11 @@ pub struct ModelProviderAuthInfo {
     #[prost(string, tag = "5")]
     pub cwd: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CursorAgentServiceProviderInfo {
-    #[prost(uint64, tag = "1")]
-    pub expected_user_id: u64,
-    #[prost(uint64, tag = "2")]
-    pub expected_team_id: u64,
-    #[prost(string, tag = "3")]
-    pub expected_service_origin: ::prost::alloc::string::String,
-    #[prost(int64, tag = "4")]
-    pub context_window_tokens: i64,
-    #[prost(int64, tag = "5")]
-    pub effective_context_window_percent: i64,
-    #[prost(uint64, tag = "6")]
-    pub max_pending_tool_actions: u64,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WireApi {
     Unspecified = 0,
     Responses = 1,
-    CursorAgentService = 2,
 }
 impl WireApi {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -130,7 +112,6 @@ impl WireApi {
         match self {
             Self::Unspecified => "WIRE_API_UNSPECIFIED",
             Self::Responses => "WIRE_API_RESPONSES",
-            Self::CursorAgentService => "WIRE_API_CURSOR_AGENT_SERVICE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -138,7 +119,6 @@ impl WireApi {
         match value {
             "WIRE_API_UNSPECIFIED" => Some(Self::Unspecified),
             "WIRE_API_RESPONSES" => Some(Self::Responses),
-            "WIRE_API_CURSOR_AGENT_SERVICE" => Some(Self::CursorAgentService),
             _ => None,
         }
     }

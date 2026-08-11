@@ -4,6 +4,7 @@ use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::TurnStartClaim;
+use crate::tasks::MailboxParentProvenance;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
@@ -35,27 +36,31 @@ impl Session {
         Ok(())
     }
 
-    /// Starts a regular turn with the provided items only if automatic idle work
+    /// Starts a regular turn with the provided input only if automatic idle work
     /// is allowed for the current session state.
     ///
     /// This is the shared gate for extension-initiated idle work. It refuses to
-    /// start a turn when user/client-triggered work is queued, any task is still
-    /// active, or the session is currently in Plan mode. Active Review tasks are
-    /// covered by the active-task check because Review turns are not steerable.
+    /// start a turn when user/client-triggered work is queued or any task is
+    /// still active. Work without user input is also rejected in Plan mode.
+    /// Active Review tasks are covered by the active-task check because Review
+    /// turns are not steerable.
     pub(crate) async fn try_start_turn_if_idle(
         self: &Arc<Self>,
-        input: Vec<ResponseItem>,
+        input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
         if input.is_empty() {
             return Ok(());
         }
+        let has_user_input = input.iter().any(
+            |item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()),
+        );
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        if self.collaboration_mode().await.mode == ModeKind::Plan {
+        if !has_user_input && self.collaboration_mode().await.mode == ModeKind::Plan {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
@@ -102,8 +107,11 @@ impl Session {
         self: &Arc<Self>,
         claim: TurnStartClaim,
         sub_id: String,
-        input: Vec<ResponseItem>,
+        input: Vec<TurnInput>,
     ) -> Result<(), TryStartTurnIfIdleError> {
+        let has_user_input = input.iter().any(
+            |item| matches!(item, TurnInput::UserInput { content, .. } if !content.is_empty()),
+        );
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
@@ -114,7 +122,7 @@ impl Session {
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
-        if turn_context.mode == ModeKind::Plan {
+        if !has_user_input && turn_context.mode == ModeKind::Plan {
             self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
@@ -132,26 +140,48 @@ impl Session {
                 input,
             ));
         }
-        let failed_start_input = input.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(
-                claim.turn_state.as_ref(),
-                input.into_iter().map(TurnInput::ResponseItem).collect(),
+        let (input_persisted_sender, input_persisted_receiver) =
+            has_user_input.then(tokio::sync::oneshot::channel).unzip();
+        let original_input = input.clone();
+        let task_input = if has_user_input {
+            self.clear_connector_selection().await;
+            for item in &input {
+                if let TurnInput::UserInput { content, .. } = item {
+                    turn_context.session_telemetry.user_prompt(content);
+                }
+            }
+            input
+        } else {
+            self.input_queue
+                .extend_pending_input_for_turn_state(claim.turn_state.as_ref(), input)
+                .await;
+            Vec::new()
+        };
+        let start_result = self
+            .start_claimed_regular_task_with_options(
+                claim,
+                turn_context,
+                task_input,
+                input_persisted_sender,
+                MailboxParentProvenance::Ignore,
             )
             .await;
-        match self
-            .start_claimed_regular_task(claim, turn_context, Vec::new())
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                tracing::warn!(%err, "failed to install claimed idle turn");
-                Err(TryStartTurnIfIdleError::new(
-                    TryStartTurnIfIdleRejectionReason::Busy,
-                    failed_start_input,
-                ))
-            }
+        if let Err(err) = start_result {
+            tracing::warn!(%err, "failed to install claimed idle turn");
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                original_input,
+            ));
         }
+        if let Some(receiver) = input_persisted_receiver {
+            return receiver
+                .await
+                .unwrap_or(Err(
+                    TryStartTurnIfIdleRejectionReason::TaskEndedBeforePersistence,
+                ))
+                .map_err(|reason| TryStartTurnIfIdleError::new(reason, original_input));
+        }
+        Ok(())
     }
 
     pub(crate) async fn cancel_claimed_start(&self, claim: &TurnStartClaim) {

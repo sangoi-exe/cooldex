@@ -2,12 +2,12 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::HistoryPosition;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;

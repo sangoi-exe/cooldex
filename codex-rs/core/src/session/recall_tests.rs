@@ -1,11 +1,11 @@
+use codex_history::CompactedItem;
+use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::RolloutItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
@@ -44,6 +44,7 @@ fn function_call(call_id: &str) -> ResponseItem {
         name: "shell".to_string(),
         namespace: None,
         arguments: "{}".to_string(),
+        encrypted_function_args: None,
         call_id: call_id.to_string(),
         internal_chat_message_metadata_passthrough: None,
     }
@@ -453,6 +454,7 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
         name: "shell".to_string(),
         namespace: None,
         arguments: "{}".to_string(),
+        encrypted_function_args: None,
         call_id: "continuity-call".to_string(),
         internal_chat_message_metadata_passthrough: None,
     };

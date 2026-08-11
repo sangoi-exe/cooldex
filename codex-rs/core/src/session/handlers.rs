@@ -20,6 +20,10 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
+use crate::user_message_admission::UserMessageAdmission;
+use codex_history::RolloutItem;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -30,13 +34,11 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
-use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoicesList;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
@@ -82,8 +84,18 @@ pub async fn user_input_or_turn(
     sub_id: String,
     op: Op,
     client_user_message_id: Option<String>,
+    parent_turn_id: Option<String>,
 ) {
-    user_input_or_turn_inner(sess, sub_id, op, client_user_message_id).await;
+    let admission = user_input_or_turn_inner(
+        sess,
+        sub_id.clone(),
+        op,
+        client_user_message_id,
+        parent_turn_id,
+    )
+    .await;
+    sess.pending_user_message_admissions
+        .complete(&sub_id, admission);
 }
 
 pub async fn update_thread_settings(
@@ -177,7 +189,8 @@ pub(super) async fn user_input_or_turn_inner(
     sub_id: String,
     op: Op,
     client_user_message_id: Option<String>,
-) {
+    parent_turn_id: Option<String>,
+) -> CodexResult<UserMessageAdmission> {
     let Op::UserInput {
         items,
         final_output_json_schema,
@@ -196,10 +209,8 @@ pub(super) async fn user_input_or_turn_inner(
     };
     updates.final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
-        // new_turn_with_sub_id already emits the error event.
-        return;
-    };
+    // new_turn_with_sub_id already emits an error event when settings are invalid.
+    let current_context = sess.new_turn_with_sub_id(sub_id.clone(), updates).await?;
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
             id: sub_id.clone(),
@@ -209,6 +220,9 @@ pub(super) async fn user_input_or_turn_inner(
     }
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;
+    if let Some(id) = parent_turn_id {
+        current_context.turn_metadata_state.set_parent_turn_id(id);
+    }
     match sess
         .route_user_input(
             Arc::clone(&current_context),
@@ -219,13 +233,22 @@ pub(super) async fn user_input_or_turn_inner(
         )
         .await
     {
-        Ok(_) => {}
+        Ok(turn_id) => {
+            if turn_id == current_context.sub_id {
+                Ok(UserMessageAdmission::Started { turn_id })
+            } else {
+                Ok(UserMessageAdmission::Steered { turn_id })
+            }
+        }
         Err(err) => {
             sess.send_event_raw(Event {
-                id: sub_id,
+                id: sub_id.clone(),
                 msg: EventMsg::Error(err.to_error_event()),
             })
             .await;
+            Err(CodexErr::InvalidRequest(format!(
+                "failed to admit user message: {err:?}"
+            )))
         }
     }
 }
@@ -236,10 +259,11 @@ pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
     communication: InterAgentCommunication,
+    parent_turn_id: Option<String>,
 ) {
     let trigger_turn = communication.trigger_turn;
     sess.input_queue
-        .enqueue_mailbox_communication(communication)
+        .enqueue_mailbox_communication(communication, parent_turn_id.filter(|_| trigger_turn))
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
@@ -292,6 +316,7 @@ pub async fn resolve_elicitation(
         // Preserve the legacy fallback for clients that only send an action.
         ElicitationAction::Accept => Some(content.unwrap_or_else(|| serde_json::json!({}))),
         ElicitationAction::Decline | ElicitationAction::Cancel => None,
+        _ => None,
     };
     let response = ElicitationResponse {
         action,
@@ -327,29 +352,18 @@ pub async fn exec_approval(
     if let ReviewDecision::ApprovedExecpolicyAmendment {
         proposed_execpolicy_amendment,
     } = &decision
-    {
-        match sess
+        && let Err(err) = sess
             .persist_execpolicy_amendment(proposed_execpolicy_amendment)
             .await
-        {
-            Ok(()) => {
-                sess.record_execpolicy_amendment_message(
-                    &event_turn_id,
-                    proposed_execpolicy_amendment,
-                )
-                .await;
-            }
-            Err(err) => {
-                let message = format!("Failed to apply execpolicy amendment: {err}");
-                tracing::warn!("{message}");
-                let warning = EventMsg::Warning(WarningEvent { message });
-                sess.send_event_raw(Event {
-                    id: event_turn_id.clone(),
-                    msg: warning,
-                })
-                .await;
-            }
-        }
+    {
+        let message = format!("Failed to apply execpolicy amendment: {err}");
+        tracing::warn!("{message}");
+        let warning = EventMsg::Warning(WarningEvent { message });
+        sess.send_event_raw(Event {
+            id: event_turn_id.clone(),
+            msg: warning,
+        })
+        .await;
     }
     match decision {
         ReviewDecision::Abort => {
@@ -389,9 +403,9 @@ pub async fn dynamic_tool_response(sess: &Arc<Session>, id: String, response: Dy
     sess.notify_dynamic_tool_response(&id, response).await;
 }
 
-pub async fn refresh_mcp_servers(sess: &Arc<Session>, refresh_config: McpServerRefreshConfig) {
-    let mut guard = sess.pending_mcp_server_refresh_config.lock().await;
-    *guard = Some(refresh_config);
+pub fn refresh_mcp_servers(sess: &Session) {
+    sess.services.mcp_runtime.reconnect_on_next_refresh();
+    sess.request_mcp_runtime_refresh();
 }
 
 pub async fn reload_user_config(sess: &Arc<Session>) {
@@ -582,6 +596,9 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.hooks().shutdown().await;
+    sess.async_hook_results.close();
+    while sess.async_hook_results.try_recv().is_ok() {}
     sess.services
         .unified_exec_manager
         .terminate_all_processes()
@@ -589,7 +606,12 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
     }
-    sess.services.mcp_runtime.shutdown().await;
+    sess.stop_mcp_prewarm_worker().await;
+    {
+        let _refresh = sess.mcp_refresh.acquire().await;
+        sess.mcp_refresh.close();
+        sess.services.mcp_runtime.shutdown().await;
+    }
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
@@ -662,8 +684,6 @@ pub async fn review(
     let turn_context = sess.new_default_turn_with_sub_id(sub_id.clone()).await;
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
-    sess.refresh_mcp_servers_if_requested(&turn_context, Some(sess.mcp_elicitation_reviewer()))
-        .await;
     #[allow(deprecated)]
     match resolve_review_request(review_request, &turn_context.cwd) {
         Ok(resolved) => {
@@ -700,7 +720,7 @@ pub(super) async fn submission_loop(
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
-            match sub.op.clone() {
+            match sub.op {
                 Op::Interrupt => {
                     interrupt(&sess).await;
                     false
@@ -744,9 +764,15 @@ pub(super) async fn submission_loop(
                     realtime_conversation_list_voices(&sess, sub.id.clone()).await;
                     false
                 }
-                Op::UserInput { .. } => {
-                    user_input_or_turn(&sess, sub.id.clone(), sub.op, sub.client_user_message_id)
-                        .await;
+                op @ Op::UserInput { .. } => {
+                    user_input_or_turn(
+                        &sess,
+                        sub.id.clone(),
+                        op,
+                        sub.client_user_message_id,
+                        sub.parent_turn_id,
+                    )
+                    .await;
                     false
                 }
                 Op::ThreadSettings { thread_settings } => {
@@ -754,7 +780,13 @@ pub(super) async fn submission_loop(
                     false
                 }
                 Op::InterAgentCommunication { communication } => {
-                    inter_agent_communication(&sess, sub.id.clone(), communication).await;
+                    inter_agent_communication(
+                        &sess,
+                        sub.id.clone(),
+                        communication,
+                        sub.parent_turn_id,
+                    )
+                    .await;
                     false
                 }
                 Op::ExecApproval {
@@ -781,8 +813,8 @@ pub(super) async fn submission_loop(
                     dynamic_tool_response(&sess, id, response).await;
                     false
                 }
-                Op::RefreshMcpServers { config } => {
-                    refresh_mcp_servers(&sess, config).await;
+                Op::RefreshMcpServers => {
+                    refresh_mcp_servers(&sess);
                     false
                 }
                 Op::ReloadUserConfig => {

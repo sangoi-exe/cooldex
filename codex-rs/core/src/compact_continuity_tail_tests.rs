@@ -55,6 +55,7 @@ fn function_call(call_id: &str) -> ResponseItem {
             name: "shell".to_string(),
             namespace: None,
             arguments: "{}".to_string(),
+            encrypted_function_args: None,
             call_id: call_id.to_string(),
             internal_chat_message_metadata_passthrough: None,
         },

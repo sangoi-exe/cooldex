@@ -1,8 +1,8 @@
+use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use tracing::warn;
 
 use super::Session;

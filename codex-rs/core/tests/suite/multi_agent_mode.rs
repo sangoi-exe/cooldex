@@ -270,21 +270,15 @@ async fn removing_configured_explanation_emits_a_policy_update() -> Result<()> {
         .with_config(configure_mode_explanation)
         .build(&server)
         .await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     submit_turn(&initial.codex, "before resume", /*effort*/ None).await?;
-    drop(initial);
 
     let mut resume_builder = test_codex().with_config(|config| {
         configure_multi_agent_v2(config);
         config.multi_agent_v2.multi_agent_mode_hint_text = Some(String::new());
     });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
+    drop(initial);
     submit_turn(&resumed.codex, "after resume", /*effort*/ None).await?;
 
     let requests = responses.requests();
@@ -409,20 +403,14 @@ async fn policy_change_after_cold_resume_emits_explicit_mode() -> Result<()> {
         })
         .build(&server)
         .await?;
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     submit_turn(&initial.codex, "before resume", /*effort*/ None).await?;
-    drop(initial);
 
     let mut resume_builder = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
-        .with_config(configure_multi_agent_v2);
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+        .with_config(configure_ultra);
+    let resumed = resume_builder.restart(&server, &initial).await?;
+    drop(initial);
     submit_turn(&resumed.codex, "after resume", Some(ReasoningEffort::High)).await?;
 
     let requests = responses.requests();

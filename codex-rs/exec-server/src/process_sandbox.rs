@@ -52,6 +52,7 @@ struct PreparedWindowsSandboxRequest {
     windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     proxy_enforced: bool,
     network_proxy_restricting_sid: Option<String>,
+    proxy_settings_mode: WindowsSandboxProxySettingsMode,
     filesystem_overrides: Option<WindowsSandboxFilesystemOverrides>,
     use_private_desktop: bool,
 }
@@ -66,7 +67,7 @@ impl PreparedExecRequest {
                 windows_sandbox_level: request.windows_sandbox_level,
                 proxy_enforced: request.proxy_enforced,
                 network_proxy_restricting_sid: request.network_proxy_restricting_sid.as_deref(),
-                proxy_settings_mode: WindowsSandboxProxySettingsMode::Reconcile,
+                proxy_settings_mode: request.proxy_settings_mode,
                 filesystem_overrides: request.filesystem_overrides.as_ref(),
                 use_private_desktop: request.use_private_desktop,
             })
@@ -114,6 +115,9 @@ pub(crate) async fn prepare_exec_request(
             windows_sandbox: None,
         });
     };
+    let windows_sandbox_proxy_settings_mode = sandbox_context
+        .windows_sandbox_proxy_settings_mode
+        .unwrap_or_default();
     let runtime_paths = runtime_paths
         .ok_or_else(|| invalid_params("sandbox runtime paths are not configured".to_string()))?;
     // TODO(jif): Transport permissions before orchestrator-local paths are materialized,
@@ -146,6 +150,7 @@ pub(crate) async fn prepare_exec_request(
         managed_mitm_ca_trust_bundle_path.as_ref(),
         native_sandbox_policy_cwd.as_path(),
     );
+    #[cfg(unix)]
     let (file_system_policy, network_policy) = permissions.to_runtime_permissions();
     #[cfg(unix)]
     let sandbox_helper_paths = params
@@ -175,8 +180,7 @@ pub(crate) async fn prepare_exec_request(
     );
     let sandbox_manager = SandboxManager::new();
     let sandbox = sandbox_manager.select_initial(
-        &file_system_policy,
-        network_policy,
+        &permissions,
         SandboxablePreference::Require,
         sandbox_context.windows_sandbox_level,
         params.enforce_managed_network,
@@ -212,8 +216,7 @@ pub(crate) async fn prepare_exec_request(
     let (program, args) = (program.into(), args.to_vec());
     let transform_request = SandboxDirectSpawnTransformRequest {
         workspace_roots,
-        windows_sandbox_proxy_settings_mode:
-            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+        windows_sandbox_proxy_settings_mode,
         transform: SandboxTransformRequest {
             command: SandboxCommand {
                 program,
@@ -245,10 +248,8 @@ pub(crate) async fn prepare_exec_request(
     let windows_sandbox = if sandbox == SandboxType::WindowsRestrictedToken {
         request.arg0 = params.arg0.clone();
         let proxy_enforced = params.enforce_managed_network;
-        let use_elevated = windows_sandbox_uses_elevated_backend(
-            sandbox_context.windows_sandbox_level,
-            proxy_enforced,
-        );
+        let use_elevated =
+            windows_sandbox_uses_elevated_backend(sandbox_context.windows_sandbox_level);
         let filesystem_overrides = if use_elevated {
             resolve_windows_elevated_filesystem_overrides(
                 sandbox,
@@ -271,6 +272,7 @@ pub(crate) async fn prepare_exec_request(
             windows_sandbox_level: sandbox_context.windows_sandbox_level,
             proxy_enforced,
             network_proxy_restricting_sid,
+            proxy_settings_mode: windows_sandbox_proxy_settings_mode,
             filesystem_overrides,
             use_private_desktop: sandbox_context.windows_sandbox_private_desktop,
         })

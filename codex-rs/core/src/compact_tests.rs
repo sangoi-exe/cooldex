@@ -1,6 +1,7 @@
 use super::*;
+use codex_model_provider::RemoteCompactionSupport;
+use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -19,7 +20,12 @@ async fn process_compacted_history_with_test_session(
         .await;
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
-    let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step_context)
+            .await
+            .expect("world state should build"),
+    );
     let (_, window_ids) = session.prepare_auto_compact_window().await;
     let initial_context = session
         .build_initial_context_with_world_state_and_mcp_for_window(
@@ -270,6 +276,7 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
             internal_chat_message_metadata_passthrough: Some(
                 InternalChatMessageMetadataPassthrough {
                     turn_id: Some("turn-1".to_string()),
+                    executed_tool_calls: None,
                 },
             ),
         }],
@@ -281,30 +288,18 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
 }
 
 #[test]
-fn should_use_remote_compact_task_for_azure_provider() {
+fn azure_provider_supports_remote_compaction_v2() {
     let provider = ModelProviderInfo {
         name: "Azure".into(),
         base_url: Some("https://example.com/openai".into()),
-        env_key: Some("AZURE_OPENAI_API_KEY".into()),
-        env_key_instructions: None,
-        experimental_bearer_token: None,
-        auth: None,
-        aws: None,
-        cursor_agent_service: None,
-        wire_api: WireApi::Responses,
-        query_params: None,
-        http_headers: None,
-        env_http_headers: None,
-        request_max_retries: None,
-        stream_max_retries: None,
-        stream_idle_timeout_ms: None,
-        websocket_connect_timeout_ms: None,
-        requires_openai_auth: false,
-        supports_websockets: false,
-        supports_standalone_web_search: false,
+        ..ModelProviderInfo::default()
     };
 
-    assert!(should_use_remote_compact_task(&provider));
+    let provider = create_model_provider(provider, /*auth_manager*/ None);
+    assert_eq!(
+        provider.capabilities().remote_compaction,
+        RemoteCompactionSupport::V2
+    );
 }
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {

@@ -1,4 +1,5 @@
 //! Prototype MCP server.
+#![recursion_limit = "256"]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::ErrorKind;
@@ -29,9 +30,11 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+mod active_turn_registry;
 mod codex_tool_config;
 mod codex_tool_runner;
 mod exec_approval;
+mod extension_event_sink;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
@@ -84,6 +87,7 @@ pub async fn run_main(
             "`tui.app_server_mode = \"instance_child\"` is not available for the MCP server",
         ));
     }
+    config.auth_config().validate()?;
     set_default_client_residency_requirement(config.enforce_residency.value());
     let otel = codex_core::otel_init::build_provider(
         &config,
@@ -107,6 +111,7 @@ pub async fn run_main(
                 arg0_paths.codex_self_exe.clone(),
                 arg0_paths.codex_linux_sandbox_exe.clone(),
             )?),
+            config.http_client_factory(),
         )
         .await
         .map_err(std::io::Error::other)?,

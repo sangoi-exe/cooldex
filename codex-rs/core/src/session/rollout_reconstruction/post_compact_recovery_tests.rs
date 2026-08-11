@@ -1,9 +1,9 @@
 use super::*;
+use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryMarker;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
-use codex_protocol::protocol::PostCompactRecoveryMarker;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
 

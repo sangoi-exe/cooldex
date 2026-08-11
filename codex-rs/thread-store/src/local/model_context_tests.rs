@@ -11,18 +11,18 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::CompactedItem;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -79,6 +79,44 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     assert!(context.items.iter().any(|item| {
         matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
     }));
+}
+
+#[tokio::test]
+async fn fork_context_excludes_items_after_frozen_cutoff() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1007);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_ordinaled_paginated_rollout(
+        home.path(),
+        "2025-01-03T13-00-06",
+        uuid,
+        [turn_started("frozen-turn"), user_message("frozen message")],
+    );
+    let history_base =
+        history_position(path.as_path(), thread_id, /*end_ordinal_exclusive*/ 3);
+    append_items(path.as_path(), [user_message("later message")]);
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let lineage = store
+        .resolve_rollout_lineage(thread_id)
+        .await
+        .expect("resolve source lineage");
+    let session_meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .expect("read source metadata");
+
+    let context = load_for_fork(lineage, Some(history_base))
+        .await
+        .expect("load frozen fork context");
+
+    let expected = vec![
+        RolloutItem::SessionMeta(session_meta),
+        turn_started("frozen-turn"),
+        user_message("frozen message"),
+    ];
+    assert_eq!(
+        serde_json::to_value(context).expect("serialize fork context"),
+        serde_json::to_value(expected).expect("serialize expected fork context")
+    );
 }
 
 #[tokio::test]
@@ -531,6 +569,7 @@ fn completed_user_message(turn_id: &str, message: &str) -> RolloutItem {
                 text_elements: Vec::new(),
             }],
         }),
+        started_at_ms: Some(0),
         completed_at_ms: 0,
     }))
 }

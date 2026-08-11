@@ -1,3 +1,4 @@
+use crate::RolloutItem;
 use codex_protocol::ThreadId;
 use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::ExitedReviewModeItem;
@@ -10,7 +11,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewTarget;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -258,6 +258,7 @@ fn item_completion_persistence_depends_on_history_mode() {
             client_id: None,
             content: Vec::new(),
         }),
+        started_at_ms: Some(0),
         completed_at_ms: 0,
     }));
 
@@ -299,6 +300,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 },
                 user_facing_hint: "Review requested.".to_string(),
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -308,6 +310,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 id: "exited-review".to_string(),
                 review_output: None,
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
     ];

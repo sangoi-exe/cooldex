@@ -1,4 +1,4 @@
-use codex_protocol::protocol::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryAppliedItem;
 
 use crate::context::PostCompactRecoveryContext;
 

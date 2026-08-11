@@ -1,6 +1,6 @@
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use uuid::Uuid;
 
 use crate::state::PostCompactRecoveryFailureClass;

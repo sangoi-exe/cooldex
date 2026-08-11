@@ -1,4 +1,5 @@
 use super::*;
+use crate::tasks::SessionTaskContext;
 use pretty_assertions::assert_eq;
 
 struct BlockingTurnStartedTask {
@@ -49,7 +50,7 @@ impl SessionTask for BlockingTurnStartedTask {
 
     async fn run(
         self: Arc<Self>,
-        _session: Arc<SessionTaskContext>,
+        _session: Arc<Session>,
         _ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
@@ -176,6 +177,7 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
                 "fresh-waiter".to_string(),
                 user_input_op(fresh_text),
                 /*client_user_message_id*/ None,
+                /*parent_turn_id*/ None,
             )
             .await;
         }
@@ -222,7 +224,8 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
         session
             .input_queue
             .get_pending_input(&session.active_turn)
-            .await,
+            .await
+            .0,
         vec![TurnInput::UserInput {
             content: user_input(fresh_text),
             client_id: None,

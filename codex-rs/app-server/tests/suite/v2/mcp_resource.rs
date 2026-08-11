@@ -36,16 +36,15 @@ use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::BooleanSchema;
-use rmcp::model::CreateElicitationRequestParams;
-use rmcp::model::CreateElicitationResult;
+use rmcp::model::ElicitRequestParams;
+use rmcp::model::ElicitResult;
 use rmcp::model::ElicitationAction;
 use rmcp::model::ElicitationSchema;
 use rmcp::model::ListResourcesResult;
-use rmcp::model::Meta;
+use rmcp::model::MetaObject;
 use rmcp::model::PaginatedRequestParams;
-use rmcp::model::PrimitiveSchema;
+use rmcp::model::PrimitiveSchemaDefinition;
 use rmcp::model::ProtocolVersion;
-use rmcp::model::RawResource;
 use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
@@ -89,6 +88,7 @@ const SKILL_CONTENTS: &str = concat!(
 const SKILL_REFERENCE_CONTENTS: &str =
     "# Deploy reference\n\nUse the orchestrator deployment API.\n";
 const SKILLS_LIST_CALL_ID: &str = "skills-list";
+const SKILLS_READ_MAIN_CALL_ID: &str = "skills-read-main";
 const SKILLS_READ_CALL_ID: &str = "skills-read";
 const SKILLS_READ_AGAIN_CALL_ID: &str = "skills-read-again";
 
@@ -155,6 +155,19 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
         &responses_server,
         vec![
             responses::sse(vec![
+                responses::ev_response_created("resp-skills-read-main"),
+                responses::ev_function_call_with_namespace(
+                    SKILLS_READ_MAIN_CALL_ID,
+                    "skills",
+                    "read",
+                    &json!({
+                        "package": SKILL_RESOURCE_URI,
+                    })
+                    .to_string(),
+                ),
+                responses::ev_completed("resp-skills-read-main"),
+            ]),
+            responses::sse(vec![
                 responses::ev_response_created("resp-skills-list"),
                 responses::ev_function_call_with_namespace(
                     SKILLS_LIST_CALL_ID,
@@ -176,10 +189,10 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
                     "skills",
                     "read",
                     &json!({
+                        "package": SKILL_RESOURCE_URI,
                         "authority": {
                             "kind": "orchestrator",
                         },
-                        "package": SKILL_RESOURCE_URI,
                         "resource": SKILL_REFERENCE_URI,
                     })
                     .to_string(),
@@ -193,9 +206,6 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
                     "skills",
                     "read",
                     &json!({
-                        "authority": {
-                            "kind": "orchestrator",
-                        },
                         "package": SKILL_RESOURCE_URI,
                         "resource": SKILL_REFERENCE_URI,
                     })
@@ -220,7 +230,7 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
-                text: format!("Use ${SKILL_NAME}"),
+                text: "Use the deployment capability.".to_string(),
                 text_elements: Vec::new(),
             }],
             ..Default::default()
@@ -235,16 +245,23 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
     .await??;
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     let first_request = &requests[0];
     assert!(first_request.tool_by_name("skills", "list").is_some());
-    assert!(first_request.tool_by_name("skills", "read").is_some());
+    let read_tool = first_request
+        .tool_by_name("skills", "read")
+        .ok_or_else(|| anyhow::anyhow!("skills.read should be available"))?;
+    assert_eq!(read_tool["parameters"]["required"], json!(["package"]));
+    assert!(
+        read_tool["parameters"]["properties"]
+            .get("authority")
+            .is_none()
+    );
     assert!(first_request.tool_by_name("skills", "search").is_none());
 
     let developer_messages = first_request.message_input_texts("developer");
-    let catalog_line = format!(
-        "- {SKILL_NAME}: {SKILL_DESCRIPTION} (orchestrator resource: {SKILL_RESOURCE_URI})"
-    );
+    let catalog_line =
+        format!("- {SKILL_NAME}: {SKILL_DESCRIPTION} (orchestrator package: {SKILL_RESOURCE_URI})");
     assert_eq!(
         1,
         developer_messages
@@ -262,17 +279,26 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
             .iter()
             .any(|text| text.contains("do not treat `skill://` identifiers as filesystem paths"))
     );
-    let skill_fragments = first_request
-        .message_input_texts("user")
-        .into_iter()
-        .filter(|text| text.starts_with("<skill>"))
-        .collect::<Vec<_>>();
-    assert_eq!(1, skill_fragments.len());
-    assert!(skill_fragments[0].contains(&format!("<name>{SKILL_NAME}</name>")));
-    assert!(skill_fragments[0].contains(SKILL_MARKER));
-    assert!(skill_fragments[0].contains(SKILL_REFERENCE_URI));
+    assert!(
+        first_request
+            .message_input_texts("user")
+            .into_iter()
+            .all(|text| !text.starts_with("<skill>"))
+    );
 
-    let list_output = requests[1]
+    let main_read_output = requests[1]
+        .function_call_output_text(SKILLS_READ_MAIN_CALL_ID)
+        .ok_or_else(|| anyhow::anyhow!("skills.read output should be sent to the model"))?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&main_read_output)?,
+        json!({
+            "resource": SKILL_MAIN_PROMPT_URI,
+            "contents": SKILL_CONTENTS,
+            "next_cursor": null,
+        })
+    );
+
+    let list_output = requests[2]
         .function_call_output_text(SKILLS_LIST_CALL_ID)
         .ok_or_else(|| anyhow::anyhow!("skills.list output should be sent to the model"))?;
     assert_eq!(
@@ -288,10 +314,11 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
                 "main_resource": SKILL_MAIN_PROMPT_URI,
             }],
             "warnings": ["Orchestrator skill discovery stopped after 2 resource pages: failed to list orchestrator skill resources: resources/list failed for `codex_apps`: Mcp error: -32603: simulated later-page failure"],
+            "next_cursor": null,
         })
     );
 
-    let read_output = requests[2]
+    let read_output = requests[3]
         .function_call_output_text(SKILLS_READ_CALL_ID)
         .ok_or_else(|| anyhow::anyhow!("skills.read output should be sent to the model"))?;
     assert_eq!(
@@ -299,9 +326,10 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
         json!({
             "resource": SKILL_REFERENCE_URI,
             "contents": SKILL_REFERENCE_CONTENTS,
+            "next_cursor": null,
         })
     );
-    let repeated_read_output = requests[3]
+    let repeated_read_output = requests[4]
         .function_call_output_text(SKILLS_READ_AGAIN_CALL_ID)
         .ok_or_else(|| {
             anyhow::anyhow!("repeated skills.read output should be sent to the model")
@@ -347,7 +375,16 @@ async fn orchestrator_skill_can_read_referenced_resource_without_an_executor() -
     .await??;
 
     let requests = response_mock.requests();
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 6);
+    let skill_fragments = requests[5]
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text.starts_with("<skill>"))
+        .collect::<Vec<_>>();
+    assert_eq!(1, skill_fragments.len());
+    assert!(skill_fragments[0].contains(&format!("<name>{SKILL_NAME}</name>")));
+    assert!(skill_fragments[0].contains(SKILL_MARKER));
+    assert!(skill_fragments[0].contains(SKILL_REFERENCE_URI));
     assert_eq!(
         ResourceAppsMcpCallCounts {
             list_resources: 6,
@@ -789,18 +826,16 @@ impl ServerHandler for ResourceAppsMcpServer {
         self.calls.list_resources.fetch_add(1, Ordering::Relaxed);
         let cursor = request.and_then(|request| request.cursor);
         if cursor.is_none() {
-            return Ok(ListResourcesResult {
-                resources: vec![skill_resource(
-                    "skill://plugin_ignored/ignored",
-                    "plugin_ignored/ignored",
-                    "Not an MCP skill resource.",
-                    "text/plain",
-                    "ignored-plugin",
-                    "ignored",
-                )],
-                next_cursor: Some("skills-page".to_string()),
-                meta: None,
-            });
+            let mut result = ListResourcesResult::with_all_items(vec![skill_resource(
+                "skill://plugin_ignored/ignored",
+                "plugin_ignored/ignored",
+                "Not an MCP skill resource.",
+                "text/plain",
+                "ignored-plugin",
+                "ignored",
+            )]);
+            result.next_cursor = Some("skills-page".to_string());
+            return Ok(result);
         }
         if cursor.as_deref() == Some("failing-page") {
             return Err(rmcp::ErrorData::internal_error(
@@ -815,75 +850,76 @@ impl ServerHandler for ResourceAppsMcpServer {
             ));
         }
 
-        Ok(ListResourcesResult {
-            resources: vec![skill_resource(
-                SKILL_RESOURCE_URI,
-                "plugin_demo/deploy",
-                RAW_SKILL_DESCRIPTION,
-                "mcp/skill",
-                "demo-plugin",
-                "deploy",
-            )],
-            next_cursor: Some("failing-page".to_string()),
-            meta: None,
-        })
+        let mut result = ListResourcesResult::with_all_items(vec![skill_resource(
+            SKILL_RESOURCE_URI,
+            "plugin_demo/deploy",
+            RAW_SKILL_DESCRIPTION,
+            "mcp/skill",
+            "demo-plugin",
+            "deploy",
+        )]);
+        result.next_cursor = Some("failing-page".to_string());
+        Ok(result)
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
         let uri = request.uri;
         if uri == TEST_ELICITATION_RESOURCE_URI {
             let requested_schema = ElicitationSchema::builder()
-                .required_property("confirmed", PrimitiveSchema::Boolean(BooleanSchema::new()))
+                .required_property(
+                    "confirmed",
+                    PrimitiveSchemaDefinition::Boolean(BooleanSchema::new()),
+                )
                 .build()
                 .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
             let result = context
                 .peer
-                .create_elicitation(CreateElicitationRequestParams::FormElicitationParams {
+                .create_elicitation(ElicitRequestParams::FormElicitationParams {
                     meta: None,
                     message: "Confirm the resource read.".to_string(),
                     requested_schema,
                 })
                 .await
                 .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
-            assert_eq!(
-                result,
-                CreateElicitationResult::new(ElicitationAction::Decline)
-            );
+            assert_eq!(result, ElicitResult::new(ElicitationAction::Decline));
 
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: TEST_ELICITATION_RESOURCE_URI.to_string(),
                     mime_type: Some("text/plain".to_string()),
                     text: TEST_ELICITATION_RESOURCE_TEXT.to_string(),
                     meta: None,
-                },
-            ]));
+                }])
+                .into(),
+            );
         }
         if uri == SKILL_MAIN_PROMPT_URI {
             self.calls.main_prompt_reads.fetch_add(1, Ordering::Relaxed);
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: SKILL_MAIN_PROMPT_URI.to_string(),
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_CONTENTS.to_string(),
                     meta: None,
-                },
-            ]));
+                }])
+                .into(),
+            );
         }
         if uri == SKILL_REFERENCE_URI {
             self.calls.reference_reads.fetch_add(1, Ordering::Relaxed);
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: SKILL_REFERENCE_URI.to_string(),
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_REFERENCE_CONTENTS.to_string(),
                     meta: None,
-                },
-            ]));
+                }])
+                .into(),
+            );
         }
         if uri != TEST_RESOURCE_URI {
             return Err(rmcp::ErrorData::resource_not_found(
@@ -905,7 +941,8 @@ impl ServerHandler for ResourceAppsMcpServer {
                 blob: TEST_RESOURCE_BLOB.to_string(),
                 meta: None,
             },
-        ]))
+        ])
+        .into())
     }
 }
 
@@ -917,17 +954,14 @@ fn skill_resource(
     plugin_name: &str,
     skill_name: &str,
 ) -> Resource {
-    Resource::new(
-        RawResource::new(uri, name)
-            .with_description(description)
-            .with_mime_type(mime_type)
-            .with_meta(skill_resource_meta(plugin_name, skill_name)),
-        /*annotations*/ None,
-    )
+    Resource::new(uri, name)
+        .with_description(description)
+        .with_mime_type(mime_type)
+        .with_meta(skill_resource_meta(plugin_name, skill_name))
 }
 
-fn skill_resource_meta(plugin_name: &str, skill_name: &str) -> Meta {
-    Meta(serde_json::Map::from_iter([
+fn skill_resource_meta(plugin_name: &str, skill_name: &str) -> MetaObject {
+    MetaObject(serde_json::Map::from_iter([
         ("plugin_name".to_string(), json!(plugin_name)),
         ("skill_name".to_string(), json!(skill_name)),
     ]))

@@ -203,6 +203,7 @@ async fn fresh_handler_input_waits_for_completion_terminal_flush() {
                 fresh_turn_id,
                 user_input_op(fresh_text),
                 /*client_user_message_id*/ None,
+                /*parent_turn_id*/ None,
             )
             .await;
         }
@@ -342,6 +343,7 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
                 fresh_request_id,
                 user_input_op(fresh_text),
                 /*client_user_message_id*/ None,
+                /*parent_turn_id*/ None,
             )
             .await;
         }
@@ -402,7 +404,8 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
         session
             .input_queue
             .get_pending_input(&session.active_turn)
-            .await,
+            .await
+            .0,
         vec![TurnInput::UserInput {
             content: user_input(fresh_text),
             client_id: None,
@@ -536,7 +539,8 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
     let pending = session
         .input_queue
         .get_pending_input(&session.active_turn)
-        .await;
+        .await
+        .0;
     assert_eq!(pending.len(), 2);
     assert!(pending.contains(&TurnInput::UserInput {
         content: user_input("second waiting input"),

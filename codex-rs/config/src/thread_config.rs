@@ -314,7 +314,6 @@ mod tests {
             requires_openai_auth: false,
             supports_websockets: true,
             supports_standalone_web_search: true,
-            cursor_agent_service: None,
         }
     }
 }
