@@ -687,12 +687,29 @@ impl Session {
             && config.features.enabled(Feature::TokenBudget);
         if restore_child_window && let InitialHistory::Forked(items) = &mut initial_history {
             let child_window_id = initial_auto_compact_window_ids.window_id.to_string();
+            // Recovery application proofs are keyed by the same window identity as their
+            // compacted checkpoint, so both must move together into the child's new lineage.
+            let parent_window_ids = items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::Compacted(checkpoint) => checkpoint.window_id.clone(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             for item in items {
-                if let RolloutItem::Compacted(checkpoint) = item {
-                    checkpoint.window_number = Some(0);
-                    checkpoint.first_window_id = Some(child_window_id.clone());
-                    checkpoint.previous_window_id = None;
-                    checkpoint.window_id = Some(child_window_id.clone());
+                match item {
+                    RolloutItem::Compacted(checkpoint) => {
+                        checkpoint.window_number = Some(0);
+                        checkpoint.first_window_id = Some(child_window_id.clone());
+                        checkpoint.previous_window_id = None;
+                        checkpoint.window_id = Some(child_window_id.clone());
+                    }
+                    RolloutItem::PostCompactRecoveryApplied(applied)
+                        if parent_window_ids.contains(&applied.compaction_window_id) =>
+                    {
+                        applied.compaction_window_id.clone_from(&child_window_id);
+                    }
+                    _ => {}
                 }
             }
         }

@@ -1731,12 +1731,32 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
     let mut expected_final_answer =
         assistant_message("parent final answer", Some(MessagePhase::FinalAnswer));
     expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_root_guidance = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Parent root guidance.".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_root_guidance.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_subagent_guidance = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Parent subagent guidance.".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_subagent_guidance.set_turn_id_if_missing(&turn_context.sub_id);
     let mut expected_developer_message = ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
         content: vec![
             ContentItem::InputText {
-                text: "Developer context before.\nChild developer instructions.\nDeveloper context after."
+                text: "Developer context before.\nParent developer instructions.\nDeveloper context after."
                     .to_string(),
             },
             ContentItem::InputText {
@@ -1747,20 +1767,11 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
         internal_chat_message_metadata_passthrough: None,
     };
     expected_developer_message.set_turn_id_if_missing(&turn_context.sub_id);
-    let mut expected_subagent_guidance = ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "Child subagent guidance.".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    expected_subagent_guidance.set_turn_id_if_missing(&turn_context.sub_id);
     let expected_history = [
         expected_parent_seed,
-        expected_developer_message,
+        expected_root_guidance,
         expected_subagent_guidance,
+        expected_developer_message,
         expected_final_answer,
     ];
     assert_eq!(
@@ -1817,18 +1828,18 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
         "full-history V2 child should preserve parent hints and never append child guidance"
     );
     assert!(
-        !history_contains_text(
+        history_contains_text(
             no_hint_history.raw_items(),
             "Parent developer instructions."
         ),
-        "empty child developer instructions should remove parent developer instructions"
+        "full-history forks should ignore empty child overrides and retain parent developer instructions"
     );
     assert!(
-        history_contains_text(
+        !history_contains_text(
             no_hint_history.raw_items(),
             "Developer context before.\n\nDeveloper context after."
         ),
-        "empty child developer instructions should preserve surrounding developer context"
+        "full-history forks should not rewrite parent developer context with an empty child override"
     );
     assert!(
         history_contains_text(no_hint_history.raw_items(), "Preserved developer context."),
@@ -2005,19 +2016,19 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         "forked child history should not inherit compacted parent agent messages"
     );
     assert!(
-        !history_contains_text(history.raw_items(), "Parent root guidance."),
-        "forked child history should strip stale parent hints from compacted replacement history"
+        history_contains_text(history.raw_items(), "Parent root guidance."),
+        "full-history child should preserve parent hints in compacted replacement history"
     );
     assert!(
-        !history_contains_text(history.raw_items(), "Parent developer instructions."),
-        "forked child history should replace parent instructions in compacted replacement history"
+        history_contains_text(history.raw_items(), "Parent developer instructions."),
+        "full-history child should preserve parent instructions in compacted replacement history"
     );
     assert!(
         history_contains_text(
             history.raw_items(),
-            "Compacted context before.\nChild developer instructions.\nCompacted context after."
+            "Compacted context before.\nParent developer instructions.\nCompacted context after."
         ),
-        "forked child history should replace compacted parent instructions without removing surrounding context"
+        "full-history child should preserve compacted parent developer context"
     );
     assert!(
         history_contains_text(
@@ -2027,8 +2038,8 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         "forked child history should preserve unrelated compacted developer fragments"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Child subagent guidance."),
-        "full-history forked child should add the child subagent hint after compacted-history sanitization"
+        !history_contains_text(history.raw_items(), "Child subagent guidance."),
+        "full-history child should not append a fresh child subagent hint"
     );
 
     let _ = harness
@@ -2042,10 +2053,10 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         .expect("parent shutdown should submit");
 }
 
-/// Full-history forks must restore child instructions when compaction discarded
-/// the only matching parent instruction fragment from effective history.
+/// Full-history forks must not append a fresh child instruction layer when
+/// compaction discarded the parent instruction fragment from effective history.
 #[tokio::test]
-async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_parent_fragment() {
+async fn spawn_agent_full_fork_does_not_append_child_instructions_after_compaction() {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -2165,8 +2176,8 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
         "full-history fork should not restore stale pre-compaction parent instructions"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Child developer instructions."),
-        "full-history fork should append child instructions absent from effective compacted history"
+        !history_contains_text(history.raw_items(), "Child developer instructions."),
+        "full-history fork should not append a fresh child developer layer"
     );
 
     let _ = harness
@@ -2181,9 +2192,9 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
 }
 
 /// A legacy compaction clears the child's baseline, so its first turn must
-/// rebuild configured developer instructions exactly once.
+/// rebuild the inherited parent developer instructions at most once.
 #[tokio::test]
-async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_once() {
+async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_once() {
     for (case, parent_developer_instructions) in [
         ("without parent instructions", None),
         (
@@ -2195,10 +2206,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         let mut parent_config = harness.config.clone();
         let _ = parent_config.features.enable(Feature::MultiAgentV2);
         parent_config.developer_instructions = parent_developer_instructions.map(str::to_string);
-        let mut child_config = parent_config.clone();
-        child_config.developer_instructions = Some("Child developer instructions.".to_string());
-        child_config.multi_agent_v2.subagent_developer_instructions =
-            Some("Child developer instructions.".to_string());
+        let child_config = parent_config.clone();
 
         let new_thread = harness
             .manager
@@ -2316,15 +2324,16 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             }
             for content_item in content {
                 if let ContentItem::InputText { text } = content_item
-                    && text == "Child developer instructions."
+                    && text == "Parent developer instructions."
                 {
                     instruction_count += 1;
                 }
             }
         }
         assert_eq!(
-            instruction_count, 1,
-            "{case}: canonical context reconstruction must not duplicate child developer instructions"
+            instruction_count,
+            usize::from(parent_developer_instructions.is_some()),
+            "{case}: canonical context reconstruction must preserve the inherited parent developer layer at most once"
         );
 
         let _ = harness

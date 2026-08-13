@@ -648,33 +648,19 @@ impl AgentControl {
 
         let parent_thread_id = *parent_thread_id;
         let parent_thread = state.get_thread(parent_thread_id).await?;
-        let (subagent_developer_instructions, parent_developer_instructions) = match (
-            multi_agent_version,
-            config
-                .multi_agent_v2
-                .subagent_developer_instructions
-                .as_ref(),
-        ) {
-            (MultiAgentVersion::V2, override_instructions)
-                if override_instructions.is_some() || session_source.get_agent_role().is_some() =>
+        let parent_developer_instructions = if multi_agent_version == MultiAgentVersion::V2 {
+            match parent_thread
+                .session
+                .new_default_turn()
+                .await
+                .developer_instructions
+                .clone()
             {
-                let parent_developer_instructions = match parent_thread
-                    .session
-                    .new_default_turn()
-                    .await
-                    .developer_instructions
-                    .clone()
-                {
-                    Some(instructions) if !instructions.is_empty() => Some(instructions),
-                    Some(_) | None => None,
-                };
-                (
-                    Some(config.developer_instructions.clone().unwrap_or_default()),
-                    parent_developer_instructions,
-                )
+                Some(instructions) if !instructions.is_empty() => Some(instructions),
+                Some(_) | None => None,
             }
-            (MultiAgentVersion::Disabled | MultiAgentVersion::V1, _)
-            | (MultiAgentVersion::V2, _) => (None, None),
+        } else {
+            None
         };
         let parent_history_mode = parent_thread.config_snapshot().await.history_mode;
         // `record_conversation_items` only queues persistence writes asynchronously.
@@ -742,11 +728,11 @@ impl AgentControl {
                 break;
             }
         }
-        let mut replaced_parent_developer_instructions = false;
-        // Scrub inherited hints and replace only the parent's developer-instruction fragment.
-        // Compaction stores response items separately, so sanitize both top-level messages and
-        // compacted replacement histories with the same policy.
-        let retain_forked_item = |response_item: &mut ResponseItem, replaced: &mut bool| {
+        // Non-full V2 forks scrub inherited hints and remove the parent's developer-instruction
+        // fragment before the child rebuilds its own context. Full-history forks retain the
+        // complete parent context instead. Compaction stores response items separately, so apply
+        // the same policy to top-level messages and compacted replacement histories.
+        let retain_forked_item = |response_item: &mut ResponseItem| {
             if matches!(response_item, ResponseItem::AgentMessage { .. }) {
                 return false;
             }
@@ -757,9 +743,8 @@ impl AgentControl {
                 return false;
             }
 
-            if let Some(parent_developer_instructions) = parent_developer_instructions.as_ref()
-                && let Some(subagent_developer_instructions) =
-                    subagent_developer_instructions.as_ref()
+            if !preserve_reference_context_item
+                && let Some(parent_developer_instructions) = parent_developer_instructions.as_ref()
                 && let ResponseItem::Message { role, content, .. } = response_item
                 && role == "developer"
             {
@@ -772,13 +757,7 @@ impl AgentControl {
                         return true;
                     }
 
-                    *replaced = true;
-                    let replacement = if preserve_reference_context_item {
-                        subagent_developer_instructions.as_str()
-                    } else {
-                        ""
-                    };
-                    *text = text.replace(parent_developer_instructions, replacement);
+                    *text = text.replace(parent_developer_instructions, "");
                     !text.is_empty()
                 });
                 return !content.is_empty();
@@ -805,19 +784,10 @@ impl AgentControl {
             }
 
             match item {
-                RolloutItem::ResponseItem(response_item) => {
-                    retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
-                }
+                RolloutItem::ResponseItem(response_item) => retain_forked_item(response_item),
                 RolloutItem::Compacted(compacted) => {
                     if let Some(replacement_history) = compacted.replacement_history.as_mut() {
-                        // Matches before this checkpoint cannot survive its replacement history.
-                        replaced_parent_developer_instructions = false;
-                        replacement_history.retain_mut(|response_item| {
-                            retain_forked_item(
-                                response_item,
-                                &mut replaced_parent_developer_instructions,
-                            )
-                        });
+                        replacement_history.retain_mut(&retain_forked_item);
                     }
                     true
                 }
@@ -832,36 +802,6 @@ impl AgentControl {
         });
         if !preserve_reference_context_item {
             drop_unowned_recovery_applications(&mut forked_rollout_items);
-        }
-        // Full forks reuse the parent's reference context instead of rebuilding it. If that
-        // context omitted the parent's developer fragment, append the child's override so its
-        // instructions still reach the model exactly once.
-        if let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
-            && preserve_reference_context_item
-            && !replaced_parent_developer_instructions
-            && !subagent_developer_instructions.is_empty()
-            && parent_thread
-                .session
-                .reference_context_item()
-                .await
-                .is_some()
-            && let Some(developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    subagent_developer_instructions.clone(),
-                ])
-        {
-            forked_rollout_items.push(RolloutItem::ResponseItem(developer_message));
-        }
-        if preserve_reference_context_item
-            && multi_agent_version == MultiAgentVersion::V2
-            && let Some(subagent_usage_hint_text) =
-                config.multi_agent_v2.subagent_usage_hint_text.clone()
-            && let Some(subagent_usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    subagent_usage_hint_text,
-                ])
-        {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
