@@ -402,25 +402,6 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let (active_turn, originating_turn_state) = claimed_turn_slot_with_state();
-    *session.active_turn.lock().await = active_turn;
-    session
-        .record_granted_request_permissions_for_turn(
-            &RequestPermissionsResponse {
-                permissions: RequestPermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                },
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: true,
-            },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
-        )
-        .await;
-
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
         .approval_policy
@@ -464,6 +445,29 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
             },
             /*input_persisted*/ None,
             crate::tasks::MailboxParentProvenance::Ignore,
+        )
+        .await;
+    let originating_turn_state = {
+        let active_turn = session.active_turn.lock().await;
+        active_turn
+            .turn_state()
+            .cloned()
+            .expect("running test task should expose its turn state")
+    };
+    session
+        .record_granted_request_permissions_for_turn(
+            &RequestPermissionsResponse {
+                permissions: RequestPermissionProfile {
+                    network: Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                },
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: true,
+            },
+            codex_exec_server::LOCAL_ENVIRONMENT_ID,
+            Some(&originating_turn_state),
         )
         .await;
 
