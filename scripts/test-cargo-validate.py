@@ -618,6 +618,10 @@ class CargoValidateTests(unittest.TestCase):
             "--bin",
             "codex",
             "-p",
+            "codex-code-mode-host",
+            "--bin",
+            "codex-code-mode-host",
+            "-p",
             "codex-rmcp-client",
             "--bin",
             "test_stdio_server",
@@ -662,6 +666,7 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(
             "build", support_bins_command["env"]["CARGO_GUARD_RESOURCE_PROFILE"]
         )  # type: ignore[index]
+        self.assertEqual("host", support_bins_command["codex_v8_target"])
         self.assertEqual("1", support_bins_command["env"]["CARGO_GUARD_NO_POST_CLEAN"])  # type: ignore[index]
         runtime_command = self.command_for_argv(plan, runtime_argv)
         self.assertEqual(
@@ -697,6 +702,10 @@ class CargoValidateTests(unittest.TestCase):
             "--bin",
             "codex",
             "-p",
+            "codex-code-mode-host",
+            "--bin",
+            "codex-code-mode-host",
+            "-p",
             "codex-rmcp-client",
             "--bin",
             "test_stdio_server",
@@ -728,6 +737,8 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(
             commands.index(support_bins_argv) + 1, commands.index(runtime_argv)
         )
+        support_bins_command = self.command_for_argv(plan, support_bins_argv)
+        self.assertEqual("host", support_bins_command["codex_v8_target"])
         runtime_command = self.command_for_argv(plan, runtime_argv)
         self.assertEqual("1", runtime_command["env"]["CARGO_GUARD_NO_CLEAN"])  # type: ignore[index]
         self.assertEqual("0", runtime_command["env"]["CARGO_GUARD_EXPECTED_GROWTH_GIB"])  # type: ignore[index]
@@ -2494,6 +2505,14 @@ class CargoValidateTests(unittest.TestCase):
             "import sys\n"
             "from pathlib import Path\n"
             "Path(os.environ['CARGO_VALIDATE_TEST_LOG']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
+            "v8_log = os.environ.get('CARGO_VALIDATE_V8_TEST_LOG')\n"
+            "if v8_log:\n"
+            "    Path(v8_log).write_text('|'.join([\n"
+            "        os.environ.get('RUSTY_V8_ARCHIVE', ''),\n"
+            "        os.environ.get('RUSTY_V8_SRC_BINDING_PATH', ''),\n"
+            "        os.environ.get('V8_FROM_SOURCE', ''),\n"
+            "        os.environ.get('RUSTY_V8_MIRROR', ''),\n"
+            "    ]) + '\\n')\n"
             f"{metrics_code}"
             f"raise SystemExit({exit_code})\n"
         )
@@ -4347,6 +4366,211 @@ class CargoValidateTests(unittest.TestCase):
         ]
         self.assertEqual(
             ["executed", "skipped"], [entry["coverage"] for entry in run_entries]
+        )
+
+    def test_codex_v8_target_config_is_host_only_and_guarded(self) -> None:
+        planner = load_planner_module()
+        cases = [
+            (
+                "unsupported target",
+                {
+                    "argv": ["./scripts/cargo-guard.sh", "cargo", "build"],
+                    "codex_v8_target": "musl",
+                },
+                "codex_v8_target must be 'host'",
+            ),
+            (
+                "unguarded command",
+                {
+                    "argv": [sys.executable, "fixture.py"],
+                    "codex_v8_target": "host",
+                },
+                "requires a direct guarded Cargo build-like command",
+            ),
+        ]
+        for name, command, expected_error in cases:
+            with self.subTest(name=name):
+                config = {
+                    "schema_version": 1,
+                    "defaults": {
+                        "standard_mode": "standard",
+                        "unknown_rust_path_policy": "disabled",
+                        "workspace_features_policy": "deny-routine-all-features",
+                    },
+                    "commands": {"fixture": command},
+                }
+                with self.assertRaises(planner.PlannerError) as context:
+                    planner.validate_config(config, [])
+                self.assertIn(expected_error, str(context.exception))
+
+    def test_codex_v8_runtime_env_uses_host_artifacts_and_workflow_cache(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        command = planner.CommandEntry(
+            argv=("./scripts/cargo-guard.sh", "cargo", "build"),
+            reason="fixture",
+            codex_v8_target="host",
+        )
+        resolved_env = {
+            "RUSTY_V8_ARCHIVE": "/cache/archive.gz",
+            "RUSTY_V8_SRC_BINDING_PATH": "/cache/binding.rs",
+        }
+        with (
+            mock.patch.object(
+                planner, "rustc_host_target", return_value="x86_64-unknown-linux-gnu"
+            ),
+            mock.patch.object(
+                planner,
+                "resolve_codex_v8_cargo_env",
+                return_value=resolved_env,
+            ) as resolver,
+            mock.patch.object(planner.Path, "home", return_value=Path("/home/test")),
+        ):
+            actual_env, cleared_env = planner.resolve_codex_v8_command_env(command)
+
+        self.assertEqual(resolved_env, actual_env)
+        self.assertEqual(planner.CODEX_V8_INHERITED_ENV_KEYS, cleared_env)
+        resolver.assert_called_once_with(
+            planner.TARGET_SPECS["x86_64-unknown-linux-gnu"],
+            environ={},
+            cache_root=Path("/home/test/.cache/codex/cargo-validation/rusty-v8"),
+        )
+
+    def test_verify_applies_and_records_resolved_codex_v8_env(self) -> None:
+        planner = load_planner_module()
+        config_path, metadata_path, command_log = self.write_direct_guard_fixture()
+        config_path.write_text(
+            config_path.read_text().replace(
+                'profile = "check"\n',
+                'profile = "check"\ncodex_v8_target = "host"\n',
+            )
+        )
+        receipt_dir = self.repo_root / "v8-env-receipts"
+        config = planner.load_config(config_path)
+        packages = planner.load_metadata(self.repo_root, metadata_path)
+        plan = planner.build_plan(
+            action="verify",
+            stage="validation",
+            mode="quick",
+            files=["fixture.txt"],
+            explicit_surfaces=[],
+            repo_root=self.repo_root,
+            config=config,
+            packages=packages,
+            receipt_dir=receipt_dir,
+            telemetry_level="off",
+        )
+        v8_log = self.repo_root / "v8-env-log.txt"
+        resolved_env = {
+            "RUSTY_V8_ARCHIVE": "/cache/canonical-archive.gz",
+            "RUSTY_V8_SRC_BINDING_PATH": "/cache/canonical-binding.rs",
+        }
+        with (
+            mock.patch.object(
+                planner,
+                "resolve_codex_v8_command_env",
+                return_value=(resolved_env, planner.CODEX_V8_INHERITED_ENV_KEYS),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CARGO_VALIDATE_TEST_LOG": str(command_log),
+                    "CARGO_VALIDATE_V8_TEST_LOG": str(v8_log),
+                    "RUSTY_V8_ARCHIVE": "/cache/inherited-archive.gz",
+                    "RUSTY_V8_MIRROR": "https://invalid.example",
+                    "RUSTY_V8_SRC_BINDING_PATH": "/cache/inherited-binding.rs",
+                    "V8_FROM_SOURCE": "1",
+                },
+            ),
+        ):
+            status = planner.verify_plan(plan, self.repo_root, keep_going=False)
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            "/cache/canonical-archive.gz|/cache/canonical-binding.rs||\n",
+            v8_log.read_text(),
+        )
+        run_entries = [
+            json.loads(line)
+            for line in (receipt_dir / "last-run.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(1, len(run_entries))
+        self.assertEqual("host", run_entries[0]["codex_v8_target"])
+        self.assertEqual(resolved_env, run_entries[0]["resolved_env"])
+        self.assertEqual(
+            list(planner.CODEX_V8_INHERITED_ENV_KEYS), run_entries[0]["cleared_env"]
+        )
+        self.assertNotIn("runtime_env_error", run_entries[0])
+
+    def test_verify_records_codex_v8_runtime_env_failure_without_running_command(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        config_path, metadata_path, command_log = self.write_direct_guard_fixture()
+        config_path.write_text(
+            config_path.read_text().replace(
+                'profile = "check"\n',
+                'profile = "check"\ncodex_v8_target = "host"\n',
+            )
+        )
+        receipt_dir = self.repo_root / "v8-env-failure-receipts"
+        config = planner.load_config(config_path)
+        packages = planner.load_metadata(self.repo_root, metadata_path)
+        plan = planner.build_plan(
+            action="verify",
+            stage="validation",
+            mode="quick",
+            files=["fixture.txt"],
+            explicit_surfaces=[],
+            repo_root=self.repo_root,
+            config=config,
+            packages=packages,
+            receipt_dir=receipt_dir,
+            telemetry_level="off",
+        )
+        error = "failed to prepare checksum-verified V8 artifacts"
+        with mock.patch.object(
+            planner,
+            "resolve_codex_v8_command_env",
+            side_effect=planner.PlannerError(error),
+        ):
+            status = planner.verify_plan(plan, self.repo_root, keep_going=False)
+
+        self.assertEqual(2, status)
+        self.assertFalse(command_log.exists())
+        run_entries = [
+            json.loads(line)
+            for line in (receipt_dir / "last-run.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(1, len(run_entries))
+        self.assertEqual(
+            {
+                "coverage": "setup_failed",
+                "coverage_source": "runtime-env-setup",
+                "runtime_env_error": error,
+                "status": 2,
+            },
+            {
+                key: run_entries[0][key]
+                for key in (
+                    "coverage",
+                    "coverage_source",
+                    "runtime_env_error",
+                    "status",
+                )
+            },
+        )
+        summary = json.loads((receipt_dir / "last-run-summary.json").read_text())
+        self.assertEqual(
+            [
+                {
+                    "index": 1,
+                    "argv": list(plan.commands[0].argv),
+                    "error": error,
+                }
+            ],
+            summary["runtime_env_failures"],
         )
 
     def test_verify_command_env_overrides_inherited_env(self) -> None:

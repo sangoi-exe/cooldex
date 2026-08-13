@@ -19,6 +19,13 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, BinaryIO, Iterable
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from codex_package.targets import TARGET_SPECS
+from codex_package.v8 import resolve_codex_v8_cargo_env
+
 # Merge-safety anchor: cargo-validate owns deterministic mechanical-prep and
 # validation planning, receipt placement, and resource-profile expansion; Cargo
 # build-like execution stays delegated to scripts/cargo-guard.sh.
@@ -29,6 +36,17 @@ PREP_ACTIONS = {"prep", "prep-plan"}
 VALIDATION_ACTIONS = {"plan", "verify"}
 FIRST_PARTY_RUNTIME_SUPPORT_BINS_COMMAND = "first-party-runtime-support-bins"
 FIRST_PARTY_RUNTIME_EXPECTED_GROWTH_SOURCE = "forced:post-support-bins"
+CODEX_V8_HOST_TARGET = "host"
+CODEX_V8_INHERITED_ENV_KEYS = (
+    "RUSTY_V8_ARCHIVE",
+    "RUSTY_V8_MIRROR",
+    "RUSTY_V8_SRC_BINDING_PATH",
+    "V8_FROM_SOURCE",
+)
+CODEX_V8_REQUIRED_ENV_KEYS = {
+    "RUSTY_V8_ARCHIVE",
+    "RUSTY_V8_SRC_BINDING_PATH",
+}
 FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES = {
     "codex-app-server",
     "codex-core",
@@ -112,6 +130,8 @@ VALIDATION_TOOLING_PATHS = (
     "scripts/cargo-validate.py",
     "scripts/cargo-guard.sh",
     "scripts/cargo-validation.toml",
+    "scripts/codex_package/targets.py",
+    "scripts/codex_package/v8.py",
     "justfile",
     "codex-rs/.config/nextest.toml",
 )
@@ -135,6 +155,7 @@ class CommandEntry:
     reason: str
     kind: str = "command"
     env: dict[str, str] = field(default_factory=dict)
+    codex_v8_target: str | None = None
     resource_profile: str | None = None
     fingerprint: str | None = None
     job_contract_digest: str | None = None
@@ -152,6 +173,8 @@ class CommandEntry:
         }
         if self.resource_profile is not None:
             payload["resource_profile"] = self.resource_profile
+        if self.codex_v8_target is not None:
+            payload["codex_v8_target"] = self.codex_v8_target
         if self.fingerprint is not None:
             payload["fingerprint"] = self.fingerprint
         if self.job_contract_digest is not None:
@@ -273,7 +296,7 @@ class Plan:
 
 
 def repo_root_from_script() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return SCRIPT_DIR.parent
 
 
 def normalize_repo_path(path_text: str, repo_root: Path) -> str:
@@ -904,6 +927,7 @@ def command_resume_id(command: CommandEntry) -> str:
             "argv": list(command.argv),
             "env": dict(sorted(resume_identity_env(command.env).items())),
             "kind": command.kind,
+            "codex_v8_target": command.codex_v8_target,
             "resource_profile": command.resource_profile,
             "fingerprint": command.fingerprint,
             "job_contract_digest": command.job_contract_digest,
@@ -1230,6 +1254,20 @@ def validate_config(config: dict[str, Any], packages: list[PackageInfo]) -> None
             raise PlannerError(
                 f"validation command {command_name!r} references unknown resource profile {profile_name!r}"
             )
+        codex_v8_target = command.get("codex_v8_target")
+        if codex_v8_target is not None and codex_v8_target != CODEX_V8_HOST_TARGET:
+            raise PlannerError(
+                f"validation command {command_name!r} codex_v8_target must be {CODEX_V8_HOST_TARGET!r}"
+            )
+        if codex_v8_target is not None and not (
+            len(argv) >= 3
+            and argv[0] == "./scripts/cargo-guard.sh"
+            and argv[1] == "cargo"
+            and argv[2] in BUILD_LIKE_CARGO
+        ):
+            raise PlannerError(
+                f"validation command {command_name!r} codex_v8_target requires a direct guarded Cargo build-like command"
+            )
 
     for surface in config.get("surfaces", []):
         surface_name = surface.get("name")
@@ -1399,14 +1437,83 @@ def command_from_config(
         raise PlannerError(
             f"validation command {command_name!r} must define argv as a string array"
         )
-    return command_with_profile(
-        tuple(argv),
-        reason,
-        command_name,
-        config,
-        command_config.get("profile"),
-        history_entries,
+    return replace(
+        command_with_profile(
+            tuple(argv),
+            reason,
+            command_name,
+            config,
+            command_config.get("profile"),
+            history_entries,
+        ),
+        codex_v8_target=command_config.get("codex_v8_target"),
     )
+
+
+def rustc_host_target() -> str:
+    try:
+        process = subprocess.run(
+            ["rustc", "-vV"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise PlannerError(
+            f"failed to inspect the Rust host target: {error}"
+        ) from error
+    if process.returncode != 0:
+        detail = process.stderr.strip() or "no stderr"
+        raise PlannerError(
+            f"rustc -vV failed while resolving the V8 host target: {detail}"
+        )
+    host_targets = [
+        line.removeprefix("host:").strip()
+        for line in process.stdout.splitlines()
+        if line.startswith("host:")
+    ]
+    if len(host_targets) != 1 or not host_targets[0]:
+        raise PlannerError("rustc -vV did not report exactly one host target")
+    return host_targets[0]
+
+
+def resolve_codex_v8_command_env(
+    command: CommandEntry,
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    if command.codex_v8_target is None:
+        return {}, ()
+    if command.codex_v8_target != CODEX_V8_HOST_TARGET:
+        raise PlannerError(
+            f"unsupported codex_v8_target on planned command: {command.codex_v8_target!r}"
+        )
+
+    target = rustc_host_target()
+    spec = TARGET_SPECS.get(target)
+    if spec is None:
+        supported = ", ".join(sorted(TARGET_SPECS))
+        raise PlannerError(
+            f"Rust host target {target!r} has no supported Codex V8 artifact; supported targets: {supported}"
+        )
+    try:
+        env = resolve_codex_v8_cargo_env(
+            spec,
+            environ={},
+            cache_root=Path.home()
+            / ".cache"
+            / "codex"
+            / "cargo-validation"
+            / "rusty-v8",
+        )
+    except (OSError, RuntimeError) as error:
+        raise PlannerError(
+            f"failed to prepare checksum-verified Codex V8 artifacts for {target}: {error}"
+        ) from error
+    if set(env) != CODEX_V8_REQUIRED_ENV_KEYS:
+        raise PlannerError(
+            f"Codex V8 preparation returned unexpected environment keys: {sorted(env)}"
+        )
+    return env, CODEX_V8_INHERITED_ENV_KEYS
 
 
 def recipe_command(
@@ -1469,7 +1576,11 @@ def add_command(
         commands.append(command)
         return
     for existing in commands:
-        if existing.argv == command.argv and existing.env == command.env:
+        if (
+            existing.argv == command.argv
+            and existing.env == command.env
+            and existing.codex_v8_target == command.codex_v8_target
+        ):
             return
     commands.append(command)
 
@@ -2575,6 +2686,8 @@ def verify_plan(
                 "expected_growth_source": command.expected_growth_source,
                 "status": skip_status,
             }
+            if command.codex_v8_target is not None:
+                entry["codex_v8_target"] = command.codex_v8_target
             write_run_entry(plan.receipt_dir, entry)
             records.append(entry)
             continue
@@ -2586,11 +2699,25 @@ def verify_plan(
         command_env = os.environ.copy()
         if "CARGO_GUARD_EXPECTED_GROWTH_GIB" not in command.env:
             command_env.pop("CARGO_GUARD_EXPECTED_GROWTH_GIB", None)
+        resolved_env: dict[str, str] = {}
+        cleared_env: tuple[str, ...] = ()
+        runtime_env_error: str | None = None
+        try:
+            resolved_env, cleared_env = resolve_codex_v8_command_env(command)
+        except PlannerError as error:
+            runtime_env_error = str(error)
+        for env_name in cleared_env:
+            command_env.pop(env_name, None)
         command_env.update(command.env)
+        command_env.update(resolved_env)
         metrics_path: Path | None = None
         telemetry_log_path: Path | None = None
         uses_guarded_cargo = command_uses_guarded_cargo(command)
-        if direct_guard_command(command) and plan.receipt_dir:
+        if (
+            runtime_env_error is None
+            and direct_guard_command(command)
+            and plan.receipt_dir
+        ):
             if command.fingerprint is None:
                 raise PlannerError(
                     f"direct guarded command {index} is missing a command fingerprint"
@@ -2598,7 +2725,7 @@ def verify_plan(
             metrics_path = plan.receipt_dir / f".guard-metrics-{index}.json"
             command_env["CARGO_GUARD_METRICS_PATH"] = str(metrics_path)
             command_env["CARGO_GUARD_COMMAND_FINGERPRINT"] = command.fingerprint
-        if uses_guarded_cargo and plan.receipt_dir:
+        if runtime_env_error is None and uses_guarded_cargo and plan.receipt_dir:
             command_env["CARGO_GUARD_TELEMETRY_LEVEL"] = plan.telemetry_level
             if plan.telemetry_level != "off":
                 telemetry_log_path = command_telemetry_log_path(
@@ -2611,7 +2738,10 @@ def verify_plan(
         stdout_log_path: Path | None = None
         stderr_log_path: Path | None = None
         output_log_error: str | None = None
-        if plan.receipt_dir:
+        command_status = 2
+        if runtime_env_error is not None:
+            print(f"[cargo-validate][error] {runtime_env_error}", file=sys.stderr)
+        elif plan.receipt_dir:
             stdout_log_path, stderr_log_path = command_log_paths(
                 plan.receipt_dir,
                 run_id=run_id,
@@ -2642,8 +2772,8 @@ def verify_plan(
             "resource_profile": command.resource_profile,
             "fingerprint": command.fingerprint,
             "job_contract_digest": command.job_contract_digest,
-            "coverage": "executed",
-            "coverage_source": "executed",
+            "coverage": "setup_failed" if runtime_env_error else "executed",
+            "coverage_source": "runtime-env-setup" if runtime_env_error else "executed",
             "partial_mode": current_partial_mode,
             "command_id": current_command_id,
             "command_key": current_command_key,
@@ -2660,6 +2790,14 @@ def verify_plan(
             "started_at": started_at,
             "duration_seconds": round(finished_at - started_at, 3),
         }
+        if command.codex_v8_target is not None:
+            entry["codex_v8_target"] = command.codex_v8_target
+        if resolved_env:
+            entry["resolved_env"] = dict(sorted(resolved_env.items()))
+        if cleared_env:
+            entry["cleared_env"] = list(cleared_env)
+        if runtime_env_error is not None:
+            entry["runtime_env_error"] = runtime_env_error
         if (
             plan.receipt_dir
             and stdout_log_path is not None
@@ -2705,6 +2843,16 @@ def verify_plan(
                 entry["guard_metrics"] = metrics
         write_run_entry(plan.receipt_dir, entry)
         records.append(entry)
+        if runtime_env_error is not None:
+            exit_status = 2
+            if not keep_going:
+                print(
+                    f"[cargo-validate][error] stopping after failed command {index}",
+                    file=sys.stderr,
+                )
+                stopped_after_failure = True
+                break
+            continue
         if output_log_error is not None:
             exit_status = 2
             print(
@@ -2786,6 +2934,8 @@ def verify_plan(
                 "expected_growth_source": command.expected_growth_source,
                 "status": None,
             }
+            if command.codex_v8_target is not None:
+                entry["codex_v8_target"] = command.codex_v8_target
             write_run_entry(plan.receipt_dir, entry)
             records.append(entry)
 
@@ -2830,6 +2980,15 @@ def verify_plan(
             if entry.get("status") not in (0, None)
             or entry.get("guard_metrics_error") is not None
             or entry.get("output_log_error") is not None
+        ],
+        "runtime_env_failures": [
+            {
+                "index": entry.get("index"),
+                "argv": entry.get("argv"),
+                "error": entry.get("runtime_env_error"),
+            }
+            for entry in records
+            if entry.get("runtime_env_error") is not None
         ],
         "output_log_failures": [
             {

@@ -219,8 +219,9 @@ argv = ["python3", "scripts/test-cargo-validate.py"]
 argv = ["just", "test-cargo-guard"]
 
 [commands.first-party-runtime-support-bins]
-argv = ["./scripts/cargo-guard.sh", "cargo", "build", "-p", "codex-cli", "--bin", "codex", "-p", "codex-rmcp-client", "--bin", "test_stdio_server", "--bin", "test_streamable_http_server", "-p", "codex-exec", "--bin", "codex-exec", "-p", "codex-linux-sandbox", "--bin", "codex-linux-sandbox", "-p", "codex-shell-escalation", "--bin", "codex-execve-wrapper"]
+argv = ["./scripts/cargo-guard.sh", "cargo", "build", "-p", "codex-cli", "--bin", "codex", "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host", "-p", "codex-rmcp-client", "--bin", "test_stdio_server", "--bin", "test_streamable_http_server", "-p", "codex-exec", "--bin", "codex-exec", "-p", "codex-linux-sandbox", "--bin", "codex-linux-sandbox", "-p", "codex-shell-escalation", "--bin", "codex-execve-wrapper"]
 profile = "build"
+codex_v8_target = "host"
 
 [commands.validate-plan-self]
 argv = ["./scripts/cargo-guard.sh", "plan", "--file", "scripts/cargo-validate.py", "--mode", "standard", "--no-receipt"]
