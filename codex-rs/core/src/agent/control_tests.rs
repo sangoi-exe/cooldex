@@ -694,6 +694,16 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
     config.model = Some("gpt-5.6-sol".to_string());
+    let role_path = config.codex_home.join("worker.toml");
+    std::fs::write(&role_path, "model = \"role-file-model\"\n").expect("write worker role config");
+    config.agent_roles.insert(
+        "worker".to_string(),
+        AgentRoleConfig {
+            description: Some("Worker role used to prove reload snapshot ownership".to_string()),
+            config_file: Some(role_path.to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_paginated_thread().await;
     let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
@@ -757,6 +767,7 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         },
         Ok(_) => panic!("expected thread to be removed"),
     }
+    std::fs::remove_file(&role_path).expect("remove worker role before residency reload");
 
     let mut reload_config = harness.config.clone();
     reload_config.model = Some("identity-drift-model".to_string());

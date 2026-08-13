@@ -292,9 +292,11 @@ async fn child_recall_reads_only_the_rollout_owned_by_its_history_mode(
     );
     assert_eq!(parent_setup.requests().len(), 2);
     if expected_availability == "available" {
-        assert!(output.contains("question before parent compaction"));
+        assert_eq!(value["boundary"]["kind"], "replacement_history");
+        assert_eq!(value["source"]["reached_recall_origin"], true);
     } else {
-        assert!(!output.contains("question before parent compaction"));
+        assert!(value["boundary"].is_null());
+        assert_eq!(value["source"]["reached_recall_origin"], false);
     }
 
     Ok(())

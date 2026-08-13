@@ -111,13 +111,41 @@ fn instance_launch(home: &Path) -> Result<InstanceChildLaunch> {
         file.sync_all()?;
         wrapper
     };
+    instance_launch_for_exe(home, codex_exe)
+}
+
+fn instance_launch_for_exe(home: &Path, codex_exe: PathBuf) -> Result<InstanceChildLaunch> {
     Ok(InstanceChildLaunch {
         codex_exe,
         codex_home: absolute(home)?,
         raw_config_overrides: Vec::new(),
         profile: None,
         strict_config: false,
+        psp: false,
     })
+}
+
+fn instance_launch_with_argv_capture(
+    home: &Path,
+    capture_path: &Path,
+) -> Result<InstanceChildLaunch> {
+    let test_exe = std::env::current_exe()?;
+    let test_exe = test_exe.to_string_lossy();
+    let capture_path = capture_path.to_string_lossy();
+    let quoted_test_exe = shlex::try_quote(test_exe.as_ref())?;
+    let quoted_capture_path = shlex::try_quote(capture_path.as_ref())?;
+    let wrapper = home.join(format!("codex-argv-wrapper-{}.sh", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o700)
+        .open(&wrapper)?;
+    writeln!(
+        file,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {quoted_capture_path}\nexec {quoted_test_exe} --exact app_server_instance::tests::app_server_child_helper --ignored --nocapture"
+    )?;
+    file.sync_all()?;
+    instance_launch_for_exe(home, wrapper)
 }
 
 #[tokio::test]
@@ -147,6 +175,7 @@ async fn app_server_child_helper() -> Result<()> {
                 codex_app_server::RemoteControlStartupMode::DisabledEphemeral,
             install_shutdown_signal_handler: false,
             launch_mode: codex_app_server::AppServerLaunchMode::InstanceChild,
+            ..Default::default()
         },
     )
     .await
@@ -455,6 +484,49 @@ async fn two_instance_children_use_distinct_endpoints_and_reap_cleanly() -> Resu
 
 #[tokio::test]
 #[serial(app_server_instance)]
+async fn instance_child_propagates_psp_flag_to_child_argv() -> Result<()> {
+    for psp in [false, true] {
+        let home = TempDir::new()?;
+        write_instance_config(home.path())?;
+        let capture_path = home.path().join("instance-child-argv.txt");
+        let mut launch = instance_launch_with_argv_capture(home.path(), &capture_path)?;
+        launch.psp = psp;
+
+        let started = AppServerInstance::start(launch).await?;
+        let args = std::fs::read_to_string(&capture_path)?
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let app_server_index = args
+            .iter()
+            .position(|arg| arg == "app-server")
+            .expect("instance child subcommand");
+        let psp_index = args.iter().position(|arg| arg == "--psp");
+        if psp {
+            assert_eq!(
+                psp_index,
+                Some(
+                    app_server_index
+                        .checked_sub(1)
+                        .expect("--psp should precede the app-server subcommand"),
+                )
+            );
+        } else {
+            assert_eq!(psp_index, None);
+        }
+
+        crate::app_server_session::AppServerSession::new_instance_child(
+            started.client,
+            started.supervisor,
+        )
+        .shutdown()
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(app_server_instance)]
 async fn spawn_failure_and_early_exit_leave_no_owned_state() -> Result<()> {
     for codex_exe in [
         PathBuf::from("/definitely/missing/codex"),
@@ -467,6 +539,7 @@ async fn spawn_failure_and_early_exit_leave_no_owned_state() -> Result<()> {
             raw_config_overrides: Vec::new(),
             profile: None,
             strict_config: false,
+            psp: false,
         };
         assert!(AppServerInstance::start(launch).await.is_err());
         let root = home.path().join("tmp/app-server-instances");

@@ -11,11 +11,11 @@ Use Node.js 22 and Python 3.10 or later.
 
 ## Run the conformance gate
 
-First install the frozen workspace dependencies and build Codex:
+From the repository root, first install the frozen workspace dependencies and build Codex through the guarded Cargo route:
 
 ```bash
 pnpm install --frozen-lockfile
-cargo build --locked --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
+./scripts/cargo-guard.sh cargo build --locked --manifest-path codex-rs/Cargo.toml -p codex-cli --bin codex
 ```
 
 From a published Codex checkout, run:

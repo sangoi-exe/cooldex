@@ -247,72 +247,78 @@ impl Session {
                 )
                 .map_err(RecallContextError::from);
             }
-            Some(expected_previous_window_id) => {
-                let previous_boundary_index = match prefix.latest_surviving_compaction_index {
-                    Some(previous_boundary_index) => previous_boundary_index,
-                    None if !tail.reached_start => {
-                        return unavailable_context(
-                            &thread_id,
-                            RecallAvailability::WorkLimit,
-                            source,
-                            None,
-                            None,
-                        )
-                        .map_err(RecallContextError::from);
-                    }
-                    None => {
+            Some(expected_previous_window_id) => match prefix.latest_surviving_compaction_index {
+                Some(previous_boundary_index) => {
+                    let previous = tail.items[..boundary_index]
+                            .get(previous_boundary_index)
+                            .and_then(|item| match item {
+                                RolloutItem::Compacted(previous) => Some(previous),
+                                _ => None,
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "rollout reconstruction selected non-compaction predecessor index {previous_boundary_index}"
+                                )
+                            })
+                            .map_err(RecallContextError::from)?;
+                    let actual_previous_window_id =
+                            previous.window_id.as_deref().ok_or_else(|| {
+                                RecallContextError::Build(anyhow::anyhow!(
+                                    "compaction predecessor at index {previous_boundary_index} has no window id"
+                                ))
+                            })?;
+                    if actual_previous_window_id != expected_previous_window_id {
                         return Err(RecallContextError::Build(anyhow::anyhow!(
-                            "compaction window {} names missing predecessor {expected_previous_window_id}",
-                            compacted.window_id.as_deref().unwrap_or("<unknown>")
+                            "compaction predecessor mismatch: expected {expected_previous_window_id}, found {actual_previous_window_id}"
                         )));
                     }
-                };
-                let previous = tail.items[..boundary_index]
-                    .get(previous_boundary_index)
-                    .and_then(|item| match item {
-                        RolloutItem::Compacted(previous) => Some(previous),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "rollout reconstruction selected non-compaction predecessor index {previous_boundary_index}"
-                        )
-                    })
-                    .map_err(RecallContextError::from)?;
-                let actual_previous_window_id = previous.window_id.as_deref().ok_or_else(|| {
-                    RecallContextError::Build(anyhow::anyhow!(
-                        "compaction predecessor at index {previous_boundary_index} has no window id"
-                    ))
-                })?;
-                if actual_previous_window_id != expected_previous_window_id {
+                    if previous.replacement_history.is_none() {
+                        if !tail.reached_start {
+                            return unavailable_context(
+                                &thread_id,
+                                RecallAvailability::WorkLimit,
+                                source,
+                                None,
+                                None,
+                            )
+                            .map_err(RecallContextError::from);
+                        }
+                        if tail.segments_read != 1 {
+                            return unavailable_context(
+                                &thread_id,
+                                RecallAvailability::UnsupportedLegacy,
+                                source,
+                                None,
+                                None,
+                            )
+                            .map_err(RecallContextError::from);
+                        }
+                    }
+                    previous_boundary_index + 1
+                }
+                None if !tail.reached_start => {
+                    return unavailable_context(
+                        &thread_id,
+                        RecallAvailability::WorkLimit,
+                        source,
+                        None,
+                        None,
+                    )
+                    .map_err(RecallContextError::from);
+                }
+                None if compacted.window_number == Some(1)
+                    && compacted.first_window_id.as_deref()
+                        == Some(expected_previous_window_id) =>
+                {
+                    0
+                }
+                None => {
                     return Err(RecallContextError::Build(anyhow::anyhow!(
-                        "compaction predecessor mismatch: expected {expected_previous_window_id}, found {actual_previous_window_id}"
+                        "compaction window {} names missing predecessor {expected_previous_window_id}",
+                        compacted.window_id.as_deref().unwrap_or("<unknown>")
                     )));
                 }
-                if previous.replacement_history.is_none() {
-                    if !tail.reached_start {
-                        return unavailable_context(
-                            &thread_id,
-                            RecallAvailability::WorkLimit,
-                            source,
-                            None,
-                            None,
-                        )
-                        .map_err(RecallContextError::from);
-                    }
-                    if tail.segments_read != 1 {
-                        return unavailable_context(
-                            &thread_id,
-                            RecallAvailability::UnsupportedLegacy,
-                            source,
-                            None,
-                            None,
-                        )
-                        .map_err(RecallContextError::from);
-                    }
-                }
-                previous_boundary_index + 1
-            }
+            },
         };
         source.reached_recall_origin = true;
 

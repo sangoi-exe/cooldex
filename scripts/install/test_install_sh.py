@@ -143,7 +143,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -199,7 +199,7 @@ class InstallShTest(unittest.TestCase):
                         archive_path=archive_path,
                         checksum_path=checksum_path,
                         force_macos=True,
-                        use_mirror=None,
+                        use_mirror=True,
                     )
 
                     self.assertEqual(result.returncode, 0, result.stderr)
@@ -233,7 +233,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -263,7 +263,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="asset_fallback",
             )
 
@@ -294,7 +294,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="corrupt_assets",
             )
 
@@ -331,7 +331,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -375,7 +375,7 @@ class InstallShTest(unittest.TestCase):
                 checksum_path=checksum_path,
                 releases_checksum_path=mirror_checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -405,7 +405,7 @@ class InstallShTest(unittest.TestCase):
                 archive_path=archive_path,
                 checksum_path=checksum_path,
                 force_macos=True,
-                use_mirror=None,
+                use_mirror=True,
                 releases_mode="corrupt_checksum_and_github",
             )
 

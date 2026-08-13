@@ -51,6 +51,7 @@ pub(crate) struct InstanceChildLaunch {
     pub(crate) raw_config_overrides: Vec<String>,
     pub(crate) profile: Option<ProfileV2Name>,
     pub(crate) strict_config: bool,
+    pub(crate) psp: bool,
 }
 
 pub(crate) struct StartedInstanceChild {
@@ -90,6 +91,9 @@ impl AppServerInstance {
         }
         if let Some(profile) = &launch.profile {
             command.arg("-p").arg(profile.as_str());
+        }
+        if launch.psp {
+            command.arg("--psp");
         }
         command
             .arg("app-server")

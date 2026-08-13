@@ -1563,8 +1563,11 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     );
     assert_ne!(new_window_id, initial_window_id);
     assert!(
-        !requests[2].body_contains_text("request new context window"),
-        "new_context should drop the prior window history before continuing the turn"
+        !requests[2]
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "request new context window"),
+        "new_context should drop the prior user item before continuing the turn"
     );
     assert_eq!(
         requests[2].function_call_output_text(continue_call_id),

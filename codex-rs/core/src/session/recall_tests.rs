@@ -516,6 +516,198 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
 }
 
 #[tokio::test]
+async fn first_compaction_accepts_metadata_backed_virtual_root() {
+    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    RolloutItem::ResponseItem(message(
+                        "assistant",
+                        "history before the first compaction",
+                    )),
+                    compacted_window(
+                        "first",
+                        Vec::new(),
+                        1,
+                        VIRTUAL_ROOT_ID,
+                        Some(VIRTUAL_ROOT_ID),
+                        CURRENT_WINDOW_ID,
+                    ),
+                ],
+            ),
+        )
+        .await
+        .expect("first compaction should accept its metadata-backed virtual root");
+    let value = parsed(&context);
+
+    assert_eq!(value["availability"], "available");
+    assert_eq!(value["source"]["reached_start"], true);
+    assert_eq!(value["source"]["reached_recall_origin"], true);
+    assert_eq!(
+        value["groups"][0]["items"][0]["content"][0]["text"],
+        "history before the first compaction"
+    );
+}
+
+#[tokio::test]
+async fn first_compaction_virtual_root_requires_complete_source_start() {
+    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    let (session, turn_context) = make_session_and_context().await;
+    let mut stored_tail = tail(
+        session.thread_id,
+        vec![compacted_window(
+            "first",
+            Vec::new(),
+            1,
+            VIRTUAL_ROOT_ID,
+            Some(VIRTUAL_ROOT_ID),
+            CURRENT_WINDOW_ID,
+        )],
+    );
+    stored_tail.reached_start = false;
+
+    let context = session
+        .build_recall_context(&turn_context, stored_tail)
+        .await
+        .expect("an incomplete source should report work limit");
+    let value = parsed(&context);
+    assert_eq!(value["availability"], "work_limit");
+    assert_eq!(value["source"]["reached_recall_origin"], false);
+}
+
+#[tokio::test]
+async fn virtual_root_rejects_window_after_first() {
+    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    let (session, turn_context) = make_session_and_context().await;
+    let error = match session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![compacted_window(
+                    "second",
+                    Vec::new(),
+                    2,
+                    VIRTUAL_ROOT_ID,
+                    Some(VIRTUAL_ROOT_ID),
+                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002",
+                )],
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("a later window cannot use the virtual root"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("names missing predecessor"));
+}
+
+#[tokio::test]
+async fn virtual_root_rejects_unequal_first_and_previous_window_ids() {
+    let (session, turn_context) = make_session_and_context().await;
+    let error = match session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![compacted_window(
+                    "first",
+                    Vec::new(),
+                    1,
+                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000",
+                    Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7afff"),
+                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+                )],
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("unequal first and previous window ids must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("names missing predecessor"));
+}
+
+#[tokio::test]
+async fn virtual_root_rejects_missing_first_window_id() {
+    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    let (session, turn_context) = make_session_and_context().await;
+    let RolloutItem::Compacted(mut first) = compacted_window(
+        "first",
+        Vec::new(),
+        1,
+        VIRTUAL_ROOT_ID,
+        Some(VIRTUAL_ROOT_ID),
+        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+    ) else {
+        unreachable!("compacted_window always builds a compacted item");
+    };
+    first.first_window_id = None;
+    let error = match session
+        .build_recall_context(
+            &turn_context,
+            tail(session.thread_id, vec![RolloutItem::Compacted(first)]),
+        )
+        .await
+    {
+        Ok(_) => panic!("missing first window id must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("names missing predecessor"));
+}
+
+#[tokio::test]
+async fn named_predecessor_rejects_mismatched_present_window_id() {
+    const EXPECTED_PREDECESSOR_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    let (session, turn_context) = make_session_and_context().await;
+    let error = match session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    compacted_window(
+                        "predecessor",
+                        Vec::new(),
+                        1,
+                        EXPECTED_PREDECESSOR_ID,
+                        None,
+                        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7afff",
+                    ),
+                    compacted_window(
+                        "current",
+                        Vec::new(),
+                        2,
+                        EXPECTED_PREDECESSOR_ID,
+                        Some(EXPECTED_PREDECESSOR_ID),
+                        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002",
+                    ),
+                ],
+            ),
+        )
+        .await
+    {
+        Ok(_) => panic!("a present predecessor with the wrong id must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("compaction predecessor mismatch")
+    );
+}
+
+#[tokio::test]
 async fn bounded_tail_without_named_previous_compaction_reports_work_limit() {
     const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";

@@ -505,6 +505,7 @@ async fn start_app_server(
                         raw_config_overrides,
                         profile: loader_overrides.user_config_profile.clone(),
                         strict_config,
+                        psp: config.psp,
                     },
                 )
                 .await?;
