@@ -692,7 +692,15 @@ impl Session {
             let parent_window_ids = items
                 .iter()
                 .filter_map(|item| match item {
-                    RolloutItem::Compacted(checkpoint) => checkpoint.window_id.clone(),
+                    RolloutItem::Compacted(checkpoint) => checkpoint
+                        .window_id
+                        .as_ref()
+                        .filter(|window_id| {
+                            Uuid::parse_str(window_id)
+                                .ok()
+                                .is_some_and(|uuid| uuid.get_version_num() == 7)
+                        })
+                        .cloned(),
                     _ => None,
                 })
                 .collect::<Vec<_>>();

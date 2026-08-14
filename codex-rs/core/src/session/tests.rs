@@ -78,6 +78,7 @@ use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
+use crate::state::PostCompactRecoveryFailureClass;
 use crate::state::PostCompactRecoveryIdentity;
 use crate::state::TaskKind;
 use crate::state::TurnSlot;
@@ -110,6 +111,8 @@ use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_history::CompactedItem;
 use codex_history::InitialHistory;
+use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryMarker;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
 use codex_network_proxy::NetworkProxyConfig;
@@ -6098,10 +6101,17 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     initial_history: InitialHistory,
     session_source: SessionSource,
     agent_control: AgentControl,
+    enabled_features: &[Feature],
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
     config.ephemeral = true;
+    for feature in enabled_features {
+        config
+            .features
+            .enable(*feature)
+            .expect("test config should allow feature update");
+    }
     let config = Arc::new(config);
     let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
     let models_manager = models_manager_with_provider(
@@ -6217,6 +6227,85 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
 }
 
 #[tokio::test]
+async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
+    let malformed_window_id = "not-a-v7-window";
+    let boundary_item_id = "msg_malformed_recovery_boundary";
+    let consuming_turn_id = "turn-malformed-recovery";
+    let replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "retained recovery boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let rollout_items = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(replacement_history.clone()),
+            window_number: Some(1),
+            first_window_id: Some(malformed_window_id.to_string()),
+            previous_window_id: None,
+            window_id: Some(malformed_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: consuming_turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: malformed_window_id.to_string(),
+            boundary_item_id: boundary_item_id.to_string(),
+            turn_id: consuming_turn_id.to_string(),
+        }),
+    ];
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Forked(rollout_items),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await
+    .expect("malformed inherited recovery should create a blocked child session");
+
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .blocked_failure(),
+        Some(PostCompactRecoveryFailureClass::BoundaryMismatch)
+    );
+    let turn_context = session.new_default_turn().await;
+    let mut prompt_input = replacement_history;
+    let error = session
+        .prepare_post_compact_recovery(&turn_context, &mut prompt_input)
+        .await
+        .expect_err("blocked inherited recovery must fail before inference");
+    assert_eq!(
+        format!("{error:#}"),
+        "Fatal error: post-compact recovery is blocked: boundary_mismatch"
+    );
+}
+
+#[tokio::test]
 async fn resumed_root_session_uses_thread_id_as_session_id() {
     let thread_id = ThreadId::new();
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
@@ -6227,6 +6316,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
         }),
         SessionSource::Exec,
         AgentControl::default(),
+        /*enabled_features*/ &[],
     )
     .await
     .expect("resume should succeed");
@@ -6270,6 +6360,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
         }),
         session_source,
         AgentControl::default(),
+        /*enabled_features*/ &[],
     )
     .await
     .expect("resume should succeed");
