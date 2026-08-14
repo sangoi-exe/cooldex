@@ -689,21 +689,41 @@ impl Session {
             let child_window_id = initial_auto_compact_window_ids.window_id.to_string();
             // Recovery application proofs are keyed by the same window identity as their
             // compacted checkpoint, so both must move together into the child's new lineage.
-            let parent_window_ids = items
+            let parent_recovery_identities = items
                 .iter()
                 .filter_map(|item| match item {
-                    RolloutItem::Compacted(checkpoint) => checkpoint
-                        .window_id
-                        .as_ref()
-                        .filter(|window_id| {
+                    RolloutItem::Compacted(checkpoint) => {
+                        let window_id = checkpoint.window_id.as_ref().filter(|window_id| {
                             Uuid::parse_str(window_id)
                                 .ok()
                                 .is_some_and(|uuid| uuid.get_version_num() == 7)
-                        })
-                        .cloned(),
+                        })?;
+                        let replacement_history = checkpoint.replacement_history.as_deref()?;
+                        let boundary_item_id = replacement_history.last()?.id()?.as_str();
+                        let boundary_occurrences = replacement_history
+                            .iter()
+                            .filter(|item| {
+                                item.id()
+                                    .is_some_and(|item_id| item_id.as_str() == boundary_item_id)
+                            })
+                            .count();
+                        if boundary_item_id.is_empty()
+                            || boundary_occurrences != 1
+                            || checkpoint
+                                .post_compact_recovery
+                                .as_ref()
+                                .is_some_and(|marker| {
+                                    marker.boundary_item_id.is_empty()
+                                        || marker.boundary_item_id != boundary_item_id
+                                })
+                        {
+                            return None;
+                        }
+                        Some((window_id.clone(), boundary_item_id.to_string()))
+                    }
                     _ => None,
                 })
-                .collect::<Vec<_>>();
+                .collect::<HashSet<_>>();
             for item in items {
                 match item {
                     RolloutItem::Compacted(checkpoint) => {
@@ -713,7 +733,10 @@ impl Session {
                         checkpoint.window_id = Some(child_window_id.clone());
                     }
                     RolloutItem::PostCompactRecoveryApplied(applied)
-                        if parent_window_ids.contains(&applied.compaction_window_id) =>
+                        if parent_recovery_identities.contains(&(
+                            applied.compaction_window_id.clone(),
+                            applied.boundary_item_id.clone(),
+                        )) =>
                     {
                         applied.compaction_window_id.clone_from(&child_window_id);
                     }

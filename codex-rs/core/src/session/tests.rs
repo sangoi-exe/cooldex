@@ -6306,6 +6306,217 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
 }
 
 #[tokio::test]
+async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
+    let older_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    let latest_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let older_boundary_item_id = "msg_older_recovery_boundary";
+    let latest_boundary_item_id = "msg_latest_recovery_boundary";
+    let consuming_turn_id = "turn-hybrid-recovery";
+    let older_replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(
+            older_boundary_item_id.to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "older retained recovery boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let latest_replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(
+            latest_boundary_item_id.to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "latest retained recovery boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let rollout_items = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "older summary".to_string(),
+            replacement_history: Some(older_replacement_history),
+            window_number: Some(1),
+            first_window_id: Some(older_window_id.to_string()),
+            previous_window_id: None,
+            window_id: Some(older_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: older_boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "latest summary".to_string(),
+            replacement_history: Some(latest_replacement_history.clone()),
+            window_number: Some(2),
+            first_window_id: Some(older_window_id.to_string()),
+            previous_window_id: Some(older_window_id.to_string()),
+            window_id: Some(latest_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: latest_boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: consuming_turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: older_window_id.to_string(),
+            boundary_item_id: latest_boundary_item_id.to_string(),
+            turn_id: consuming_turn_id.to_string(),
+        }),
+    ];
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Forked(rollout_items),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await
+    .expect("hybrid inherited recovery should create a blocked child session");
+
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .blocked_failure(),
+        Some(PostCompactRecoveryFailureClass::BoundaryMismatch)
+    );
+    let turn_context = session.new_default_turn().await;
+    let mut prompt_input = latest_replacement_history;
+    let error = session
+        .prepare_post_compact_recovery(&turn_context, &mut prompt_input)
+        .await
+        .expect_err("hybrid inherited recovery must fail before inference");
+    assert_eq!(
+        format!("{error:#}"),
+        "Fatal error: post-compact recovery is blocked: boundary_mismatch"
+    );
+}
+
+#[tokio::test]
+async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof() {
+    let older_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    let latest_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let older_boundary_item_id = "msg_older_recovery_boundary";
+    let latest_boundary_item_id = "msg_latest_recovery_boundary";
+    let consuming_turn_id = "turn-earlier-recovery";
+    let older_replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(
+            older_boundary_item_id.to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "older retained recovery boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let latest_replacement_history = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(
+            latest_boundary_item_id.to_string(),
+        )),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "latest retained recovery boundary".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let rollout_items = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "older summary".to_string(),
+            replacement_history: Some(older_replacement_history),
+            window_number: Some(1),
+            first_window_id: Some(older_window_id.to_string()),
+            previous_window_id: None,
+            window_id: Some(older_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: older_boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: consuming_turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: older_window_id.to_string(),
+            boundary_item_id: older_boundary_item_id.to_string(),
+            turn_id: consuming_turn_id.to_string(),
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "latest summary".to_string(),
+            replacement_history: Some(latest_replacement_history),
+            window_number: Some(2),
+            first_window_id: Some(older_window_id.to_string()),
+            previous_window_id: Some(older_window_id.to_string()),
+            window_id: Some(latest_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: latest_boundary_item_id.to_string(),
+            }),
+        }),
+    ];
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
+        InitialHistory::Forked(rollout_items),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await
+    .expect("earlier recovery proof should preserve the latest pending checkpoint");
+
+    let child_window_id = session
+        .state
+        .lock()
+        .await
+        .auto_compact_window_ids()
+        .window_id
+        .to_string();
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity()
+            .cloned(),
+        Some(PostCompactRecoveryIdentity {
+            compaction_window_id: child_window_id,
+            boundary_item_id: latest_boundary_item_id.to_string(),
+        })
+    );
+}
+
+#[tokio::test]
 async fn resumed_root_session_uses_thread_id_as_session_id() {
     let thread_id = ThreadId::new();
     let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx(
