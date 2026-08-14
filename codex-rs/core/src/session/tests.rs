@@ -6104,8 +6104,27 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     enabled_features: &[Feature],
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let codex_home = tempfile::tempdir().expect("create temp dir");
-    let mut config = build_test_config(codex_home.path()).await;
-    config.ephemeral = true;
+    make_session_with_history_source_and_agent_control_and_rx_at(
+        codex_home.path(),
+        /*ephemeral*/ true,
+        initial_history,
+        session_source,
+        agent_control,
+        enabled_features,
+    )
+    .await
+}
+
+async fn make_session_with_history_source_and_agent_control_and_rx_at(
+    codex_home: &Path,
+    ephemeral: bool,
+    initial_history: InitialHistory,
+    session_source: SessionSource,
+    agent_control: AgentControl,
+    enabled_features: &[Feature],
+) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
+    let mut config = build_test_config(codex_home).await;
+    config.ephemeral = ephemeral;
     for feature in enabled_features {
         config
             .features
@@ -6226,13 +6245,611 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     Ok((session, rx_event))
 }
 
+fn repeated_boundary_fork_rollout(boundary_item_id: &str) -> Vec<RolloutItem> {
+    let omitted_root_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    let older_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
+    let latest_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
+    let older_turn_id = "turn-repeated-boundary-older";
+    let latest_turn_id = "turn-repeated-boundary-latest";
+    let replacement_history = |text: &str| {
+        vec![ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]
+    };
+
+    vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: older_turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::ResponseItem(user_message("older retained user turn")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "older summary".to_string(),
+            replacement_history: Some(replacement_history("older retained boundary")),
+            window_number: Some(1),
+            first_window_id: Some(omitted_root_window_id.to_string()),
+            previous_window_id: Some(omitted_root_window_id.to_string()),
+            window_id: Some(older_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: older_window_id.to_string(),
+            boundary_item_id: boundary_item_id.to_string(),
+            turn_id: older_turn_id.to_string(),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: older_turn_id.to_string(),
+            started_at: None,
+            last_agent_message: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: latest_turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: Some(128_000),
+            collaboration_mode_kind: ModeKind::Default,
+        })),
+        RolloutItem::ResponseItem(user_message("latest retained user turn")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "latest summary".to_string(),
+            replacement_history: Some(replacement_history("latest retained boundary")),
+            window_number: Some(2),
+            first_window_id: Some(omitted_root_window_id.to_string()),
+            previous_window_id: Some(older_window_id.to_string()),
+            window_id: Some(latest_window_id.to_string()),
+            post_compact_recovery: Some(PostCompactRecoveryMarker {
+                boundary_item_id: boundary_item_id.to_string(),
+            }),
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: latest_turn_id.to_string(),
+            started_at: None,
+            last_agent_message: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })),
+    ]
+}
+
+async fn persisted_history(session: &Session) -> anyhow::Result<Arc<Vec<RolloutItem>>> {
+    session.flush_rollout().await?;
+    let rollout_path = session
+        .current_rollout_path()
+        .await?
+        .expect("persistent session should expose a rollout path");
+    let InitialHistory::Resumed(resumed) =
+        RolloutRecorder::get_rollout_history(&rollout_path).await?
+    else {
+        panic!("expected persisted resumed history");
+    };
+    Ok(resumed.history)
+}
+
+fn mapped_checkpoint_windows(
+    history: &[RolloutItem],
+) -> Vec<(u64, String, Option<String>, String)> {
+    history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(checkpoint) => Some((
+                checkpoint
+                    .window_number
+                    .expect("mapped checkpoint should have a number"),
+                checkpoint
+                    .first_window_id
+                    .clone()
+                    .expect("mapped checkpoint should have a first window"),
+                checkpoint.previous_window_id.clone(),
+                checkpoint
+                    .window_id
+                    .clone()
+                    .expect("mapped checkpoint should have a current window"),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+const GRAPH_FIRST_ALIAS: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b000";
+const GRAPH_PREVIOUS_ALIAS: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b001";
+const GRAPH_FIRST_RETAINED: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b002";
+const GRAPH_SECOND_RETAINED: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b003";
+const GRAPH_THIRD_RETAINED: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b004";
+const GRAPH_OTHER_V7: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7b005";
+const GRAPH_V4: &str = "8b10a62c-9122-4f65-a87f-2cf0ff997ceb";
+
+#[derive(Clone, Copy)]
+struct CheckpointGraphSpec<'a> {
+    window_number: Option<u64>,
+    first_window_id: Option<&'a str>,
+    previous_window_id: Option<&'a str>,
+    window_id: Option<&'a str>,
+}
+
+fn checkpoint_graph_item(spec: CheckpointGraphSpec<'_>) -> RolloutItem {
+    RolloutItem::Compacted(CompactedItem {
+        message: "checkpoint graph summary".to_string(),
+        replacement_history: None,
+        window_number: spec.window_number,
+        first_window_id: spec.first_window_id.map(ToString::to_string),
+        previous_window_id: spec.previous_window_id.map(ToString::to_string),
+        window_id: spec.window_id.map(ToString::to_string),
+        post_compact_recovery: None,
+    })
+}
+
+fn base_checkpoint_graph() -> Vec<RolloutItem> {
+    vec![
+        checkpoint_graph_item(CheckpointGraphSpec {
+            window_number: Some(2),
+            first_window_id: Some(GRAPH_FIRST_ALIAS),
+            previous_window_id: Some(GRAPH_PREVIOUS_ALIAS),
+            window_id: Some(GRAPH_FIRST_RETAINED),
+        }),
+        checkpoint_graph_item(CheckpointGraphSpec {
+            window_number: Some(3),
+            first_window_id: Some(GRAPH_FIRST_ALIAS),
+            previous_window_id: Some(GRAPH_FIRST_RETAINED),
+            window_id: Some(GRAPH_SECOND_RETAINED),
+        }),
+    ]
+}
+
+fn checkpoint_graph_mut(items: &mut [RolloutItem], ordinal: usize) -> &mut CompactedItem {
+    items
+        .iter_mut()
+        .filter_map(|item| match item {
+            RolloutItem::Compacted(checkpoint) => Some(checkpoint),
+            _ => None,
+        })
+        .nth(ordinal)
+        .expect("checkpoint graph fixture should contain the requested checkpoint")
+}
+
+async fn inherited_checkpoint_graph_session(
+    items: Vec<RolloutItem>,
+) -> anyhow::Result<Arc<Session>> {
+    let codex_home = tempfile::tempdir()?;
+    inherited_checkpoint_graph_session_at(codex_home.path(), /*ephemeral*/ true, items).await
+}
+
+async fn inherited_checkpoint_graph_session_at(
+    codex_home: &Path,
+    ephemeral: bool,
+    items: Vec<RolloutItem>,
+) -> anyhow::Result<Arc<Session>> {
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx_at(
+        codex_home,
+        ephemeral,
+        InitialHistory::Forked(items),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await?;
+    Ok(session)
+}
+
+fn checkpoint_graph_rejection_case(case_id: &str) -> Vec<RolloutItem> {
+    let mut items = base_checkpoint_graph();
+    match case_id {
+        "G01" => checkpoint_graph_mut(&mut items, 0).window_id = None,
+        "G02" => checkpoint_graph_mut(&mut items, 1).window_id = None,
+        "G03" => checkpoint_graph_mut(&mut items, 0).window_id = Some(GRAPH_V4.to_string()),
+        "G04" => checkpoint_graph_mut(&mut items, 1).window_id = Some(GRAPH_V4.to_string()),
+        "G05" => {
+            checkpoint_graph_mut(&mut items, 1).window_id = Some(GRAPH_FIRST_RETAINED.to_string());
+        }
+        "G06" => checkpoint_graph_mut(&mut items, 0).window_number = None,
+        "G07" => checkpoint_graph_mut(&mut items, 1).window_number = None,
+        "G08" => checkpoint_graph_mut(&mut items, 0).first_window_id = None,
+        "G09" => checkpoint_graph_mut(&mut items, 1).first_window_id = None,
+        "G10" => {
+            checkpoint_graph_mut(&mut items, 0).first_window_id = Some(GRAPH_V4.to_string());
+        }
+        "G11" => {
+            checkpoint_graph_mut(&mut items, 1).first_window_id = Some(GRAPH_V4.to_string());
+        }
+        "G12" => {
+            let first = checkpoint_graph_mut(&mut items, 0);
+            first.window_number = Some(0);
+            first.first_window_id = Some(GRAPH_FIRST_ALIAS.to_string());
+            first.previous_window_id = None;
+        }
+        "G13" => {
+            let first = checkpoint_graph_mut(&mut items, 0);
+            first.window_number = Some(0);
+            first.first_window_id = Some(GRAPH_FIRST_RETAINED.to_string());
+            first.previous_window_id = Some(GRAPH_PREVIOUS_ALIAS.to_string());
+        }
+        "G14" => checkpoint_graph_mut(&mut items, 0).previous_window_id = None,
+        "G15" => {
+            checkpoint_graph_mut(&mut items, 0).previous_window_id = Some(GRAPH_V4.to_string());
+        }
+        "G16" => {
+            checkpoint_graph_mut(&mut items, 0).first_window_id =
+                Some(GRAPH_SECOND_RETAINED.to_string());
+        }
+        "G18" => {
+            let first = checkpoint_graph_mut(&mut items, 0);
+            first.window_number = Some(1);
+            first.first_window_id = Some(GRAPH_FIRST_ALIAS.to_string());
+            first.previous_window_id = Some(GRAPH_PREVIOUS_ALIAS.to_string());
+        }
+        "G19" => {
+            checkpoint_graph_mut(&mut items, 0).previous_window_id =
+                Some(GRAPH_FIRST_ALIAS.to_string());
+        }
+        "G20" => {
+            checkpoint_graph_mut(&mut items, 1).first_window_id = Some(GRAPH_OTHER_V7.to_string());
+        }
+        "G21" => checkpoint_graph_mut(&mut items, 1).previous_window_id = None,
+        "G22" => {
+            checkpoint_graph_mut(&mut items, 1).previous_window_id = Some(GRAPH_V4.to_string());
+        }
+        "G23" => {
+            checkpoint_graph_mut(&mut items, 1).previous_window_id =
+                Some(GRAPH_OTHER_V7.to_string());
+        }
+        "GC01" => {
+            let second = checkpoint_graph_mut(&mut items, 1);
+            second.window_number = Some(4);
+            second.previous_window_id = Some(GRAPH_SECOND_RETAINED.to_string());
+        }
+        "GC02" => {
+            let second = checkpoint_graph_mut(&mut items, 1);
+            second.window_number = Some(4);
+            second.previous_window_id = Some(GRAPH_THIRD_RETAINED.to_string());
+            items.push(checkpoint_graph_item(CheckpointGraphSpec {
+                window_number: Some(3),
+                first_window_id: Some(GRAPH_FIRST_ALIAS),
+                previous_window_id: Some(GRAPH_FIRST_RETAINED),
+                window_id: Some(GRAPH_THIRD_RETAINED),
+            }));
+        }
+        "GC03" => {
+            let second = checkpoint_graph_mut(&mut items, 1);
+            second.window_number = Some(u64::MAX);
+            second.previous_window_id = Some(GRAPH_THIRD_RETAINED.to_string());
+            items.push(checkpoint_graph_item(CheckpointGraphSpec {
+                window_number: Some(u64::MAX),
+                first_window_id: Some(GRAPH_FIRST_ALIAS),
+                previous_window_id: Some(GRAPH_SECOND_RETAINED),
+                window_id: Some(GRAPH_THIRD_RETAINED),
+            }));
+        }
+        _ => panic!("unknown checkpoint graph rejection case {case_id}"),
+    }
+    items
+}
+
+#[tokio::test]
+async fn inherited_checkpoint_graph_validation_matrix() {
+    const DECLARED_CASES: [&str; 27] = [
+        "G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G11", "G12", "G13",
+        "G14", "G15", "G16", "G17", "G18", "G19", "G20", "G21", "G22", "G23", "G24", "GC01",
+        "GC02", "GC03",
+    ];
+    let mut executed_cases = Vec::new();
+    let mut executed_g17_variants = Vec::new();
+    let mut executed_g24_variants = Vec::new();
+
+    for case_id in DECLARED_CASES {
+        match case_id {
+            "G17" => {
+                for (variant, previous_alias) in [
+                    ("self", GRAPH_FIRST_RETAINED),
+                    ("forward", GRAPH_SECOND_RETAINED),
+                ] {
+                    let mut items = base_checkpoint_graph();
+                    checkpoint_graph_mut(&mut items, 0).previous_window_id =
+                        Some(previous_alias.to_string());
+                    assert!(
+                        inherited_checkpoint_graph_session(items).await.is_err(),
+                        "G17/{variant} should reject a compressed-root alias collision"
+                    );
+                    executed_g17_variants.push(variant);
+                }
+            }
+            "G24" => {
+                let mut ordinary_mismatch = base_checkpoint_graph();
+                checkpoint_graph_mut(&mut ordinary_mismatch, 1).window_number = Some(4);
+                assert!(
+                    inherited_checkpoint_graph_session(ordinary_mismatch)
+                        .await
+                        .is_err(),
+                    "G24 ordinary mismatch should reject"
+                );
+                executed_g24_variants.push("ordinary-mismatch");
+
+                let saturated_root = checkpoint_graph_item(CheckpointGraphSpec {
+                    window_number: Some(u64::MAX),
+                    first_window_id: Some(GRAPH_FIRST_ALIAS),
+                    previous_window_id: Some(GRAPH_PREVIOUS_ALIAS),
+                    window_id: Some(GRAPH_FIRST_RETAINED),
+                });
+                let saturated_successor = checkpoint_graph_item(CheckpointGraphSpec {
+                    window_number: Some(u64::MAX),
+                    first_window_id: Some(GRAPH_FIRST_ALIAS),
+                    previous_window_id: Some(GRAPH_FIRST_RETAINED),
+                    window_id: Some(GRAPH_SECOND_RETAINED),
+                });
+                assert!(
+                    inherited_checkpoint_graph_session(vec![
+                        saturated_root.clone(),
+                        saturated_successor,
+                    ])
+                    .await
+                    .is_ok(),
+                    "G24 u64::MAX -> u64::MAX is the valid saturating successor"
+                );
+                executed_g24_variants.push("saturating-max-valid");
+
+                let invalid_neighbor = checkpoint_graph_item(CheckpointGraphSpec {
+                    window_number: Some(u64::MAX - 1),
+                    first_window_id: Some(GRAPH_FIRST_ALIAS),
+                    previous_window_id: Some(GRAPH_FIRST_RETAINED),
+                    window_id: Some(GRAPH_SECOND_RETAINED),
+                });
+                assert!(
+                    inherited_checkpoint_graph_session(vec![saturated_root, invalid_neighbor])
+                        .await
+                        .is_err(),
+                    "G24 neighboring value must not match a saturated successor"
+                );
+                executed_g24_variants.push("saturating-max-invalid-neighbor");
+            }
+            _ => assert!(
+                inherited_checkpoint_graph_session(checkpoint_graph_rejection_case(case_id))
+                    .await
+                    .is_err(),
+                "{case_id} should reject its declared invalid graph"
+            ),
+        }
+        executed_cases.push(case_id);
+    }
+
+    assert_eq!(executed_cases, DECLARED_CASES);
+    assert_eq!(executed_g17_variants, ["self", "forward"]);
+    assert_eq!(
+        executed_g24_variants,
+        [
+            "ordinary-mismatch",
+            "saturating-max-valid",
+            "saturating-max-invalid-neighbor",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn forked_subagent_maps_one_checkpoint_to_the_child_root() -> anyhow::Result<()> {
+    let source_window_id = GRAPH_FIRST_RETAINED;
+    let session =
+        inherited_checkpoint_graph_session(vec![checkpoint_graph_item(CheckpointGraphSpec {
+            window_number: Some(0),
+            first_window_id: Some(source_window_id),
+            previous_window_id: None,
+            window_id: Some(source_window_id),
+        })])
+        .await?;
+
+    let state = session.state.lock().await;
+    assert_eq!(state.auto_compact_window_number(), 0);
+    let child_ids = state.auto_compact_window_ids();
+    assert_eq!(child_ids.first_window_id, child_ids.window_id);
+    assert_eq!(child_ids.previous_window_id, None);
+    assert_ne!(child_ids.window_id.to_string(), source_window_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_subagent_maps_compressed_root_aliases_without_parent_ids() -> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let session = inherited_checkpoint_graph_session_at(
+        codex_home.path(),
+        /*ephemeral*/ false,
+        base_checkpoint_graph(),
+    )
+    .await?;
+    let history = persisted_history(session.as_ref()).await?;
+    let mapped = mapped_checkpoint_windows(history.as_slice());
+    assert_eq!(mapped.len(), 2);
+    assert_eq!(mapped[0].0, 0);
+    assert_eq!(mapped[0].2, None);
+    assert_eq!(mapped[1].0, 1);
+    assert_eq!(mapped[1].1, mapped[0].3);
+    assert_eq!(mapped[1].2.as_deref(), Some(mapped[0].3.as_str()));
+    assert_ne!(mapped[0].3, GRAPH_FIRST_RETAINED);
+    assert_ne!(mapped[1].3, GRAPH_SECOND_RETAINED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_subagent_maps_post_rollback_successor_as_distinct_sibling() -> anyhow::Result<()> {
+    let mut items = base_checkpoint_graph();
+    items.push(checkpoint_graph_item(CheckpointGraphSpec {
+        window_number: Some(3),
+        first_window_id: Some(GRAPH_FIRST_ALIAS),
+        previous_window_id: Some(GRAPH_FIRST_RETAINED),
+        window_id: Some(GRAPH_THIRD_RETAINED),
+    }));
+    let codex_home = tempfile::tempdir()?;
+    let session =
+        inherited_checkpoint_graph_session_at(codex_home.path(), /*ephemeral*/ false, items)
+            .await?;
+    let history = persisted_history(session.as_ref()).await?;
+    let mapped = mapped_checkpoint_windows(history.as_slice());
+    assert_eq!(mapped.len(), 3);
+    assert_eq!(mapped[1].0, 1);
+    assert_eq!(mapped[2].0, 1);
+    assert_eq!(mapped[1].2, mapped[2].2);
+    assert_ne!(mapped[1].3, mapped[2].3);
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .auto_compact_window_ids()
+            .window_id
+            .to_string(),
+        mapped[2].3
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_subagent_keeps_repeated_boundary_checkpoints_distinct_and_latest_pending()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let boundary_item_id = "msg_repeated_recovery_boundary";
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx_at(
+        codex_home.path(),
+        /*ephemeral*/ false,
+        InitialHistory::Forked(repeated_boundary_fork_rollout(boundary_item_id)),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await?;
+
+    let history = persisted_history(session.as_ref()).await?;
+    let mapped_windows = mapped_checkpoint_windows(history.as_slice());
+    assert_eq!(mapped_windows.len(), 2);
+    let older_window_id = mapped_windows[0].3.clone();
+    let latest_window_id = mapped_windows[1].3.clone();
+    assert_ne!(older_window_id, latest_window_id);
+    let mapped_application_window_id = history
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::PostCompactRecoveryApplied(applied) => {
+                Some(applied.compaction_window_id.clone())
+            }
+            _ => None,
+        })
+        .expect("mapped recovery application should be persisted");
+    assert_eq!(mapped_application_window_id, older_window_id);
+    assert_ne!(mapped_application_window_id, latest_window_id);
+
+    let state = session.state.lock().await;
+    assert_eq!(state.auto_compact_window_number(), mapped_windows[1].0);
+    assert_eq!(
+        state.auto_compact_window_ids(),
+        AutoCompactWindowIds {
+            first_window_id: Uuid::parse_str(&mapped_windows[1].1)?,
+            previous_window_id: mapped_windows[1]
+                .2
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()?,
+            window_id: Uuid::parse_str(&latest_window_id)?,
+        }
+    );
+    assert_eq!(
+        state.post_compact_recovery.pending_identity(),
+        Some(&PostCompactRecoveryIdentity {
+            compaction_window_id: latest_window_id,
+            boundary_item_id: boundary_item_id.to_string(),
+        })
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_subagent_persists_repeated_boundary_lineage_and_rolls_back_to_older_checkpoint()
+-> anyhow::Result<()> {
+    let codex_home = tempfile::tempdir()?;
+    let boundary_item_id = "msg_repeated_rollback_boundary";
+    let parent_thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let (session, rx_event) = make_session_with_history_source_and_agent_control_and_rx_at(
+        codex_home.path(),
+        /*ephemeral*/ false,
+        InitialHistory::Forked(repeated_boundary_fork_rollout(boundary_item_id)),
+        session_source,
+        AgentControl::default(),
+        /*enabled_features*/ &[Feature::TokenBudget],
+    )
+    .await?;
+
+    let history = persisted_history(session.as_ref()).await?;
+    let mapped_windows = mapped_checkpoint_windows(history.as_slice());
+    assert_eq!(mapped_windows.len(), 2);
+    let older_window_id = mapped_windows[0].3.clone();
+    let latest_window_id = mapped_windows[1].3.clone();
+    assert_ne!(older_window_id, latest_window_id);
+
+    handlers::thread_rollback(&session, "rollback-repeated-boundary".to_string(), 1).await;
+    let rollback_event = wait_for_thread_rolled_back(&rx_event).await;
+    assert_eq!(rollback_event.num_turns, 1);
+
+    let state = session.state.lock().await;
+    assert_eq!(state.auto_compact_window_number(), mapped_windows[0].0);
+    assert_eq!(
+        state.auto_compact_window_ids(),
+        AutoCompactWindowIds {
+            first_window_id: Uuid::parse_str(&mapped_windows[0].1)?,
+            previous_window_id: mapped_windows[0]
+                .2
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()?,
+            window_id: Uuid::parse_str(&older_window_id)?,
+        }
+    );
+    assert!(state.post_compact_recovery.pending_identity().is_none());
+    assert!(state.post_compact_recovery.blocked_failure().is_none());
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
-    let malformed_window_id = "not-a-v7-window";
+    let omitted_root_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
+    let source_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     let boundary_item_id = "msg_malformed_recovery_boundary";
     let consuming_turn_id = "turn-malformed-recovery";
     let replacement_history = vec![ResponseItem::Message {
-        id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
+        id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
             text: "retained recovery boundary".to_string(),
@@ -6245,9 +6862,9 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
             message: "summary".to_string(),
             replacement_history: Some(replacement_history.clone()),
             window_number: Some(1),
-            first_window_id: Some(malformed_window_id.to_string()),
-            previous_window_id: None,
-            window_id: Some(malformed_window_id.to_string()),
+            first_window_id: Some(omitted_root_window_id.to_string()),
+            previous_window_id: Some(omitted_root_window_id.to_string()),
+            window_id: Some(source_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
             }),
@@ -6262,7 +6879,7 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
             },
         )),
         RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
-            compaction_window_id: malformed_window_id.to_string(),
+            compaction_window_id: source_window_id.to_string(),
             boundary_item_id: boundary_item_id.to_string(),
             turn_id: consuming_turn_id.to_string(),
         }),
@@ -6282,7 +6899,7 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
         /*enabled_features*/ &[Feature::TokenBudget],
     )
     .await
-    .expect("malformed inherited recovery should create a blocked child session");
+    .expect("malformed recovery identity on a valid graph should create a blocked child session");
 
     assert_eq!(
         session
@@ -6291,7 +6908,7 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
             .await
             .post_compact_recovery
             .blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::BoundaryMismatch)
+        Some(PostCompactRecoveryFailureClass::MalformedMarker)
     );
     let turn_context = session.new_default_turn().await;
     let mut prompt_input = replacement_history;
@@ -6301,12 +6918,13 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
         .expect_err("blocked inherited recovery must fail before inference");
     assert_eq!(
         format!("{error:#}"),
-        "Fatal error: post-compact recovery is blocked: boundary_mismatch"
+        "Fatal error: post-compact recovery is blocked: malformed_marker"
     );
 }
 
 #[tokio::test]
 async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
+    let omitted_root_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
     let older_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     let latest_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
     let older_boundary_item_id = "msg_older_recovery_boundary";
@@ -6339,8 +6957,8 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
             message: "older summary".to_string(),
             replacement_history: Some(older_replacement_history),
             window_number: Some(1),
-            first_window_id: Some(older_window_id.to_string()),
-            previous_window_id: None,
+            first_window_id: Some(omitted_root_window_id.to_string()),
+            previous_window_id: Some(omitted_root_window_id.to_string()),
             window_id: Some(older_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: older_boundary_item_id.to_string(),
@@ -6350,7 +6968,7 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
             message: "latest summary".to_string(),
             replacement_history: Some(latest_replacement_history.clone()),
             window_number: Some(2),
-            first_window_id: Some(older_window_id.to_string()),
+            first_window_id: Some(omitted_root_window_id.to_string()),
             previous_window_id: Some(older_window_id.to_string()),
             window_id: Some(latest_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
@@ -6412,6 +7030,7 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
 
 #[tokio::test]
 async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof() {
+    let omitted_root_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
     let older_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     let latest_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
     let older_boundary_item_id = "msg_older_recovery_boundary";
@@ -6444,8 +7063,8 @@ async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof
             message: "older summary".to_string(),
             replacement_history: Some(older_replacement_history),
             window_number: Some(1),
-            first_window_id: Some(older_window_id.to_string()),
-            previous_window_id: None,
+            first_window_id: Some(omitted_root_window_id.to_string()),
+            previous_window_id: Some(omitted_root_window_id.to_string()),
             window_id: Some(older_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: older_boundary_item_id.to_string(),
@@ -6469,7 +7088,7 @@ async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof
             message: "latest summary".to_string(),
             replacement_history: Some(latest_replacement_history),
             window_number: Some(2),
-            first_window_id: Some(older_window_id.to_string()),
+            first_window_id: Some(omitted_root_window_id.to_string()),
             previous_window_id: Some(older_window_id.to_string()),
             window_id: Some(latest_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {

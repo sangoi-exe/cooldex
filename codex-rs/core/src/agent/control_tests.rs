@@ -60,6 +60,11 @@ use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
 use codex_thread_store::ThreadStore;
 use codex_utils_path_uri::PathUri;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
+use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_response_item_ids;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -364,6 +369,44 @@ async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str
         .flush_rollout()
         .await
         .expect("test thread rollout should flush");
+}
+
+async fn persisted_rollout_items(thread: &CodexThread) -> Vec<RolloutItem> {
+    thread.session.ensure_rollout_materialized().await;
+    thread
+        .session
+        .flush_rollout()
+        .await
+        .expect("test thread rollout should flush");
+    std::fs::read_to_string(
+        thread
+            .rollout_path()
+            .expect("test thread should have a rollout path"),
+    )
+    .expect("test thread rollout should be readable")
+    .lines()
+    .map(|line| {
+        serde_json::from_str::<RolloutLine>(line)
+            .expect("test thread rollout line should parse")
+            .item
+    })
+    .collect()
+}
+
+async fn wait_for_turn_complete(thread: &CodexThread) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let event = thread
+                .next_event()
+                .await
+                .expect("test thread event stream should remain open");
+            if matches!(event.msg, EventMsg::TurnComplete(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("test thread should complete its turn");
 }
 
 async fn wait_for_live_thread_spawn_children(
@@ -1503,6 +1546,366 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
         .shutdown_live_agent(child_thread_id)
         .await
         .expect("child shutdown should submit");
+    let _ = parent_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_compaction() {
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("msg-child-initial", "child initial response"),
+                ev_completed("resp-child-initial"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-child-resumed", "child resumed response"),
+                ev_completed("resp-child-resumed"),
+            ]),
+        ],
+    )
+    .await;
+    let (home, mut config) = test_config().await;
+    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+    let _ = config.features.enable(Feature::TokenBudget);
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
+
+    const SOURCE_FIRST_ALIAS: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7c000";
+    const SOURCE_OMITTED_CHECKPOINT: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7c001";
+    const SOURCE_RETAINED_CHECKPOINT: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7c002";
+    const SOURCE_RETAINED_SIBLING: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7c003";
+    const OMITTED_BOUNDARY: &str = "msg_l07_omitted_boundary";
+    const RETAINED_BOUNDARY: &str = "msg_l07_retained_boundary";
+    const SIBLING_BOUNDARY: &str = "msg_l07_sibling_boundary";
+    const OMITTED_PROOF_TURN: &str = "turn-l07-omitted-proof";
+    const RETAINED_PROOF_TURN: &str = "turn-l07-retained-proof";
+    let recovery_boundary = |id: &str, text: &str| {
+        vec![ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(id.to_string())),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]
+    };
+    parent_thread
+        .session
+        .persist_rollout_items(&[
+            RolloutItem::Compacted(CompactedItem {
+                message: "omitted prefix checkpoint".to_string(),
+                replacement_history: Some(recovery_boundary(
+                    OMITTED_BOUNDARY,
+                    "omitted prefix context",
+                )),
+                window_number: Some(1),
+                first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
+                previous_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
+                window_id: Some(SOURCE_OMITTED_CHECKPOINT.to_string()),
+                post_compact_recovery: Some(PostCompactRecoveryMarker {
+                    boundary_item_id: OMITTED_BOUNDARY.to_string(),
+                }),
+            }),
+            RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "retained paginated turn".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: OMITTED_PROOF_TURN.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            })),
+            RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+                compaction_window_id: SOURCE_OMITTED_CHECKPOINT.to_string(),
+                boundary_item_id: OMITTED_BOUNDARY.to_string(),
+                turn_id: OMITTED_PROOF_TURN.to_string(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: OMITTED_PROOF_TURN.to_string(),
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::Compacted(CompactedItem {
+                message: "retained compressed checkpoint".to_string(),
+                replacement_history: Some(recovery_boundary(
+                    RETAINED_BOUNDARY,
+                    "retained compressed context",
+                )),
+                window_number: Some(2),
+                first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
+                previous_window_id: Some(SOURCE_OMITTED_CHECKPOINT.to_string()),
+                window_id: Some(SOURCE_RETAINED_CHECKPOINT.to_string()),
+                post_compact_recovery: Some(PostCompactRecoveryMarker {
+                    boundary_item_id: RETAINED_BOUNDARY.to_string(),
+                }),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: RETAINED_PROOF_TURN.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            })),
+            RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+                compaction_window_id: SOURCE_RETAINED_CHECKPOINT.to_string(),
+                boundary_item_id: RETAINED_BOUNDARY.to_string(),
+                turn_id: RETAINED_PROOF_TURN.to_string(),
+            }),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: RETAINED_PROOF_TURN.to_string(),
+                started_at: None,
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+            RolloutItem::Compacted(CompactedItem {
+                message: "retained sibling checkpoint".to_string(),
+                replacement_history: Some(recovery_boundary(
+                    SIBLING_BOUNDARY,
+                    "retained sibling context",
+                )),
+                window_number: Some(2),
+                first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
+                previous_window_id: Some(SOURCE_OMITTED_CHECKPOINT.to_string()),
+                window_id: Some(SOURCE_RETAINED_SIBLING.to_string()),
+                post_compact_recovery: Some(PostCompactRecoveryMarker {
+                    boundary_item_id: SIBLING_BOUNDARY.to_string(),
+                }),
+            }),
+            RolloutItem::ResponseItem(spawn_agent_call("spawn-call-l07")),
+        ])
+        .await;
+
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some("spawn-call-l07".to_string()),
+                fork_mode: Some(SpawnAgentForkMode::LastNTurns(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("copied child thread should be registered");
+    wait_for_turn_complete(child_thread.as_ref()).await;
+
+    let checkpoint_rows = |items: &[RolloutItem]| {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::Compacted(checkpoint) => Some((
+                    checkpoint
+                        .window_number
+                        .expect("mapped checkpoint should have a number"),
+                    checkpoint
+                        .first_window_id
+                        .clone()
+                        .expect("mapped checkpoint should have a first window"),
+                    checkpoint.previous_window_id.clone(),
+                    checkpoint
+                        .window_id
+                        .clone()
+                        .expect("mapped checkpoint should have a current window"),
+                    checkpoint
+                        .post_compact_recovery
+                        .as_ref()
+                        .expect("mapped checkpoint should retain its recovery marker")
+                        .boundary_item_id
+                        .clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let application_rows = |items: &[RolloutItem]| {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::PostCompactRecoveryApplied(applied) => Some((
+                    applied.compaction_window_id.clone(),
+                    applied.boundary_item_id.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let before_shutdown = persisted_rollout_items(child_thread.as_ref()).await;
+    let before_shutdown_json =
+        serde_json::to_string(&before_shutdown).expect("serialize copied child rollout");
+    for source_id in [
+        SOURCE_FIRST_ALIAS,
+        SOURCE_OMITTED_CHECKPOINT,
+        SOURCE_RETAINED_CHECKPOINT,
+        SOURCE_RETAINED_SIBLING,
+    ] {
+        assert!(
+            !before_shutdown_json.contains(source_id),
+            "copied child rollout must not retain parent window id {source_id}"
+        );
+    }
+    assert!(
+        !before_shutdown_json.contains(OMITTED_BOUNDARY),
+        "the application proof owned by the omitted checkpoint must be dropped"
+    );
+    let mapped_before_shutdown = checkpoint_rows(&before_shutdown);
+    assert_eq!(mapped_before_shutdown.len(), 2);
+    assert_eq!(mapped_before_shutdown[0].0, 0);
+    assert_eq!(mapped_before_shutdown[0].2, None);
+    assert_eq!(mapped_before_shutdown[1].0, 1);
+    assert_eq!(mapped_before_shutdown[1].1, mapped_before_shutdown[0].1);
+    assert_eq!(
+        mapped_before_shutdown[1].2.as_deref(),
+        Some(mapped_before_shutdown[0].3.as_str())
+    );
+    assert_ne!(mapped_before_shutdown[0].3, mapped_before_shutdown[1].3);
+    assert_eq!(mapped_before_shutdown[0].4, RETAINED_BOUNDARY);
+    assert_eq!(mapped_before_shutdown[1].4, SIBLING_BOUNDARY);
+    let applications_before_shutdown = application_rows(&before_shutdown);
+    assert!(applications_before_shutdown.contains(&(
+        mapped_before_shutdown[0].3.clone(),
+        RETAINED_BOUNDARY.to_string(),
+    )));
+    assert!(applications_before_shutdown.contains(&(
+        mapped_before_shutdown[1].3.clone(),
+        SIBLING_BOUNDARY.to_string(),
+    )));
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("copied child shutdown should submit");
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            child_thread_id,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+        )
+        .await
+        .expect("copied child should resume from its paginated rollout");
+    assert_eq!(resumed_thread_id, child_thread_id);
+    let resumed_thread = harness
+        .manager
+        .get_thread(resumed_thread_id)
+        .await
+        .expect("resumed copied child should be registered");
+    assert_eq!(
+        resumed_thread.config_snapshot().await.history_mode,
+        ThreadHistoryMode::Paginated
+    );
+    let after_resume = persisted_rollout_items(resumed_thread.as_ref()).await;
+    assert_eq!(checkpoint_rows(&after_resume), mapped_before_shutdown);
+    assert_eq!(
+        application_rows(&after_resume),
+        applications_before_shutdown
+    );
+
+    let recall_turn = resumed_thread.session.new_default_turn().await;
+    let recall = resumed_thread
+        .session
+        .load_current_thread_recall_context(recall_turn.as_ref())
+        .await
+        .expect("resumed copied child recall should load");
+    assert!(recall.is_available());
+    assert!(recall.json().contains(&child_thread_id.to_string()));
+    assert!(recall.json().contains(&mapped_before_shutdown[1].3));
+    for source_id in [
+        SOURCE_FIRST_ALIAS,
+        SOURCE_OMITTED_CHECKPOINT,
+        SOURCE_RETAINED_CHECKPOINT,
+        SOURCE_RETAINED_SIBLING,
+    ] {
+        assert!(
+            !recall.json().contains(source_id),
+            "resumed copied child recall must not expose parent window id {source_id}"
+        );
+    }
+
+    resumed_thread
+        .submit(Op::UserInput {
+            items: text_input("resumed first inference"),
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("resumed copied child first inference should submit");
+    wait_for_turn_complete(resumed_thread.as_ref()).await;
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_request = &requests[1];
+    assert!(resumed_request.body_contains_text("resumed first inference"));
+    assert!(!resumed_request.body_contains_text("omitted prefix context"));
+    let resumed_request_json = resumed_request.body_json().to_string();
+    for source_id in [
+        SOURCE_FIRST_ALIAS,
+        SOURCE_OMITTED_CHECKPOINT,
+        SOURCE_RETAINED_CHECKPOINT,
+        SOURCE_RETAINED_SIBLING,
+    ] {
+        assert!(
+            !resumed_request_json.contains(source_id),
+            "resumed copied child inference must not expose parent window id {source_id}"
+        );
+    }
+
+    resumed_thread
+        .submit(Op::Compact)
+        .await
+        .expect("resumed copied child compaction should submit");
+    wait_for_turn_complete(resumed_thread.as_ref()).await;
+    assert_eq!(responses.requests().len(), 2);
+    let after_compaction = persisted_rollout_items(resumed_thread.as_ref()).await;
+    let mapped_after_compaction = checkpoint_rows(&after_compaction);
+    assert_eq!(mapped_after_compaction.len(), 3);
+    assert_eq!(mapped_after_compaction[..2], mapped_before_shutdown);
+    let successor = &mapped_after_compaction[2];
+    assert_eq!(successor.0, 2);
+    assert_eq!(successor.1, mapped_before_shutdown[0].1);
+    assert_eq!(
+        successor.2.as_deref(),
+        Some(mapped_before_shutdown[1].3.as_str())
+    );
+    assert_ne!(successor.3, mapped_before_shutdown[0].3);
+    assert_ne!(successor.3, mapped_before_shutdown[1].3);
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(resumed_thread_id)
+        .await
+        .expect("resumed copied child shutdown should submit");
     let _ = parent_thread
         .submit(Op::Shutdown {})
         .await

@@ -686,59 +686,288 @@ impl Session {
             && session_configuration.session_source.is_non_root_agent()
             && config.features.enabled(Feature::TokenBudget);
         if restore_child_window && let InitialHistory::Forked(items) = &mut initial_history {
-            let child_window_id = initial_auto_compact_window_ids.window_id.to_string();
-            // Recovery application proofs are keyed by the same window identity as their
-            // compacted checkpoint, so both must move together into the child's new lineage.
-            let parent_recovery_identities = items
-                .iter()
-                .filter_map(|item| match item {
-                    RolloutItem::Compacted(checkpoint) => {
-                        let window_id = checkpoint.window_id.as_ref().filter(|window_id| {
-                            Uuid::parse_str(window_id)
-                                .ok()
-                                .is_some_and(|uuid| uuid.get_version_num() == 7)
-                        })?;
-                        let replacement_history = checkpoint.replacement_history.as_deref()?;
-                        let boundary_item_id = replacement_history.last()?.id()?.as_str();
-                        let boundary_occurrences = replacement_history
-                            .iter()
-                            .filter(|item| {
-                                item.id()
-                                    .is_some_and(|item_id| item_id.as_str() == boundary_item_id)
-                            })
-                            .count();
-                        if boundary_item_id.is_empty()
-                            || boundary_occurrences != 1
-                            || checkpoint
-                                .post_compact_recovery
-                                .as_ref()
-                                .is_some_and(|marker| {
-                                    marker.boundary_item_id.is_empty()
-                                        || marker.boundary_item_id != boundary_item_id
-                                })
-                        {
-                            return None;
-                        }
-                        Some((window_id.clone(), boundary_item_id.to_string()))
-                    }
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-            for item in items {
-                match item {
-                    RolloutItem::Compacted(checkpoint) => {
-                        checkpoint.window_number = Some(0);
-                        checkpoint.first_window_id = Some(child_window_id.clone());
-                        checkpoint.previous_window_id = None;
-                        checkpoint.window_id = Some(child_window_id.clone());
-                    }
-                    RolloutItem::PostCompactRecoveryApplied(applied)
-                        if parent_recovery_identities.contains(&(
-                            applied.compaction_window_id.clone(),
-                            applied.boundary_item_id.clone(),
-                        )) =>
+            #[derive(Clone)]
+            struct SourceCheckpoint {
+                item_index: usize,
+                window_id_text: String,
+                window_id: Uuid,
+                window_number: u64,
+                first_window_id: Uuid,
+                previous_window_id: Option<Uuid>,
+            }
+
+            #[derive(Clone, Copy)]
+            struct MappedCheckpoint {
+                item_index: usize,
+                window_number: u64,
+                first_window_id: Uuid,
+                previous_window_id: Option<Uuid>,
+                window_id: Uuid,
+            }
+
+            let parse_v7 = |item_index: usize,
+                            field: &str,
+                            value: Option<&str>|
+             -> anyhow::Result<Uuid> {
+                let value = value.ok_or_else(|| {
+                    anyhow::anyhow!("inherited checkpoint {item_index} is missing required {field}")
+                })?;
+                let uuid = Uuid::parse_str(value).map_err(|_| {
+                    anyhow::anyhow!(
+                        "inherited checkpoint {item_index} has invalid {field}: {value}"
+                    )
+                })?;
+                if uuid.get_version_num() != 7 {
+                    return Err(anyhow::anyhow!(
+                        "inherited checkpoint {item_index} has non-v7 {field}: {value}"
+                    ));
+                }
+                Ok(uuid)
+            };
+
+            let mut source_checkpoints = Vec::new();
+            let mut retained_window_ids = HashSet::new();
+            for (item_index, item) in items.iter().enumerate() {
+                let RolloutItem::Compacted(checkpoint) = item else {
+                    continue;
+                };
+                let window_id_text = checkpoint.window_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "inherited checkpoint {item_index} is missing required window_id"
+                    )
+                })?;
+                let window_id = parse_v7(item_index, "window_id", Some(window_id_text.as_str()))?;
+                if !retained_window_ids.insert(window_id) {
+                    return Err(anyhow::anyhow!(
+                        "inherited checkpoint {item_index} duplicates window_id {window_id_text}"
+                    ));
+                }
+                let window_number = checkpoint.window_number.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "inherited checkpoint {item_index} is missing required window_number"
+                    )
+                })?;
+                let first_window_id = parse_v7(
+                    item_index,
+                    "first_window_id",
+                    checkpoint.first_window_id.as_deref(),
+                )?;
+                let previous_window_id = checkpoint
+                    .previous_window_id
+                    .as_deref()
+                    .map(|value| parse_v7(item_index, "previous_window_id", Some(value)))
+                    .transpose()?;
+                source_checkpoints.push(SourceCheckpoint {
+                    item_index,
+                    window_id_text,
+                    window_id,
+                    window_number,
+                    first_window_id,
+                    previous_window_id,
+                });
+            }
+
+            let mut mapped_checkpoints = Vec::with_capacity(source_checkpoints.len());
+            if let Some(first) = source_checkpoints.first() {
+                let child_root_window_id = initial_auto_compact_window_ids.window_id;
+                let mut admitted_windows: HashMap<Uuid, (Uuid, u64, u64)> = HashMap::new();
+                let mut mapped_window_ids = HashSet::from([child_root_window_id]);
+
+                if first.window_number == 0 {
+                    if first.first_window_id != first.window_id
+                        || first.previous_window_id.is_some()
                     {
-                        applied.compaction_window_id.clone_from(&child_window_id);
+                        return Err(anyhow::anyhow!(
+                            "inherited root checkpoint {} has a noncanonical window-zero shape",
+                            first.item_index
+                        ));
+                    }
+                } else {
+                    let previous_alias = first.previous_window_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "inherited compressed root checkpoint {} is missing previous_window_id",
+                            first.item_index
+                        )
+                    })?;
+                    if retained_window_ids.contains(&first.first_window_id)
+                        || retained_window_ids.contains(&previous_alias)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "inherited compressed root checkpoint {} aliases a retained window",
+                            first.item_index
+                        ));
+                    }
+                    if (first.window_number == 1 && first.first_window_id != previous_alias)
+                        || (first.window_number > 1 && first.first_window_id == previous_alias)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "inherited compressed root checkpoint {} has invalid omitted-prefix aliases",
+                            first.item_index
+                        ));
+                    }
+                    admitted_windows.insert(first.first_window_id, (child_root_window_id, 0, 0));
+                    let previous_alias_source_number = first.window_number.saturating_sub(1);
+                    if let Some((_, source_number, _)) = admitted_windows.insert(
+                        previous_alias,
+                        (child_root_window_id, previous_alias_source_number, 0),
+                    ) && source_number != previous_alias_source_number
+                    {
+                        return Err(anyhow::anyhow!(
+                            "inherited compressed root checkpoint {} assigns conflicting alias numbers",
+                            first.item_index
+                        ));
+                    }
+                }
+
+                admitted_windows.insert(
+                    first.window_id,
+                    (child_root_window_id, first.window_number, 0),
+                );
+                mapped_checkpoints.push(MappedCheckpoint {
+                    item_index: first.item_index,
+                    window_number: 0,
+                    first_window_id: child_root_window_id,
+                    previous_window_id: None,
+                    window_id: child_root_window_id,
+                });
+
+                for source in &source_checkpoints[1..] {
+                    if source.first_window_id != first.first_window_id {
+                        return Err(anyhow::anyhow!(
+                            "inherited checkpoint {} changes first_window_id",
+                            source.item_index
+                        ));
+                    }
+                    let previous_window_id = source.previous_window_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "inherited checkpoint {} is missing previous_window_id",
+                            source.item_index
+                        )
+                    })?;
+                    let Some(&(
+                        mapped_previous_window_id,
+                        predecessor_source_number,
+                        mapped_predecessor_number,
+                    )) = admitted_windows.get(&previous_window_id)
+                    else {
+                        return Err(anyhow::anyhow!(
+                            "inherited checkpoint {} references a self, forward, cyclic, or unknown predecessor",
+                            source.item_index
+                        ));
+                    };
+                    if source.window_number != predecessor_source_number.saturating_add(1) {
+                        return Err(anyhow::anyhow!(
+                            "inherited checkpoint {} has a window_number that is not the saturating successor of its predecessor",
+                            source.item_index
+                        ));
+                    }
+                    let mapped_window_number = mapped_predecessor_number.saturating_add(1);
+                    let mapped_window_id = loop {
+                        let candidate = Uuid::now_v7();
+                        if mapped_window_ids.insert(candidate) {
+                            break candidate;
+                        }
+                    };
+                    admitted_windows.insert(
+                        source.window_id,
+                        (mapped_window_id, source.window_number, mapped_window_number),
+                    );
+                    mapped_checkpoints.push(MappedCheckpoint {
+                        item_index: source.item_index,
+                        window_number: mapped_window_number,
+                        first_window_id: child_root_window_id,
+                        previous_window_id: Some(mapped_previous_window_id),
+                        window_id: mapped_window_id,
+                    });
+                }
+            }
+
+            let mapped_by_item_index = mapped_checkpoints
+                .iter()
+                .map(|mapped| (mapped.item_index, *mapped))
+                .collect::<HashMap<_, _>>();
+            let mut recovery_window_mappings = HashMap::new();
+            for (source, mapped) in source_checkpoints.iter().zip(&mapped_checkpoints) {
+                let RolloutItem::Compacted(checkpoint) = &items[source.item_index] else {
+                    unreachable!("source checkpoint index must still name a checkpoint");
+                };
+                let Some(replacement_history) = checkpoint.replacement_history.as_deref() else {
+                    continue;
+                };
+                let Some(boundary_item_id) = replacement_history.last().and_then(ResponseItem::id)
+                else {
+                    continue;
+                };
+                let boundary_item_id = boundary_item_id.as_str();
+                let boundary_occurrences = replacement_history
+                    .iter()
+                    .filter(|item| {
+                        item.id()
+                            .is_some_and(|item_id| item_id.as_str() == boundary_item_id)
+                    })
+                    .count();
+                if boundary_item_id.is_empty()
+                    || boundary_occurrences != 1
+                    || checkpoint
+                        .post_compact_recovery
+                        .as_ref()
+                        .is_some_and(|marker| {
+                            marker.boundary_item_id.is_empty()
+                                || marker.boundary_item_id != boundary_item_id
+                        })
+                {
+                    continue;
+                }
+                recovery_window_mappings.insert(
+                    (source.window_id_text.clone(), boundary_item_id.to_string()),
+                    mapped.window_id.to_string(),
+                );
+            }
+
+            let mut active_turn_id = None;
+            for (item_index, item) in items.iter_mut().enumerate() {
+                match item {
+                    RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                        active_turn_id = Some(event.turn_id.clone());
+                    }
+                    RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                        if active_turn_id.as_deref() == Some(event.turn_id.as_str()) =>
+                    {
+                        active_turn_id = None;
+                    }
+                    RolloutItem::EventMsg(EventMsg::TurnAborted(event))
+                        if event
+                            .turn_id
+                            .as_deref()
+                            .is_some_and(|turn_id| active_turn_id.as_deref() == Some(turn_id)) =>
+                    {
+                        active_turn_id = None;
+                    }
+                    RolloutItem::Compacted(checkpoint) => {
+                        let mapped = mapped_by_item_index.get(&item_index).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "inherited checkpoint {item_index} is missing its admitted mapping"
+                            )
+                        })?;
+                        checkpoint.window_number = Some(mapped.window_number);
+                        checkpoint.first_window_id = Some(mapped.first_window_id.to_string());
+                        checkpoint.previous_window_id = mapped
+                            .previous_window_id
+                            .map(|window_id| window_id.to_string());
+                        checkpoint.window_id = Some(mapped.window_id.to_string());
+                    }
+                    RolloutItem::PostCompactRecoveryApplied(applied) => {
+                        if !applied.compaction_window_id.is_empty()
+                            && !applied.boundary_item_id.is_empty()
+                            && !applied.turn_id.is_empty()
+                            && active_turn_id.as_deref() == Some(applied.turn_id.as_str())
+                            && let Some(mapped_window_id) = recovery_window_mappings.get(&(
+                                applied.compaction_window_id.clone(),
+                                applied.boundary_item_id.clone(),
+                            ))
+                        {
+                            applied.compaction_window_id.clone_from(mapped_window_id);
+                        }
                     }
                     _ => {}
                 }
@@ -1471,12 +1700,6 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
-            if restore_child_window {
-                sess.state.lock().await.restore_auto_compact_window(
-                    /*window_number*/ 0,
-                    initial_auto_compact_window_ids,
-                );
-            }
             if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
                 // Keep the source reserved until the child's history reference is durable.
                 sess.try_ensure_rollout_materialized().await?;
