@@ -955,11 +955,7 @@ impl Session {
             let retired_turn_id = retired_turn.task.turn_context.sub_id.clone();
             self.abort_retired_turn(retired_turn, reason.clone()).await;
             if let Err(err) = self
-                .finish_transition_idle(
-                    transition_generation,
-                    &retired_turn_id,
-                    ThreadIdleCause::Interrupted,
-                )
+                .finish_transition_idle(transition_generation, &retired_turn_id)
                 .await
             {
                 warn!(%err, "failed to finish turn abort transition");
@@ -1016,11 +1012,7 @@ impl Session {
             let retired_turn_id = retired_turn.task.turn_context.sub_id.clone();
             self.abort_retired_turn(retired_turn, reason.clone()).await;
             if let Err(err) = self
-                .finish_transition_idle(
-                    transition_generation,
-                    &retired_turn_id,
-                    ThreadIdleCause::Interrupted,
-                )
+                .finish_transition_idle(transition_generation, &retired_turn_id)
                 .await
             {
                 warn!(%err, "failed to finish targeted turn abort transition");
@@ -1054,13 +1046,9 @@ impl Session {
         self: &Arc<Self>,
         transition_generation: u64,
         retired_turn_id: &str,
-        cause: ThreadIdleCause,
     ) -> Result<(), TurnSlotError> {
-        {
-            let mut slot = self.active_turn.lock().await;
-            slot.finish_transition_idle(transition_generation, retired_turn_id)?;
-        }
-        self.emit_thread_idle_lifecycle_if_idle(cause).await;
+        let mut slot = self.active_turn.lock().await;
+        slot.finish_transition_idle(transition_generation, retired_turn_id)?;
         Ok(())
     }
 
@@ -1384,12 +1372,13 @@ impl Session {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
         if let Err(err) = self
-            .finish_transition_idle(transition_generation, &turn_context.sub_id, idle_cause)
+            .finish_transition_idle(transition_generation, &turn_context.sub_id)
             .await
         {
             warn!(%err, "failed to finish task completion transition");
             return;
         }
+        self.emit_thread_idle_lifecycle_if_idle(idle_cause).await;
         self.maybe_start_turn_for_pending_work().await;
     }
 

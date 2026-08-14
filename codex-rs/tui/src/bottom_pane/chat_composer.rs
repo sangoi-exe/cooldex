@@ -506,6 +506,8 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: EditorKeymap,
     vim_normal_keymap: VimNormalKeymap,
+    #[cfg(test)]
+    shortcut_overlay_wsl_override: Option<bool>,
 }
 
 /// A resolved legacy `$` target plus any catalog built while disambiguating shell syntax.
@@ -692,6 +694,8 @@ impl ChatComposer {
             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
+            #[cfg(test)]
+            shortcut_overlay_wsl_override: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -3695,7 +3699,18 @@ impl ChatComposer {
         let is_wsl = {
             #[cfg(target_os = "linux")]
             {
-                mode == FooterMode::ShortcutOverlay && crate::clipboard_paste::is_probably_wsl()
+                let detected_wsl = {
+                    #[cfg(test)]
+                    {
+                        self.shortcut_overlay_wsl_override
+                            .unwrap_or_else(crate::clipboard_paste::is_probably_wsl)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        crate::clipboard_paste::is_probably_wsl()
+                    }
+                };
+                mode == FooterMode::ShortcutOverlay && detected_wsl
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -4910,6 +4925,7 @@ mod tests {
         )));
         let keymap = RuntimeKeymap::from_config(&config).expect("valid composer chords");
         let (mut composer, _rx) = new_test_composer();
+        set_non_wsl_shortcut_overlay_for_snapshot(&mut composer);
         composer.set_keymap_bindings(&keymap);
         composer.footer.mode = FooterMode::ShortcutOverlay;
 
@@ -5132,6 +5148,7 @@ mod tests {
             "Ask Codex to do anything".to_string(),
             /*disable_paste_burst*/ false,
         );
+        set_non_wsl_shortcut_overlay_for_snapshot(&mut composer);
         setup(&mut composer);
         let footer_props = composer.footer_props();
         let footer_lines = footer_height(&footer_props);
@@ -5154,6 +5171,17 @@ mod tests {
             enhanced_keys_supported,
             setup,
         );
+    }
+
+    fn set_non_wsl_shortcut_overlay_for_snapshot(composer: &mut ChatComposer) {
+        #[cfg(target_os = "linux")]
+        {
+            composer.shortcut_overlay_wsl_override = Some(false);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = composer;
+        }
     }
 
     #[test]

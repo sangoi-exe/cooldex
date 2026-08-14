@@ -7,6 +7,22 @@ struct BlockingTurnStop {
     release_rx: async_channel::Receiver<()>,
 }
 
+struct ThreadIdleSignal(async_channel::Sender<()>);
+
+impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for ThreadIdleSignal {
+    fn on_thread_idle<'a>(
+        &'a self,
+        _input: codex_extension_api::ThreadIdleInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.0
+                .send(())
+                .await
+                .expect("thread-idle observer should remain open");
+        })
+    }
+}
+
 impl codex_extension_api::TurnLifecycleContributor for BlockingTurnStop {
     fn on_turn_stop<'a>(
         &'a self,
@@ -644,5 +660,95 @@ async fn cancelling_interrupt_caller_does_not_abandon_transition() {
             .expect("expected-id steer task should not panic")
             .expect_err("interrupted turn should no longer be active"),
         SteerInputError::NoActiveTurn(expected_old_input)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_interrupt_does_not_emit_thread_idle_lifecycle() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let (idle_tx, idle_rx) = async_channel::bounded(1);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.thread_lifecycle_contributor(Arc::new(ThreadIdleSignal(idle_tx)));
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .extensions = Arc::new(builder.build());
+
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    wait_for_running_turn(session.as_ref(), &turn_context.sub_id).await;
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+
+    session.interrupt_task().await;
+
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+    assert!(session.active_turn.lock().await.is_idle());
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(
+        timeout(Duration::from_millis(100), idle_rx.recv())
+            .await
+            .is_err(),
+        "user interrupt must not emit generic thread-idle lifecycle"
+    );
+    assert!(
+        !matches!(
+            rx.try_recv(),
+            Ok(Event {
+                msg: EventMsg::TurnStarted(_),
+                ..
+            })
+        ),
+        "user interrupt without pending work must not start a successor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_turn_abort_does_not_emit_thread_idle_lifecycle() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let (idle_tx, idle_rx) = async_channel::bounded(1);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.thread_lifecycle_contributor(Arc::new(ThreadIdleSignal(idle_tx)));
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .extensions = Arc::new(builder.build());
+
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    wait_for_running_turn(session.as_ref(), &turn_context.sub_id).await;
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+
+    assert!(
+        session
+            .abort_turn_if_active(&turn_context.sub_id, TurnAbortReason::Interrupted)
+            .await
+    );
+
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+    assert!(session.active_turn.lock().await.is_idle());
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(
+        timeout(Duration::from_millis(100), idle_rx.recv())
+            .await
+            .is_err(),
+        "targeted interrupt must leave generic thread-idle ownership to its caller"
     );
 }

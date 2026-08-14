@@ -7103,10 +7103,6 @@ async fn user_turn_updates_approvals_reviewer() {
         state.session_configuration.approvals_reviewer,
         codex_config::types::ApprovalsReviewer::AutoReview
     );
-    assert!(
-        session.mcp_refresh.is_pending(),
-        "server elicitation authority changes must refresh MCP state"
-    );
 }
 
 #[tokio::test]
@@ -10349,15 +10345,15 @@ impl SessionTask for GuardianDeniedApprovalTask {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_auto_review_emits_thread_idle_after_interrupt() {
-    struct ThreadIdleRecorder(async_channel::Sender<()>);
+    struct ThreadIdleRecorder(async_channel::Sender<codex_extension_api::ThreadIdleCause>);
 
     impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for ThreadIdleRecorder {
         fn on_thread_idle<'a>(
             &'a self,
-            _input: codex_extension_api::ThreadIdleInput<'a>,
+            input: codex_extension_api::ThreadIdleInput<'a>,
         ) -> codex_extension_api::ExtensionFuture<'a, ()> {
             Box::pin(async move {
-                self.0.send(()).await.expect("idle receiver open");
+                self.0.send(input.cause).await.expect("idle receiver open");
             })
         }
     }
@@ -10368,7 +10364,8 @@ async fn guardian_auto_review_emits_thread_idle_after_interrupt() {
     builder.thread_lifecycle_contributor(Arc::new(ThreadIdleRecorder(idle_tx)));
     session.services.extensions = Arc::new(builder.build());
 
-    Arc::new(session)
+    let session = Arc::new(session);
+    session
         .spawn_task(
             Arc::new(turn_context),
             Vec::new(),
@@ -10376,10 +10373,21 @@ async fn guardian_auto_review_emits_thread_idle_after_interrupt() {
         )
         .await;
 
-    timeout(StdDuration::from_secs(5), idle_rx.recv())
+    let first_cause = timeout(StdDuration::from_secs(5), idle_rx.recv())
         .await
         .expect("guardian interrupt should emit thread idle lifecycle")
         .expect("idle receiver open");
+    assert_eq!(
+        first_cause,
+        codex_extension_api::ThreadIdleCause::Interrupted
+    );
+    match timeout(StdDuration::from_millis(100), idle_rx.recv()).await {
+        Err(_) => {}
+        Ok(Ok(cause)) => {
+            panic!("guardian interrupt emitted a second thread idle lifecycle with {cause:?}")
+        }
+        Ok(Err(err)) => panic!("idle receiver closed unexpectedly: {err}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

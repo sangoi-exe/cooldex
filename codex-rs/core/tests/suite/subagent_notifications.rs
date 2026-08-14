@@ -1238,6 +1238,21 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
             ),
             (Some(0), Some(window_ids[1]), None, Some(window_ids[1]))
         );
+        let recovery_application = child_rollout
+            .get_rollout_items()
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::PostCompactRecoveryApplied(applied) => Some(applied),
+                _ => None,
+            })
+            .expect("inherited post-compact recovery application");
+        assert_eq!(
+            recovery_application.compaction_window_id.as_str(),
+            checkpoint
+                .window_id
+                .as_deref()
+                .expect("rebased compaction window id")
+        );
         assert!(
             child_request.has_message_with_input_texts("developer", |message| {
                 matches!(
@@ -1643,9 +1658,7 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     });
     if let Some(model) = model {
         spawn_args["model"] = json!(model);
-        if model == "gpt-5.5" {
-            spawn_args["fork_turns"] = json!("none");
-        }
+        spawn_args["fork_turns"] = json!("none");
     }
     let spawn_args = serde_json::to_string(&spawn_args)?;
     let mut spawn_event = ev_function_call_with_namespace(

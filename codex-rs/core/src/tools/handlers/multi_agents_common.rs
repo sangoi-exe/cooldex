@@ -525,3 +525,7 @@ fn validate_spawn_agent_reasoning_effort(
         "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
     )))
 }
+
+#[cfg(test)]
+#[path = "multi_agents_common_tests.rs"]
+mod tests;
