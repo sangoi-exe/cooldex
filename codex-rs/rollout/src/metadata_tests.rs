@@ -9,8 +9,6 @@ use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
 use codex_history::PostCompactRecoveryAppliedItem;
-use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionMeta;
