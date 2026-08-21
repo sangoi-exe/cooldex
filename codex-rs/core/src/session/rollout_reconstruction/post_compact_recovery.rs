@@ -1,6 +1,5 @@
 use codex_history::CompactedItem;
 use codex_history::RolloutItem;
-use codex_protocol::models::ResponseItem;
 use uuid::Uuid;
 
 use crate::state::PostCompactRecoveryFailureClass;
@@ -118,7 +117,7 @@ fn identity_from_compaction(
         .ok_or_else(failure_for_missing_identity)?;
     let boundary_item_id = replacement_history
         .last()
-        .and_then(ResponseItem::id)
+        .and_then(|item| item.id())
         .map(ToString::to_string)
         .filter(|boundary_item_id| !boundary_item_id.is_empty())
         .ok_or_else(failure_for_missing_identity)?;

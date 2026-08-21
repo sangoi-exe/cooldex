@@ -71,17 +71,11 @@ async fn wait_for_recall_output_request(mock: &ResponseMock) -> Result<String> {
     }
 }
 
-fn user_turn(text: &str) -> Op {
-    Op::UserInput {
-        items: vec![UserInput::Text {
-            text: text.to_string(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }
+fn user_turn(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
+    codex_protocol::turn_input::TurnInputRequest::user_input(vec![UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -122,7 +116,7 @@ async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
     let test = builder.build_with_auto_env(&server).await?;
 
     test.codex
-        .submit(user_turn("question before compaction"))
+        .start_or_steer_turn(user_turn("question before compaction"))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -134,7 +128,9 @@ async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    test.codex.submit(user_turn("use recall")).await?;
+    test.codex
+        .start_or_steer_turn(user_turn("use recall"))
+        .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -262,7 +258,7 @@ async fn child_recall_reads_only_the_rollout_owned_by_its_history_mode(
     let parent_thread_id = test.session_configured.thread_id;
 
     test.codex
-        .submit(user_turn("question before parent compaction"))
+        .start_or_steer_turn(user_turn("question before parent compaction"))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

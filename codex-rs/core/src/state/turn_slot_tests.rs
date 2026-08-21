@@ -46,6 +46,25 @@ fn running_install_rejects_a_stale_generation() {
 }
 
 #[tokio::test]
+async fn cancel_unopened_start_settles_to_idle_and_notifies_waiters() {
+    let mut slot = TurnSlot::default();
+    slot.claim_start("turn".to_string())
+        .expect("idle slot should accept claim");
+
+    let mut generation_rx = slot.subscribe_generation();
+    let cancelled_turn_id = slot
+        .cancel_unopened_start()
+        .expect("starting slot should cancel");
+
+    generation_rx
+        .changed()
+        .await
+        .expect("cancelling a starting turn should notify generation waiters");
+    assert_eq!(cancelled_turn_id, "turn");
+    assert!(slot.is_idle());
+}
+
+#[tokio::test]
 async fn terminal_transitions_notify_generation_waiters_when_they_settle() {
     for kind in [
         TerminalTransitionKind::Completing,

@@ -296,6 +296,20 @@ impl TurnSlot {
         Ok(())
     }
 
+    pub(crate) fn cancel_unopened_start(&mut self) -> Result<String, TurnSlotError> {
+        let TurnSlotPhase::Starting { target_turn_id, .. } = &self.phase else {
+            return Err(TurnSlotError::PhaseMismatch {
+                operation: "cancel unopened turn startup",
+                expected: "starting",
+                actual: self.phase_name(),
+            });
+        };
+        let target_turn_id = target_turn_id.clone();
+        self.phase = TurnSlotPhase::Idle;
+        self.advance_and_notify();
+        Ok(target_turn_id)
+    }
+
     pub(crate) fn open_running(&mut self, claim: &TurnStartClaim) -> Result<(), TurnSlotError> {
         self.require_generation("open running task", claim.generation)?;
         let actual_phase = self.phase_name();

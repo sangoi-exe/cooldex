@@ -1,5 +1,6 @@
 use codex_history::CompactedItem;
 use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -53,21 +54,29 @@ fn function_call(call_id: &str) -> ResponseItem {
 fn function_output(call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: call_id.to_string(),
+        call_id: Some(call_id.to_string()),
+        name: Some("shell".to_string()),
+        namespace: None,
         output: FunctionCallOutputPayload::from_text(output.to_string()),
         internal_chat_message_metadata_passthrough: None,
     }
 }
 
+fn rollout_response_item(item: ResponseItem) -> RolloutItem {
+    RolloutItem::ResponseItem(item.into())
+}
+
 fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: message.to_string(),
-        replacement_history,
+        replacement_history: replacement_history
+            .map(|items| items.into_iter().map(ResponseItemEnvelope::new).collect()),
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
         post_compact_recovery: None,
+        mcp_resource_origins: None,
     })
 }
 
@@ -81,12 +90,18 @@ fn compacted_window(
 ) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: message.to_string(),
-        replacement_history: Some(replacement_history),
+        replacement_history: Some(
+            replacement_history
+                .into_iter()
+                .map(ResponseItemEnvelope::new)
+                .collect(),
+        ),
         window_number: Some(window_number),
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: previous_window_id.map(ToString::to_string),
         window_id: Some(window_id.to_string()),
         post_compact_recovery: None,
+        mcp_resource_origins: None,
     })
 }
 
@@ -105,6 +120,7 @@ fn legacy_compacted_window(
         previous_window_id: previous_window_id.map(ToString::to_string),
         window_id: Some(window_id.to_string()),
         post_compact_recovery: None,
+        mcp_resource_origins: None,
     })
 }
 
@@ -184,12 +200,12 @@ async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(message("user", "old question")),
-                    RolloutItem::ResponseItem(call),
-                    RolloutItem::ResponseItem(output),
-                    RolloutItem::ResponseItem(tool_search_call),
-                    RolloutItem::ResponseItem(tool_search_output),
-                    RolloutItem::ResponseItem(message("assistant", "old answer")),
+                    rollout_response_item(message("user", "old question")),
+                    rollout_response_item(call),
+                    rollout_response_item(output),
+                    rollout_response_item(tool_search_call),
+                    rollout_response_item(tool_search_output),
+                    rollout_response_item(message("assistant", "old answer")),
                     compacted("summary", Some(Vec::new())),
                 ],
             ),
@@ -228,10 +244,10 @@ async fn preserves_parallel_tool_batch_order_and_atomicity() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(function_call("call-a")),
-                    RolloutItem::ResponseItem(function_call("call-b")),
-                    RolloutItem::ResponseItem(function_output("call-b", "second")),
-                    RolloutItem::ResponseItem(function_output("call-a", "first")),
+                    rollout_response_item(function_call("call-a")),
+                    rollout_response_item(function_call("call-b")),
+                    rollout_response_item(function_output("call-b", "second")),
+                    rollout_response_item(function_output("call-a", "first")),
                     compacted("summary", Some(Vec::new())),
                 ],
             ),
@@ -263,9 +279,9 @@ async fn omits_an_incomplete_tool_batch_as_one_group() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(function_call("call-a")),
-                    RolloutItem::ResponseItem(function_call("call-b")),
-                    RolloutItem::ResponseItem(function_output("call-a", "only one")),
+                    rollout_response_item(function_call("call-a")),
+                    rollout_response_item(function_call("call-b")),
+                    rollout_response_item(function_output("call-a", "only one")),
                     compacted("summary", Some(Vec::new())),
                 ],
             ),
@@ -288,9 +304,9 @@ async fn omits_an_unidentified_call_with_its_parallel_batch() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(function_call("")),
-                    RolloutItem::ResponseItem(function_call("call-b")),
-                    RolloutItem::ResponseItem(function_output("call-b", "second")),
+                    rollout_response_item(function_call("")),
+                    rollout_response_item(function_call("call-b")),
+                    rollout_response_item(function_output("call-b", "second")),
                     compacted("summary", Some(Vec::new())),
                 ],
             ),
@@ -315,12 +331,12 @@ async fn rollback_removes_the_newest_compaction_boundary() {
                 vec![
                     turn_started("turn-1"),
                     user_event("first"),
-                    RolloutItem::ResponseItem(message("assistant", "before older")),
+                    rollout_response_item(message("assistant", "before older")),
                     compacted("older", Some(Vec::new())),
                     turn_complete("turn-1"),
                     turn_started("turn-2"),
                     user_event("second"),
-                    RolloutItem::ResponseItem(message("assistant", "before latest")),
+                    rollout_response_item(message("assistant", "before latest")),
                     compacted("latest", Some(Vec::new())),
                     turn_complete("turn-2"),
                     RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
@@ -347,9 +363,9 @@ async fn selects_the_latest_of_multiple_surviving_compactions() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(message("assistant", "before first")),
+                    rollout_response_item(message("assistant", "before first")),
                     compacted("first", Some(Vec::new())),
-                    RolloutItem::ResponseItem(message("assistant", "before latest")),
+                    rollout_response_item(message("assistant", "before latest")),
                     compacted("latest", Some(Vec::new())),
                 ],
             ),
@@ -389,7 +405,7 @@ async fn excludes_the_predecessor_replacement_history_from_the_next_recall_windo
                         None,
                         FIRST_WINDOW_ID,
                     ),
-                    RolloutItem::ResponseItem(message("assistant", INTERCOMPACT_DELTA)),
+                    rollout_response_item(message("assistant", INTERCOMPACT_DELTA)),
                     compacted_window(
                         "latest",
                         vec![retained_user],
@@ -428,8 +444,8 @@ async fn excludes_a_user_message_already_retained_by_the_current_replacement() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(retained_user.clone()),
-                    RolloutItem::ResponseItem(message("assistant", UNRETAINED_HISTORY)),
+                    rollout_response_item(retained_user.clone()),
+                    rollout_response_item(message("assistant", UNRETAINED_HISTORY)),
                     compacted("summary", Some(vec![retained_user])),
                 ],
             ),
@@ -460,7 +476,9 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
     };
     let output = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "continuity-call".to_string(),
+        call_id: Some("continuity-call".to_string()),
+        name: Some("shell".to_string()),
+        namespace: None,
         output: FunctionCallOutputPayload::from_text("continuity output".to_string()),
         internal_chat_message_metadata_passthrough: None,
     };
@@ -475,9 +493,9 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
                 None,
                 FIRST_WINDOW_ID,
             ),
-            RolloutItem::ResponseItem(message("assistant", "between compactions")),
-            RolloutItem::ResponseItem(call.clone()),
-            RolloutItem::ResponseItem(output.clone()),
+            rollout_response_item(message("assistant", "between compactions")),
+            rollout_response_item(call.clone()),
+            rollout_response_item(output.clone()),
             compacted_window(
                 "latest",
                 vec![
@@ -526,7 +544,7 @@ async fn first_compaction_accepts_metadata_backed_virtual_root() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(message(
+                    rollout_response_item(message(
                         "assistant",
                         "history before the first compaction",
                     )),
@@ -715,7 +733,7 @@ async fn bounded_tail_without_named_previous_compaction_reports_work_limit() {
     let mut stored_tail = tail(
         session.thread_id,
         vec![
-            RolloutItem::ResponseItem(message("assistant", "bounded suffix only")),
+            rollout_response_item(message("assistant", "bounded suffix only")),
             compacted_window(
                 "latest",
                 Vec::new(),
@@ -751,7 +769,7 @@ async fn bounded_tail_with_legacy_predecessor_reports_work_limit() {
                 None,
                 FIRST_WINDOW_ID,
             ),
-            RolloutItem::ResponseItem(message("assistant", "bounded legacy suffix")),
+            rollout_response_item(message("assistant", "bounded legacy suffix")),
             compacted_window(
                 "current",
                 Vec::new(),
@@ -789,7 +807,7 @@ async fn bounded_tail_with_legacy_current_and_predecessor_reports_work_limit() {
                 None,
                 FIRST_WINDOW_ID,
             ),
-            RolloutItem::ResponseItem(message("assistant", "bounded legacy suffix")),
+            rollout_response_item(message("assistant", "bounded legacy suffix")),
             legacy_compacted_window(
                 "legacy current",
                 2,
@@ -825,7 +843,7 @@ async fn bounded_legacy_current_accepts_a_self_contained_modern_predecessor() {
                 None,
                 FIRST_WINDOW_ID,
             ),
-            RolloutItem::ResponseItem(message("assistant", "bounded modern suffix")),
+            rollout_response_item(message("assistant", "bounded modern suffix")),
             legacy_compacted_window(
                 "legacy current",
                 2,
@@ -866,7 +884,7 @@ async fn reports_unavailable_source_and_missing_compaction() {
             &turn_context,
             tail(
                 session.thread_id,
-                vec![RolloutItem::ResponseItem(message("user", "hello"))],
+                vec![rollout_response_item(message("user", "hello"))],
             ),
         )
         .await
@@ -880,7 +898,7 @@ async fn reports_projected_historical_schema_drift_without_reconstruction() {
     let (session, turn_context) = make_session_and_context().await;
     let mut stored_tail = tail(
         session.thread_id,
-        vec![RolloutItem::ResponseItem(message(
+        vec![rollout_response_item(message(
             "assistant",
             "must not be reconstructed",
         ))],
@@ -985,7 +1003,7 @@ async fn accepts_legacy_boundary_after_complete_replay() {
             tail(
                 session.thread_id,
                 vec![
-                    RolloutItem::ResponseItem(message("user", "legacy input")),
+                    rollout_response_item(message("user", "legacy input")),
                     compacted("legacy summary", /*replacement_history*/ None),
                 ],
             ),
@@ -1005,7 +1023,7 @@ async fn rejects_legacy_boundary_when_chronology_spans_multiple_segments() {
     let mut stored_tail = tail(
         session.thread_id,
         vec![
-            RolloutItem::ResponseItem(message("user", "legacy parent input")),
+            rollout_response_item(message("user", "legacy parent input")),
             compacted("legacy summary", /*replacement_history*/ None),
         ],
     );
@@ -1024,7 +1042,7 @@ async fn keeps_only_the_newest_64_complete_groups() {
     let (session, turn_context) = make_session_and_context().await;
     let mut items = (0..70)
         .map(|index| {
-            RolloutItem::ResponseItem(message("assistant", format!("message {index}").as_str()))
+            rollout_response_item(message("assistant", format!("message {index}").as_str()))
         })
         .collect::<Vec<_>>();
     items.push(compacted("summary", Some(Vec::new())));
@@ -1047,7 +1065,7 @@ async fn keeps_only_the_newest_64_complete_groups() {
 async fn applies_serialized_output_limits_deterministically() {
     let (session, turn_context) = make_session_and_context().await;
     let items = vec![
-        RolloutItem::ResponseItem(message("assistant", &"x".repeat(RECALL_RESULT_MAX_BYTES))),
+        rollout_response_item(message("assistant", &"x".repeat(RECALL_RESULT_MAX_BYTES))),
         compacted("summary", Some(Vec::new())),
     ];
     let stored_tail = tail(session.thread_id, items);
@@ -1118,7 +1136,7 @@ async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
                         boundary_item_id: "msg_boundary".to_string(),
                         turn_id: "turn_consuming".to_string(),
                     }),
-                    RolloutItem::ResponseItem(message("assistant", "model-visible history")),
+                    rollout_response_item(message("assistant", "model-visible history")),
                     compacted("summary", Some(Vec::new())),
                 ],
             ),

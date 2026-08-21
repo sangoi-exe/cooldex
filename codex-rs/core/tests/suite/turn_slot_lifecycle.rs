@@ -78,16 +78,12 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
 
 async fn submit_user_input(codex: &codex_core::CodexThread, text: &str) {
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(codex_protocol::turn_input::TurnInputRequest::user_input(
+            vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        ))
         .await
         .expect("submit user input");
 }

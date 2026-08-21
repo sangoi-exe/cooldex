@@ -48,14 +48,8 @@ fn user_input(text: &str) -> Vec<UserInput> {
     }]
 }
 
-fn user_input_op(text: &str) -> Op {
-    Op::UserInput {
-        items: user_input(text),
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }
+fn user_input_request(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
+    codex_protocol::turn_input::TurnInputRequest::user_input(user_input(text))
 }
 
 async fn install_blocked_startup_prewarm(session: &Session) -> tokio::sync::oneshot::Sender<()> {
@@ -161,10 +155,14 @@ async fn recv_turn_aborted(
     .expect("expected TurnAborted")
 }
 
-fn count_user_message_text(items: &[ResponseItem], expected_text: &str) -> usize {
+fn count_user_message_text(
+    items: impl IntoIterator<Item = impl std::borrow::Borrow<ResponseItem>>,
+    expected_text: &str,
+) -> usize {
     items
-        .iter()
+        .into_iter()
         .filter(|item| {
+            let item = item.borrow();
             matches!(
                 item,
                 ResponseItem::Message {
@@ -217,7 +215,7 @@ async fn fresh_handler_input_waits_for_completion_terminal_flush() {
             handlers::user_input_or_turn(
                 &session,
                 fresh_turn_id,
-                user_input_op(fresh_text),
+                user_input_request(fresh_text),
                 /*client_user_message_id*/ None,
                 /*parent_turn_id*/ None,
             )
@@ -357,7 +355,7 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
             handlers::user_input_or_turn(
                 &session,
                 fresh_request_id,
-                user_input_op(fresh_text),
+                user_input_request(fresh_text),
                 /*client_user_message_id*/ None,
                 /*parent_turn_id*/ None,
             )

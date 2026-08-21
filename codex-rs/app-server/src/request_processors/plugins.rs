@@ -32,6 +32,7 @@ use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
 use codex_protocol::auth::AuthMode as DomainAuthMode;
+use codex_rmcp_client::McpOAuthClientRegistration;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login_silent;
@@ -53,13 +54,12 @@ pub(crate) struct PluginRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     analytics_events_client: AnalyticsEventsClient,
     config_manager: ConfigManager,
-    workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
     on_effective_plugins_changed:
         Arc<dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync>,
 }
 
 fn plugin_skills_to_info(
-    skills: &[codex_core::skills::SkillMetadata],
+    skills: &[codex_skills::SkillMetadata],
     disabled_skill_paths: &HashSet<AbsolutePathBuf>,
 ) -> Vec<SkillSummary> {
     skills
@@ -399,7 +399,6 @@ impl PluginRequestProcessor {
         outgoing: Arc<OutgoingMessageSender>,
         analytics_events_client: AnalyticsEventsClient,
         config_manager: ConfigManager,
-        workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
         on_effective_plugins_changed: Arc<
             dyn Fn(codex_core_plugins::EffectivePluginsChange) + Send + Sync,
         >,
@@ -410,7 +409,6 @@ impl PluginRequestProcessor {
             outgoing,
             analytics_events_client,
             config_manager,
-            workspace_settings_cache,
             on_effective_plugins_changed,
         }
     }
@@ -520,8 +518,10 @@ impl PluginRequestProcessor {
         Arc::clone(&self.on_effective_plugins_changed)
     }
 
-    fn on_effective_plugins_changed(&self) {
-        (self.on_effective_plugins_changed)(Default::default());
+    async fn on_effective_plugins_changed(&self) {
+        self.clear_plugin_related_caches();
+        self.thread_manager.invalidate_mcp_runtimes().await;
+        self.thread_manager.refresh_hook_runtimes().await;
     }
 
     fn clear_plugin_related_caches(&self) {
@@ -537,28 +537,6 @@ impl PluginRequestProcessor {
             .load_latest_config(fallback_cwd)
             .await
             .map_err(|err| internal_error(format!("failed to reload config: {err}")))
-    }
-
-    async fn workspace_codex_plugins_enabled(
-        &self,
-        config: &Config,
-        auth: Option<&CodexAuth>,
-    ) -> bool {
-        match workspace_settings::codex_plugins_enabled_for_workspace(
-            config,
-            auth,
-            Some(&self.workspace_settings_cache),
-        )
-        .await
-        {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                warn!(
-                    "failed to fetch workspace Codex plugins setting; allowing Codex plugins: {err:#}"
-                );
-                true
-            }
-        }
     }
 
     async fn plugin_list_response(
@@ -588,14 +566,7 @@ impl PluginRequestProcessor {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            return Ok(empty_response());
-        }
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
-        plugins_manager.set_auth_mode(auth_mode);
         let plugins_input = config.plugins_config_input();
         if include_local
             && force_refetch
@@ -603,7 +574,7 @@ impl PluginRequestProcessor {
                 .refresh_non_curated_plugin_cache_for_config(&plugins_input, &roots)
                 .await
         {
-            self.on_effective_plugins_changed();
+            self.on_effective_plugins_changed().await;
         }
         let include_shared_with_me =
             marketplace_kinds.contains(&PluginListMarketplaceKind::SharedWithMe);
@@ -848,14 +819,7 @@ impl PluginRequestProcessor {
             return Ok(empty_response());
         }
         let auth = self.auth_manager.auth().await;
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            return Ok(empty_response());
-        }
         let auth_mode = auth.as_ref().map(CodexAuth::api_auth_mode);
-        plugins_manager.set_auth_mode(auth_mode);
 
         let plugins_input = config.plugins_config_input();
         let use_remote_global_catalog = config.features.enabled(Feature::RemotePlugin)
@@ -1045,7 +1009,6 @@ impl PluginRequestProcessor {
         let config = self.load_latest_config(config_cwd).await?;
         let plugins_input = config.plugins_config_input();
         let auth = self.auth_manager.auth().await;
-        plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
 
         let plugin = match read_source {
             Ok(marketplace_path) => {
@@ -1503,15 +1466,6 @@ impl PluginRequestProcessor {
         let config = self.load_latest_config(config_cwd.clone()).await?;
         let auth = self.auth_manager.auth().await;
 
-        if !self
-            .workspace_codex_plugins_enabled(&config, auth.as_ref())
-            .await
-        {
-            return Err(invalid_request(
-                "Codex plugins are disabled for this workspace",
-            ));
-        }
-
         let plugins_manager = self.thread_manager.plugins_manager();
         let marketplace_display = marketplace_path.display().to_string();
         let plugin_name_for_log = plugin_name.clone();
@@ -1544,7 +1498,7 @@ impl PluginRequestProcessor {
             }
         };
 
-        self.on_effective_plugins_changed();
+        self.on_effective_plugins_changed().await;
 
         let plugin_mcp_servers = load_configured_plugin_mcp_servers(
             result.installed_path.as_path(),
@@ -1979,7 +1933,7 @@ impl PluginRequestProcessor {
 
             let store_mode = config.mcp_oauth_credentials_store_mode;
             let keyring_backend_kind = config.auth_keyring_backend_kind();
-            let callback_port = config.mcp_oauth_callback_port;
+            let callback_port = server.oauth_callback_port(config.mcp_oauth_callback_port);
             let callback_url = config.mcp_oauth_callback_url.clone();
             let outgoing = Arc::clone(&self.outgoing);
             let notification_name = name.clone();
@@ -1998,6 +1952,7 @@ impl PluginRequestProcessor {
                     oauth_config.env_http_headers.clone(),
                     &resolved_scopes.scopes,
                     oauth_client_id,
+                    McpOAuthClientRegistration::Auto,
                     server.oauth_resource.as_deref(),
                     callback_port,
                     callback_url.as_deref(),
@@ -2017,6 +1972,7 @@ impl PluginRequestProcessor {
                             oauth_config.env_http_headers,
                             &[],
                             oauth_client_id,
+                            McpOAuthClientRegistration::Auto,
                             server.oauth_resource.as_deref(),
                             callback_port,
                             callback_url.as_deref(),
@@ -2069,7 +2025,7 @@ impl PluginRequestProcessor {
             .await
             .map_err(Self::plugin_uninstall_error)?;
         match self.load_latest_config(/*fallback_cwd*/ None).await {
-            Ok(_) => self.on_effective_plugins_changed(),
+            Ok(_) => self.on_effective_plugins_changed().await,
             Err(err) => {
                 warn!(
                     "failed to reload config after plugin uninstall, clearing plugin-related caches only: {err:?}"
@@ -2187,7 +2143,7 @@ impl PluginRequestProcessor {
             self.analytics_events_client
                 .track_plugin_uninstalled(plugin_telemetry);
             if plugins_manager.clear_remote_installed_plugins_cache() {
-                self.on_effective_plugins_changed();
+                self.on_effective_plugins_changed().await;
             }
             plugins_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
                 &config.plugins_config_input(),

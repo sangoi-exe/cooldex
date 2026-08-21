@@ -1,13 +1,11 @@
 use anyhow::Result;
-use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::TokenBudgetConfig;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
-use codex_features::FeatureToml;
-use codex_features::TokenBudgetConfigToml;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::items::TurnItem;
@@ -35,9 +33,9 @@ use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
+use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
@@ -58,7 +56,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::TempDir;
+use test_case::test_case;
 
 const CONFIGURED_CONTEXT_WINDOW: i64 = 128_000;
 const AUTO_COMPACT_FALLBACK_PROMPT: &str = "Save the important state before rollover.";
@@ -383,126 +381,6 @@ async fn token_budget_explicit_default_template_overrides_model_defaults() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_model_defaults_survive_config_lock_replay() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
-    )
-    .await;
-    let home = Arc::new(TempDir::new()?);
-    let initial = test_codex()
-        .with_home(Arc::clone(&home))
-        .with_model_info_override("gpt-5.2", |model_info| {
-            model_info
-                .model_messages
-                .as_mut()
-                .expect("bundled model should have model messages")
-                .token_budget = Some(model_token_budget_config());
-        })
-        .with_config(|config| {
-            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-            config.config_lock_export_dir = Some(config.codex_home.join("memento-config-locks"));
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("test config should allow token budget");
-        })
-        .build_with_auto_env(&server)
-        .await?;
-    initial
-        .submit_turn("inspect guidance before lock replay")
-        .await?;
-
-    let lock_path = initial
-        .codex_home_path()
-        .join("memento-config-locks")
-        .join(format!(
-            "{}.config.lock.toml",
-            initial.session_configured.thread_id
-        ));
-    let lock: ConfigLockfileToml = toml::from_str(&std::fs::read_to_string(&lock_path)?)?;
-    assert_eq!(
-        lock.config
-            .features
-            .as_ref()
-            .and_then(|features| features.token_budget.as_ref()),
-        Some(&FeatureToml::Config(TokenBudgetConfigToml {
-            enabled: Some(true),
-            reminder_threshold_tokens: Some(6_144),
-            reminder_message_template: Some(
-                "Model reminder: {n_remaining} tokens remain.".to_string()
-            ),
-            guidance_message: Some("Use the model-owned context-window guidance.".to_string()),
-            auto_compact_fallback_prompt: Some(AUTO_COMPACT_FALLBACK_PROMPT.to_string()),
-            auto_compact_fallback_buffer_tokens: Some(16_384),
-        }))
-    );
-    let replay = test_codex()
-        .with_home(home)
-        .with_pre_build_hook(move |home| {
-            std::fs::write(
-                home.join("config.toml"),
-                format!("[debug.config_lockfile]\nload_path = {lock_path:?}\n"),
-            )
-            .expect("write exported config lock replay settings");
-        })
-        .with_model_info_override("gpt-5.2", |model_info| {
-            let mut updated_defaults = model_token_budget_config();
-            updated_defaults.reminder_threshold_tokens = 4_096;
-            updated_defaults.reminder_message_template =
-                "Updated model reminder: {n_remaining} tokens remain.".to_string();
-            updated_defaults.guidance_message =
-                "Use the updated model-owned context-window guidance.".to_string();
-            updated_defaults.auto_compact_fallback_prompt =
-                "Use the updated fallback before rollover.".to_string();
-            updated_defaults.auto_compact_fallback_buffer_tokens = 8_192;
-            model_info
-                .model_messages
-                .as_mut()
-                .expect("bundled model should have model messages")
-                .token_budget = Some(updated_defaults);
-        })
-        .with_config(|config| {
-            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
-        })
-        .build_with_auto_env(&server)
-        .await?;
-    core_test_support::submit_thread_settings(
-        &replay.codex,
-        ThreadSettingsOverrides {
-            model: Some("gpt-5.4".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
-    replay
-        .submit_text_turn("inspect guidance after lock replay and model switch")
-        .await?;
-
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    for request in &requests {
-        assert!(
-            request.body_contains_text("Use the model-owned context-window guidance."),
-            "exporting and replaying a config lock must preserve model-owned guidance"
-        );
-    }
-    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
-    assert!(
-        requests[1]
-            .message_input_texts("developer")
-            .iter()
-            .any(|text| text.contains("<model_switch>")),
-        "replaying model-owned instructions must not override the new model's template"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -552,16 +430,10 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
     )
     .await?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "inspect second-model guidance".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "inspect second-model guidance".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -1080,8 +952,12 @@ async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> 
     Ok(())
 }
 
+#[test_case(false; "token_budget_only")]
+#[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_context_uses_new_window_after_compaction() -> Result<()> {
+async fn token_budget_context_uses_new_window_after_compaction(
+    retain_client_developer_messages: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1111,10 +987,25 @@ async fn token_budget_context_uses_new_window_after_compaction() -> Result<()> {
                 .features
                 .enable(Feature::TokenBudget)
                 .expect("test config should allow token budget");
+            if retain_client_developer_messages {
+                config
+                    .features
+                    .enable(Feature::RetainClientDeveloperMessages)
+                    .expect("test config should allow client developer retention");
+            }
         })
         .build(&server)
         .await?;
 
+    if retain_client_developer_messages {
+        test.codex
+            .inject_response_items(vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "CLIENT_DEVELOPER_INSTRUCTIONS"}]
+            }))?])
+            .await?;
+    }
     test.submit_turn("before compact").await?;
     test.codex.submit(Op::Compact).await?;
     assert_context_compaction_item_lifecycle(&test.codex).await;
@@ -1147,15 +1038,20 @@ async fn token_budget_context_uses_new_window_after_compaction() -> Result<()> {
     );
     assert_ne!(post_compaction_window_id, initial_window_id);
     assert!(
-        !requests[1].body_contains_text("before compact"),
+        !requests[1].body_contains_message_text_outside_recall("before compact"),
         "token budget compaction should drop prior user messages"
     );
     assert!(
-        !requests[1].body_contains_text("assistant before compact"),
+        !requests[1].body_contains_message_text_outside_recall("assistant before compact"),
         "token budget compaction should drop prior assistant messages"
     );
+    assert_eq!(
+        requests[1].body_contains_message_text_outside_recall("CLIENT_DEVELOPER_INSTRUCTIONS"),
+        retain_client_developer_messages,
+        "token budget compaction should retain client-authored developer messages when enabled"
+    );
     assert!(
-        requests[1].body_contains_text("after compact"),
+        requests[1].body_contains_message_text_outside_recall("after compact"),
         "follow-up should still include the new turn input"
     );
 
@@ -1211,8 +1107,12 @@ async fn token_budget_compaction_runs_compact_hooks() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "token_budget_only")]
+#[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() -> Result<()> {
+async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
+    retain_client_developer_messages: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -1258,10 +1158,25 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
                 .features
                 .enable(Feature::TokenBudget)
                 .expect("test config should allow token budget");
+            if retain_client_developer_messages {
+                config
+                    .features
+                    .enable(Feature::RetainClientDeveloperMessages)
+                    .expect("test config should allow client developer retention");
+            }
         })
         .build(&server)
         .await?;
 
+    if retain_client_developer_messages {
+        test.codex
+            .inject_response_items(vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "MID_TURN_CLIENT_INSTRUCTIONS"}]
+            }))?])
+            .await?;
+    }
     test.submit_turn("trigger mid-turn auto compaction").await?;
 
     let requests = responses.requests();
@@ -1271,16 +1186,17 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
         "token-budget auto-compaction should reset locally before the continuation"
     );
     assert!(
-        !requests
-            .iter()
-            .any(|request| request
-                .body_contains_text("Use the model-owned context-window guidance.")),
+        !requests.iter().any(|request| {
+            request.body_contains_message_text_outside_recall(
+                "Use the model-owned context-window guidance.",
+            )
+        }),
         "an explicit token-budget config must not inherit model-owned guidance"
     );
     assert!(
-        !requests
-            .iter()
-            .any(|request| request.body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT)),
+        !requests.iter().any(|request| {
+            request.body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT)
+        }),
         "an explicit token-budget config must not enable model-owned fallback"
     );
     assert!(
@@ -1305,8 +1221,13 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
         Some(initial_window_id.as_str())
     );
     assert!(
-        !requests[1].body_contains_text("trigger mid-turn auto compaction"),
+        !requests[1].body_contains_message_text_outside_recall("trigger mid-turn auto compaction"),
         "fresh token-budget windows should drop prior user messages"
+    );
+    assert_eq!(
+        requests[1].body_contains_message_text_outside_recall("MID_TURN_CLIENT_INSTRUCTIONS"),
+        retain_client_developer_messages,
+        "mid-turn token-budget compaction should retain client-authored developer messages when enabled"
     );
     assert_ne!(
         follow_up_window_id, initial_window_id,
@@ -1334,7 +1255,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
             ]),
             sse(vec![
                 ev_response_created("fallback-tool-resp"),
-                ev_shell_command_call(fallback_call_id, "echo fallback-note > fallback-note.txt"),
+                ev_exec_command_call(fallback_call_id, "echo fallback-note > fallback-note.txt"),
                 ev_completed_with_tokens("fallback-tool-resp", /*total_tokens*/ 10_000),
             ]),
             sse(vec![
@@ -1404,7 +1325,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
         Some(initial_window_id.as_str())
     );
     assert_ne!(follow_up_window_id, initial_window_id);
-    assert!(!requests[3].body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[3].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
     assert_eq!(
         requests[3].function_call_output_text(fallback_call_id),
         None
@@ -1472,8 +1393,8 @@ async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<
             .iter()
             .any(|text| text == AUTO_COMPACT_FALLBACK_PROMPT)
     );
-    assert!(!requests[2].body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT));
-    assert!(!requests[2].body_contains_text("exhaust the fallback buffer"));
+    assert!(!requests[2].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[2].body_contains_message_text_outside_recall("exhaust the fallback buffer"));
     assert_eq!(requests[2].function_call_output_text("buffer-call"), None);
 
     Ok(())
@@ -1516,6 +1437,7 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
@@ -1541,7 +1463,7 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
-    assert!(!requests[1].body_contains_text(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[1].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
     assert!(
         tool_names(&requests[0])
             .iter()

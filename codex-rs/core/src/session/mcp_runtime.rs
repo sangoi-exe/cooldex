@@ -22,20 +22,26 @@ pub(super) struct McpDesiredState {
     pub(super) originator: String,
     pub(super) session_source: SessionSource,
     pub(super) environments: TurnEnvironmentSnapshot,
+    pub(super) local_process_cwd: PathBuf,
     pub(super) windows_sandbox_level: WindowsSandboxLevel,
 }
 
-impl McpDesiredState {
-    pub(super) fn local_stdio_fallback_cwd(&self) -> PathBuf {
-        self.environments
-            .primary()
-            .and_then(|environment| environment.cwd().to_abs_path().ok())
-            .map(|cwd| cwd.to_path_buf())
-            .unwrap_or_else(|| self.config.cwd.to_path_buf())
-    }
-}
-
 impl Session {
+    pub(super) fn mcp_inputs_differ(
+        &self,
+        current: &SessionConfiguration,
+        next: &SessionConfiguration,
+        updates: &SessionSettingsUpdate,
+    ) -> bool {
+        current.cwd() != next.cwd()
+            || current.approval_policy.value() != next.approval_policy.value()
+            || current.approvals_reviewer != next.approvals_reviewer
+            || current.permission_profile() != next.permission_profile()
+            || updates.environments.as_ref().is_some_and(|environments| {
+                environments.environments != self.services.turn_environments.selections()
+            })
+    }
+
     /// Waits on this session's refreshed server before tool execution is admitted.
     pub(crate) async fn wait_for_mcp_server(self: &Arc<Self>, server: &str) {
         self.refresh_mcp_if_dirty().await;
@@ -72,7 +78,11 @@ impl Session {
             .primary()
             .and_then(|environment| environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
-        let config = Self::build_per_turn_config(&session_configuration, cwd);
+        let config = self.build_per_turn_config(&session_configuration, cwd);
+        let local_process_cwd = environments
+            .local_environment_cwd()
+            .unwrap_or_else(|| session_configuration.cwd().clone())
+            .to_path_buf();
 
         McpDesiredState {
             config: Arc::new(config),
@@ -81,6 +91,7 @@ impl Session {
             originator: session_configuration.originator.clone(),
             session_source: session_configuration.session_source.clone(),
             environments,
+            local_process_cwd,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
         }
     }
@@ -91,11 +102,15 @@ impl Session {
         auth: Option<CodexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
-        local_stdio_fallback_cwd: PathBuf,
+        mcp_runtime_cwd: PathBuf,
     ) -> anyhow::Result<()> {
-        let cwd = AbsolutePathBuf::from_absolute_path(local_stdio_fallback_cwd)
+        let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
             .unwrap_or_else(|_| session_configuration.cwd().clone());
-        let config = Self::build_per_turn_config(session_configuration, cwd);
+        let config = self.build_per_turn_config(session_configuration, cwd);
+        let local_process_cwd = resolved_environments
+            .local_environment_cwd()
+            .unwrap_or_else(|| session_configuration.cwd().clone())
+            .to_path_buf();
         let desired = McpDesiredState {
             config: Arc::new(config),
             auth,
@@ -103,6 +118,7 @@ impl Session {
             originator: session_configuration.originator.clone(),
             session_source: session_configuration.session_source.clone(),
             environments: resolved_environments.clone(),
+            local_process_cwd,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
         };
         self.publish_mcp_runtime(
@@ -128,6 +144,7 @@ impl Session {
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
+        let selected_plugins = mcp_projection.selected_plugins.clone();
         let input = self.build_mcp_runtime_input(
             desired,
             mcp_projection,
@@ -135,6 +152,7 @@ impl Session {
             elicitation_reviewer,
         );
         self.services.mcp_runtime.replace(input).await;
+        self.services.thread_extension_data.insert(selected_plugins);
     }
 
     pub(super) fn build_mcp_runtime_input(
@@ -148,6 +166,7 @@ impl Session {
         let McpRuntimeProjection {
             mut config,
             plugins_available,
+            selected_plugins: _,
         } = mcp_projection;
         config.approval_policy = desired.config.permissions.approval_policy.clone();
         config.permission_profile = desired.config.permissions.effective_permission_profile();
@@ -157,7 +176,7 @@ impl Session {
             .turn_environments()
             .map(|environment| {
                 (
-                    environment.environment_id.clone(),
+                    environment.selection.environment_id.clone(),
                     environment.cwd().clone(),
                 )
             })
@@ -168,10 +187,9 @@ impl Session {
             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
         let mcp_config = Arc::new(config);
         let mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
-        let local_stdio_fallback_cwd = desired.local_stdio_fallback_cwd();
         let runtime_context = McpRuntimeContext::new(
             self.services.turn_environments.environment_manager(),
-            local_stdio_fallback_cwd,
+            desired.local_process_cwd.clone(),
         );
         let codex_apps_auth_manager =
             codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())

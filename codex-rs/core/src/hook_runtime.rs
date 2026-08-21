@@ -19,6 +19,8 @@ use codex_hooks::StopOutcome;
 use codex_hooks::SubagentHookContext;
 use codex_hooks::UserPromptSubmitOutcome;
 use codex_hooks::UserPromptSubmitRequest;
+use codex_hooks::hook_execution_mode_label;
+use codex_hooks::hook_handler_type_label;
 use codex_otel::HOOK_RUN_DURATION_METRIC;
 use codex_otel::HOOK_RUN_METRIC;
 use codex_protocol::items::TurnItem;
@@ -30,6 +32,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
@@ -38,6 +41,8 @@ use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::WarningEvent;
+use codex_rollout::state_db;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ReadThreadParams;
 use serde_json::Value;
 use tracing::instrument;
@@ -573,16 +578,13 @@ pub(crate) async fn inspect_pending_input(
     }
 }
 
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "durable queue admission must settle before its active turn can be aborted"
-)]
 pub(crate) async fn record_pending_input(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     pending_input: TurnInput,
     additional_contexts: Vec<String>,
-) -> Result<(), TryStartTurnIfIdleRejectionReason> {
+    persist_context: PersistContext,
+) {
     match pending_input {
         TurnInput::UserInput { content, client_id } => {
             let awaiting_admission = client_id.as_deref().is_some_and(|client_id| {
@@ -599,6 +601,7 @@ pub(crate) async fn record_pending_input(
                     turn_context.as_ref(),
                     content.as_slice(),
                     client_id.clone(),
+                    persist_context,
                 )
                 .await;
                 record_additional_contexts(sess, turn_context, additional_contexts).await;
@@ -629,21 +632,22 @@ pub(crate) async fn record_pending_input(
                             let _ = sender
                                 .send(Err(TryStartTurnIfIdleRejectionReason::PersistenceFailed));
                         }
-                        return Err(TryStartTurnIfIdleRejectionReason::PersistenceFailed);
+                        return;
                     }
                 }
-                return Ok(());
+                return;
             }
             drop(active);
             sess.record_user_prompt_and_emit_turn_item(
                 turn_context.as_ref(),
                 content.as_slice(),
                 client_id,
+                persist_context,
             )
             .await;
         }
         TurnInput::ResponseItem(item) => {
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+            sess.record_annotated_conversation_items(turn_context, vec![item])
                 .await;
         }
         TurnInput::InterAgentCommunication(communication) => {
@@ -652,7 +656,6 @@ pub(crate) async fn record_pending_input(
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;
-    Ok(())
 }
 
 pub(crate) async fn reject_pending_input(
@@ -800,6 +803,23 @@ pub(crate) async fn emit_hook_completed_events(
     turn_context: &Arc<TurnContext>,
     completed_events: Vec<HookCompletedEvent>,
 ) {
+    if turn_context.config.memories.disable_on_external_context
+        && completed_events.iter().any(|completed| {
+            completed.run.handler_type == HookHandlerType::McpTool
+                && matches!(
+                    completed.run.status,
+                    HookRunStatus::Completed | HookRunStatus::Blocked | HookRunStatus::Stopped
+                )
+        })
+    {
+        state_db::mark_thread_memory_mode_polluted(
+            sess.services.state_db.as_deref(),
+            sess.thread_id,
+            "mcp_tool_hook",
+        )
+        .await;
+    }
+
     for completed in completed_events {
         emit_hook_completed_metrics(turn_context, &completed);
         track_hook_completed_analytics(sess, turn_context, &completed);
@@ -856,12 +876,14 @@ fn hook_run_analytics_payload(
         HookRunFact {
             event_name: completed.run.event_name,
             hook_source: completed.run.source,
+            handler_type: completed.run.handler_type,
+            execution_mode: completed.run.execution_mode,
             status: completed.run.status,
         },
     )
 }
 
-fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 3] {
+fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 5] {
     let hook_name = match run.event_name {
         HookEventName::PreToolUse => "PreToolUse",
         HookEventName::PermissionRequest => "PermissionRequest",
@@ -895,11 +917,15 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookRunStatus::Blocked => "blocked",
         HookRunStatus::Stopped => "stopped",
     };
-
     [
         ("hook_name", hook_name),
         ("source", hook_source),
         ("status", status),
+        ("handler_type", hook_handler_type_label(run.handler_type)),
+        (
+            "execution_mode",
+            hook_execution_mode_label(run.execution_mode),
+        ),
     ]
 }
 
@@ -1066,6 +1092,8 @@ mod tests {
         assert_eq!(tracking.turn_id, "turn-from-hook");
         assert_eq!(tracking.model_slug, turn_context.model_info.slug);
         assert_eq!(hook.event_name, HookEventName::Stop);
+        assert_eq!(hook.handler_type, HookHandlerType::Command);
+        assert_eq!(hook.execution_mode, HookExecutionMode::Sync);
         assert_eq!(hook.hook_source, HookSource::Project);
         assert_eq!(hook.status, HookRunStatus::Blocked);
     }
@@ -1073,22 +1101,25 @@ mod tests {
     #[tokio::test]
     async fn hook_run_analytics_payload_falls_back_to_turn_context_id() {
         let (_session, turn_context) = make_session_and_context().await;
-        let completed = HookCompletedEvent {
-            turn_id: None,
-            run: sample_hook_run(HookRunStatus::Failed, HookSource::Unknown),
-        };
+        let mut run = sample_hook_run(HookRunStatus::Failed, HookSource::Unknown);
+        run.handler_type = HookHandlerType::Prompt;
+        run.execution_mode = HookExecutionMode::Async;
+        let completed = HookCompletedEvent { turn_id: None, run };
 
         let (tracking, hook) =
             hook_run_analytics_payload("thread-123".to_string(), &turn_context, &completed);
 
         assert_eq!(tracking.turn_id, turn_context.sub_id);
+        assert_eq!(hook.handler_type, HookHandlerType::Prompt);
+        assert_eq!(hook.execution_mode, HookExecutionMode::Async);
         assert_eq!(hook.hook_source, HookSource::Unknown);
         assert_eq!(hook.status, HookRunStatus::Failed);
     }
 
     #[test]
     fn hook_run_metric_tags_match_analytics_shape() {
-        let run = sample_hook_run(HookRunStatus::Blocked, HookSource::Project);
+        let mut run = sample_hook_run(HookRunStatus::Blocked, HookSource::Project);
+        run.handler_type = HookHandlerType::McpTool;
 
         assert_eq!(
             hook_run_metric_tags(&run),
@@ -1096,6 +1127,8 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "project"),
                 ("status", "blocked"),
+                ("handler_type", "mcp_tool"),
+                ("execution_mode", "sync"),
             ]
         );
 
@@ -1108,13 +1141,16 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "cloud_requirements"),
                 ("status", "blocked"),
+                ("handler_type", "command"),
+                ("execution_mode", "sync"),
             ]
         );
     }
 
     #[test]
     fn hook_run_metric_tags_include_expanded_hook_sources() {
-        let run = sample_hook_run(HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm);
+        let mut run = sample_hook_run(HookRunStatus::Completed, HookSource::LegacyManagedConfigMdm);
+        run.execution_mode = HookExecutionMode::Async;
 
         assert_eq!(
             hook_run_metric_tags(&run),
@@ -1122,6 +1158,8 @@ mod tests {
                 ("hook_name", "Stop"),
                 ("source", "legacy_managed_config_mdm"),
                 ("status", "completed"),
+                ("handler_type", "command"),
+                ("execution_mode", "async"),
             ]
         );
     }

@@ -42,17 +42,11 @@ const CUSTOM_RECOVERY_INSTRUCTIONS: &str = "Use the configured post-compact reco
 
 type RecoveryFragment = (usize, (String, String));
 
-fn user_turn(text: &str) -> Op {
-    Op::UserInput {
-        items: vec![UserInput::Text {
-            text: text.to_string(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }
+fn user_turn(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
+    codex_protocol::turn_input::TurnInputRequest::user_input(vec![UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }])
 }
 
 fn read_rollout_items(path: &Path) -> Vec<RolloutItem> {
@@ -188,7 +182,7 @@ async fn wait_for_failed_turn_complete(codex: &codex_core::CodexThread) {
 }
 
 async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
-    codex.submit(user_turn(FIRST_USER)).await?;
+    codex.start_or_steer_turn(user_turn(FIRST_USER)).await?;
     wait_for_successful_turn_complete(codex).await;
     codex.submit(Op::Compact).await?;
     let EventMsg::Warning(WarningEvent { message }) = wait_for_event(codex, |event| {
@@ -245,7 +239,7 @@ async fn post_compact_recovery_stream_closes_after_created_without_sampling_succ
         .expect("rollout path");
 
     seed_and_compact(&test.codex).await?;
-    test.codex.submit(user_turn(LIVE_USER)).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
     wait_for_failed_turn_complete(&test.codex).await;
 
     assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
@@ -342,9 +336,11 @@ else:
         .expect("rollout path");
 
     seed_and_compact(&test.codex).await?;
-    test.codex.submit(user_turn(LIVE_USER)).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
     wait_for_successful_turn_complete(&test.codex).await;
-    test.codex.submit(user_turn(AFTER_RECOVERY_USER)).await?;
+    test.codex
+        .start_or_steer_turn(user_turn(AFTER_RECOVERY_USER))
+        .await?;
     wait_for_successful_turn_complete(&test.codex).await;
 
     let requests = requests.requests();
@@ -568,10 +564,12 @@ print(json.dumps({{"systemMessage": "stop hook passed"}}))
         .join("recovery_waiting_stop_hook_release");
 
     seed_and_compact(&test.codex).await?;
-    test.codex.submit(user_turn(LIVE_USER)).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
     fs_wait::wait_for_path_exists(&started_path, Duration::from_secs(5)).await?;
 
-    test.codex.submit(user_turn(STEER_DURING_STOP)).await?;
+    test.codex
+        .start_or_steer_turn(user_turn(STEER_DURING_STOP))
+        .await?;
     submit_thread_settings(
         &test.codex,
         ThreadSettingsOverrides {

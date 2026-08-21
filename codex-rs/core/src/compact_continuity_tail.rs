@@ -3,6 +3,7 @@
 use crate::context_manager::truncate_function_output_payload;
 use crate::session::turn_context::TurnContext;
 use crate::tool_batch::complete_trailing_tool_batch;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
@@ -25,6 +26,19 @@ pub(crate) fn append_remote_v2_mid_turn_continuity_tail(
     turn_context: &TurnContext,
 ) {
     append_tail_with_budget(
+        new_history,
+        prompt_input,
+        &turn_context.sub_id,
+        continuity_tail_budget_tokens(turn_context),
+    );
+}
+
+pub(crate) fn append_remote_v2_mid_turn_continuity_tail_enveloped(
+    new_history: &mut Vec<ResponseItemEnvelope>,
+    prompt_input: &[ResponseItem],
+    turn_context: &TurnContext,
+) {
+    append_enveloped_tail_with_budget(
         new_history,
         prompt_input,
         &turn_context.sub_id,
@@ -72,6 +86,60 @@ fn append_tail_with_budget(
     let truncated_output_count = budgeted.truncated_output_count;
     let estimated_tokens = budgeted.estimated_tokens;
     new_history.splice(compaction_index + 1..compaction_index + 1, budgeted.items);
+    debug!(
+        turn_id = %current_turn_id,
+        item_count,
+        output_count,
+        truncated_output_count,
+        budget_tokens,
+        estimated_tokens,
+        "appended remote v2 post-compact continuity tail"
+    );
+}
+
+fn append_enveloped_tail_with_budget(
+    new_history: &mut Vec<ResponseItemEnvelope>,
+    prompt_input: &[ResponseItem],
+    current_turn_id: &str,
+    budget_tokens: usize,
+) {
+    if budget_tokens == 0 {
+        log_omitted(current_turn_id, "zero_budget");
+        return;
+    }
+
+    let Some(compaction_index) = new_history
+        .iter()
+        .rposition(|item| matches!(&item.item, ResponseItem::Compaction { .. }))
+    else {
+        log_omitted(current_turn_id, "missing_compaction_anchor");
+        return;
+    };
+
+    let candidate = match latest_complete_current_turn_tail(prompt_input, current_turn_id) {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            log_omitted(current_turn_id, reason);
+            return;
+        }
+    };
+    let output_count = candidate.output_count;
+
+    let budgeted = match apply_tail_budget(candidate, budget_tokens) {
+        Ok(budgeted) => budgeted,
+        Err(reason) => {
+            log_omitted(current_turn_id, reason);
+            return;
+        }
+    };
+
+    let item_count = budgeted.items.len();
+    let truncated_output_count = budgeted.truncated_output_count;
+    let estimated_tokens = budgeted.estimated_tokens;
+    new_history.splice(
+        compaction_index + 1..compaction_index + 1,
+        budgeted.items.into_iter().map(ResponseItemEnvelope::new),
+    );
     debug!(
         turn_id = %current_turn_id,
         item_count,

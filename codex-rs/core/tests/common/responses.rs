@@ -81,13 +81,20 @@ impl ResponseMock {
 }
 
 pub fn assert_parent_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "parent_turn_id", expected)
+}
+
+pub fn assert_root_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "root_turn_id", expected)
+}
+
+fn assert_turn_id(body: &Value, key: &str, expected: Option<&str>) -> Result<()> {
     let metadata = &body["client_metadata"];
     let payload = metadata["x-codex-turn-metadata"]
         .as_str()
         .expect("canonical turn metadata");
     let canonical: Value = serde_json::from_str(payload)?;
     let expected = expected.map(Value::from);
-    let key = "parent_turn_id";
     let actual = (metadata.get(key), canonical.get(key));
     assert_eq!(actual, (expected.as_ref(), expected.as_ref()));
     Ok(())
@@ -199,6 +206,18 @@ impl ResponsesRequest {
             .trim_matches('"')
             .to_string();
         self.body_json().to_string().contains(&json_fragment)
+    }
+
+    /// Returns true if any message text outside a post-compact recall block
+    /// contains the provided substring.
+    pub fn body_contains_message_text_outside_recall(&self, text: &str) -> bool {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+            .filter(|message_text| !message_text.starts_with("<post_compact_recall>"))
+            .any(|message_text| message_text.contains(text))
     }
 
     pub fn tool_by_name(&self, namespace: &str, tool_name: &str) -> Option<Value> {
@@ -994,21 +1013,21 @@ pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
     })
 }
 
-pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
-    let args = serde_json::json!({ "command": command });
-    ev_shell_command_call_with_args(call_id, &args)
+pub fn ev_exec_command_call(call_id: &str, command: &str) -> Value {
+    let args = serde_json::json!({ "cmd": command });
+    ev_exec_command_call_with_args(call_id, &args)
 }
 
-pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
-    let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
-    ev_function_call(call_id, "shell_command", &arguments)
+pub fn ev_exec_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
+    let arguments = serde_json::to_string(args).expect("serialize exec command arguments");
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
-pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
+pub fn ev_apply_patch_exec_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
+    let args = serde_json::json!({ "cmd": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
     let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
 
-    ev_function_call(call_id, "shell_command", &arguments)
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
 pub fn sse_failed(id: &str, code: &str, message: &str) -> String {

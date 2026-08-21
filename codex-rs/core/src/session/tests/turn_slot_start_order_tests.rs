@@ -67,14 +67,8 @@ fn user_input(text: &str) -> Vec<UserInput> {
     }]
 }
 
-fn user_input_op(text: &str) -> Op {
-    Op::UserInput {
-        items: user_input(text),
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
-    }
+fn user_input_request(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
+    codex_protocol::turn_input::TurnInputRequest::user_input(user_input(text))
 }
 
 async fn recv_turn_started(rx: &async_channel::Receiver<Event>, expected_turn_id: &str) -> Event {
@@ -175,7 +169,7 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
             handlers::user_input_or_turn(
                 &session,
                 "fresh-waiter".to_string(),
-                user_input_op(fresh_text),
+                user_input_request(fresh_text),
                 /*client_user_message_id*/ None,
                 /*parent_turn_id*/ None,
             )

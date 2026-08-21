@@ -120,7 +120,7 @@ pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) ->
                 )));
                 response_item_bytes =
                     response_item_bytes.saturating_add(message_byte_count(&message));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
                 current_turn = Some((turn_id, started_at));
             }
             MessageRole::Assistant => {
@@ -135,9 +135,10 @@ pub(super) fn rollout_items_from_messages(messages: Vec<ConversationMessage>) ->
                         message: message.text.clone(),
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     },
                 )));
-                items.push(RolloutItem::ResponseItem(response_item(message)));
+                items.push(RolloutItem::ResponseItem(response_item(message).into()));
             }
         }
     }
@@ -156,6 +157,7 @@ fn external_session_imported_marker_item() -> RolloutItem {
         message: EXTERNAL_SESSION_IMPORTED_MARKER.to_string(),
         phase: None,
         memory_citation: None,
+        delivery: None,
     }))
 }
 
@@ -251,6 +253,7 @@ mod tests {
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }
         );
     }
@@ -283,6 +286,7 @@ mod tests {
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             })
         );
         let last_turn_complete = imported
@@ -325,7 +329,8 @@ mod tests {
             .filter(|item| {
                 matches!(
                     item,
-                    RolloutItem::ResponseItem(ResponseItem::Message { .. })
+                    RolloutItem::ResponseItem(response_item)
+                        if matches!(&response_item.item, ResponseItem::Message { .. })
                 )
             })
             .count();

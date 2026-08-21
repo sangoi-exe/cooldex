@@ -97,6 +97,9 @@ pub struct EnvironmentInfo {
     /// On Windows, a command's `TEMP` or `TMP` overrides take precedence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary_directories: Option<Vec<PathUri>>,
+    /// Executor-native temporary directory for child-visible sidecars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_dir: Option<PathUri>,
     /// Optional executor features that clients must gate before sending newer request fields.
     #[serde(default)]
     pub capabilities: EnvironmentCapabilities,
@@ -115,6 +118,12 @@ pub struct EnvironmentCapabilities {
     /// Whether this executor supports the `environmentConfig/read` request.
     #[serde(default)]
     pub environment_config_read: bool,
+    /// Whether filesystem streams can use the requested platform sandbox.
+    #[serde(default)]
+    pub sandboxed_file_streaming: bool,
+    /// Whether shell state can be cached and restored entirely inside the executor.
+    #[serde(default)]
+    pub shell_snapshot_v2: bool,
 }
 
 /// Status returned by an initialized exec-server connection.
@@ -145,34 +154,39 @@ impl EnvironmentInfo {
         } else {
             &["TMPDIR"]
         };
+        let normalize_temp_path = |path: std::ffi::OsString| {
+            PathUri::from_host_native_path(&path).ok().or_else(|| {
+                if cfg!(unix) {
+                    PathUri::from_host_native_path(cwd.as_ref()?.join(path)).ok()
+                } else {
+                    None
+                }
+            })
+        };
         let mut temporary_directories = Vec::new();
         for name in temporary_directory_env_vars {
             if let Some(path) = std::env::var_os(name)
                 .filter(|path| !path.is_empty())
                 .filter(|path| cfg!(unix) || std::path::Path::new(path).is_absolute())
-                .and_then(|path| {
-                    PathUri::from_host_native_path(&path).ok().or_else(|| {
-                        if cfg!(unix) {
-                            PathUri::from_host_native_path(cwd.as_ref()?.join(path)).ok()
-                        } else {
-                            None
-                        }
-                    })
-                })
+                .and_then(&normalize_temp_path)
                 && !temporary_directories.contains(&path)
             {
                 temporary_directories.push(path);
             }
         }
+        let temp_dir = normalize_temp_path(std::env::temp_dir().into_os_string());
 
         Self {
             shell: codex_shell_command::shell_detect::default_user_shell().into(),
             cwd: cwd.and_then(|cwd| PathUri::from_host_native_path(cwd).ok()),
             temporary_directories: Some(temporary_directories),
+            temp_dir,
             capabilities: EnvironmentCapabilities {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: true,
+                sandboxed_file_streaming: true,
+                shell_snapshot_v2: cfg!(unix),
             },
         }
     }
@@ -209,6 +223,9 @@ pub struct ExecParams {
     pub cwd: PathUri,
     #[serde(default)]
     pub env_policy: Option<ExecEnvPolicy>,
+    /// Optional request to restore executor-owned, attachment-scoped shell state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_snapshot: Option<ShellSnapshotRequest>,
     pub env: HashMap<String, String>,
     pub tty: bool,
     /// Keep non-tty stdin writable through `process/write`.
@@ -242,6 +259,19 @@ pub struct ExecEnvPolicy {
     pub exclude: Vec<String>,
     pub r#set: HashMap<String, String>,
     pub include_only: Vec<String>,
+}
+
+/// Identifies shell state owned by one attachment within an executor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellSnapshotRequest {
+    /// Attachment identity; executor sessions independently scope every cache.
+    pub scope_id: String,
+    /// Executor-native shell used to capture and restore the snapshot.
+    pub shell: ShellInfo,
+    /// Runtime-owned PATH entries to replay after restoring profile state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_path_prepends: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +381,8 @@ pub struct TerminateResponse {
 #[serde(rename_all = "camelCase")]
 pub struct FsReadFileParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -404,6 +436,8 @@ pub struct FsCloseResponse {}
 pub struct FsWriteFileParams {
     pub path: PathUri,
     pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -416,6 +450,8 @@ pub struct FsWriteFileResponse {}
 pub struct FsCreateDirectoryParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -427,6 +463,8 @@ pub struct FsCreateDirectoryResponse {}
 #[serde(rename_all = "camelCase")]
 pub struct FsGetMetadataParams {
     pub path: PathUri,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -491,6 +529,8 @@ pub struct FsRemoveParams {
     pub path: PathUri,
     pub recursive: Option<bool>,
     pub force: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_symlinks: Option<bool>,
     pub sandbox: Option<FileSystemSandboxContext>,
 }
 
@@ -829,6 +869,7 @@ mod tests {
             argv: vec!["true".to_string()],
             cwd,
             env_policy: None,
+            shell_snapshot: None,
             env: HashMap::new(),
             tty: false,
             pipe_stdin: false,
@@ -902,6 +943,7 @@ mod tests {
                 },
                 cwd: None,
                 temporary_directories: None,
+                temp_dir: None,
                 capabilities: EnvironmentCapabilities::default(),
             }
         );
@@ -921,6 +963,8 @@ mod tests {
                 network_proxy_launch: true,
                 capability_discovery_sandbox: true,
                 environment_config_read: false,
+                sandboxed_file_streaming: false,
+                shell_snapshot_v2: false,
             }
         );
     }
@@ -935,6 +979,8 @@ mod tests {
                 "networkProxyLaunch": false,
                 "capabilityDiscoverySandbox": false,
                 "environmentConfigRead": false,
+                "sandboxedFileStreaming": false,
+                "shellSnapshotV2": false,
             },
         });
         let info: EnvironmentInfo = serde_json::from_value(expected.clone())
@@ -1000,10 +1046,9 @@ mod tests {
                 .join("relative-temp"),
         )
         .expect("absolute temporary directory URI");
-        assert_eq!(
-            EnvironmentInfo::local().temporary_directories,
-            Some(vec![expected])
-        );
+        let info = EnvironmentInfo::local();
+        assert_eq!(info.temporary_directories, Some(vec![expected.clone()]));
+        assert_eq!(info.temp_dir, Some(expected));
     }
 
     #[test]
@@ -1043,15 +1088,14 @@ mod tests {
         let file_system = ManagedFileSystemPermissions::Restricted {
             entries: vec![
                 FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: native_cwd.clone().try_into().expect("absolute cwd"),
-                    },
+                    path: FileSystemPath::Path { path: cwd.clone() },
                     access: FileSystemAccessMode::Read,
                     missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry::skip_missing_path(
                     FileSystemPath::Path {
-                        path: native_cwd.join(".git").try_into().expect("absolute path"),
+                        path: PathUri::from_host_native_path(native_cwd.join(".git"))
+                            .expect("absolute path"),
                     },
                     FileSystemAccessMode::Read,
                 ),
@@ -1121,9 +1165,7 @@ mod tests {
         let cwd = PathUri::from_host_native_path(&native_cwd).expect("cwd URI");
         let mut file_system_policy =
             FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: native_cwd.try_into().expect("absolute cwd"),
-                },
+                path: FileSystemPath::Path { path: cwd.clone() },
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             }]);

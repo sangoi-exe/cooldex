@@ -15,8 +15,8 @@ use codex_rollout::ScanOutcome;
 use serde_json::Value;
 
 use super::LocalThreadStore;
-use super::read_thread;
 use super::rollout_lineage::validate_cutoff_bounds;
+use super::thread_rollout_resolver;
 use crate::LoadRolloutTailParams;
 use crate::RecallRolloutSourceIssue;
 use crate::RecallRolloutSourceIssueKind;
@@ -64,7 +64,7 @@ async fn load_rollout_tail_with_projection(
     params: LoadRolloutTailParams,
     projection: TailProjection,
 ) -> ThreadStoreResult<StoredRecallRolloutTail> {
-    let path = read_thread::resolve_rollout_path(store, params.thread_id, params.include_archived)
+    let path = resolve_rollout_path(store, params.thread_id, params.include_archived)
         .await?
         .ok_or_else(|| ThreadStoreError::InvalidRequest {
             message: format!("no rollout found for thread id {}", params.thread_id),
@@ -164,13 +164,12 @@ async fn scan_rollout_tail(
                 };
                 segment_thread_id = base.thread_id;
                 segment_end = Some(base);
-                segment_path = read_thread::resolve_rollout_path(
-                    store,
-                    segment_thread_id,
-                    /*include_archived*/ true,
-                )
-                .await?
-                .ok_or_else(|| invalid_lineage(segment_thread_id, "missing source rollout"))?;
+                segment_path =
+                    resolve_rollout_path(store, segment_thread_id, /*include_archived*/ true)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid_lineage(segment_thread_id, "missing source rollout")
+                        })?;
             }
         }
     }
@@ -185,6 +184,19 @@ async fn scan_rollout_tail(
         segments_read,
         source_issue,
     })
+}
+
+async fn resolve_rollout_path(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    include_archived: bool,
+) -> ThreadStoreResult<Option<PathBuf>> {
+    let resolved = if include_archived {
+        thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
+    } else {
+        thread_rollout_resolver::resolve_current(store, thread_id).await?
+    };
+    Ok(resolved.map(|resolved| resolved.path))
 }
 
 #[derive(Clone, Copy)]

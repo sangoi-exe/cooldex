@@ -1,4 +1,5 @@
 use assert_matches::assert_matches;
+use codex_core::TurnInputRequest;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,44 +18,38 @@ use core_test_support::wait_for_event;
 use regex_lite::Regex;
 use serde_json::json;
 
-/// Integration test: spawn a long‑running shell_command tool via a mocked Responses SSE
+/// Integration test: spawn a long‑running exec_command tool via a mocked Responses SSE
 /// function call, then interrupt the session and expect TurnAborted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_long_running_tool_emits_turn_aborted() {
     let command = "sleep 60";
 
     let args = json!({
-        "command": command,
-        "timeout_ms": 60_000
+        "cmd": command,
+        "yield_time_ms": 60_000
     })
     .to_string();
     let body = sse(vec![
-        ev_function_call("call_sleep", "shell_command", &args),
+        ev_function_call("call_sleep", "exec_command", &args),
         ev_completed("done"),
     ]);
 
     let server = start_mock_server().await;
     mount_sse_once(&server, body).await;
 
-    let codex = test_codex()
+    let fixture = test_codex()
         .with_model("gpt-5.4")
         .build(&server)
         .await
-        .unwrap()
-        .codex;
+        .unwrap();
+    let codex = Arc::clone(&fixture.codex);
 
     // Kick off a turn that triggers the function call.
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "start sleep".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "start sleep".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -65,6 +60,7 @@ async fn interrupt_long_running_tool_emits_turn_aborted() {
 
     // Expect TurnAborted soon after.
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
+    codex.submit(Op::CleanBackgroundTerminals).await.unwrap();
 }
 
 /// After an interrupt we expect the next request to the model to include both
@@ -77,13 +73,13 @@ async fn interrupt_tool_records_history_entries() {
     let call_id = "call-history";
 
     let args = json!({
-        "command": command,
-        "timeout_ms": 60_000
+        "cmd": command,
+        "yield_time_ms": 60_000
     })
     .to_string();
     let first_body = sse(vec![
         ev_response_created("resp-history"),
-        ev_function_call(call_id, "shell_command", &args),
+        ev_function_call(call_id, "exec_command", &args),
         ev_completed("resp-history"),
     ]);
     let follow_up_body = sse(vec![
@@ -102,16 +98,10 @@ async fn interrupt_tool_records_history_entries() {
     let codex = Arc::clone(&fixture.codex);
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "start history recording".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "start history recording".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -123,16 +113,10 @@ async fn interrupt_tool_records_history_entries() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "follow up".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "follow up".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -171,6 +155,7 @@ async fn interrupt_tool_records_history_entries() {
         secs >= 0.1,
         "expected at least one tenth of a second of elapsed time, got {secs}"
     );
+    codex.submit(Op::CleanBackgroundTerminals).await.unwrap();
 }
 
 /// After an interrupt we persist a model-visible `<turn_aborted>` marker in the conversation
@@ -181,13 +166,13 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     let call_id = "call-turn-aborted-marker";
 
     let args = json!({
-        "command": command,
-        "timeout_ms": 60_000
+        "cmd": command,
+        "yield_time_ms": 60_000
     })
     .to_string();
     let first_body = sse(vec![
         ev_response_created("resp-marker"),
-        ev_function_call(call_id, "shell_command", &args),
+        ev_function_call(call_id, "exec_command", &args),
         ev_completed("resp-marker"),
     ]);
     let follow_up_body = sse(vec![
@@ -206,16 +191,10 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     let codex = Arc::clone(&fixture.codex);
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "start interrupt marker".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "start interrupt marker".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -227,16 +206,10 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnAborted(_))).await;
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "follow up".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "follow up".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -253,4 +226,5 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
             .any(|text| text.contains("<turn_aborted>")),
         "expected <turn_aborted> marker in follow-up request"
     );
+    codex.submit(Op::CleanBackgroundTerminals).await.unwrap();
 }

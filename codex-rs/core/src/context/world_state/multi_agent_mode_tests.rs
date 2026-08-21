@@ -1,5 +1,6 @@
 use super::super::test_support::render_section_cases;
 use super::*;
+use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::WorldState;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
@@ -92,7 +93,7 @@ fn unchanged_mode_is_reemitted_after_usage_hint_migration() {
         /*explanation*/ None,
     )))
     .with_usage_hint(&MultiAgentUsageHintState::new(
-        "Current usage instructions.",
+        MultiAgentRoleInstructions::unmarked("Current usage instructions."),
     ));
 
     let instructions = current
@@ -108,7 +109,38 @@ fn unchanged_mode_is_reemitted_after_usage_hint_migration() {
 }
 
 #[test]
-fn custom_mode_and_explanation_are_bounded_before_snapshot_and_rendering() {
+fn catalog_role_updates_remain_separate_from_active_mode() {
+    let previous_hint =
+        MultiAgentUsageHintState::new(MultiAgentRoleInstructions::catalog("Previous role."));
+    let previous_mode = state(Some(MultiAgentMode::Proactive)).with_usage_hint(&previous_hint);
+    let mut previous = WorldState::default();
+    previous.add_section(previous_hint);
+    previous.add_section(previous_mode);
+
+    let current_role = MultiAgentRoleInstructions::catalog("Current role.");
+    let current_hint = MultiAgentUsageHintState::new(current_role.clone());
+    let current_mode = state(Some(MultiAgentMode::Proactive)).with_usage_hint(&current_hint);
+    let mut current = WorldState::default();
+    current.add_section(current_hint);
+    current.add_section(current_mode);
+
+    let updates = crate::context_manager::updates::merge_contextual_fragments(
+        current.render_diff(&previous.snapshot()),
+    );
+    let expected_mode =
+        MultiAgentModeInstructions::new(MultiAgentMode::Proactive, /*explanation*/ None)
+            .expect("proactive mode should render");
+    assert_eq!(
+        updates,
+        vec![
+            ContextualUserFragment::into(current_role),
+            ContextualUserFragment::into(expected_mode),
+        ],
+    );
+}
+
+#[test]
+fn custom_mode_is_bounded_before_snapshot_and_rendering() {
     let state = state(Some(MultiAgentMode::Custom("custom mode ".repeat(1_000))));
     let Some(MultiAgentMode::Custom(snapshot_mode)) = state.snapshot().mode else {
         panic!("expected custom multi-agent mode")

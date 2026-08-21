@@ -215,11 +215,16 @@ fn classified_identity(item: &ResponseItem) -> ClassifiedToolItem {
                 ClassifiedToolItem::UnsupportedCall,
                 ClassifiedToolItem::Call,
             ),
-        ResponseItem::FunctionCallOutput { call_id, .. } => identity(call_id, PairKind::Function)
-            .map_or(
-                ClassifiedToolItem::UnsupportedOutput,
-                ClassifiedToolItem::Output,
-            ),
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        } => identity(call_id, PairKind::Function).map_or(
+            ClassifiedToolItem::UnsupportedOutput,
+            ClassifiedToolItem::Output,
+        ),
+        ResponseItem::FunctionCallOutput { call_id: None, .. } => {
+            ClassifiedToolItem::UnsupportedOutput
+        }
         ResponseItem::CustomToolCallOutput { call_id, .. } => identity(call_id, PairKind::Custom)
             .map_or(
                 ClassifiedToolItem::UnsupportedOutput,

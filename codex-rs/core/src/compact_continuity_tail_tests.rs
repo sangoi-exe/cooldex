@@ -67,7 +67,9 @@ fn function_output(call_id: &str, output: &str) -> ResponseItem {
     stamped(
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: call_id.to_string(),
+            call_id: Some(call_id.to_string()),
+            name: Some("shell".to_string()),
+            namespace: None,
             output: FunctionCallOutputPayload::from_text(output.to_string()),
             internal_chat_message_metadata_passthrough: None,
         },
@@ -209,7 +211,7 @@ fn truncates_output_without_orphaning_the_call() {
     else {
         panic!("expected function output");
     };
-    assert_eq!(call_id, "call-1");
+    assert_eq!(call_id.as_deref(), Some("call-1"));
     assert!(
         output
             .text_content()

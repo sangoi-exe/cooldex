@@ -33,7 +33,7 @@ struct RecallToolOutput {
 }
 
 impl ToolOutput for RecallToolOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         format!("recall result ({} bytes)", self.context.json().len())
     }
 

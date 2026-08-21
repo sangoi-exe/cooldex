@@ -1,8 +1,10 @@
 use super::*;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
@@ -13,7 +15,7 @@ const UUID_V4_WINDOW_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 const BOUNDARY_ID: &str = "msg_boundary";
 const TURN_ID: &str = "turn_consuming";
 
-fn boundary_item(id: &str) -> ResponseItem {
+fn boundary_item(id: &str) -> ResponseItemEnvelope {
     ResponseItem::Message {
         id: Some(ResponseItemId::from_server(id.to_string())),
         role: "user".to_string(),
@@ -23,16 +25,18 @@ fn boundary_item(id: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+    .into()
 }
 
 fn compaction(
     window_id: Option<&str>,
     marker_boundary_id: Option<&str>,
-    replacement_history: Option<Vec<ResponseItem>>,
+    replacement_history: Option<Vec<ResponseItemEnvelope>>,
 ) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history,
+        mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: window_id.map(ToString::to_string),
         previous_window_id: None,

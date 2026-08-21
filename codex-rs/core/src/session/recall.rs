@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use codex_history::CompactedItem;
+use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
 use codex_protocol::models::ResponseItem;
 use codex_thread_store::LoadRolloutTailParams;
@@ -343,6 +344,7 @@ impl Session {
             .as_deref()
             .into_iter()
             .flatten()
+            .map(|item| &item.item)
             .filter(|item| {
                 matches!(
                     item,
@@ -361,6 +363,7 @@ impl Session {
             .history
             .into_iter()
             .filter(|item| {
+                let item = &item.item;
                 let duplicates_retained_user =
                     retained_user_messages
                         .iter()
@@ -391,6 +394,7 @@ impl Session {
                         .or_else(|| output_pair_key(item))
                         .is_none_or(|key| !native_continuity_pairs.contains(&key))
             })
+            .map(ResponseItemEnvelope::into_item)
             .collect();
         let (groups, incomplete_groups) =
             group_history(history).map_err(RecallContextError::from)?;
@@ -585,10 +589,10 @@ fn bounded_diagnostic_message(message: &str) -> String {
     format!("{}...", &message[..end])
 }
 
-fn complete_native_continuity_pair_keys(items: &[ResponseItem]) -> HashSet<PairKey> {
+fn complete_native_continuity_pair_keys(items: &[ResponseItemEnvelope]) -> HashSet<PairKey> {
     let Some(compaction_index) = items
         .iter()
-        .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))
+        .rposition(|item| matches!(&item.item, ResponseItem::Compaction { .. }))
     else {
         return HashSet::new();
     };
@@ -666,9 +670,7 @@ fn call_pair_key(item: &ResponseItem) -> Option<PairKey> {
 
 fn output_pair_key(item: &ResponseItem) -> Option<PairKey> {
     match item {
-        ResponseItem::FunctionCallOutput { call_id, .. } => {
-            Some(PairKey::Function(call_id.clone()))
-        }
+        ResponseItem::FunctionCallOutput { call_id, .. } => call_id.clone().map(PairKey::Function),
         ResponseItem::CustomToolCallOutput { call_id, .. } => {
             Some(PairKey::Custom(call_id.clone()))
         }

@@ -12,7 +12,7 @@ const MULTI_AGENT_MODE_MAX_TOKENS: usize = 400;
 const EXPLANATION_SEPARATOR: &str = "\n\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MultiAgentModeInstructions {
+pub(crate) struct MultiAgentModeInstructions {
     multi_agent_mode: MultiAgentMode,
     explanation: Option<String>,
 }

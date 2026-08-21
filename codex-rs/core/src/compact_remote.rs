@@ -28,6 +28,7 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -280,6 +281,12 @@ async fn run_remote_compact_task_inner_impl(
             replacement_history: &new_history,
         });
     }
+    // Legacy `/responses/compact` returns provider-normalized items without a stable link to their
+    // original envelopes, so it does not preserve harness metadata. Compaction-trigger/v2 does.
+    let new_history = new_history
+        .into_iter()
+        .map(ResponseItemEnvelope::new)
+        .collect();
     sess.replace_compacted_history(
         new_history,
         reference_context_item,
@@ -304,6 +311,33 @@ pub(crate) async fn process_compacted_history(
     initial_context_injection: &InitialContextInjection,
     window_ids: AutoCompactWindowIds,
 ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+    let compacted_history = compacted_history
+        .into_iter()
+        .map(ResponseItemEnvelope::new)
+        .collect();
+    let (compacted_history, world_state_baseline) = process_annotated_compacted_history(
+        sess,
+        compacted_history,
+        initial_context_injection,
+        window_ids,
+    )
+    .await;
+    (
+        compacted_history
+            .into_iter()
+            .map(ResponseItemEnvelope::into_item)
+            .collect(),
+        world_state_baseline,
+    )
+}
+
+/// Installs already-annotated remote compaction output without dropping its metadata sidecar.
+pub(crate) async fn process_annotated_compacted_history(
+    sess: &Session,
+    compacted_history: Vec<ResponseItemEnvelope>,
+    initial_context_injection: &InitialContextInjection,
+    window_ids: AutoCompactWindowIds,
+) -> (Vec<ResponseItemEnvelope>, Option<Arc<WorldState>>) {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
@@ -311,7 +345,7 @@ pub(crate) async fn process_compacted_history(
         build_compaction_initial_context(sess, initial_context_injection, window_ids).await;
 
     let compacted_history = history_item_groups(compacted_history)
-        .filter(|group| should_keep_compacted_history_item(&group.source))
+        .filter(|group| should_keep_compacted_history_item(&group.source.item))
         .flat_map(HistoryItemGroup::into_items)
         .collect();
     (
@@ -377,15 +411,15 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     // saturation in the normal history estimator.
     let base_tokens =
         i128::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i128::MAX);
-    let original_items = history.raw_items();
-    let mut estimated_tokens = history_item_groups(original_items)
+    let original_items = history.annotated_items();
+    let mut estimated_tokens = history_item_groups(original_items.iter().map(|item| &item.item))
         .map(|group| group.estimated_token_count())
         .fold(base_tokens, i128::saturating_add);
     let initial_estimated_tokens = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
     let mut rewritten_items = Vec::new();
-    let mut consumed_items = 0;
+    let mut consumed_items: usize = 0;
 
-    for group in history_item_groups(original_items)
+    for group in history_item_groups(original_items.iter().map(|item| &item.item))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -393,13 +427,20 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
         if i64::try_from(estimated_tokens).unwrap_or(i64::MAX) <= context_window {
             break;
         }
-        let Some(rewritten_item) = rewritten_output_for_context_window(group.source) else {
+        let group_item_count = 1 + usize::from(group.attached_notice.is_some());
+        let source_index = original_items
+            .len()
+            .saturating_sub(consumed_items.saturating_add(group_item_count));
+        let Some(rewritten_item) = original_items
+            .get(source_index)
+            .and_then(rewritten_output_for_context_window)
+        else {
             break;
         };
         estimated_tokens = estimated_tokens
             .saturating_sub(group.estimated_token_count())
-            .saturating_add(i128::from(estimate_item_token_count(&rewritten_item)));
-        consumed_items += 1 + usize::from(group.attached_notice.is_some());
+            .saturating_add(i128::from(estimate_item_token_count(&rewritten_item.item)));
+        consumed_items += group_item_count;
         rewritten_items.push(rewritten_item);
     }
 
@@ -408,7 +449,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
         let retained_len = original_items.len() - consumed_items;
         let mut items = original_items[..retained_len].to_vec();
         items.extend(rewritten_items.into_iter().rev());
-        history.replace(items);
+        history.replace_annotated(items);
     }
 
     let final_estimated_tokens = i64::try_from(estimated_tokens).unwrap_or(i64::MAX);
@@ -416,16 +457,22 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     (rewritten_outputs, estimated_deleted_tokens)
 }
 
-fn rewritten_output_for_context_window(item: &ResponseItem) -> Option<ResponseItem> {
-    Some(match item {
+fn rewritten_output_for_context_window(
+    envelope: &ResponseItemEnvelope,
+) -> Option<ResponseItemEnvelope> {
+    let item = match &envelope.item {
         ResponseItem::FunctionCallOutput {
             id,
             call_id,
+            name,
+            namespace,
             output,
             internal_chat_message_metadata_passthrough: metadata,
         } => ResponseItem::FunctionCallOutput {
             id: id.clone(),
             call_id: call_id.clone(),
+            name: name.clone(),
+            namespace: namespace.clone(),
             output: truncated_output_payload(output),
             internal_chat_message_metadata_passthrough: metadata.clone(),
         },
@@ -458,6 +505,10 @@ fn rewritten_output_for_context_window(item: &ResponseItem) -> Option<ResponseIt
             internal_chat_message_metadata_passthrough: metadata.clone(),
         },
         _ => return None,
+    };
+    Some(ResponseItemEnvelope {
+        item,
+        metadata: envelope.metadata.clone(),
     })
 }
 
@@ -467,3 +518,7 @@ fn truncated_output_payload(output: &FunctionCallOutputPayload) -> FunctionCallO
         success: output.success,
     }
 }
+
+#[cfg(test)]
+#[path = "compact_remote_metadata_tests.rs"]
+mod metadata_tests;
