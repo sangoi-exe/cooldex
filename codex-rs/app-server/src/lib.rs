@@ -7,8 +7,6 @@ use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_code_mode::WebSocketCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
-use codex_config::RemoteThreadConfigLoader;
-use codex_config::ThreadConfigLoader;
 use codex_config::types::AppServerMode;
 use codex_core::config::Config;
 use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
@@ -452,7 +450,6 @@ pub struct AppServerRuntimeOptions {
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
     pub launch_mode: AppServerLaunchMode,
-    pub psp: bool,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -463,7 +460,6 @@ impl Default for AppServerRuntimeOptions {
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
             launch_mode: AppServerLaunchMode::Direct,
-            psp: false,
         }
     }
 }

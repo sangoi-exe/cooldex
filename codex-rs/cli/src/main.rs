@@ -114,6 +114,11 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Enable process-only PSP routing by translating it into a runtime-only
+    /// canonical feature override.
+    #[arg(long, global = true, hide = true)]
+    psp: bool,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -1032,6 +1037,14 @@ struct FeatureSetArgs {
     feature: String,
 }
 
+fn apply_runtime_psp_override(psp: bool, overrides: &mut CliConfigOverrides) {
+    if psp {
+        overrides
+            .raw_overrides
+            .push("features.psp=true".to_string());
+    }
+}
+
 fn stage_str(stage: Stage) -> &'static str {
     match stage {
         Stage::UnderDevelopment => "under development",
@@ -1055,6 +1068,7 @@ async fn cli_main(
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
+        psp,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
@@ -1064,6 +1078,7 @@ async fn cli_main(
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
+    apply_runtime_psp_override(psp, &mut root_config_overrides);
     let agents_options = match &subcommand {
         Some(Subcommand::Agents(options)) => Some(options),
         _ => None,
@@ -1301,7 +1316,6 @@ async fn cli_main(
                         } else {
                             codex_app_server::AppServerLaunchMode::Direct
                         },
-                        psp,
                         ..Default::default()
                     };
                     codex_app_server::run_main_with_transport_options(
@@ -3011,12 +3025,14 @@ mod tests {
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
+            psp,
             mut interactive,
             config_overrides: mut root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
+        apply_runtime_psp_override(psp, &mut root_overrides);
         interactive
             .shared
             .take_auto_review_config_overrides(&mut root_overrides);
@@ -3048,12 +3064,14 @@ mod tests {
     fn finalize_fork_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
+            psp,
             mut interactive,
             config_overrides: mut root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
+        apply_runtime_psp_override(psp, &mut root_overrides);
         interactive
             .shared
             .take_auto_review_config_overrides(&mut root_overrides);
@@ -3075,6 +3093,7 @@ mod tests {
 
     fn finalize_exec_from_args(args: &[&str]) -> ExecCli {
         let mut cli = MultitoolCli::try_parse_from(args).expect("parse");
+        apply_runtime_psp_override(cli.psp, &mut cli.config_overrides);
         cli.interactive
             .shared
             .take_auto_review_config_overrides(&mut cli.config_overrides);
@@ -3092,12 +3111,14 @@ mod tests {
     fn finalize_archive_from_args(args: &[&str]) -> (String, TuiCli, InteractiveRemoteOptions) {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
+            psp,
             interactive,
-            config_overrides: root_overrides,
+            config_overrides: mut root_overrides,
             subcommand,
             feature_toggles: _,
             remote: _,
         } = cli;
+        apply_runtime_psp_override(psp, &mut root_overrides);
 
         let Subcommand::Archive(SessionArchiveCommand {
             target,
@@ -4119,6 +4140,29 @@ mod tests {
         let app_server =
             app_server_from_args(["codex", "app-server", "--analytics-default-enabled"].as_ref());
         assert!(app_server.analytics_default_enabled);
+    }
+
+    #[test]
+    fn psp_is_a_global_runtime_argument() {
+        for args in [
+            ["codex", "--psp"].as_slice(),
+            ["codex", "app-server", "--psp"].as_slice(),
+            ["codex", "remote-control", "--psp"].as_slice(),
+        ] {
+            let cli = MultitoolCli::try_parse_from(args).expect("parse runtime PSP flag");
+            assert!(cli.psp);
+            assert!(cli.config_overrides.raw_overrides.is_empty());
+        }
+    }
+
+    #[test]
+    fn psp_is_forwarded_as_runtime_feature_override() {
+        let exec = finalize_exec_from_args(&["codex", "--psp", "exec"]);
+        assert!(
+            exec.config_overrides
+                .raw_overrides
+                .contains(&"features.psp=true".to_string())
+        );
     }
 
     #[test]

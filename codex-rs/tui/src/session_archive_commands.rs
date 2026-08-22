@@ -345,7 +345,7 @@ pub(super) async fn start_app_server_for_session_command(
             &cli_kv_overrides,
             &launch_loader_overrides,
             strict_config,
-            cli.bypass_hook_trust || cli.psp,
+            cli.bypass_hook_trust,
         );
     let provisional_app_server_target =
         explicit_remote_endpoint

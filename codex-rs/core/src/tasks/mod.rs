@@ -1188,6 +1188,8 @@ impl Session {
         } else {
             false
         };
+        self.pending_user_message_admissions
+            .complete_task_end(&turn_context.sub_id);
         let steer_admission = task.steer_admission;
         task.handle.detach();
 

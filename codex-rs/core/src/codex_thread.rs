@@ -4,7 +4,11 @@ use crate::elicitation::ElicitationRegistration;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
 use crate::session::TurnInput;
+use crate::session::new_submission_id;
 use crate::session::session::Session;
+use crate::user_message_admission::PendingUserMessageAdmissionState;
+use crate::user_message_admission::UserMessageAdmission;
+use crate::user_message_admission::UserMessageAdmissionError;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_exec_server::SelectedCapabilityRootsStatus;
@@ -28,14 +32,18 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -47,6 +55,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::turn_input::RecoverTurnRequest;
 use codex_protocol::turn_input::StartIfIdleSubmission;
 use codex_protocol::turn_input::SteerSubmission;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -63,6 +72,7 @@ use rmcp::model::ReadResourceRequestParams;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -321,6 +331,46 @@ impl CodexThread {
             .await
     }
 
+    /// Waits until Core has started a turn or steered the active turn.
+    pub async fn submit_user_input_and_wait_for_admission(
+        &self,
+        request: TurnInputRequest,
+    ) -> CodexResult<UserMessageAdmission> {
+        self.submit_user_input_and_wait_for_admission_inner(
+            request,
+            PendingUserMessageAdmissionState::Immediate,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Waits for durable admission and preserves its typed failure outcome.
+    ///
+    /// A client user-message id is required to identify the persisted message.
+    pub async fn submit_user_input_and_wait_for_persisted_admission(
+        &self,
+        request: TurnInputRequest,
+    ) -> Result<UserMessageAdmission, UserMessageAdmissionError> {
+        let SubmittedTurnInput::UserInput { client_id, .. } = &request.input else {
+            return Err(UserMessageAdmissionError::Admission(
+                CodexErr::InvalidRequest("user message admission requires user input".to_string()),
+            ));
+        };
+        if client_id.is_none() {
+            return Err(UserMessageAdmissionError::Admission(
+                CodexErr::InvalidRequest(
+                    "persisted user message admission requires a client user message id"
+                        .to_string(),
+                ),
+            ));
+        }
+        self.submit_user_input_and_wait_for_admission_inner(
+            request,
+            PendingUserMessageAdmissionState::WaitingForAdmission,
+        )
+        .await
+    }
+
     /// Submits turn input without requiring the caller to inspect thread state.
     ///
     /// The result describes whether Core started a turn, steered an active
@@ -409,6 +459,117 @@ impl CodexThread {
             }
             TurnInputSubmission::Started { .. } => {
                 unreachable!("steer-only submission cannot start a turn")
+            }
+        }
+    }
+
+    async fn submit_user_input_and_wait_for_admission_inner(
+        &self,
+        mut request: TurnInputRequest,
+        state: PendingUserMessageAdmissionState,
+    ) -> Result<UserMessageAdmission, UserMessageAdmissionError> {
+        let SubmittedTurnInput::UserInput { content, client_id } = &request.input else {
+            return Err(UserMessageAdmissionError::Admission(
+                CodexErr::InvalidRequest("user message admission requires user input".to_string()),
+            ));
+        };
+        if content.is_empty() {
+            return Err(UserMessageAdmissionError::Admission(
+                CodexErr::InvalidRequest(
+                    "user message admission requires nonempty user input".to_string(),
+                ),
+            ));
+        }
+
+        self.session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_turn_start(self)
+            .await
+            .map_err(UserMessageAdmissionError::Admission)?;
+
+        let submission_id = new_submission_id();
+        let (_pending_admission, admission) = self
+            .session
+            .pending_user_message_admissions
+            .register(submission_id.clone(), client_id.clone(), state);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let trace = request.trace.take();
+        self.io
+            .submit_with_id(Submission {
+                id: submission_id.clone(),
+                op: Op::TurnInput {
+                    request: Box::new(request),
+                    mode: TurnInputMode::StartOrSteer,
+                    reply: reply_tx,
+                },
+                trace,
+                parent_turn_id: None,
+                root_turn_id: None,
+            })
+            .await
+            .map_err(UserMessageAdmissionError::Admission)?;
+
+        let routing_result = tokio::select! {
+            biased;
+            result = reply_rx => result,
+            () = self.io.session_loop_termination.clone() => {
+                return Err(UserMessageAdmissionError::TaskEndedBeforePersistence);
+            }
+        };
+
+        match routing_result.unwrap_or(Err(CodexErr::InternalAgentDied)) {
+            Ok(TurnInputSubmission::Started { turn_id }) => {
+                self.session.pending_user_message_admissions.complete(
+                    &submission_id,
+                    Ok(UserMessageAdmission::Started { turn_id }),
+                );
+            }
+            Ok(TurnInputSubmission::Steered { turn_id }) => {
+                self.session.pending_user_message_admissions.complete(
+                    &submission_id,
+                    Ok(UserMessageAdmission::Steered { turn_id }),
+                );
+            }
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => {
+                self.session
+                    .send_event_raw(Event {
+                        id: submission_id.clone(),
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: format!("failed to submit turn input: {reason:?}"),
+                            codex_error_info: Some(CodexErrorInfo::BadRequest),
+                        }),
+                    })
+                    .await;
+                self.session.pending_user_message_admissions.complete(
+                    &submission_id,
+                    Err(CodexErr::InvalidRequest(format!(
+                        "failed to admit user message: {reason:?}"
+                    ))),
+                );
+            }
+            Err(error) => {
+                self.session
+                    .send_event_raw(Event {
+                        id: submission_id.clone(),
+                        msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
+                    })
+                    .await;
+                self.session.pending_user_message_admissions.complete(
+                    &submission_id,
+                    Err(CodexErr::InvalidRequest(format!(
+                        "failed to admit user message: {error:?}"
+                    ))),
+                );
+            }
+        }
+
+        tokio::select! {
+            biased;
+            result = admission => result
+                .unwrap_or(Err(UserMessageAdmissionError::TaskEndedBeforePersistence)),
+            () = self.io.session_loop_termination.clone() => {
+                Err(UserMessageAdmissionError::TaskEndedBeforePersistence)
             }
         }
     }

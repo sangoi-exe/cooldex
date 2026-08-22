@@ -238,6 +238,30 @@ class CargoValidateTests(unittest.TestCase):
                 return command
         self.fail(f"missing command argv: {argv}")
 
+    def test_plan_help_works_without_codex_repo_root_env(self) -> None:
+        env = os.environ.copy()
+        env.pop("CODEX_REPO_ROOT", None)
+
+        process = subprocess.run(
+            [sys.executable, str(PLANNER), "plan", "--help"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(
+            process.returncode,
+            0,
+            msg=(
+                f"plan --help should succeed without CODEX_REPO_ROOT\n"
+                f"STDOUT:\n{process.stdout}\nSTDERR:\n{process.stderr}"
+            ),
+        )
+        self.assertIn("usage:", process.stdout)
+
     def init_git_repo(self) -> None:
         subprocess.run(
             ["git", "init"],

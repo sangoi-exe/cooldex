@@ -25,6 +25,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -666,9 +667,19 @@ fn permission_profile_from_toml(profile: &str) -> Result<PermissionProfile> {
                 ":project_roots" => FileSystemPath::Special {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
-                _ if *access == FileSystemAccessMode::Deny => FileSystemPath::GlobPattern {
-                    pattern: path.clone(),
-                },
+                _ if *access == FileSystemAccessMode::Deny => {
+                    if denied_path_uses_glob_syntax(path) {
+                        FileSystemPath::GlobPattern {
+                            pattern: path.clone(),
+                        }
+                    } else {
+                        FileSystemPath::Path {
+                            path: AbsolutePathBuf::try_from(Path::new(path))
+                                .context("test deny path should be absolute")?
+                                .into(),
+                        }
+                    }
+                }
                 _ => anyhow::bail!("unexpected filesystem entry in test profile: {path}"),
             };
             Ok(FileSystemSandboxEntry {
@@ -690,6 +701,11 @@ fn permission_profile_from_toml(profile: &str) -> Result<PermissionProfile> {
         &file_system_sandbox_policy,
         network_sandbox_policy,
     ))
+}
+
+fn denied_path_uses_glob_syntax(path: &str) -> bool {
+    path.chars()
+        .any(|character| matches!(character, '*' | '?' | '[' | '{'))
 }
 
 async fn mount_unified_exec_command(

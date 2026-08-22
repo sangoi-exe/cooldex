@@ -271,6 +271,8 @@ mod guardian_tests;
 mod turn_slot_lifecycle_tests;
 #[path = "tests/turn_slot_start_order_tests.rs"]
 mod turn_slot_start_order_tests;
+#[path = "tests/user_message_admission_lifecycle_tests.rs"]
+mod user_message_admission_lifecycle_tests;
 
 struct InstructionsTestCase {
     slug: &'static str,

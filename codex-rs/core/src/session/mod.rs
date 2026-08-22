@@ -3811,7 +3811,8 @@ impl Session {
         if turn_context.config.features.enabled(Feature::TokenBudget)
             && turn_context.model_context_window().is_some()
         {
-            let mcp_result = if let Some(call) = mcp.prepare_call("notes", "thread_hint") {
+            let mcp_result = if let Some(call) = mcp.prepare_permitted_call("notes", "thread_hint")
+            {
                 call.call(
                     /*arguments*/ None,
                     Some(serde_json::json!({

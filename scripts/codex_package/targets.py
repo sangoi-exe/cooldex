@@ -6,13 +6,26 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-_repo_root = os.environ.get("CODEX_REPO_ROOT")
-if _repo_root is None:
-    raise RuntimeError(
-        "CODEX_REPO_ROOT must point to the repository root; "
-        "run `just assemble-codex-package` to set it automatically"
-    )
-REPO_ROOT = Path(_repo_root)
+
+def repo_root_from_script() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_repo_root() -> Path:
+    repo_root = os.environ.get("CODEX_REPO_ROOT")
+    if repo_root is None:
+        return repo_root_from_script()
+
+    resolved_repo_root = Path(repo_root).resolve()
+    if not (resolved_repo_root / "codex-rs").is_dir():
+        raise RuntimeError(
+            "CODEX_REPO_ROOT must point to the repository root; "
+            "run `just assemble-codex-package` to set it automatically"
+        )
+    return resolved_repo_root
+
+
+REPO_ROOT = resolve_repo_root()
 
 
 @dataclass(frozen=True)

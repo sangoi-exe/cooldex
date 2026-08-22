@@ -96,6 +96,14 @@ impl McpBinding {
             .cloned()
     }
 
+    /// Binds an internal call to any permitted tool in this binding, even when
+    /// the tool is intentionally hidden from model-visible tool exposure.
+    pub fn prepare_permitted_call(&self, server: &str, tool: &str) -> Option<PreparedMcpCall> {
+        self.calls
+            .get(&(server.to_string(), tool.to_string()))
+            .cloned()
+    }
+
     pub fn has_servers(&self) -> bool {
         self.connections.has_servers()
     }

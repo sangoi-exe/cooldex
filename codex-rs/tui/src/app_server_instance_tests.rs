@@ -121,7 +121,6 @@ fn instance_launch_for_exe(home: &Path, codex_exe: PathBuf) -> Result<InstanceCh
         raw_config_overrides: Vec::new(),
         profile: None,
         strict_config: false,
-        psp: false,
     })
 }
 
@@ -484,44 +483,38 @@ async fn two_instance_children_use_distinct_endpoints_and_reap_cleanly() -> Resu
 
 #[tokio::test]
 #[serial(app_server_instance)]
-async fn instance_child_propagates_psp_flag_to_child_argv() -> Result<()> {
-    for psp in [false, true] {
-        let home = TempDir::new()?;
-        write_instance_config(home.path())?;
-        let capture_path = home.path().join("instance-child-argv.txt");
-        let mut launch = instance_launch_with_argv_capture(home.path(), &capture_path)?;
-        launch.psp = psp;
+async fn instance_child_propagates_psp_feature_override_to_child_argv() -> Result<()> {
+    let home = TempDir::new()?;
+    write_instance_config(home.path())?;
+    let capture_path = home.path().join("instance-child-argv.txt");
+    let mut launch = instance_launch_with_argv_capture(home.path(), &capture_path)?;
+    launch
+        .raw_config_overrides
+        .push("features.psp=true".to_string());
 
-        let started = AppServerInstance::start(launch).await?;
-        let args = std::fs::read_to_string(&capture_path)?
-            .lines()
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        let app_server_index = args
-            .iter()
-            .position(|arg| arg == "app-server")
-            .expect("instance child subcommand");
-        let psp_index = args.iter().position(|arg| arg == "--psp");
-        if psp {
-            assert_eq!(
-                psp_index,
-                Some(
-                    app_server_index
-                        .checked_sub(1)
-                        .expect("--psp should precede the app-server subcommand"),
-                )
-            );
-        } else {
-            assert_eq!(psp_index, None);
-        }
+    let started = AppServerInstance::start(launch).await?;
+    let args = std::fs::read_to_string(&capture_path)?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let app_server_index = args
+        .iter()
+        .position(|arg| arg == "app-server")
+        .expect("instance child subcommand");
+    let feature_override_index = args
+        .windows(2)
+        .position(|window| window == ["-c", "features.psp=true"])
+        .expect("feature override should be forwarded to the child");
 
-        crate::app_server_session::AppServerSession::new_instance_child(
-            started.client,
-            started.supervisor,
-        )
-        .shutdown()
-        .await?;
-    }
+    assert!(feature_override_index + 1 < app_server_index);
+    assert!(!args.iter().any(|arg| arg == "--psp"));
+
+    crate::app_server_session::AppServerSession::new_instance_child(
+        started.client,
+        started.supervisor,
+    )
+    .shutdown()
+    .await?;
     Ok(())
 }
 
@@ -539,7 +532,6 @@ async fn spawn_failure_and_early_exit_leave_no_owned_state() -> Result<()> {
             raw_config_overrides: Vec::new(),
             profile: None,
             strict_config: false,
-            psp: false,
         };
         assert!(AppServerInstance::start(launch).await.is_err());
         let root = home.path().join("tmp/app-server-instances");

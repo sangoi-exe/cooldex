@@ -15,6 +15,7 @@ use codex_rmcp_client::RmcpClient;
 use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
+use rmcp::model::MetaObject;
 use rmcp::model::Tool;
 use tokio::io::DuplexStream;
 use tokio::sync::Notify;
@@ -71,6 +72,15 @@ async fn test_step(
         connector_name: None,
         plugin_display_names: Vec::new(),
     };
+    test_step_with_tool(label, tool, approval_mode, supports_sandbox_state_meta).await
+}
+
+async fn test_step_with_tool(
+    label: &str,
+    tool: ToolInfo,
+    approval_mode: AppToolApproval,
+    supports_sandbox_state_meta: bool,
+) -> TestStep {
     let client = Arc::new(
         RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
             .await
@@ -140,6 +150,56 @@ async fn test_step(
         client,
         tool_catalog_revision,
     }
+}
+
+#[tokio::test]
+async fn prepare_permitted_call_keeps_model_hidden_tools_internal_only() {
+    let mut tool = ToolInfo {
+        server_name: SERVER_NAME.to_string(),
+        supports_parallel_tool_calls: false,
+        server_origin: None,
+        callable_name: TOOL_NAME.to_string(),
+        callable_namespace: SERVER_NAME.to_string(),
+        namespace_description: None,
+        tool: Tool::new(
+            TOOL_NAME.to_string(),
+            "hidden catalog".to_string(),
+            Arc::new(JsonObject::default()),
+        ),
+        openai_file_input_optional_fields: Default::default(),
+        connector_id: None,
+        connector_name: None,
+        plugin_display_names: Vec::new(),
+    };
+    tool.tool.meta = Some(MetaObject(
+        serde_json::json!({
+            "ui": {
+                "visibility": ["app"],
+            },
+        })
+        .as_object()
+        .expect("hidden tool meta should be an object")
+        .clone(),
+    ));
+
+    let step = test_step_with_tool(
+        "hidden",
+        tool,
+        AppToolApproval::Prompt,
+        /*supports_sandbox_state_meta*/ true,
+    )
+    .await;
+
+    assert!(
+        step.step.prepare_call(SERVER_NAME, TOOL_NAME).is_none(),
+        "model-visible binding must keep hidden tools out of normal prepare_call"
+    );
+    assert!(
+        step.step
+            .prepare_permitted_call(SERVER_NAME, TOOL_NAME)
+            .is_some(),
+        "internal binding should still be able to call permitted hidden tools"
+    );
 }
 
 #[tokio::test]

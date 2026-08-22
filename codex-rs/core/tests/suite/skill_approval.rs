@@ -116,7 +116,9 @@ fn skill_script_command(test: &TestCodex, script_name: &str) -> Result<String> {
     Ok(shlex::try_join([script_path.to_string_lossy().as_ref()])?)
 }
 
-async fn wait_for_exec_approval_request(test: &TestCodex) -> Option<ExecApprovalRequestEvent> {
+async fn wait_for_exec_approval_or_turn_complete(
+    test: &TestCodex,
+) -> Option<ExecApprovalRequestEvent> {
     wait_for_event_match(test.codex.as_ref(), |event| match event {
         EventMsg::ExecApprovalRequest(request) => Some(Some(request.clone())),
         EventMsg::TurnComplete(_) => Some(None),
@@ -204,13 +206,11 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
     )
     .await?;
 
-    let approval = wait_for_exec_approval_request(&test).await;
+    let approval = wait_for_exec_approval_or_turn_complete(&test).await;
     assert!(
         approval.is_none(),
         "expected skill script execution to skip the removed skill approval path"
     );
-
-    wait_for_turn_complete(&test).await;
 
     let call_output = mocks
         .completion
