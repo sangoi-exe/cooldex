@@ -148,6 +148,34 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
 }
 
 #[tokio::test]
+async fn apply_role_clears_inherited_developer_instructions_when_role_file_omits_them() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "legacy-role.toml",
+        "model = \"role-model\"\nmodel_reasoning_effort = \"high\"",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    config.developer_instructions = Some("Parent-only developer instructions".to_string());
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("legacy role should apply");
+
+    assert_eq!(config.developer_instructions, None);
+    assert_eq!(config.model.as_deref(), Some("role-model"));
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[tokio::test]
 async fn apply_role_ignores_agent_metadata_fields_in_user_role_file() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(
@@ -615,6 +643,36 @@ async fn apply_role_rejects_disabling_v2_with_live_subagent_instruction_snapshot
     let err = apply_role_to_config(&mut config, Some("custom"))
         .await
         .expect_err("role must not disable V2 while the child instruction snapshot is active");
+
+    assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
+}
+
+#[tokio::test]
+async fn apply_role_rejects_multi_agent_v2_subagent_instructions_file_override() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let child_instructions_path = home.path().join("child.md");
+    fs::write(&child_instructions_path, "Child instructions").expect("write child instructions");
+    let role_path = write_role_config(
+        &home,
+        "invalid-subagent-instructions-role.toml",
+        &format!(
+            "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = {:?}",
+            child_instructions_path
+        ),
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let err = apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect_err("role must not set a live child instruction file");
 
     assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
 }

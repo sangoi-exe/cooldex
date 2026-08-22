@@ -1008,7 +1008,7 @@ impl ThreadManager {
             && !session_source.is_non_root_agent()
         {
             agent_control
-                .restore_v2_agent_metadata(&config, resumed.conversation_id)
+                .restore_v2_root_agent_metadata(&config, resumed.conversation_id)
                 .await;
         }
         let options = StartThreadOptions {

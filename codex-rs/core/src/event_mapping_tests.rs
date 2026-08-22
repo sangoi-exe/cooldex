@@ -1,3 +1,4 @@
+use super::first_non_contextual_dev_message_text;
 use super::has_non_contextual_dev_message_content;
 use super::is_contextual_dev_message_content;
 use super::parse_turn_item;
@@ -68,6 +69,28 @@ fn recognizes_context_window_guidance_as_contextual_developer_content() {
 
     assert!(is_contextual_dev_message_content(&content));
     assert!(!has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn returns_first_non_contextual_developer_text_from_mixed_message() {
+    let content = vec![
+        ContentItem::InputText {
+            text: format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills"),
+        },
+        ContentItem::InputText {
+            text: "Persistent developer instructions.".to_string(),
+        },
+        ContentItem::InputText {
+            text: format!(
+                "{CONTEXT_WINDOW_GUIDANCE_OPEN_TAG}\nPreserve important state.\n{CONTEXT_WINDOW_GUIDANCE_CLOSE_TAG}"
+            ),
+        },
+    ];
+
+    assert_eq!(
+        first_non_contextual_dev_message_text(&content),
+        Some("Persistent developer instructions.")
+    );
 }
 
 #[test]

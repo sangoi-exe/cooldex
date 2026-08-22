@@ -21,6 +21,7 @@ use tracing::Instrument;
 use tracing::Span;
 use tracing::field;
 use tracing::info_span;
+use tracing::instrument::WithSubscriber;
 use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
@@ -414,7 +415,8 @@ impl Session {
                     )
                     .await
             }
-            .instrument(Span::current()),
+            .in_current_span()
+            .with_current_subscriber(),
         );
         match transition.await {
             Ok(Ok(())) => {}
@@ -892,7 +894,8 @@ impl Session {
                     )
                     .await
             }
-            .instrument(Span::current()),
+            .in_current_span()
+            .with_current_subscriber(),
         );
         match startup.await {
             Ok(Ok(())) => {}
@@ -905,7 +908,8 @@ impl Session {
         let session = Arc::clone(self);
         let abort = tokio::spawn(
             async move { session.abort_active_turn_owned(reason).await }
-                .instrument(Span::current()),
+                .in_current_span()
+                .with_current_subscriber(),
         );
         if let Err(err) = abort.await {
             warn!(%err, "turn-slot abort task failed");
@@ -921,7 +925,8 @@ impl Session {
         let turn_id = turn_id.to_string();
         let abort = tokio::spawn(
             async move { session.abort_matching_turn_owned(&turn_id, reason).await }
-                .instrument(Span::current()),
+                .in_current_span()
+                .with_current_subscriber(),
         );
         match abort.await {
             Ok(aborted) => aborted,

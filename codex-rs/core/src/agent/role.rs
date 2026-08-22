@@ -36,6 +36,8 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 #[derive(Default, Serialize)]
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
+    #[serde(skip)]
+    clear_inherited_developer_instructions: bool,
     model: Option<String>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
@@ -75,10 +77,30 @@ async fn apply_role_to_config_inner(
     let Some(config_file) = role.config_file.as_ref() else {
         return Ok(());
     };
-    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
-    let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
+    let raw_role_layer_toml =
+        load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    let role_config =
+        deserialize_config_toml_with_base(raw_role_layer_toml.clone(), &config.codex_home)?;
+    let role_disables_multi_agent_v2 = raw_role_layer_toml
+        .get("features")
+        .and_then(|features| features.get("multi_agent_v2"))
+        .and_then(|multi_agent_v2| match multi_agent_v2 {
+            TomlValue::Boolean(enabled) => Some(!enabled),
+            TomlValue::Table(config) => config
+                .get("enabled")
+                .and_then(TomlValue::as_bool)
+                .map(|enabled| !enabled),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let developer_instructions = role_config.developer_instructions;
+    let clear_inherited_developer_instructions =
+        role.config_file.is_some() && developer_instructions.is_none();
     let mut overrides = AgentRoleOverrides {
-        developer_instructions: role_config.developer_instructions,
+        developer_instructions,
+        // A configured role file owns the child's developer-instruction identity. If the
+        // file omits that field entirely, do not silently inherit the parent instructions.
+        clear_inherited_developer_instructions,
         model: role_config.model,
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
@@ -118,13 +140,7 @@ async fn apply_role_to_config_inner(
     }
 
     let role_layer_toml = TomlValue::try_from(&overrides)?;
-    if role_layer_toml
-        .as_table()
-        .is_some_and(toml::map::Map::is_empty)
-    {
-        return Ok(());
-    }
-    if role_layer_toml
+    if raw_role_layer_toml
         .get("features")
         .and_then(|features| features.get("multi_agent_v2"))
         .and_then(|multi_agent_v2| multi_agent_v2.get("subagent_instructions_file"))
@@ -134,7 +150,23 @@ async fn apply_role_to_config_inner(
             "agent role configs cannot set features.multi_agent_v2.subagent_instructions_file"
         ));
     }
-    *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
+    if config.multi_agent_v2.subagent_instructions.is_some() && role_disables_multi_agent_v2 {
+        return Err(anyhow!(
+            "agent role config cannot disable MultiAgentV2 while a subagent instruction snapshot is active"
+        ));
+    }
+    if role_layer_toml
+        .as_table()
+        .is_some_and(toml::map::Map::is_empty)
+    {
+        return Ok(());
+    }
+    *config = role_overrides::build_next_config(
+        config,
+        role_layer_toml,
+        &overrides,
+        config.multi_agent_v2.subagent_instructions.is_some(),
+    )?;
     Ok(())
 }
 
@@ -189,19 +221,8 @@ mod role_overrides {
         config: &Config,
         role_layer_toml: TomlValue,
         overrides: &AgentRoleOverrides,
+        has_live_subagent_instruction_snapshot: bool,
     ) -> anyhow::Result<Config> {
-        let role_disables_multi_agent_v2 = role_layer_toml
-            .get("features")
-            .and_then(|features| features.get("multi_agent_v2"))
-            .and_then(|multi_agent_v2| match multi_agent_v2 {
-                TomlValue::Boolean(enabled) => Some(!enabled),
-                TomlValue::Table(config) => config
-                    .get("enabled")
-                    .and_then(TomlValue::as_bool)
-                    .map(|enabled| !enabled),
-                _ => None,
-            })
-            .unwrap_or(false);
         let mut next_config = config.clone();
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         if let Some(model) = &overrides.model {
@@ -209,6 +230,8 @@ mod role_overrides {
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());
+        } else if overrides.clear_inherited_developer_instructions {
+            next_config.developer_instructions = None;
         }
         if let Some(effort) = overrides.model_reasoning_effort.clone() {
             next_config.model_reasoning_effort = Some(effort);
@@ -237,12 +260,7 @@ mod role_overrides {
                 next_config.features.disable(feature)?;
             }
         }
-        if config.multi_agent_v2.subagent_instructions.is_some() {
-            if role_disables_multi_agent_v2 {
-                return Err(anyhow!(
-                    "agent role config cannot disable MultiAgentV2 while a subagent instruction snapshot is active"
-                ));
-            }
+        if has_live_subagent_instruction_snapshot {
             next_config
                 .features
                 .enable(Feature::MultiAgentV2)

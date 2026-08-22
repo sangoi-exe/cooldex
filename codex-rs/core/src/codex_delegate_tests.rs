@@ -456,7 +456,7 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
     .await
     .expect("timed out waiting for guardian assessment");
     let expected_action = GuardianAssessmentAction::Command {
-        source: GuardianCommandSource::Shell,
+        source: GuardianCommandSource::UnifiedExec,
         command: "rm -rf tmp".to_string(),
         cwd: test_path_buf("/tmp").abs(),
     };
@@ -509,14 +509,14 @@ async fn handle_exec_approval_uses_call_id_for_guardian_review_and_approval_id_f
 }
 
 #[tokio::test]
-async fn run_codex_thread_interactive_rejects_approval_policy_that_can_prompt() {
+async fn run_codex_thread_interactive_allows_approval_policy_that_can_prompt() {
     let (parent_session, parent_ctx, _rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
     let mut config = parent_ctx.config.as_ref().clone();
     config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let parent_environments = parent_ctx.environments.clone();
 
-    let result = run_codex_thread_interactive(
+    let (session, io) = run_codex_thread_interactive(
         config,
         Arc::clone(&parent_session.services.auth_manager),
         Arc::clone(&parent_session.services.models_manager),
@@ -529,17 +529,13 @@ async fn run_codex_thread_interactive_rejects_approval_policy_that_can_prompt() 
         crate::session::GitEnrichmentPolicy::Fresh,
         codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
     )
-    .await;
+    .await
+    .expect("delegate session should start when approvals can route through the parent");
 
-    assert!(matches!(
-        result,
-        Err(err)
-            if matches!(
-                err.details(),
-                CodexErrorDetails::InvalidRequest(message)
-                    if message == "Codex delegates require approval policy `never`"
-            )
-    ));
+    io.shutdown_and_wait()
+        .await
+        .expect("delegate session should shut down");
+    drop(session);
 }
 
 #[tokio::test]

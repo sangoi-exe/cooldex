@@ -175,12 +175,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use tracing::Instrument;
-use tracing::Span;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::info_span;
 use tracing::instrument;
+use tracing::instrument::WithSubscriber;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -4461,7 +4461,8 @@ impl Session {
                             .start_claimed_regular_task(claim, turn_context, task_input)
                             .await
                     }
-                    .instrument(Span::current()),
+                    .in_current_span()
+                    .with_current_subscriber(),
                 );
                 return match startup.await {
                     Ok(Ok(())) => Ok(accepted_turn_id),

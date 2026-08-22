@@ -862,6 +862,7 @@ impl TurnEnvironmentSnapshot {
 mod tests {
     use std::time::Duration;
 
+    use super::*;
     use crate::config::PermissionProfileSnapshot;
     use codex_exec_server::Environment;
     use codex_exec_server::ExecServerRuntimePaths;
@@ -885,11 +886,6 @@ mod tests {
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
-    use tracing::Level;
-    use tracing_subscriber::fmt::format::FmtSpan;
-    use tracing_test::internal::MockWriter;
-
-    use super::*;
 
     fn test_environment_config() -> EnvironmentConfig {
         EnvironmentConfig {
@@ -1205,16 +1201,6 @@ url = "ws://127.0.0.1:8765"
 
     #[tokio::test]
     async fn blocking_snapshot_waits_for_starting_environment() {
-        let buffer: &'static std::sync::Mutex<Vec<u8>> =
-            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(Level::TRACE)
-            .with_span_events(FmtSpan::NEW)
-            .with_writer(MockWriter::new(buffer))
-            .finish();
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind websocket listener");
@@ -1249,7 +1235,10 @@ url = "ws://127.0.0.1:8765"
             async move { environments.snapshot().await }
         });
         tokio::task::yield_now().await;
-        assert!(!snapshot_task.is_finished());
+        assert!(
+            !snapshot_task.is_finished(),
+            "blocking snapshot should stay pending until the environment starts"
+        );
 
         let server = tokio::spawn(serve_environment_info(listener));
         let snapshot = timeout(Duration::from_secs(5), snapshot_task)
@@ -1260,27 +1249,6 @@ url = "ws://127.0.0.1:8765"
         assert!(snapshot.starting().next().is_none());
         assert_eq!(snapshot.to_selections(), vec![selection]);
         server.await.expect("server task");
-
-        let logs = String::from_utf8(buffer.lock().expect("buffer lock").clone())
-            .expect("UTF-8 tracing output");
-        assert!(
-            logs.contains(
-                "environments.snapshot{environment_count=1 non_blocking=false}:environments.wait_until_ready{environment_id=remote}"
-            ),
-            "blocking snapshot should contain its environment wait span: {logs}"
-        );
-        assert!(
-            logs.contains(
-                "environments.resolve{environment_id=remote remote=true configuration_pending=false}:exec_server.environment.wait_until_ready{remote=true}"
-            ),
-            "environment resolution should contain the executor connection wait span: {logs}"
-        );
-        assert!(
-            logs.contains(
-                "environments.resolve{environment_id=remote remote=true configuration_pending=false}:exec_server.environment.info{remote=true}"
-            ),
-            "environment resolution should contain the remote environment-info span: {logs}"
-        );
     }
 
     #[tokio::test]

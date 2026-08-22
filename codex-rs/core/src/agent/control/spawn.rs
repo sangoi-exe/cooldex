@@ -2,8 +2,6 @@ use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::CodexThread;
 use crate::agent::AgentIdentitySnapshot;
-use crate::agent::role::apply_role_to_config;
-use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::ManagedDeveloperInstructions;
@@ -11,6 +9,8 @@ use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::session::multi_agents::resolve_usage_hints;
 use codex_extension_api::ExtensionDataInit;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TurnContextItem;
 use std::collections::HashSet;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -178,6 +178,140 @@ async fn load_agent_model_context(
     }
 }
 
+fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
+    for item in history {
+        let RolloutItem::ResponseItem(response_item) = item else {
+            continue;
+        };
+        match &response_item.item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                if let Some(instructions) =
+                    crate::event_mapping::first_non_contextual_dev_message_text(content)
+                {
+                    return Some(instructions.to_string());
+                }
+            }
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && !crate::event_mapping::is_contextual_user_message_content(content) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn latest_turn_context_item(history: &[RolloutItem]) -> Option<&TurnContextItem> {
+    history.iter().rev().find_map(|item| match item {
+        RolloutItem::TurnContext(turn_context) => Some(turn_context),
+        _ => None,
+    })
+}
+
+fn latest_thread_settings_snapshot(history: &[RolloutItem]) -> Option<ThreadSettingsSnapshot> {
+    history.iter().rev().find_map(|item| match item {
+        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+            Some(event.thread_settings.clone())
+        }
+        _ => None,
+    })
+}
+
+async fn restore_v2_identity_snapshot(
+    state: &ThreadManagerState,
+    config: &Config,
+    stored_thread: &codex_thread_store::StoredThread,
+) -> CodexResult<AgentIdentitySnapshot> {
+    let history = load_agent_model_context(
+        state,
+        stored_thread.thread_id,
+        stored_thread.history_mode,
+    )
+    .await?
+    .ok_or_else(|| {
+        CodexErr::InvalidRequest(format!(
+            "agent {} is missing persisted model context required to restore its identity snapshot",
+            stored_thread.thread_id
+        ))
+    })?;
+    let initial_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: stored_thread.thread_id,
+        history: Arc::new(history.clone()),
+        rollout_path: stored_thread.rollout_path.clone(),
+    });
+    let latest_turn_context = latest_turn_context_item(&history);
+    let latest_thread_settings = latest_thread_settings_snapshot(&history);
+    let model_provider_id = latest_thread_settings
+        .as_ref()
+        .map(|thread_settings| thread_settings.model_provider_id.clone())
+        .unwrap_or_else(|| stored_thread.model_provider.clone());
+    let model_provider = if config.model_provider_id == model_provider_id {
+        config.model_provider.clone()
+    } else {
+        config
+            .model_providers
+            .get(&model_provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!("Model provider `{model_provider_id}` not found"))
+            })?
+    };
+    let model = latest_thread_settings
+        .as_ref()
+        .map(|thread_settings| thread_settings.model.clone())
+        .or_else(|| stored_thread.model.clone())
+        .or_else(|| latest_turn_context.map(|turn_context| turn_context.model.clone()))
+        .or_else(|| config.model.clone())
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "agent {} is missing a persisted model required to restore its identity snapshot",
+                stored_thread.thread_id
+            ))
+        })?;
+    let reasoning_effort = latest_thread_settings
+        .as_ref()
+        .and_then(|thread_settings| thread_settings.reasoning_effort.clone())
+        .or(stored_thread.reasoning_effort.clone())
+        .or_else(|| latest_turn_context.and_then(|turn_context| turn_context.effort.clone()));
+    let reasoning_summary = latest_thread_settings
+        .as_ref()
+        .and_then(|thread_settings| thread_settings.reasoning_summary)
+        .or_else(|| latest_turn_context.map(|turn_context| turn_context.summary))
+        .or(config.model_reasoning_summary);
+    let base_instructions = initial_history
+        .get_base_instructions()
+        .map(|base_instructions| base_instructions.text)
+        .or_else(|| config.base_instructions.clone())
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "agent {} is missing persisted base instructions required to restore its identity snapshot",
+                stored_thread.thread_id
+            ))
+        })?;
+    let service_tier = latest_thread_settings
+        .as_ref()
+        .and_then(|thread_settings| thread_settings.service_tier.clone())
+        .or_else(|| config.service_tier.clone());
+    let session_source = initial_history
+        .get_resumed_session_sources()
+        .map(|(session_source, _)| session_source)
+        .unwrap_or_else(|| stored_thread.source.clone());
+
+    Ok(AgentIdentitySnapshot::capture(
+        session_source.get_agent_role(),
+        model_provider_id,
+        model_provider,
+        model,
+        reasoning_effort,
+        reasoning_summary,
+        base_instructions,
+        first_persisted_developer_instructions(&history),
+        service_tier,
+    ))
+}
+
 async fn verify_loaded_v2_agent_identity(
     loaded_thread: &CodexThread,
     thread_id: ThreadId,
@@ -193,10 +327,41 @@ async fn verify_loaded_v2_agent_identity(
 
 impl AgentControl {
     /// Restore persisted V2 agent identities without reopening their runtimes.
+    #[cfg(test)]
     pub(crate) async fn restore_v2_agent_metadata(
         &self,
         config: &Config,
         root_thread_id: ThreadId,
+    ) {
+        self.restore_v2_agent_metadata_inner(
+            config,
+            root_thread_id,
+            /*restore_identity_snapshots*/ false,
+        )
+        .await;
+    }
+
+    /// Restore persisted V2 descendant metadata for a resumed root, including
+    /// enough stored identity to lazily reload descendants without rereading
+    /// mutable live role files.
+    pub(crate) async fn restore_v2_root_agent_metadata(
+        &self,
+        config: &Config,
+        root_thread_id: ThreadId,
+    ) {
+        self.restore_v2_agent_metadata_inner(
+            config,
+            root_thread_id,
+            /*restore_identity_snapshots*/ true,
+        )
+        .await;
+    }
+
+    async fn restore_v2_agent_metadata_inner(
+        &self,
+        config: &Config,
+        root_thread_id: ThreadId,
+        restore_identity_snapshots: bool,
     ) {
         self.state.register_root_thread(root_thread_id);
 
@@ -232,6 +397,11 @@ impl AgentControl {
                         include_history: false,
                     })
                     .await?;
+                let restored_identity_snapshot = if restore_identity_snapshots {
+                    Some(restore_v2_identity_snapshot(&state, config, &stored_thread).await?)
+                } else {
+                    None
+                };
                 let stored_agent_path = stored_thread
                     .agent_path
                     .as_deref()
@@ -252,6 +422,7 @@ impl AgentControl {
                         .agent_nickname
                         .or_else(|| stored_thread.source.get_nickname()),
                 )?;
+                metadata.identity_snapshot = restored_identity_snapshot;
                 metadata.agent_id = Some(thread_id);
                 reservation.commit(metadata);
                 Ok::<(), CodexErr>(())
@@ -382,42 +553,6 @@ impl AgentControl {
         let (mut session_source, _) = initial_history
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
-        if let Some(role_name) = session_source.get_agent_role() {
-            let runtime_approval_policy = config.permissions.approval_policy.value();
-            let runtime_approvals_reviewer = config.approvals_reviewer;
-            let runtime_cwd = config.cwd.clone();
-            let runtime_permission_profile = match config.permissions.active_permission_profile() {
-                Some(active_permission_profile) => {
-                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
-                        config.permissions.permission_profile().clone(),
-                        active_permission_profile,
-                        config.permissions.profile_workspace_roots().to_vec(),
-                    )
-                }
-                None => PermissionProfileSnapshot::legacy(
-                    config.permissions.permission_profile().clone(),
-                ),
-            };
-
-            apply_role_to_config(&mut config, Some(&role_name))
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            config
-                .permissions
-                .approval_policy
-                .set(runtime_approval_policy)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
-                })?;
-            config.approvals_reviewer = runtime_approvals_reviewer;
-            config.cwd = runtime_cwd;
-            config
-                .permissions
-                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
-                })?;
-        }
         if let Some(model) = stored_model {
             config.model = Some(model);
         }
@@ -433,6 +568,8 @@ impl AgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
+        // Cold V2 reload must restore the agent's stored identity, not reinterpret the
+        // current role file. The live role config can drift or disappear after spawn.
         identity_snapshot.apply(&mut config, &mut session_source)?;
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))

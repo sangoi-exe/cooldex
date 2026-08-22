@@ -12,6 +12,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
 use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 impl Session {
     /// Returns the input if there is no active turn to inject into.
@@ -172,7 +173,8 @@ impl Session {
                     .try_start_claimed_idle_turn(claim, sub_id, input)
                     .await
             }
-            .instrument(tracing::Span::current()),
+            .in_current_span()
+            .with_current_subscriber(),
         );
         match startup.await {
             Ok(result) => result,
