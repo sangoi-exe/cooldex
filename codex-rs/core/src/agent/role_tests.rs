@@ -148,7 +148,7 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
 }
 
 #[tokio::test]
-async fn apply_role_clears_inherited_developer_instructions_when_role_file_omits_them() {
+async fn apply_role_preserves_inherited_developer_instructions_when_role_file_omits_them() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(
         &home,
@@ -170,7 +170,10 @@ async fn apply_role_clears_inherited_developer_instructions_when_role_file_omits
         .await
         .expect("legacy role should apply");
 
-    assert_eq!(config.developer_instructions, None);
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("Parent-only developer instructions")
+    );
     assert_eq!(config.model.as_deref(), Some("role-model"));
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
 }

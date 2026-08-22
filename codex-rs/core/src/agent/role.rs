@@ -36,8 +36,6 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 #[derive(Default, Serialize)]
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
-    #[serde(skip)]
-    clear_inherited_developer_instructions: bool,
     model: Option<String>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
@@ -93,14 +91,8 @@ async fn apply_role_to_config_inner(
             _ => None,
         })
         .unwrap_or(false);
-    let developer_instructions = role_config.developer_instructions;
-    let clear_inherited_developer_instructions =
-        role.config_file.is_some() && developer_instructions.is_none();
     let mut overrides = AgentRoleOverrides {
-        developer_instructions,
-        // A configured role file owns the child's developer-instruction identity. If the
-        // file omits that field entirely, do not silently inherit the parent instructions.
-        clear_inherited_developer_instructions,
+        developer_instructions: role_config.developer_instructions,
         model: role_config.model,
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
@@ -230,8 +222,6 @@ mod role_overrides {
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());
-        } else if overrides.clear_inherited_developer_instructions {
-            next_config.developer_instructions = None;
         }
         if let Some(effort) = overrides.model_reasoning_effort.clone() {
             next_config.model_reasoning_effort = Some(effort);
