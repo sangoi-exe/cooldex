@@ -5,23 +5,20 @@ mod imp {
     use std::fs::OpenOptions;
     use std::io;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    use std::os::fd::OwnedFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::Duration;
+    use std::time::Instant;
 
     use rand::RngCore as _;
     use rand::TryRngCore;
     use rand::rngs::OsRng;
-    use tokio::io::AsyncBufReadExt;
-    use tokio::io::BufReader;
     use tokio::process::Child;
     use tokio::process::Command;
+    use tokio::time::sleep;
     use tokio::time::timeout;
 
     use crate::protocol::ComputerUseError;
@@ -38,6 +35,11 @@ mod imp {
     const XAUTHORITY_MODE: u32 = 0o600;
     const XAUTHORITY_PROTOCOL_NAME: &str = "MIT-MAGIC-COOKIE-1";
     const XAUTHORITY_COOKIE_BYTES: usize = 16;
+    const FIRST_DISPLAY: u16 = 90;
+    const DISPLAY_COUNT: u16 = 100;
+    const CHILD_START_POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const XVFB_START_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+    const OPENBOX_START_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct DesktopCommandPaths {
@@ -109,43 +111,29 @@ mod imp {
                 return Err(session_start_failed(error));
             }
 
-            let (display_reader, display_writer) = match create_inherited_pipe() {
-                Ok(pipe) => pipe,
-                Err(error) => {
-                    let _ = cleanup_private_session_dir(&session_dir);
-                    return Err(session_start_failed(error));
-                }
-            };
-
-            let mut xvfb = match spawn_xvfb(
+            let startup_deadline = Instant::now() + config.display_ready_timeout;
+            let (mut xvfb, display) = match reserve_display(
                 &config.command_paths.xvfb,
                 &session_dir,
                 &xauthority_path,
-                display_writer.as_raw_fd(),
-            ) {
-                Ok(xvfb) => xvfb,
+                startup_deadline,
+            )
+            .await
+            {
+                Ok(reserved_display) => reserved_display,
                 Err(error) => {
                     let _ = cleanup_private_session_dir(&session_dir);
                     return Err(error);
                 }
             };
-            drop(display_writer);
-
-            let display = match read_display(display_reader, config.display_ready_timeout).await {
-                Ok(display) => display,
-                Err(error) => {
-                    let _ = xvfb.terminate(config.shutdown_grace_period).await;
-                    let _ = cleanup_private_session_dir(&session_dir);
-                    return Err(error);
-                }
-            };
-
-            let environment =
-                DesktopEnvironment::new(display.clone(), xauthority_path.display().to_string());
             if let Err(error) = xvfb.ensure_running("Xvfb").await {
+                let _ = xvfb.terminate(config.shutdown_grace_period).await;
                 let _ = cleanup_private_session_dir(&session_dir);
                 return Err(error);
             }
+
+            let environment =
+                DesktopEnvironment::new(display.clone(), xauthority_path.display().to_string());
 
             let mut openbox =
                 match spawn_openbox(&config.command_paths.openbox, &session_dir, &environment) {
@@ -156,6 +144,18 @@ mod imp {
                         return Err(error);
                     }
                 };
+            let openbox_settle_timeout = startup_deadline
+                .saturating_duration_since(Instant::now())
+                .min(OPENBOX_START_SETTLE_TIMEOUT);
+            if let Err(error) = openbox
+                .wait_for_startup("Openbox", openbox_settle_timeout)
+                .await
+            {
+                let _ = openbox.terminate(config.shutdown_grace_period).await;
+                let _ = xvfb.terminate(config.shutdown_grace_period).await;
+                let _ = cleanup_private_session_dir(&session_dir);
+                return Err(error);
+            }
             if let Err(error) = openbox.ensure_running("Openbox").await {
                 let _ = openbox.terminate(config.shutdown_grace_period).await;
                 let _ = xvfb.terminate(config.shutdown_grace_period).await;
@@ -234,6 +234,32 @@ mod imp {
                 child,
                 process_group_id,
             })
+        }
+
+        async fn wait_for_startup(
+            &mut self,
+            label: &str,
+            settle_timeout: Duration,
+        ) -> Result<(), ComputerUseError> {
+            let startup_deadline = Instant::now() + settle_timeout;
+            loop {
+                if let Some(status) = self.child.try_wait().map_err(session_start_failed)? {
+                    return Err(ComputerUseError::new(
+                        ComputerUseErrorCode::SessionStartFailed,
+                        format!("{label} exited before startup completed with status {status}"),
+                        /*retryable*/ true,
+                    ));
+                }
+
+                if Instant::now() >= startup_deadline {
+                    return Ok(());
+                }
+
+                let sleep_duration = startup_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(CHILD_START_POLL_INTERVAL);
+                sleep(sleep_duration).await;
+            }
         }
 
         async fn ensure_running(&mut self, label: &str) -> Result<(), ComputerUseError> {
@@ -327,70 +353,46 @@ mod imp {
         writer.write_all(&value.to_be_bytes())
     }
 
-    fn create_inherited_pipe() -> io::Result<(File, OwnedFd)> {
-        let mut fds = [0_i32; 2];
-        let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if result == -1 {
-            return Err(io::Error::last_os_error());
+    async fn reserve_display(
+        program: &Path,
+        session_dir: &Path,
+        xauthority_path: &Path,
+        startup_deadline: Instant,
+    ) -> Result<(OwnedChild, String), ComputerUseError> {
+        for display_number in candidate_displays(std::process::id()) {
+            let remaining_startup_budget =
+                startup_deadline.saturating_duration_since(Instant::now());
+            if remaining_startup_budget.is_zero() {
+                break;
+            }
+
+            let display = format!(":{display_number}");
+            let mut xvfb = spawn_xvfb(program, session_dir, xauthority_path, &display)?;
+            let settle_timeout = remaining_startup_budget.min(XVFB_START_SETTLE_TIMEOUT);
+            if xvfb.wait_for_startup("Xvfb", settle_timeout).await.is_ok() {
+                return Ok((xvfb, display));
+            }
         }
 
-        let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        Ok((File::from(read_fd), write_fd))
+        Err(ComputerUseError::new(
+            ComputerUseErrorCode::SessionStartFailed,
+            "Xvfb could not reserve an isolated display before the startup timeout",
+            /*retryable*/ true,
+        ))
     }
 
-    async fn read_display(
-        display_reader: File,
-        ready_timeout: Duration,
-    ) -> Result<String, ComputerUseError> {
-        let reader = tokio::fs::File::from_std(display_reader);
-        let mut buffer = Vec::new();
-        let bytes_read = timeout(
-            ready_timeout,
-            BufReader::new(reader).read_until(b'\n', &mut buffer),
-        )
-        .await
-        .map_err(|_| {
-            ComputerUseError::new(
-                ComputerUseErrorCode::SessionStartFailed,
-                "Xvfb did not report a display before the startup timeout",
-                /*retryable*/ true,
-            )
-        })?
-        .map_err(session_start_failed)?;
-
-        if bytes_read == 0 {
-            return Err(ComputerUseError::new(
-                ComputerUseErrorCode::SessionStartFailed,
-                "Xvfb exited before reporting a display number",
-                /*retryable*/ true,
-            ));
-        }
-
-        let display_number = String::from_utf8(buffer).map_err(|error| {
-            ComputerUseError::new(
-                ComputerUseErrorCode::SessionStartFailed,
-                format!("Xvfb reported a non-UTF-8 display number: {error}"),
-                /*retryable*/ true,
-            )
-        })?;
-        let display_number = display_number.trim();
-        if display_number.is_empty() || !display_number.chars().all(|ch| ch.is_ascii_digit()) {
-            return Err(ComputerUseError::new(
-                ComputerUseErrorCode::SessionStartFailed,
-                format!("Xvfb reported an invalid display number: {display_number:?}"),
-                /*retryable*/ true,
-            ));
-        }
-
-        Ok(format!(":{display_number}"))
+    fn candidate_displays(pid: u32) -> impl Iterator<Item = u16> {
+        let display_count = u32::from(DISPLAY_COUNT);
+        let start_offset = pid % display_count;
+        (0..display_count)
+            .map(move |index| FIRST_DISPLAY + ((start_offset + index) % display_count) as u16)
     }
 
     fn spawn_xvfb(
         program: &Path,
         session_dir: &Path,
         xauthority_path: &Path,
-        displayfd: i32,
+        display: &str,
     ) -> Result<OwnedChild, ComputerUseError> {
         let mut command = Command::new(program);
         command
@@ -400,8 +402,7 @@ mod imp {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .current_dir(session_dir)
-            .arg("-displayfd")
-            .arg(displayfd.to_string())
+            .arg(display)
             .arg("-screen")
             .arg("0")
             .arg(format!(

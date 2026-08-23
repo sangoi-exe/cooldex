@@ -15,7 +15,7 @@ use crate::DesktopSessionConfig;
 
 #[tokio::test(flavor = "current_thread")]
 async fn start_creates_private_session_and_xauthority() {
-    let harness = FakeDesktopHarness::startable("77");
+    let harness = FakeDesktopHarness::startable();
     let config = harness.config();
 
     let session = DesktopSession::start(&config)
@@ -23,7 +23,7 @@ async fn start_creates_private_session_and_xauthority() {
         .expect("start fake desktop session");
 
     assert!(session.session_id().starts_with("computer-use-"));
-    assert_eq!(session.environment().display, ":77");
+    assert!(session.environment().display.starts_with(':'));
     assert_eq!(
         session.environment().xauthority,
         session.xauthority_path().display().to_string()
@@ -50,7 +50,10 @@ async fn start_creates_private_session_and_xauthority() {
     assert_eq!(xauthority_record.cookie.len(), 16);
 
     let xvfb_log = fs::read_to_string(&harness.xvfb_log).expect("read xvfb log");
-    assert!(xvfb_log.contains("-displayfd"));
+    assert_eq!(
+        extract_logged_display(&xvfb_log).expect("logged display"),
+        session.environment().display
+    );
     assert!(xvfb_log.contains("-screen"));
     assert!(xvfb_log.contains("1440x900x24"));
     assert!(xvfb_log.contains("-dpi"));
@@ -62,7 +65,7 @@ async fn start_creates_private_session_and_xauthority() {
     let openbox_log = wait_for_file_contents(&harness.openbox_log)
         .await
         .expect("read openbox log");
-    assert!(openbox_log.contains("display=:77"));
+    assert!(openbox_log.contains(&format!("display={}", session.environment().display)));
     assert!(openbox_log.contains(&format!(
         "xauthority={}",
         session.xauthority_path().display()
@@ -73,7 +76,7 @@ async fn start_creates_private_session_and_xauthority() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn stop_terminates_owned_children_and_preserves_unrelated_process() {
-    let harness = FakeDesktopHarness::startable("88");
+    let harness = FakeDesktopHarness::startable();
     let config = harness.config();
 
     let session = DesktopSession::start(&config)
@@ -121,11 +124,35 @@ async fn start_fails_when_xvfb_never_reports_display() {
     assert!(
         error
             .message
-            .contains("Xvfb exited before reporting a display number")
-            || error.message.contains("startup timeout"),
+            .contains("Xvfb could not reserve an isolated display before the startup timeout"),
         "unexpected error message: {}",
         error.message
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_retries_with_another_display_after_early_xvfb_exit() {
+    let harness = FakeDesktopHarness::display_retries_once_then_starts();
+    let config = harness.config();
+
+    let session = DesktopSession::start(&config)
+        .await
+        .expect("start fake desktop session after retry");
+
+    let xvfb_log = wait_for_file_contents(&harness.xvfb_log)
+        .await
+        .expect("read xvfb log");
+    let attempt_displays = extract_attempt_displays(&xvfb_log);
+    assert!(
+        attempt_displays.len() >= 2,
+        "unexpected xvfb log: {xvfb_log}"
+    );
+    assert_eq!(attempt_displays[0].0, 1);
+    assert_eq!(attempt_displays[1].0, 2);
+    assert_ne!(attempt_displays[0].1, attempt_displays[1].1);
+    assert_eq!(session.environment().display, attempt_displays[1].1);
+
+    session.stop().await.expect("stop fake desktop session");
 }
 
 struct FakeDesktopHarness {
@@ -138,7 +165,7 @@ struct FakeDesktopHarness {
 }
 
 impl FakeDesktopHarness {
-    fn startable(display_number: &str) -> Self {
+    fn startable() -> Self {
         let tempdir = TempDir::new().expect("create tempdir");
         let temp_root = tempdir.path().join("sessions");
         let xvfb_log = tempdir.path().join("xvfb.log");
@@ -152,17 +179,68 @@ impl FakeDesktopHarness {
                 r#"#!/usr/bin/env bash
 set -euo pipefail
 log={xvfb_log:?}
-displayfd=""
-while (($#)); do
-  case "$1" in
-    -displayfd)
-      displayfd="$2"
-      ;;
-  esac
-  printf '%s\n' "$1" >> "$log"
-  shift
+printf 'display=%s\n' "$1" >> "$log"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$log"
 done
-printf '%s\n' "{display_number}" >&"$displayfd"
+trap 'echo term >> "$log"; exit 0' TERM
+while true; do
+  sleep 1
+done
+"#,
+            ),
+        );
+        write_executable(
+            &openbox_script,
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+log={openbox_log:?}
+printf 'display=%s\n' "${{DISPLAY:-}}" >> "$log"
+printf 'xauthority=%s\n' "${{XAUTHORITY:-}}" >> "$log"
+trap 'echo term >> "$log"; exit 0' TERM
+while true; do
+  sleep 1
+done
+"#,
+            ),
+        );
+
+        Self {
+            _tempdir: tempdir,
+            temp_root,
+            xvfb_script,
+            openbox_script,
+            xvfb_log,
+            openbox_log,
+        }
+    }
+
+    fn display_retries_once_then_starts() -> Self {
+        let tempdir = TempDir::new().expect("create tempdir");
+        let temp_root = tempdir.path().join("sessions");
+        let xvfb_log = tempdir.path().join("xvfb.log");
+        let openbox_log = tempdir.path().join("openbox.log");
+        let attempt_state = tempdir.path().join("xvfb-attempt-state");
+        let xvfb_script = tempdir.path().join("fake-xvfb.sh");
+        let openbox_script = tempdir.path().join("fake-openbox.sh");
+        write_executable(
+            &xvfb_script,
+            &format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+log={xvfb_log:?}
+state={attempt_state:?}
+attempt=0
+if [[ -f "$state" ]]; then
+  attempt="$(cat "$state")"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$state"
+printf 'attempt=%s display=%s\n' "$attempt" "$1" >> "$log"
+if [[ "$attempt" -eq 1 ]]; then
+  exit 17
+fi
 trap 'echo term >> "$log"; exit 0' TERM
 while true; do
   sleep 1
@@ -271,6 +349,21 @@ async fn wait_for_file_contents(path: &Path) -> std::io::Result<String> {
         }
     }
     fs::read_to_string(path)
+}
+
+fn extract_logged_display(log: &str) -> Option<&str> {
+    log.lines().find_map(|line| line.strip_prefix("display="))
+}
+
+fn extract_attempt_displays(log: &str) -> Vec<(u32, String)> {
+    log.lines()
+        .filter_map(|line| {
+            let (attempt, display) = line.split_once(' ')?;
+            let attempt = attempt.strip_prefix("attempt=")?.parse().ok()?;
+            let display = display.strip_prefix("display=")?.to_string();
+            Some((attempt, display))
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]

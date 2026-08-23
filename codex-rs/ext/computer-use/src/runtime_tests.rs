@@ -102,13 +102,13 @@ async fn runtime_type_text_routes_through_sky_with_display_environment() {
     let env_log = wait_for_file_contents(&harness.sky_env_log)
         .await
         .expect("read Sky env log");
-    assert!(env_log.contains("display=:91"));
+    assert!(env_log.contains(&format!("display={}", running_environment(&start).display)));
     assert!(env_log.contains("xauthority="));
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_screenshot_returns_jpeg_and_cleans_invocation_dir() {
-    let harness = RuntimeHarness::with_screenshot_sky();
+    let harness = RuntimeHarness::with_relative_screenshot_sky();
     let runtime = harness.runtime();
 
     let start = runtime
@@ -143,6 +143,56 @@ async fn runtime_screenshot_returns_jpeg_and_cleans_invocation_dir() {
     assert!(entries.next().is_none());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_screenshot_accepts_absolute_path_within_invocation_dir() {
+    let harness = RuntimeHarness::with_absolute_screenshot_sky();
+    let runtime = harness.runtime();
+
+    runtime
+        .execute(ComputerUseRequest::Start(StartArgs {}))
+        .await
+        .expect("start session");
+
+    let output = runtime
+        .execute(ComputerUseRequest::GetScreenshot(GetScreenshotArgs {}))
+        .await
+        .expect("get screenshot");
+
+    match output {
+        ComputerUseOutput::Screenshot { screenshot, .. } => {
+            assert_eq!(screenshot.width, SCREENSHOT_VIEWPORT_WIDTH);
+            assert_eq!(screenshot.height, SCREENSHOT_VIEWPORT_HEIGHT);
+            assert_eq!(
+                screenshot.bytes,
+                fs::read(&harness.fixture_jpeg).expect("read fixture")
+            );
+        }
+        other => panic!("expected screenshot output, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_screenshot_rejects_absolute_path_outside_invocation_dir() {
+    let harness = RuntimeHarness::with_outside_absolute_screenshot_sky();
+    let runtime = harness.runtime();
+
+    runtime
+        .execute(ComputerUseRequest::Start(StartArgs {}))
+        .await
+        .expect("start session");
+
+    let error = runtime
+        .execute(ComputerUseRequest::GetScreenshot(GetScreenshotArgs {}))
+        .await
+        .expect_err("absolute screenshot path outside invocation dir must fail");
+
+    assert_eq!(
+        error.code,
+        crate::ComputerUseErrorCode::ScreenshotPathInvalid
+    );
+    assert!(error.message.contains("outside the invocation directory"));
+}
+
 struct RuntimeHarness {
     _tempdir: TempDir,
     temp_root: PathBuf,
@@ -159,8 +209,16 @@ impl RuntimeHarness {
         Self::new(SkyScriptMode::Click)
     }
 
-    fn with_screenshot_sky() -> Self {
-        Self::new(SkyScriptMode::Screenshot)
+    fn with_relative_screenshot_sky() -> Self {
+        Self::new(SkyScriptMode::RelativeScreenshot)
+    }
+
+    fn with_absolute_screenshot_sky() -> Self {
+        Self::new(SkyScriptMode::AbsoluteScreenshot)
+    }
+
+    fn with_outside_absolute_screenshot_sky() -> Self {
+        Self::new(SkyScriptMode::OutsideAbsoluteScreenshot)
     }
 
     fn new(mode: SkyScriptMode) -> Self {
@@ -172,6 +230,7 @@ impl RuntimeHarness {
         let sky_env_log = tempdir.path().join("sky-env.log");
         let sky_stdin_log = tempdir.path().join("sky-stdin.log");
         let fixture_jpeg = tempdir.path().join("fixture.jpg");
+        let outside_screenshot = tempdir.path().join("outside-shot.jpg");
 
         fs::write(
             &fixture_jpeg,
@@ -182,16 +241,6 @@ impl RuntimeHarness {
             &xvfb_script,
             r#"#!/usr/bin/env bash
 set -euo pipefail
-displayfd=""
-while (($#)); do
-  case "$1" in
-    -displayfd)
-      displayfd="$2"
-      ;;
-  esac
-  shift
-done
-printf '91\n' >&"$displayfd"
 trap 'exit 0' TERM
 while true; do
   sleep 1
@@ -217,11 +266,27 @@ printf 'xauthority=%s\n' "${{XAUTHORITY:-}}" >> {sky_env_log:?}
 cat > {sky_stdin_log:?}
 "#,
             ),
-            SkyScriptMode::Screenshot => format!(
+            SkyScriptMode::RelativeScreenshot => format!(
                 r#"#!/usr/bin/env bash
 set -euo pipefail
 cp {fixture_jpeg:?} "$PWD/shot.jpg"
 printf '[{{"filepath":"shot.jpg"}}]'
+"#,
+            ),
+            SkyScriptMode::AbsoluteScreenshot => format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+: "${{TMPDIR:?}}"
+cp {fixture_jpeg:?} "$TMPDIR/shot.jpg"
+printf '[{{"filepath":"%s"}}]' "$TMPDIR/shot.jpg"
+"#,
+            ),
+            SkyScriptMode::OutsideAbsoluteScreenshot => format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+outside_path={outside_screenshot:?}
+cp {fixture_jpeg:?} "$outside_path"
+printf '[{{"filepath":"%s"}}]' "$outside_path"
 "#,
             ),
         };
@@ -257,12 +322,21 @@ printf '[{{"filepath":"shot.jpg"}}]'
 
 enum SkyScriptMode {
     Click,
-    Screenshot,
+    RelativeScreenshot,
+    AbsoluteScreenshot,
+    OutsideAbsoluteScreenshot,
 }
 
 fn running_session_id(output: &ComputerUseOutput) -> &str {
     match output {
         ComputerUseOutput::Running { session_id, .. } => session_id,
+        other => panic!("expected running output, got {other:?}"),
+    }
+}
+
+fn running_environment(output: &ComputerUseOutput) -> &crate::protocol::DesktopEnvironment {
+    match output {
+        ComputerUseOutput::Running { environment, .. } => environment,
         other => panic!("expected running output, got {other:?}"),
     }
 }

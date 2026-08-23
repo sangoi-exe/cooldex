@@ -387,6 +387,7 @@ fn spawn_sky_child(
         .env("DISPLAY", &environment.display)
         .env("XAUTHORITY", &environment.xauthority)
         .env("HOME", invocation_dir)
+        .env("TMPDIR", invocation_dir)
         .env("LANG", "C.UTF-8")
         .args(&sky_invocation.argv);
     if let Some(path) = std::env::var_os("PATH") {
@@ -486,20 +487,15 @@ fn load_screenshot_payload(
     invocation_dir: &Path,
     reported_path: &str,
 ) -> Result<crate::ScreenshotPayload, ComputerUseError> {
-    let relative_path = PathBuf::from(reported_path);
-    if relative_path.is_absolute() {
-        return Err(ComputerUseError::new(
-            ComputerUseErrorCode::ScreenshotPathInvalid,
-            "Sky reported an absolute screenshot path",
-            /*retryable*/ false,
-        ));
-    }
-    if relative_path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
+    let reported_path = PathBuf::from(reported_path);
+    if !reported_path.is_absolute()
+        && reported_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
         return Err(ComputerUseError::new(
             ComputerUseErrorCode::ScreenshotPathInvalid,
             "Sky reported a screenshot path outside the invocation directory",
@@ -507,7 +503,11 @@ fn load_screenshot_payload(
         ));
     }
 
-    let absolute_path = invocation_dir.join(&relative_path);
+    let absolute_path = if reported_path.is_absolute() {
+        reported_path
+    } else {
+        invocation_dir.join(&reported_path)
+    };
     let invocation_dir_canonical = invocation_dir.canonicalize().map_err(|error| {
         ComputerUseError::new(
             ComputerUseErrorCode::InternalError,
