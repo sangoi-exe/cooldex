@@ -64,8 +64,6 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WarningNotification;
-use codex_computer_use_extension::CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR;
-use codex_computer_use_extension::CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR;
 use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
@@ -730,8 +728,8 @@ async fn turn_start_emits_warning_when_computer_use_runtime_is_unavailable() -> 
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("warning")).await??;
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
     assert!(warning.message.starts_with("Computer Use is unavailable: "));
-    assert!(warning.message.contains(CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR));
-    assert!(warning.message.contains(CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR));
+    assert!(warning.message.contains("[features.computer_use]"));
+    assert!(warning.message.contains("CODEX_COMPUTER_USE_*"));
     assert!(
         warning
             .message

@@ -11,6 +11,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use toml::Table;
 use toml::Value as TomlValue;
 
@@ -615,6 +616,58 @@ multi_agent_v2 = true
 }
 
 #[test]
+fn computer_use_feature_config_deserializes_boolean_toggle() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+computer_use = true
+"#,
+    )
+    .expect("features table should deserialize");
+
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("computer_use".to_string(), true)])
+    );
+    assert_eq!(features.computer_use, Some(FeatureToml::Enabled(true)));
+}
+
+#[test]
+fn computer_use_feature_config_deserializes_table() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+[computer_use]
+enabled = true
+mcp_bin = "/tmp/codex-computer-use-mcp"
+sky_bin = "/tmp/sky"
+xvfb = "/usr/bin/Xvfb"
+openbox = "/usr/bin/openbox"
+temp_root = "/tmp/codex-computer-use"
+display_ready_timeout = 7000
+shutdown_grace_period = 3000
+"#,
+    )
+    .expect("features table should deserialize");
+
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("computer_use".to_string(), true)])
+    );
+    assert_eq!(
+        features.computer_use,
+        Some(FeatureToml::Config(crate::ComputerUseConfigToml {
+            enabled: Some(true),
+            mcp_bin: Some(PathBuf::from("/tmp/codex-computer-use-mcp")),
+            sky_bin: Some(PathBuf::from("/tmp/sky")),
+            xvfb: Some(PathBuf::from("/usr/bin/Xvfb")),
+            openbox: Some(PathBuf::from("/usr/bin/openbox")),
+            temp_root: Some(PathBuf::from("/tmp/codex-computer-use")),
+            display_ready_timeout: Some(7000),
+            shutdown_grace_period: Some(3000),
+        }))
+    );
+}
+
+#[test]
 fn multi_agent_v2_feature_config_deserializes_table() {
     let features: FeaturesToml = toml::from_str(
         r#"
@@ -670,7 +723,6 @@ non_code_mode_only = true
     );
 }
 
-#[test]
 #[test]
 fn multi_agent_v2_policy_rejects_unknown_values() {
     toml::from_str::<FeaturesToml>(

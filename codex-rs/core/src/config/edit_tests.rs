@@ -214,6 +214,91 @@ fn multi_agent_v2_nested_edit_preserves_legacy_boolean_toggle() {
     }
 }
 
+/// Toggling Computer Use must preserve settings stored in its feature table.
+#[test]
+fn computer_use_feature_toggle_preserves_nested_configuration() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &config_path,
+        "[features.computer_use]\nenabled = true\nxvfb = \"/usr/bin/Xvfb\"\n",
+    )
+    .expect("write config");
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_feature_enabled("computer_use", /*enabled*/ false)
+        .apply_blocking()
+        .expect("disable feature");
+    let disabled: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read disabled config"))
+            .expect("parse disabled config");
+    assert_eq!(
+        disabled,
+        toml::from_str::<TomlValue>(
+            "[features.computer_use]\nenabled = false\nxvfb = \"/usr/bin/Xvfb\"\n",
+        )
+        .expect("parse expected config")
+    );
+
+    ConfigEditsBuilder::new(codex_home)
+        .set_feature_enabled("computer_use", /*enabled*/ true)
+        .apply_blocking()
+        .expect("enable feature");
+    let enabled: TomlValue =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read enabled config"))
+            .expect("parse enabled config");
+    assert_eq!(
+        enabled,
+        toml::from_str::<TomlValue>(
+            "[features.computer_use]\nenabled = true\nxvfb = \"/usr/bin/Xvfb\"\n",
+        )
+        .expect("parse expected config")
+    );
+}
+
+/// Adding nested Computer Use settings must retain an existing legacy boolean toggle.
+#[test]
+fn computer_use_nested_edit_preserves_legacy_boolean_toggle() {
+    for feature_path in ["features", "profiles.work.features"] {
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+        let config_path = codex_home.join(CONFIG_TOML_FILE);
+        std::fs::write(
+            &config_path,
+            format!("[{feature_path}]\ncomputer_use = false\n"),
+        )
+        .expect("write config");
+
+        let mut feature_segments = feature_path
+            .split('.')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        feature_segments.push("computer_use".to_string());
+        let mut xvfb_segments = feature_segments.clone();
+        xvfb_segments.push("xvfb".to_string());
+
+        ConfigEditsBuilder::new(codex_home)
+            .with_edits([ConfigEdit::SetPath {
+                segments: xvfb_segments,
+                value: value("/usr/bin/Xvfb"),
+            }])
+            .apply_blocking()
+            .expect("persist nested config");
+
+        let updated: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .expect("parse config");
+        assert_eq!(
+            updated,
+            toml::from_str::<TomlValue>(&format!(
+                "[{feature_path}.computer_use]\nenabled = false\nxvfb = \"/usr/bin/Xvfb\"\n",
+            ))
+            .expect("parse expected config")
+        );
+    }
+}
+
 #[test]
 fn session_picker_view_edit_writes_root_tui_setting() {
     let tmp = tempdir().expect("tmpdir");

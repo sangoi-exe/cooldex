@@ -16,10 +16,9 @@ use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use pretty_assertions::assert_eq;
 
-use crate::CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR;
-use crate::CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR;
 use crate::COMPUTER_USE_SERVER_NAME;
 use crate::extension::RuntimeLocator;
+use crate::extension::RuntimePathOverrides;
 use crate::extension::install_with_locator;
 use crate::vendored_artifact_path;
 
@@ -38,7 +37,11 @@ async fn valid_override_pair_contributes_required_stdio_server() -> TestResult {
 
     let contributions = contribute_global(
         &config,
-        RuntimeLocator::new_for_test(Some(mcp_bin.clone()), Some(sky_bin.clone())),
+        RuntimeLocator::new_for_test(RuntimePathOverrides {
+            mcp_bin: Some(mcp_bin.clone()),
+            sky_bin: Some(sky_bin.clone()),
+            ..Default::default()
+        }),
     )
     .await;
 
@@ -70,10 +73,140 @@ async fn valid_override_pair_contributes_required_stdio_server() -> TestResult {
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn config_pair_contributes_required_stdio_server_with_runtime_args() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let mcp_bin = tempdir.path().join("codex-computer-use-mcp");
+    copy_executable(&sky_bin, &mcp_bin)?;
+    let config = test_config_with_contents(&format!(
+        r#"[features.computer_use]
+enabled = true
+mcp_bin = "{mcp_bin}"
+sky_bin = "{sky_bin}"
+xvfb = "/usr/bin/Xvfb"
+openbox = "/usr/bin/openbox"
+temp_root = "/tmp/codex-computer-use"
+display_ready_timeout = 7000
+shutdown_grace_period = 3000
+"#,
+        mcp_bin = mcp_bin.display(),
+        sky_bin = sky_bin.display(),
+    ))
+    .await?;
+
+    let contributions = contribute_global(
+        &config,
+        RuntimeLocator::new_for_test(RuntimePathOverrides::default()),
+    )
+    .await;
+
+    let [McpServerContribution::Set { name, config }] = contributions.as_slice() else {
+        panic!("expected one computer_use registration");
+    };
+    assert_eq!(name, COMPUTER_USE_SERVER_NAME);
+    let McpServerTransportConfig::Stdio { command, args, .. } = &config.transport else {
+        panic!("computer_use should use stdio transport");
+    };
+    assert_eq!(Path::new(command), mcp_bin.as_path());
+    assert_eq!(
+        args,
+        &vec![
+            "--sky-bin".to_string(),
+            sky_bin.display().to_string(),
+            "--xvfb".to_string(),
+            "/usr/bin/Xvfb".to_string(),
+            "--openbox".to_string(),
+            "/usr/bin/openbox".to_string(),
+            "--temp-root".to_string(),
+            "/tmp/codex-computer-use".to_string(),
+            "--display-ready-timeout-ms".to_string(),
+            "7000".to_string(),
+            "--shutdown-grace-period-ms".to_string(),
+            "3000".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn env_path_overrides_take_precedence_over_configured_paths() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let configured_sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let configured_mcp_bin = tempdir.path().join("configured-codex-computer-use-mcp");
+    let override_mcp_bin = tempdir.path().join("override-codex-computer-use-mcp");
+    let override_sky_bin = tempdir.path().join("override-sky");
+    copy_executable(&configured_sky_bin, &configured_mcp_bin)?;
+    copy_executable(&configured_sky_bin, &override_mcp_bin)?;
+    copy_executable(&configured_sky_bin, &override_sky_bin)?;
+    let config = test_config_with_contents(&format!(
+        r#"[features.computer_use]
+enabled = true
+mcp_bin = "{configured_mcp_bin}"
+sky_bin = "{configured_sky_bin}"
+xvfb = "/usr/bin/Xvfb-config"
+openbox = "/usr/bin/openbox-config"
+temp_root = "/tmp/codex-computer-use-config"
+display_ready_timeout = 7000
+shutdown_grace_period = 3000
+"#,
+        configured_mcp_bin = configured_mcp_bin.display(),
+        configured_sky_bin = configured_sky_bin.display(),
+    ))
+    .await?;
+
+    let contributions = contribute_global(
+        &config,
+        RuntimeLocator::new_for_test(RuntimePathOverrides {
+            mcp_bin: Some(override_mcp_bin.clone()),
+            sky_bin: Some(override_sky_bin.clone()),
+            xvfb: Some(PathBuf::from("/usr/bin/Xvfb-override")),
+            openbox: Some(PathBuf::from("/usr/bin/openbox-override")),
+            temp_root: Some(PathBuf::from("/tmp/codex-computer-use-override")),
+        }),
+    )
+    .await;
+
+    let [McpServerContribution::Set { name, config }] = contributions.as_slice() else {
+        panic!("expected one computer_use registration");
+    };
+    assert_eq!(name, COMPUTER_USE_SERVER_NAME);
+    let McpServerTransportConfig::Stdio { command, args, .. } = &config.transport else {
+        panic!("computer_use should use stdio transport");
+    };
+    assert_eq!(Path::new(command), override_mcp_bin.as_path());
+    assert_eq!(
+        args,
+        &vec![
+            "--sky-bin".to_string(),
+            override_sky_bin.display().to_string(),
+            "--xvfb".to_string(),
+            "/usr/bin/Xvfb-override".to_string(),
+            "--openbox".to_string(),
+            "/usr/bin/openbox-override".to_string(),
+            "--temp-root".to_string(),
+            "/tmp/codex-computer-use-override".to_string(),
+            "--display-ready-timeout-ms".to_string(),
+            "7000".to_string(),
+            "--shutdown-grace-period-ms".to_string(),
+            "3000".to_string(),
+        ]
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_source_runtime_pair_removes_server() -> TestResult {
     let config = test_config().await?;
-    let contributions = contribute_global(&config, RuntimeLocator::new_for_test(None, None)).await;
+    let contributions = contribute_global(
+        &config,
+        RuntimeLocator::new_for_test(RuntimePathOverrides::default()),
+    )
+    .await;
 
     assert!(matches!(
         contributions.as_slice(),
@@ -89,7 +222,10 @@ async fn incomplete_override_emits_one_warning_per_thread() -> TestResult {
     let mut builder = ExtensionRegistryBuilder::with_event_sink(sink.clone());
     install_with_locator(
         &mut builder,
-        RuntimeLocator::new_for_test(Some(PathBuf::from("/tmp/computer-use-mcp")), None),
+        RuntimeLocator::new_for_test(RuntimePathOverrides {
+            mcp_bin: Some(PathBuf::from("/tmp/computer-use-mcp")),
+            ..Default::default()
+        }),
     );
     let registry = builder.build();
     let contributor = registry
@@ -135,8 +271,8 @@ async fn incomplete_override_emits_one_warning_per_thread() -> TestResult {
     assert_eq!(warning.thread_id, "thread-1");
     assert_eq!(warning.turn_id, None);
     assert!(warning.message.starts_with("Computer Use is unavailable: "));
-    assert!(warning.message.contains(CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR));
-    assert!(warning.message.contains(CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR));
+    assert!(warning.message.contains("[features.computer_use]"));
+    assert!(warning.message.contains("CODEX_COMPUTER_USE_*"));
     assert!(
         warning
             .message
@@ -146,12 +282,88 @@ async fn incomplete_override_emits_one_warning_per_thread() -> TestResult {
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn invalid_xvfb_override_emits_generic_warning() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let mcp_bin = tempdir.path().join("codex-computer-use-mcp");
+    copy_executable(&sky_bin, &mcp_bin)?;
+    let config = test_config_with_contents(&format!(
+        r#"[features.computer_use]
+enabled = true
+mcp_bin = "{mcp_bin}"
+sky_bin = "{sky_bin}"
+"#,
+        mcp_bin = mcp_bin.display(),
+        sky_bin = sky_bin.display(),
+    ))
+    .await?;
+    let sink = Arc::new(RecordingEventSink::default());
+    let mut builder = ExtensionRegistryBuilder::with_event_sink(sink.clone());
+    install_with_locator(
+        &mut builder,
+        RuntimeLocator::new_for_test(RuntimePathOverrides {
+            xvfb: Some(PathBuf::new()),
+            ..Default::default()
+        }),
+    );
+    let registry = builder.build();
+    let contributor = registry
+        .mcp_server_contributors()
+        .first()
+        .expect("computer use contributor should be installed");
+    let thread_init = ExtensionDataInit::default();
+    let thread_store = ExtensionData::new("thread-xvfb");
+
+    let contributions = contributor
+        .contribute(McpServerContributionContext::for_step(
+            &config,
+            &thread_init,
+            &thread_store,
+            "test-originator",
+            &[],
+            None,
+        ))
+        .await;
+
+    assert!(matches!(
+        contributions.as_slice(),
+        [McpServerContribution::Remove { name }] if name == COMPUTER_USE_SERVER_NAME
+    ));
+
+    let warnings = sink.warnings();
+    assert_eq!(warnings.len(), 1);
+    let warning = &warnings[0];
+    assert_eq!(warning.thread_id, "thread-xvfb");
+    assert_eq!(warning.turn_id, None);
+    assert!(warning.message.starts_with("Computer Use is unavailable: "));
+    assert!(warning.message.contains("invalid Computer Use xvfb"));
+    assert!(warning.message.contains("[features.computer_use]"));
+    assert!(warning.message.contains("CODEX_COMPUTER_USE_*"));
+    assert!(
+        warning
+            .message
+            .contains("source/development execution only")
+    );
+    assert!(!warning.message.contains(".mcp_bin/.sky_bin"));
+
+    Ok(())
+}
+
 async fn test_config() -> Result<Config, Box<dyn std::error::Error>> {
+    test_config_with_contents("features.computer_use = true\n").await
+}
+
+async fn test_config_with_contents(contents: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let codex_home = tempfile::tempdir()?;
+    std::fs::write(
+        codex_home.path().join(codex_config::CONFIG_TOML_FILE),
+        contents,
+    )?;
     Ok(ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .cli_overrides(vec![("features.computer_use".to_string(), true.into())])
         .build()
         .await?)
 }

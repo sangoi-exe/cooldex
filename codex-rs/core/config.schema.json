@@ -445,6 +445,47 @@
       },
       "type": "object"
     },
+    "ComputerUseConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "display_ready_timeout": {
+          "description": "Maximum time to wait for Xvfb/Openbox startup, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mcp_bin": {
+          "description": "Absolute path to the source/development Computer Use MCP binary.",
+          "type": "string"
+        },
+        "openbox": {
+          "description": "Command or path used to start Openbox for the local desktop session.",
+          "type": "string"
+        },
+        "shutdown_grace_period": {
+          "description": "Grace period before force-terminating owned session processes, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sky_bin": {
+          "description": "Absolute path to the source/development Sky binary.",
+          "type": "string"
+        },
+        "temp_root": {
+          "description": "Session temp root for Computer Use working files.",
+          "type": "string"
+        },
+        "xvfb": {
+          "description": "Command or path used to start Xvfb for the local desktop session.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -549,7 +590,7 @@
               "type": "boolean"
             },
             "computer_use": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
             },
             "concurrent_reasoning_summaries": {
               "type": "boolean"
@@ -1071,6 +1112,16 @@
         },
         {
           "$ref": "#/definitions/CodeModeHostConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_ComputerUseConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ComputerUseConfigToml"
         }
       ]
     },
@@ -5497,7 +5548,7 @@
           "type": "boolean"
         },
         "computer_use": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
         },
         "concurrent_reasoning_summaries": {
           "type": "boolean"

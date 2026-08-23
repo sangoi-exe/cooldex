@@ -43,6 +43,31 @@
 - The delimited upstream core below must remain byte-identical to the blob named by its
   opening marker. Local policy belongs outside that core.
 
+## Computer Use Operator Contract
+
+- The canonical local config owner for Computer Use runtime knobs is
+  `[features.computer_use]`.
+- The supported keys are `mcp_bin`, `sky_bin`, `xvfb`, `openbox`, `temp_root`,
+  `display_ready_timeout`, and `shutdown_grace_period`.
+- `display_ready_timeout` and `shutdown_grace_period` are millisecond values.
+- Path precedence is: matching environment-variable override first, then
+  `config.toml`, then the current runtime owner default or absence.
+- The supported path override environment variables are
+  `CODEX_COMPUTER_USE_MCP_BIN`, `CODEX_COMPUTER_USE_SKY_BIN`,
+  `CODEX_COMPUTER_USE_XVFB_BIN`, `CODEX_COMPUTER_USE_OPENBOX_BIN`, and
+  `CODEX_COMPUTER_USE_TEMP_ROOT`.
+- Missing `mcp_bin` and `sky_bin` leaves the source/development Computer Use MCP
+  runtime unavailable. Do not invent a fallback runtime pair.
+- The current live Computer Use worktree starts Xvfb display reservation at
+  `FIRST_DISPLAY = 90` and scans a high display range instead of relying on the
+  previous/default display allocation path. That high-range start is a proven
+  current code fact.
+- Workspace-local rationale: current-thread historical evidence records the
+  current user reporting another local Xvfb consumer in `~/work/chatgpt-web.js`
+  on `X0`, and separately reporting that using higher display IDs fixed the WSL
+  collision here. This file does not claim a stronger historical root cause
+  than that operator-reported fact pattern.
+
 ## Upstream Defect Policy
 
 - Do not fix an upstream bug or suspected upstream bug in this fork unless direct causal

@@ -606,6 +606,56 @@ disable_in_process_fallback = true
 }
 
 #[tokio::test]
+async fn load_config_resolves_computer_use_config() -> std::io::Result<()> {
+    let codex_home = tempdir()?;
+    let config_toml: ConfigToml = toml::from_str(
+        r#"
+[features.computer_use]
+enabled = true
+mcp_bin = "/tmp/codex-computer-use-mcp"
+sky_bin = "/tmp/sky"
+xvfb = "/usr/bin/Xvfb"
+openbox = "/usr/bin/openbox"
+temp_root = "/tmp/codex-computer-use"
+display_ready_timeout = 7000
+shutdown_grace_period = 3000
+"#,
+    )
+    .expect("TOML deserialization should succeed");
+    let config = Config::load_from_base_config_with_overrides(
+        config_toml,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.computer_use.mcp_bin,
+        Some(std::path::PathBuf::from("/tmp/codex-computer-use-mcp"))
+    );
+    assert_eq!(
+        config.computer_use.sky_bin,
+        Some(std::path::PathBuf::from("/tmp/sky"))
+    );
+    assert_eq!(
+        config.computer_use.xvfb,
+        Some(std::path::PathBuf::from("/usr/bin/Xvfb"))
+    );
+    assert_eq!(
+        config.computer_use.openbox,
+        Some(std::path::PathBuf::from("/usr/bin/openbox"))
+    );
+    assert_eq!(
+        config.computer_use.temp_root,
+        Some(std::path::PathBuf::from("/tmp/codex-computer-use"))
+    );
+    assert_eq!(config.computer_use.display_ready_timeout_ms, Some(7_000));
+    assert_eq!(config.computer_use.shutdown_grace_period_ms, Some(3_000));
+    assert!(config.features.enabled(Feature::ComputerUse));
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_resolves_tool_registry_config() -> std::io::Result<()> {
     let codex_home = tempdir()?;
 

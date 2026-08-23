@@ -11,7 +11,10 @@ mod sky;
 mod vendor;
 
 pub use extension::CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR;
+pub use extension::CODEX_COMPUTER_USE_OPENBOX_BIN_ENV_VAR;
 pub use extension::CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR;
+pub use extension::CODEX_COMPUTER_USE_TEMP_ROOT_ENV_VAR;
+pub use extension::CODEX_COMPUTER_USE_XVFB_BIN_ENV_VAR;
 pub use extension::install;
 pub use protocol::COMPUTER_USE_SERVER_NAME;
 pub use protocol::ComputerUseError;

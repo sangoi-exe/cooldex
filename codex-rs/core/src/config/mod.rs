@@ -63,6 +63,7 @@ use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::LOCAL_FS;
 use codex_exec_server::ReadFileOptions;
 use codex_features::CodeModeConfigToml;
+use codex_features::ComputerUseConfigToml;
 use codex_features::CurrentTimeReminderConfigToml;
 use codex_features::CurrentTimeReminderDeliveryMode;
 use codex_features::CurrentTimeSource;
@@ -1045,6 +1046,9 @@ pub struct Config {
     /// Configuration for the experimental code-mode tool surface.
     pub code_mode: CodeModeConfig,
 
+    /// Configuration for the Computer Use extension runtime seam.
+    pub computer_use: ComputerUseConfig,
+
     /// Maximum poll window for background terminal output (`write_stdin`), in milliseconds.
     /// Default: `300000` (5 minutes).
     pub background_terminal_max_timeout: u64,
@@ -1129,6 +1133,17 @@ impl Default for CodeModeConfig {
             disable_in_process_fallback: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ComputerUseConfig {
+    pub mcp_bin: Option<PathBuf>,
+    pub sky_bin: Option<PathBuf>,
+    pub xvfb: Option<PathBuf>,
+    pub openbox: Option<PathBuf>,
+    pub temp_root: Option<PathBuf>,
+    pub display_ready_timeout_ms: Option<u64>,
+    pub shutdown_grace_period_ms: Option<u64>,
 }
 
 pub(crate) const DEFAULT_TOKEN_BUDGET_REMINDER_MESSAGE_TEMPLATE: &str = concat!(
@@ -2693,6 +2708,20 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     }
 }
 
+fn resolve_computer_use_config(config_toml: &ConfigToml) -> ComputerUseConfig {
+    let base = computer_use_toml_config(config_toml.features.as_ref());
+
+    ComputerUseConfig {
+        mcp_bin: base.and_then(|config| config.mcp_bin.clone()),
+        sky_bin: base.and_then(|config| config.sky_bin.clone()),
+        xvfb: base.and_then(|config| config.xvfb.clone()),
+        openbox: base.and_then(|config| config.openbox.clone()),
+        temp_root: base.and_then(|config| config.temp_root.clone()),
+        display_ready_timeout_ms: base.and_then(|config| config.display_ready_timeout),
+        shutdown_grace_period_ms: base.and_then(|config| config.shutdown_grace_period),
+    }
+}
+
 fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
     let max_concurrent_threads_per_session = base
@@ -3056,6 +3085,13 @@ fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalRe
 
 fn code_mode_toml_config(features: Option<&FeaturesToml>) -> Option<&CodeModeConfigToml> {
     match features?.code_mode.as_ref()? {
+        FeatureToml::Enabled(_) => None,
+        FeatureToml::Config(config) => Some(config),
+    }
+}
+
+fn computer_use_toml_config(features: Option<&FeaturesToml>) -> Option<&ComputerUseConfigToml> {
+    match features?.computer_use.as_ref()? {
         FeatureToml::Enabled(_) => None,
         FeatureToml::Config(config) => Some(config),
     }
@@ -3830,6 +3866,7 @@ impl Config {
                 .unwrap_or_default(),
         };
         let code_mode = resolve_code_mode_config(&cfg);
+        let computer_use = resolve_computer_use_config(&cfg);
         let mut multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         multi_agent_v2.subagent_instructions = load_multi_agent_v2_subagent_instructions(
             fs,
@@ -4384,6 +4421,7 @@ impl Config {
             update_plan_enabled,
             tool_registry,
             code_mode,
+            computer_use,
             background_terminal_max_timeout,
             ghost_snapshot,
             multi_agent_v2,

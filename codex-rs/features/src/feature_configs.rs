@@ -42,6 +42,40 @@ impl FeatureConfig for CodeModeConfigToml {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerUseConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Absolute path to the source/development Computer Use MCP binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_bin: Option<PathBuf>,
+    /// Absolute path to the source/development Sky binary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sky_bin: Option<PathBuf>,
+    /// Command or path used to start Xvfb for the local desktop session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xvfb: Option<PathBuf>,
+    /// Command or path used to start Openbox for the local desktop session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openbox: Option<PathBuf>,
+    /// Session temp root for Computer Use working files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_root: Option<PathBuf>,
+    /// Maximum time to wait for Xvfb/Openbox startup, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_ready_timeout: Option<u64>,
+    /// Grace period before force-terminating owned session processes, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shutdown_grace_period: Option<u64>,
+}
+
+impl FeatureConfig for ComputerUseConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
 /// Selects the built-in MultiAgentV2 delegation policy.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]

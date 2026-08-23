@@ -323,7 +323,7 @@ impl ConfigDocument {
                 Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
             }
             ConfigEdit::SetPath { segments, value } => {
-                if is_multi_agent_v2_feature_path(segments) && value.as_bool().is_some() {
+                if preserves_nested_feature_config_path(segments) && value.as_bool().is_some() {
                     let mut existing = Some(self.doc.as_item());
                     for segment in segments {
                         existing = existing.and_then(|item| item.as_table_like()?.get(segment));
@@ -618,7 +618,7 @@ impl ConfigDocument {
                     }
 
                     let item = current.get_mut(segment.as_str())?;
-                    if is_multi_agent_v2_feature_path(&segments[..=index])
+                    if preserves_nested_feature_config_path(&segments[..=index])
                         && let Some(enabled) = item.as_bool()
                     {
                         let mut feature = document_helpers::new_implicit_table();
@@ -669,11 +669,15 @@ impl ConfigDocument {
     }
 }
 
-fn is_multi_agent_v2_feature_path(segments: &[String]) -> bool {
+fn preserves_nested_feature_config_path(segments: &[String]) -> bool {
     match segments {
-        [features, feature] => features == "features" && feature == "multi_agent_v2",
+        [features, feature] => {
+            features == "features" && matches!(feature.as_str(), "multi_agent_v2" | "computer_use")
+        }
         [profiles, _, features, feature] => {
-            profiles == "profiles" && features == "features" && feature == "multi_agent_v2"
+            profiles == "profiles"
+                && features == "features"
+                && matches!(feature.as_str(), "multi_agent_v2" | "computer_use")
         }
         _ => false,
     }
@@ -864,11 +868,11 @@ impl ConfigEditsBuilder {
     ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
-    /// graduates to globally enabled. Structured multi-agent v2 settings are
-    /// an exception: its explicit `enabled = false` preserves nested options.
+    /// graduates to globally enabled. Structured feature-table settings can
+    /// preserve nested options by writing `enabled = false` when needed.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
         let mut segments = vec!["features".to_string(), key.to_string()];
-        if key == "multi_agent_v2" && !enabled {
+        if !enabled && preserves_nested_feature_config_path(&segments) {
             segments.push("enabled".to_string());
             self.edits.push(ConfigEdit::SetPath {
                 segments,

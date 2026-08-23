@@ -18,6 +18,7 @@ mod feature_configs;
 mod legacy;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CodeModeHostConfigToml;
+pub use feature_configs::ComputerUseConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
@@ -707,6 +708,8 @@ pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode_host: Option<FeatureToml<CodeModeHostConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<FeatureToml<ComputerUseConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub non_prefixed_mcp_tool_names: Option<FeatureToml<NonPrefixedMcpToolNamesConfigToml>>,
     #[serde(
         default,
@@ -746,6 +749,9 @@ impl FeaturesToml {
         }
         if let Some(enabled) = self.code_mode_host.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::CodeModeHost.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self.computer_use.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::ComputerUse.key().to_string(), enabled);
         }
         if let Some(enabled) = self
             .non_prefixed_mcp_tool_names
