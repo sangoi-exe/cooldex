@@ -1750,14 +1750,15 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
     Ok(())
 }
 
-#[test_case(None, false; "encrypted")]
-#[test_case(None, true; "plaintext")]
-#[test_case(Some("gpt-5.6-luna"), false; "luna encrypted leaf")]
-#[test_case(Some("gpt-5.5"), false; "legacy encrypted leaf")]
+#[test_case(None, false, true; "encrypted")]
+#[test_case(None, true, true; "plaintext")]
+#[test_case(Some("gpt-5.6-luna"), false, false; "luna encrypted leaf")]
+#[test_case(Some("gpt-5.4"), false, true; "unspecified gpt 5.4 inherits v2")]
 #[tokio::test]
 async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     model: Option<&str>,
     plaintext: bool,
+    expects_collaboration_tools: bool,
 ) -> Result<()> {
     let output: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::fmt()
@@ -1891,14 +1892,14 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     );
     if let Some(model) = model {
         assert_eq!(child_request.body_json()["model"], json!(model));
-        assert!(
-            !child_request
-                .body_json()
-                .to_string()
-                .contains("\"name\":\"collaboration\""),
-            "leaf workers must not receive collaboration tools",
-        );
     }
+    assert_eq!(
+        child_request
+            .body_json()
+            .to_string()
+            .contains("\"name\":\"collaboration\""),
+        expects_collaboration_tools,
+    );
     if plaintext {
         assert!(
             parent_request_log.requests().into_iter().any(|request| {

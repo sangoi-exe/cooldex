@@ -604,7 +604,10 @@ fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
         ),
         MultiAgentVersion::V2 => {
             turn_context.session_source.get_agent_path().is_none()
-                || turn_context.model_info.multi_agent_version == Some(MultiAgentVersion::V2)
+                || match turn_context.model_info.multi_agent_version {
+                    None | Some(MultiAgentVersion::V2) => true,
+                    Some(MultiAgentVersion::Disabled | MultiAgentVersion::V1) => false,
+                }
         }
     }
 }

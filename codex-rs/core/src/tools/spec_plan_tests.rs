@@ -2611,7 +2611,7 @@ async fn multi_agent_v2_namespace_is_supported_by_bedrock_provider() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
+async fn multi_agent_v2_bedrock_workers_inherit_v2_when_model_version_is_unspecified() {
     for (model, model_multi_agent_version, supports_delegation) in [
         (
             AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
@@ -2623,7 +2623,8 @@ async fn multi_agent_v2_bedrock_workers_only_delegate_when_model_supports_v2() {
             Some(MultiAgentVersion::V1),
             false,
         ),
-        (AMAZON_BEDROCK_GPT_5_5_MODEL_ID, None, false),
+        (AMAZON_BEDROCK_GPT_5_5_MODEL_ID, None, true),
+        ("disabled-model", Some(MultiAgentVersion::Disabled), false),
     ] {
         let plan = probe(|turn| {
             set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
