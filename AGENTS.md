@@ -22,9 +22,10 @@
   `codex`/`cdx` TUI or exec sessions.
 - The supported command topology is `/home/lucas/.cargo/bin/codex` as the reviewed
   regular Cooldex executable, `/home/lucas/.local/bin/cdx-dev` for development sessions,
-  and `cdx` selecting `/home/lucas/.local/bin/codex` for the standalone release. The
-  supported topology has no interactive Bash `codex` alias. `cdx-pro` is retired and
-  must not be recreated as an alias, wrapper, or compatibility path.
+  and `cdx` selecting `/home/lucas/.codex/packages/standalone/current/bin/codex` through
+  `/home/lucas/.cargo/bin/cdx` for the standalone release. The supported topology has no
+  interactive Bash `codex` alias. `cdx-pro` is retired and must not be recreated as an
+  alias, wrapper, or compatibility path.
 - Before installing, promoting, removing, or publishing command surfaces, inspect the
   live resolution, aliases, symlink targets, executable identities, and hashes with
   `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable. This file defines
