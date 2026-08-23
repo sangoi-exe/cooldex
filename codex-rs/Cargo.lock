@@ -1999,6 +1999,7 @@ dependencies = [
  "codex-chatgpt",
  "codex-cloud-config",
  "codex-code-mode",
+ "codex-computer-use-extension",
  "codex-config",
  "codex-connectors",
  "codex-core",
@@ -2637,6 +2638,34 @@ dependencies = [
 [[package]]
 name = "codex-collaboration-mode-templates"
 version = "0.0.0"
+
+[[package]]
+name = "codex-computer-use-extension"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "codex-config",
+ "codex-core",
+ "codex-extension-api",
+ "codex-features",
+ "codex-protocol",
+ "codex-utils-cargo-bin",
+ "codex-utils-pty",
+ "image",
+ "libc",
+ "pretty_assertions",
+ "rand 0.9.3",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "codex-config"

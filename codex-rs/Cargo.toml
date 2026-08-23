@@ -54,6 +54,7 @@ members = [
     "exec-server/tests/support",
     "execpolicy",
     "ext/agent",
+    "ext/computer-use",
     "ext/connectors",
     "ext/extension-api",
     "ext/goal",
@@ -182,6 +183,7 @@ codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
 codex-agent-extension = { path = "ext/agent" }
 codex-connectors-extension = { path = "ext/connectors" }
+codex-computer-use-extension = { path = "ext/computer-use" }
 codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
 codex-core-api = { path = "core-api" }

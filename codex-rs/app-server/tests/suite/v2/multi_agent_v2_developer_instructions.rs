@@ -8,6 +8,7 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
+use codex_features::Feature;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -152,7 +153,9 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
             );
     }
     let codex_home = TempDir::new()?;
-    let mut config = MockResponsesConfig::new(&server.uri()).with_model("gpt-5.4");
+    let mut config = MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::ComputerUse)
+        .with_model("gpt-5.4");
     if role_has_instructions {
         config =
             config.with_root_config(&format!("developer_instructions = {ROLE_INSTRUCTIONS:?}"));
@@ -320,6 +323,7 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::ComputerUse)
         .with_model("gpt-5.4")
         .with_root_config(&format!(
             "developer_instructions = {PARENT_INSTRUCTIONS:?}\nmodel_context_window = 100\nmodel_auto_compact_token_limit = 90\ncompact_prompt = {COMPACT_PROMPT:?}"

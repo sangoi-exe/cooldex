@@ -107,6 +107,7 @@ async fn assert_standalone_web_search_round_trips_output(
     let codex_home = TempDir::new()?;
     let config = MockResponsesConfig::new(&server.uri())
         .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::StandaloneWebSearch)
         .with_provider_config("supports_websockets = false");
     let config = match provider {

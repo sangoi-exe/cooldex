@@ -1,0 +1,45 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-computer-use-extension"
+version.workspace = true
+
+[lib]
+name = "codex_computer_use_extension"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "codex-computer-use-mcp"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+codex-config = { workspace = true }
+codex-core = { workspace = true }
+codex-extension-api = { workspace = true }
+codex-features = { workspace = true }
+codex-utils-pty = { workspace = true }
+image = { workspace = true, features = ["jpeg"] }
+libc = { workspace = true }
+rand = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = ["schemars", "server"] }
+schemars = "1.2.1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+codex-utils-cargo-bin = { workspace = true }
+codex-protocol = { workspace = true }
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

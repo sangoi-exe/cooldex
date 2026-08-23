@@ -52,6 +52,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
         .write(codex_home.path())?;
     let root = AbsolutePathBuf::from_absolute_path(codex_home.path())?;
@@ -473,6 +474,7 @@ async fn deleted_project_is_dropped_before_first_durable_thread_persistence() ->
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
         .write(codex_home.path())?;
     let mut server = TestAppServer::builder()
@@ -562,6 +564,7 @@ async fn project_import_is_atomic_and_notifies_after_commit_in_order() -> Result
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
         .write(codex_home.path())?;
     let mut server = TestAppServer::builder()
@@ -708,6 +711,7 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
         .write(codex_home.path())?;
     let mut server = TestAppServer::builder()
@@ -778,7 +782,9 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     assert_eq!(unchanged.thread.git_info, None);
 
     let unsupported_projects_home = TempDir::new()?;
-    MockResponsesConfig::new(&responses.uri()).write(unsupported_projects_home.path())?;
+    MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
+        .write(unsupported_projects_home.path())?;
     let store_id = Uuid::now_v7();
     std::fs::write(
         unsupported_projects_home.path().join("config.toml"),
@@ -835,6 +841,7 @@ async fn assigned_forks_inherit_projects_for_persistent_and_ephemeral_children()
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&responses.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
         .write(codex_home.path())?;
     let mut server = TestAppServer::builder()

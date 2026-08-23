@@ -351,6 +351,7 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
         format!(
             r#"{config}
 [features]
+computer_use = false
 plugins = true
 remote_plugin = false
 unified_exec = true

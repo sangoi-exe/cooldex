@@ -58,7 +58,9 @@ async fn app_server(
     requirements: &str,
 ) -> Result<(TempDir, TestAppServer)> {
     let home = TempDir::new()?;
-    config.write(home.path())?;
+    config
+        .disable_feature(Feature::ComputerUse)
+        .write(home.path())?;
     std::fs::write(home.path().join("requirements.toml"), requirements)?;
     let server = TestAppServer::builder()
         .with_codex_home(home.path())
@@ -315,6 +317,7 @@ async fn thread_resume_and_fork_upgrade_legacy_protected_model_settings() -> Res
     MockResponsesConfig::new(&responses.uri())
         .with_model("ordinary-model")
         .with_approval_policy("on-request")
+        .disable_feature(Feature::ComputerUse)
         .write(home.path())?;
     std::fs::write(home.path().join("requirements.toml"), REQUIREMENTS)?;
     let mut server = TestAppServer::builder()

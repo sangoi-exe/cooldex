@@ -768,7 +768,7 @@ async fn thread_fork_defers_inherited_active_goal_until_next_turn() -> Result<()
     let config = std::fs::read_to_string(&config_path)?;
     std::fs::write(
         &config_path,
-        format!("{config}\n[features]\ngoals = true\n"),
+        format!("{config}\n[features]\ncomputer_use = false\ngoals = true\n"),
     )?;
 
     let mut mcp = TestAppServer::builder()

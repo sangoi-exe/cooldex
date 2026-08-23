@@ -136,6 +136,18 @@ async fn handle_spawn_agent(
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     if !is_full_history_fork {
+        if turn
+            .config
+            .multi_agent_v2
+            .subagent_developer_instructions
+            .is_none()
+        {
+            // Non-full-history V2 spawns rebuild child identity from explicit subagent
+            // instructions and role defaults. When no subagent-specific override is configured,
+            // do not let the parent turn's developer instructions leak through as the child's
+            // starting point.
+            config.developer_instructions = None;
+        }
         apply_requested_spawn_agent_model_overrides(
             &session,
             turn.as_ref(),

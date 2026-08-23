@@ -461,6 +461,7 @@ patterns = [
   "codex-rs/exec-server-protocol/**",
   "codex-rs/execpolicy/**",
   "codex-rs/ext/agent/**",
+  "codex-rs/ext/computer-use/**",
   "codex-rs/ext/connectors/**",
   "codex-rs/ext/extension-api/**",
   "codex-rs/ext/goal/**",

@@ -489,6 +489,8 @@ Codex supports running connected app-server and exec-server on different operati
   `/home/lucas/work/codex/scripts/build_codex_package.py` and
   `/home/lucas/work/codex/scripts/codex_package/` — release installer and package
   construction owners.
+- `/home/lucas/work/codex/codex-rs/ext/computer-use/AGENTS.md` — Computer Use
+  extension crate, vendored payload provenance, and future MCP sidecar owner.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — TUI bottom-pane
   subtree instruction owner.
 

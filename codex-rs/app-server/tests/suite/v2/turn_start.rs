@@ -64,6 +64,8 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_app_server_protocol::WarningNotification;
+use codex_computer_use_extension::CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR;
+use codex_computer_use_extension::CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR;
 use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
@@ -450,6 +452,7 @@ async fn turn_start_sends_originator_header() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Personality)
         .write(codex_home.path())?;
 
@@ -519,6 +522,7 @@ async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Personality)
         .write(codex_home.path())?;
 
@@ -597,6 +601,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Personality)
         .write(codex_home.path())?;
     write_models_cache(codex_home.path())?;
@@ -680,6 +685,64 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
         !body_contains(request, "- alpha-skill:") && !body_contains(request, "- beta-skill:"),
         "expected trimmed skills to be omitted from the outgoing request body"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_emits_warning_when_computer_use_runtime_is_unavailable() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, body).await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::ComputerUse)
+        .write(codex_home.path())?;
+    write_models_cache(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp.start_thread(ThreadStartParams::default()).await?;
+
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "Hello".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let warning: WarningNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("warning")).await??;
+    assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
+    assert!(warning.message.starts_with("Computer Use is unavailable: "));
+    assert!(warning.message.contains(CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR));
+    assert!(warning.message.contains(CODEX_COMPUTER_USE_SKY_BIN_ENV_VAR));
+    assert!(
+        warning
+            .message
+            .contains("source/development execution only")
+    );
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
 
     Ok(())
 }

@@ -90,7 +90,7 @@ async fn recommended_plugins_after_external_login(
     std::fs::write(
         config_path,
         format!(
-            "{config}\n[features]\napps = true\nplugins = true\ntool_suggest = {tool_suggest_enabled}\n{recommended_plugins_config}"
+            "{config}\n[features]\napps = true\ncomputer_use = false\nplugins = true\ntool_suggest = {tool_suggest_enabled}\n{recommended_plugins_config}"
         ),
     )?;
 

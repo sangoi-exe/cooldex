@@ -1,0 +1,7 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    name = "computer-use",
+    compile_data = glob(["vendor/openai/**"]),
+    crate_name = "codex_computer_use_extension",
+)

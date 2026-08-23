@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "source_package": {
+    "identity": "OpenAI.Codex_26.727.6591.0_x64__2p2nqsd0c76g0",
+    "package_version": "26.727.6591.0",
+    "plugin_version": "26.727.51351",
+    "sky_version": "0.6.2",
+    "cua_version": "0.1.1",
+    "cua_runtime_manifest": "0.0.6/20260723162306-088049353ddc"
+  },
+  "recovered_frontier": {
+    "current_windowsapps_identity": "OpenAI.Codex_26.818.5229.0_x64__2p2nqsd0c76g0",
+    "desktop_runtime_cache_root": "C:/Users/lucas/AppData/Local/OpenAI/Codex/runtimes/cua_node/fb8898c05a62885e/bin/node_modules/@oai/sky",
+    "bundled_marketplace_root": "C:/Users/lucas/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use",
+    "log_evidence": [
+      {
+        "path": "C:/Users/lucas/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0/LocalCache/Local/Codex/Logs/2026/08/04/codex-desktop-c5922436-5017-4f10-912d-5636315887e3-75188-t0-i1-123003-0.log",
+        "fact": "stdio_transport_spawned from the pinned 26.727.6591.0 WindowsApps path and bundled marketplace copied from the pinned source root"
+      },
+      {
+        "path": "C:/Users/lucas/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0/LocalCache/Local/Codex/Logs/2026/08/05/codex-desktop-c5922436-5017-4f10-912d-5636315887e3-75188-t0-i1-000032-0.log",
+        "fact": "windows-store-updater reported buildVersion=26.727.6591.0"
+      }
+    ]
+  },
+  "extracted_at_utc": "2026-08-22T22:52:25.264299Z",
+  "license_warning": "Proprietary upstream payload. Local repository versioning is authorized for this task. External publication or redistribution is not authorized by this artifact.",
+  "current_user_authorization": "The current user explicitly authorized copying every necessary installed Windows artifact into this repository for local versioning.",
+  "publication_status": "Local-only. Any remote release, push, or redistribution requires a future explicit user decision.",
+  "artifacts": [
+    {
+      "relative_path": "sky/0.6.2/bin/linux/sky_linux_x64",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/bin/linux/sky_linux_x64",
+      "bytes": 2909128,
+      "sha256": "6ab59cabc5b817791c2d58d643d3046c6617b1d4aa5d6e01b956c7c36818011d",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/package.json",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/package.json",
+      "bytes": 1103,
+      "sha256": "6fcd0ef7d0b746dfbeedce74a862d88c5bbf6c5e595c20862feb53265b603b3f",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/README.md",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/README.md",
+      "bytes": 5716,
+      "sha256": "38edfba326c9ea3c36ac78d38b228a35f7a1ccafd4a762817deae78ce7acf80d",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/docs/sky-full-desktop-api.md",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/docs/sky-full-desktop-api.md",
+      "bytes": 2940,
+      "sha256": "a8dc0d1ccbe9c9419972e9858e13dd16b97b508b6ba8a78a23140ef0d0f4fbd0",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/reference/linux/sky_linux.js",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/dist/project/cua/sky_js/src/targets/linux/sky_linux.js",
+      "bytes": 777,
+      "sha256": "8c95f7b93eb7b69351b7ab87e19ebbed29035dd5a043c2b058cf0fff3ea905df",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/reference/linux/get_screenshot.js",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/dist/project/cua/sky_js/src/targets/linux/get_screenshot.js",
+      "bytes": 621,
+      "sha256": "bbd1595aaced28b467a6e58b686577c0f8a8abb5fc42387c392ccd164a30bdda",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/reference/linux/post_action_sleep.js",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/dist/project/cua/sky_js/src/targets/linux/post_action_sleep.js",
+      "bytes": 389,
+      "sha256": "ce1c25bacf9c7ecb344fa1f4a9400e2a63ec1855d429cfad1a1241365f48e452",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "sky/0.6.2/reference/full-desktop/Options.d.ts",
+      "source_package_relative_path": "resources/cua_node/bin/node_modules/@oai/sky/dist/project/cua/sky_js/src/types/full-desktop/Options.d.ts",
+      "bytes": 391,
+      "sha256": "d35e0d89f0e4642309e56cb603983d2aa45e6d6d3cf8560d5810a04ab92baf0f",
+      "recovered_from": "desktop_runtime_cache"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/.codex-plugin/plugin.json",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/.codex-plugin/plugin.json",
+      "bytes": 1730,
+      "sha256": "e81279cb0e9939c0edf2936b626d4c39a4a57333219d589c8e3d33758adbb50a",
+      "recovered_from": "bundled_marketplace_copy"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/skills/computer-use/SKILL.md",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/skills/computer-use/SKILL.md",
+      "bytes": 1619,
+      "sha256": "0be0ff2686142b486597cbe0ad2050007a32bc0211c6c605e0a12ce9b00876ad",
+      "recovered_from": "bundled_marketplace_copy"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/docs/api.md",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/docs/api.md",
+      "bytes": 8207,
+      "sha256": "cfb5535a75b568e7325ce1279ef703fb67c490b75ae9c052199fc0fd036d0725",
+      "recovered_from": "bundled_marketplace_copy"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/docs/guidance.md",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/docs/guidance.md",
+      "bytes": 14166,
+      "sha256": "81b412ae2e9aae65aeef0e60517b32d51ce2c91ba65120d8139d416933a56676",
+      "recovered_from": "bundled_marketplace_copy"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/docs/confirmations.md",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/docs/confirmations.md",
+      "bytes": 4722,
+      "sha256": "ddb0c90c80344b1dac8d0c5f97e4a827532391e25502f1f990da28a0e414fd16",
+      "recovered_from": "bundled_marketplace_copy"
+    },
+    {
+      "relative_path": "computer-use-plugin/26.727.51351/scripts/computer-use-client.mjs",
+      "source_package_relative_path": "resources/plugins/openai-bundled/plugins/computer-use/scripts/computer-use-client.mjs",
+      "bytes": 10638,
+      "sha256": "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e",
+      "recovered_from": "bundled_marketplace_copy"
+    }
+  ]
+}
