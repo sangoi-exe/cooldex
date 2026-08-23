@@ -84,23 +84,49 @@ pub enum ScrollDirection {
 #[serde(deny_unknown_fields)]
 pub struct ClickArgs {
     #[serde(default)]
+    #[schemars(
+        description = "Optional positive click count. Omit to use the runtime default of one click."
+    )]
     pub click_count: Option<u32>,
     #[serde(default)]
+    #[schemars(description = "Optional X11 keysym-style key or chord to hold while clicking.")]
     pub key: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Optional mouse button. Omit to use the runtime default left button."
+    )]
     pub mouse_button: Option<MouseButton>,
+    #[schemars(
+        description = "Required desktop X coordinate within the 1440 by 900 Computer Use display."
+    )]
     pub x: i32,
+    #[schemars(
+        description = "Required desktop Y coordinate within the 1440 by 900 Computer Use display."
+    )]
     pub y: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DragArgs {
+    #[schemars(
+        description = "Required starting desktop X coordinate within the 1440 by 900 display."
+    )]
     pub from_x: i32,
+    #[schemars(
+        description = "Required starting desktop Y coordinate within the 1440 by 900 display."
+    )]
     pub from_y: i32,
     #[serde(default)]
+    #[schemars(description = "Optional X11 keysym-style key or chord to hold during the drag.")]
     pub key: Option<String>,
+    #[schemars(
+        description = "Required destination desktop X coordinate within the 1440 by 900 display."
+    )]
     pub to_x: i32,
+    #[schemars(
+        description = "Required destination desktop Y coordinate within the 1440 by 900 display."
+    )]
     pub to_y: i32,
 }
 
@@ -108,34 +134,56 @@ pub struct DragArgs {
 #[serde(deny_unknown_fields)]
 pub struct MoveArgs {
     #[serde(default)]
+    #[schemars(
+        description = "Optional X11 keysym-style key or chord to hold while moving the pointer."
+    )]
     pub key: Option<String>,
+    #[schemars(
+        description = "Required destination desktop X coordinate within the 1440 by 900 display."
+    )]
     pub x: i32,
+    #[schemars(
+        description = "Required destination desktop Y coordinate within the 1440 by 900 display."
+    )]
     pub y: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PressKeyArgs {
+    #[schemars(
+        description = "Required X11 keysym-style key or plus-separated chord, for example Return or Control_L+Shift_L+period."
+    )]
     pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScrollArgs {
+    #[schemars(description = "Required scroll direction.")]
     pub direction: ScrollDirection,
     #[serde(default)]
+    #[schemars(description = "Optional X11 keysym-style key or chord to hold while scrolling.")]
     pub key: Option<String>,
     #[serde(default)]
+    #[schemars(description = "Optional positive scroll distance in pixels.")]
     pub pixels: Option<u32>,
     #[serde(default)]
+    #[schemars(
+        description = "Optional desktop X coordinate. Supply both x and y together when targeting a specific origin point."
+    )]
     pub x: Option<i32>,
     #[serde(default)]
+    #[schemars(
+        description = "Optional desktop Y coordinate. Supply both x and y together when targeting a specific origin point."
+    )]
     pub y: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeTextArgs {
+    #[schemars(description = "Required literal text to type into the current focus.")]
     pub text: String,
 }
 

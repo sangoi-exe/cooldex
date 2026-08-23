@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use pretty_assertions::assert_eq;
+use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::ToolAnnotations;
+use serde_json::Value;
 use serde_json::json;
 
+use crate::ComputerUseServer;
 use crate::computer_use_tools;
 use crate::dispatch_tool_call;
 use crate::protocol::CLICK_TOOL_NAME;
@@ -67,6 +70,15 @@ fn tool_inventory_matches_contract() {
         .iter()
         .map(|tool| tool.name.as_ref().to_string())
         .collect::<Vec<_>>();
+    let descriptions = tools
+        .iter()
+        .map(|tool| {
+            tool.description
+                .as_ref()
+                .expect("tool description")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
 
     assert_eq!(
         names,
@@ -81,6 +93,21 @@ fn tool_inventory_matches_contract() {
             SCROLL_TOOL_NAME.to_string(),
             TYPE_TEXT_TOOL_NAME.to_string(),
             STOP_TOOL_NAME.to_string(),
+        ]
+    );
+    assert_eq!(
+        descriptions,
+        vec![
+            "Start or reuse the owned Computer Use desktop session. Call this before get_environment, get_screenshot, or any input tool.".to_string(),
+            "Return DISPLAY and XAUTHORITY for the running Computer Use session so shell or exec can launch GUI apps into this desktop.".to_string(),
+            "Capture the current desktop as an original-detail JPEG. Use this to observe state before coordinate-based input and again after each mutating action.".to_string(),
+            "Click one desktop coordinate in the Computer Use display, then refresh your observation before the next action.".to_string(),
+            "Drag from one desktop coordinate to another in the Computer Use display, then refresh your observation before the next action.".to_string(),
+            "Move the pointer to one desktop coordinate in the Computer Use display. Treat hover or focus changes as state changes and refresh before the next action.".to_string(),
+            "Press one X11 keysym-style key or chord in the Computer Use display, then refresh your observation before the next action.".to_string(),
+            "Scroll inside the Computer Use display by direction and optional coordinate, then refresh your observation before the next action.".to_string(),
+            "Type literal text into the current focus in the Computer Use display. Verify focus first, then refresh your observation after typing.".to_string(),
+            "Stop and clean up the owned Computer Use desktop session when you are done.".to_string(),
         ]
     );
 
@@ -142,6 +169,62 @@ fn tool_inventory_matches_contract() {
         .map(|tool| tool.annotations.clone().expect("tool annotations"))
         .collect::<Vec<_>>();
     assert_eq!(annotations, expected_annotations);
+}
+
+#[test]
+fn server_info_instructions_match_operating_sequence() {
+    let runtime = FakeRuntime::success(ComputerUseOutput::Stopped {
+        session_id: "session-seq".to_string(),
+    });
+    let server = ComputerUseServer::new(runtime);
+    let info = server.get_info();
+
+    assert_eq!(
+        info.instructions.as_deref(),
+        Some(
+            "Use these tools to control the owned WSL/Linux Computer Use desktop. Call start first. Use get_environment before launching GUI apps through shell or exec into the returned DISPLAY and XAUTHORITY. Use get_screenshot to observe before coordinate-based input, perform one mutating action at a time, then observe again instead of reusing stale coordinates or focus assumptions. Call stop when you are done with the session."
+        )
+    );
+}
+
+#[test]
+fn input_schemas_expose_local_contract_descriptions() {
+    let tools = computer_use_tools();
+    let click_tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == CLICK_TOOL_NAME)
+        .expect("click tool");
+    let scroll_tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == SCROLL_TOOL_NAME)
+        .expect("scroll tool");
+    let type_text_tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == TYPE_TEXT_TOOL_NAME)
+        .expect("type_text tool");
+
+    assert_eq!(
+        schema_property_description(click_tool.input_schema.as_ref(), "x"),
+        Some("Required desktop X coordinate within the 1440 by 900 Computer Use display.")
+    );
+    assert_eq!(
+        schema_property_description(click_tool.input_schema.as_ref(), "y"),
+        Some("Required desktop Y coordinate within the 1440 by 900 Computer Use display.")
+    );
+    assert_eq!(
+        schema_property_description(scroll_tool.input_schema.as_ref(), "pixels"),
+        Some("Optional positive scroll distance in pixels.")
+    );
+    assert_eq!(
+        schema_property_description(scroll_tool.input_schema.as_ref(), "x"),
+        Some(
+            "Optional desktop X coordinate. Supply both x and y together when targeting a specific origin point."
+        )
+    );
+    assert_eq!(
+        schema_property_description(type_text_tool.input_schema.as_ref(), "text"),
+        Some("Required literal text to type into the current focus.")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -265,6 +348,19 @@ async fn dispatch_maps_parse_failures_to_invalid_argument_without_runtime_call()
 
 fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     value.as_object().expect("object arguments").clone()
+}
+
+fn schema_property_description<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    property: &str,
+) -> Option<&'a str> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
 }
 
 fn valid_jpeg(width: u32, height: u32) -> Vec<u8> {

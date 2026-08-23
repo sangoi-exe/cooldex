@@ -43,6 +43,32 @@ use crate::protocol::TYPE_TEXT_TOOL_NAME;
 use crate::protocol::TypeTextArgs;
 use crate::sky::screenshot_content_block;
 
+const COMPUTER_USE_SERVER_INSTRUCTIONS: &str = "Use these tools to control the owned WSL/Linux Computer Use desktop. Call start first. \
+Use get_environment before launching GUI apps through shell or exec into the returned DISPLAY \
+and XAUTHORITY. Use get_screenshot to observe before coordinate-based input, perform one \
+mutating action at a time, then observe again instead of reusing stale coordinates or focus \
+assumptions. Call stop when you are done with the session.";
+const START_TOOL_DESCRIPTION: &str = "Start or reuse the owned Computer Use desktop session. Call this before get_environment, \
+get_screenshot, or any input tool.";
+const GET_ENVIRONMENT_TOOL_DESCRIPTION: &str = "Return DISPLAY and XAUTHORITY for the running Computer Use session so shell or exec can \
+launch GUI apps into this desktop.";
+const GET_SCREENSHOT_TOOL_DESCRIPTION: &str = "Capture the current desktop as an original-detail JPEG. Use this to observe state before \
+coordinate-based input and again after each mutating action.";
+const CLICK_TOOL_DESCRIPTION: &str = "Click one desktop coordinate in the Computer Use display, then refresh your observation \
+before the next action.";
+const DRAG_TOOL_DESCRIPTION: &str = "Drag from one desktop coordinate to another in the Computer Use display, then refresh your \
+observation before the next action.";
+const MOVE_TOOL_DESCRIPTION: &str = "Move the pointer to one desktop coordinate in the Computer Use display. Treat hover or \
+focus changes as state changes and refresh before the next action.";
+const PRESS_KEY_TOOL_DESCRIPTION: &str = "Press one X11 keysym-style key or chord in the Computer Use display, then refresh your \
+observation before the next action.";
+const SCROLL_TOOL_DESCRIPTION: &str = "Scroll inside the Computer Use display by direction and optional coordinate, then refresh \
+your observation before the next action.";
+const TYPE_TEXT_TOOL_DESCRIPTION: &str = "Type literal text into the current focus in the Computer Use display. Verify focus first, \
+then refresh your observation after typing.";
+const STOP_TOOL_DESCRIPTION: &str =
+    "Stop and clean up the owned Computer Use desktop session when you are done.";
+
 /// Runtime owner for the Computer Use MCP surface.
 ///
 /// Implementations receive already-parsed tool requests and return stable
@@ -87,9 +113,8 @@ where
     Runtime: ComputerUseRuntime,
 {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Use these tools to control the Computer Use virtual desktop. Call start before get_environment, then launch GUI apps into the returned DISPLAY and XAUTHORITY through shell or exec.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(COMPUTER_USE_SERVER_INSTRUCTIONS)
     }
 
     fn list_tools(
@@ -114,7 +139,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
     vec![
         tool_definition::<StartArgs>(
             START_TOOL_NAME,
-            "Start the Computer Use virtual desktop. Call this before launching GUI applications.",
+            START_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -123,7 +148,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<GetEnvironmentArgs>(
             GET_ENVIRONMENT_TOOL_NAME,
-            "Return the DISPLAY and XAUTHORITY environment for the running Computer Use desktop.",
+            GET_ENVIRONMENT_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(true)
                 .destructive(false)
@@ -132,7 +157,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<GetScreenshotArgs>(
             GET_SCREENSHOT_TOOL_NAME,
-            "Capture the current Computer Use desktop screenshot as an original-detail JPEG.",
+            GET_SCREENSHOT_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(true)
                 .destructive(false)
@@ -141,7 +166,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<ClickArgs>(
             CLICK_TOOL_NAME,
-            "Click at a desktop coordinate in the Computer Use display.",
+            CLICK_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -150,7 +175,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<DragArgs>(
             DRAG_TOOL_NAME,
-            "Drag from one desktop coordinate to another in the Computer Use display.",
+            DRAG_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -159,7 +184,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<MoveArgs>(
             MOVE_TOOL_NAME,
-            "Move the pointer to a desktop coordinate in the Computer Use display.",
+            MOVE_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -168,7 +193,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<PressKeyArgs>(
             PRESS_KEY_TOOL_NAME,
-            "Press an X11 keysym-style key or chord in the Computer Use display.",
+            PRESS_KEY_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -177,7 +202,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<ScrollArgs>(
             SCROLL_TOOL_NAME,
-            "Scroll inside the Computer Use display by direction, optionally from a coordinate.",
+            SCROLL_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -186,7 +211,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<TypeTextArgs>(
             TYPE_TEXT_TOOL_NAME,
-            "Type text into the current focus in the Computer Use display.",
+            TYPE_TEXT_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
@@ -195,7 +220,7 @@ pub fn computer_use_tools() -> Vec<Tool> {
         ),
         tool_definition::<StopArgs>(
             STOP_TOOL_NAME,
-            "Stop the owned Computer Use virtual desktop session.",
+            STOP_TOOL_DESCRIPTION,
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
