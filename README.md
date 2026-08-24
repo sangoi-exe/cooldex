@@ -32,6 +32,24 @@ The WSL/Linux x86_64 release contains exactly:
 
 </details>
 
+### Cooldex fork inventory
+
+Cooldex tracks its upstream baseline and keeps a small local surface for bounded
+current-thread `recall`, post-compaction continuity, MultiAgentV2 controls, a
+local app-server child, a source/development Computer Use island, and the
+full-Responses override for the GPT-5.6 model family. Local operator support
+includes `cargo-guard` and separate `codex`, `cdx`, and `cdx-dev` command lanes.
+
+`codex` is the regular stable lane. `cdx` selects the standalone package lane
+for QA and promotion checks. `cdx-dev` is the development-session lane. These
+roles support local workflow; they do not define separate deployment
+environments. Release and cross-machine installation remain in the source tree
+as a future retirement candidate. This inventory does not remove or change them.
+
+The detailed current inventory is maintained in the companion `.sangoi`
+repository at `reference/areas/cooldex-fork-feature-inventory.md`. It records
+source owners and evidence limits. It is not a release or shipped-status ledger.
+
 ### Using Codex with your ChatGPT plan
 
 Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).

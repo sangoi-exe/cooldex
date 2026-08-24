@@ -515,6 +515,8 @@ Codex supports running connected app-server and exec-server on different operati
   and stable root owner map.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` —
   product requirements, architecture boundaries, and shipped-status interpretation.
+- `/home/lucas/work/codex/.sangoi/reference/areas/cooldex-fork-feature-inventory.md` —
+  detailed current fork-feature inventory, operator-support layout, and evidence limits.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`,
   `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
   `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust
