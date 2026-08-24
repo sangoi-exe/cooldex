@@ -113,6 +113,14 @@
   run, benchmark, and generator command through `./scripts/cargo-guard.sh` or a root
   `just` recipe that delegates to that wrapper. Raw Cargo execution is not valid Cooldex
   workspace evidence.
+- If a guarded local WSL build hits the upstream `rusty_v8` prebuilt `404` path, do not
+  invent a mirror or a broad local compatibility route. Read the current owners first:
+  `third_party/v8/README.md`, `scripts/codex_package/v8.py`, and
+  `scripts/cargo-validation.toml`. Those owners define the paired
+  `RUSTY_V8_ARCHIVE` plus `RUSTY_V8_SRC_BINDING_PATH` route for package/release/CI
+  flows, require an exact `codex-rs/Cargo.lock` version match, and already register the
+  guarded host-artifact command `first-party-runtime-support-bins` with
+  `codex_v8_target = "host"`. Keep this root note at owner-pointer altitude only.
 - `scripts/cargo-validation.toml` owns resource profiles, job caps, one-thread runtime-test
   limits, and receipt placement under `.sangoi/validation/`. Missing guard, policy,
   profile, or receipt ownership fails closed.
