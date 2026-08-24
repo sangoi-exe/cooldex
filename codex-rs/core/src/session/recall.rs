@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use codex_history::CompactedItem;
 use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
@@ -113,15 +111,7 @@ struct RecallDocument<'a> {
     diagnostic_message: Option<&'a str>,
     truncated: bool,
     omitted_groups: usize,
-    excluded_native_continuity_pairs: usize,
     groups: &'a [RecallGroup],
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum PairKey {
-    Function(String),
-    Custom(String),
-    ToolSearch(String),
 }
 
 impl Session {
@@ -334,11 +324,6 @@ impl Session {
             .map_err(RecallContextError::from);
         }
 
-        let native_continuity_pairs = compacted
-            .replacement_history
-            .as_deref()
-            .map(complete_native_continuity_pair_keys)
-            .unwrap_or_default();
         let retained_user_messages = compacted
             .replacement_history
             .as_deref()
@@ -352,7 +337,6 @@ impl Session {
                 )
             })
             .collect::<Vec<_>>();
-        let excluded_native_continuity_pairs = native_continuity_pairs.len();
         let recall_delta = self
             .reconstruct_history_from_rollout(
                 turn_context,
@@ -390,24 +374,14 @@ impl Session {
                             _ => false,
                         });
                 !duplicates_retained_user
-                    && call_pair_key(item)
-                        .or_else(|| output_pair_key(item))
-                        .is_none_or(|key| !native_continuity_pairs.contains(&key))
             })
             .map(ResponseItemEnvelope::into_item)
             .collect();
         let (groups, incomplete_groups) =
             group_history(history).map_err(RecallContextError::from)?;
         let boundary = recall_boundary(boundary_index, compacted);
-        available_context(
-            &thread_id,
-            source,
-            &boundary,
-            groups,
-            incomplete_groups,
-            excluded_native_continuity_pairs,
-        )
-        .map_err(RecallContextError::from)
+        available_context(&thread_id, source, &boundary, groups, incomplete_groups)
+            .map_err(RecallContextError::from)
     }
 }
 
@@ -442,7 +416,6 @@ fn unavailable_context(
         diagnostic_message,
         truncated: false,
         omitted_groups: 0,
-        excluded_native_continuity_pairs: 0,
         groups: &[],
     };
     let serialized = serde_json::to_string(&document)?;
@@ -471,7 +444,6 @@ fn unavailable_context(
         diagnostic_message: Some(RECALL_METADATA_OMITTED_MESSAGE),
         truncated: true,
         omitted_groups: 0,
-        excluded_native_continuity_pairs: 0,
         groups: &[],
     };
     let serialized = serde_json::to_string(&fallback)?;
@@ -487,7 +459,6 @@ fn available_context(
     boundary: &RecallBoundary,
     groups: Vec<RecallGroup>,
     incomplete_groups: usize,
-    excluded_native_continuity_pairs: usize,
 ) -> anyhow::Result<RecallContext> {
     let mut selected_start = groups.len();
     let mut selected_count = 0_usize;
@@ -503,7 +474,6 @@ fn available_context(
             diagnostic_message: None,
             truncated: omitted_groups > 0,
             omitted_groups,
-            excluded_native_continuity_pairs,
             groups: &groups[proposed_start..],
         };
         let serialized = serde_json::to_string(&document)?;
@@ -524,7 +494,6 @@ fn available_context(
         diagnostic_message: None,
         truncated: omitted_groups > 0,
         omitted_groups,
-        excluded_native_continuity_pairs,
         groups: &groups[selected_start..],
     };
     let serialized = serde_json::to_string(&document)?;
@@ -589,26 +558,6 @@ fn bounded_diagnostic_message(message: &str) -> String {
     format!("{}...", &message[..end])
 }
 
-fn complete_native_continuity_pair_keys(items: &[ResponseItemEnvelope]) -> HashSet<PairKey> {
-    let Some(compaction_index) = items
-        .iter()
-        .rposition(|item| matches!(&item.item, ResponseItem::Compaction { .. }))
-    else {
-        return HashSet::new();
-    };
-    let mut calls = HashSet::new();
-    let mut outputs = HashSet::new();
-    for item in &items[compaction_index + 1..] {
-        if let Some(key) = call_pair_key(item) {
-            calls.insert(key);
-        }
-        if let Some(key) = output_pair_key(item) {
-            outputs.insert(key);
-        }
-    }
-    calls.intersection(&outputs).cloned().collect()
-}
-
 fn group_history(items: Vec<ResponseItem>) -> anyhow::Result<(Vec<RecallGroup>, usize)> {
     let mut groups = Vec::new();
     let mut incomplete_groups = 0_usize;
@@ -644,42 +593,11 @@ fn group_history(items: Vec<ResponseItem>) -> anyhow::Result<(Vec<RecallGroup>, 
                 }
             }
             ToolItemKind::Output | ToolItemKind::UnsupportedOutput => {
-                let key = output_pair_key(&items[index]);
-                anyhow::bail!("historical tool output precedes its batch call: {key:?}");
+                anyhow::bail!("historical tool output precedes its batch call");
             }
         }
     }
     Ok((groups, incomplete_groups))
-}
-
-fn call_pair_key(item: &ResponseItem) -> Option<PairKey> {
-    match item {
-        ResponseItem::FunctionCall { call_id, .. } => Some(PairKey::Function(call_id.clone())),
-        ResponseItem::LocalShellCall {
-            call_id: Some(call_id),
-            ..
-        } => Some(PairKey::Function(call_id.clone())),
-        ResponseItem::CustomToolCall { call_id, .. } => Some(PairKey::Custom(call_id.clone())),
-        ResponseItem::ToolSearchCall {
-            call_id: Some(call_id),
-            ..
-        } => Some(PairKey::ToolSearch(call_id.clone())),
-        _ => None,
-    }
-}
-
-fn output_pair_key(item: &ResponseItem) -> Option<PairKey> {
-    match item {
-        ResponseItem::FunctionCallOutput { call_id, .. } => call_id.clone().map(PairKey::Function),
-        ResponseItem::CustomToolCallOutput { call_id, .. } => {
-            Some(PairKey::Custom(call_id.clone()))
-        }
-        ResponseItem::ToolSearchOutput {
-            call_id: Some(call_id),
-            ..
-        } => Some(PairKey::ToolSearch(call_id.clone())),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

@@ -461,7 +461,7 @@ async fn excludes_a_user_message_already_retained_by_the_current_replacement() {
 }
 
 #[tokio::test]
-async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start() {
+async fn bounded_history_reaches_previous_compaction_without_reaching_session_start() {
     const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
     const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
     let (session, turn_context) = make_session_and_context().await;
@@ -498,15 +498,11 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
             rollout_response_item(output.clone()),
             compacted_window(
                 "latest",
-                vec![
-                    ResponseItem::Compaction {
-                        id: None,
-                        encrypted_content: "opaque".to_string(),
-                        internal_chat_message_metadata_passthrough: None,
-                    },
-                    call,
-                    output,
-                ],
+                vec![ResponseItem::Compaction {
+                    id: None,
+                    encrypted_content: "opaque".to_string(),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
                 2,
                 FIRST_WINDOW_ID,
                 Some(FIRST_WINDOW_ID),
@@ -525,11 +521,23 @@ async fn bounded_tail_reaches_previous_compaction_without_reaching_session_start
     assert_eq!(value["availability"], "available");
     assert_eq!(value["source"]["reached_start"], false);
     assert_eq!(value["source"]["reached_recall_origin"], true);
-    assert_eq!(value["excluded_native_continuity_pairs"], 1);
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
+    assert!(value.get("excluded_native_continuity_pairs").is_none());
+    assert_eq!(value["groups"].as_array().expect("groups").len(), 2);
     assert_eq!(
         value["groups"][0]["items"][0]["content"][0]["text"],
         "between compactions"
+    );
+    assert_eq!(
+        value["groups"][1]["items"]
+            .as_array()
+            .expect("complete historical tool batch")
+            .iter()
+            .map(|item| (item["type"].as_str(), item["call_id"].as_str(),))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("function_call"), Some("continuity-call")),
+            (Some("function_call_output"), Some("continuity-call")),
+        ]
     );
 }
 

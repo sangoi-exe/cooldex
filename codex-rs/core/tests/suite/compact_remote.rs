@@ -4377,50 +4377,8 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
                 compaction_index < recall_index && recall_index < recovery_index
             })
             && compaction_index < recovery_index
-            && recovery_index + 1 < post_compact_input.len(),
-        "expected historical user < compaction < optional recall < recovery directive < native tool batch"
-    );
-    let native_batch = &post_compact_input[recovery_index + 1..];
-    assert_eq!(native_batch.len(), 4);
-    assert_eq!(
-        native_batch
-            .iter()
-            .take(2)
-            .map(|item| (
-                item.get("type").and_then(Value::as_str),
-                item.get("call_id").and_then(Value::as_str),
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (Some("function_call"), Some("call-before-compact-1")),
-            (Some("function_call"), Some("call-before-compact-2")),
-        ],
-        "parallel native calls should remain ordered and contiguous after the directive"
-    );
-    let mut output_call_ids = native_batch
-        .iter()
-        .skip(2)
-        .map(|item| {
-            assert_eq!(
-                item.get("type").and_then(Value::as_str),
-                Some("function_call_output")
-            );
-            item.get("call_id")
-                .and_then(Value::as_str)
-                .expect("native continuity tool output call id")
-        })
-        .collect::<Vec<_>>();
-    output_call_ids.sort_unstable();
-    assert_eq!(
-        output_call_ids,
-        vec!["call-before-compact-1", "call-before-compact-2"],
-        "parallel native outputs should remain complete and contiguous after the directive"
-    );
-    assert!(
-        !post_compact_input[recovery_index + 1..]
-            .iter()
-            .any(|item| item.get("role").and_then(Value::as_str) == Some("user")),
-        "no historical user-authority item may follow the recovery directive"
+            && recovery_index + 1 == post_compact_input.len(),
+        "expected historical user < compaction < optional recall < recovery directive, with no native tool batch"
     );
 
     Ok(())
@@ -4524,11 +4482,7 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    for (request_index, call_id) in [
-        (2, "call-before-compact-1"),
-        (4, "call-before-compact-2"),
-        (6, "call-before-compact-3"),
-    ] {
+    for request_index in [2, 4, 6] {
         let input = requests[request_index].input();
         let retained_user_index = input
             .iter()
@@ -4554,21 +4508,6 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
                         .is_some_and(|text| text.starts_with("<post_compact_recovery>"))
             })
             .expect("developer recovery directive");
-        let tool_call_index = input
-            .iter()
-            .position(|item| {
-                item.get("type").and_then(Value::as_str) == Some("function_call")
-                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
-            })
-            .expect("native continuity tool call");
-        let tool_output_index = input
-            .iter()
-            .position(|item| {
-                item.get("type").and_then(Value::as_str) == Some("function_call_output")
-                    && item.get("call_id").and_then(Value::as_str) == Some(call_id)
-            })
-            .expect("native continuity tool output");
-
         assert!(retained_user_index < compaction_index);
         if let Some((recall_index, recall_item, recall_text)) = recall {
             assert!(compaction_index < recall_index && recall_index < recovery_index);
@@ -4594,13 +4533,10 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
         } else {
             assert!(compaction_index < recovery_index);
         }
-        assert_eq!(tool_call_index, recovery_index + 1);
-        assert_eq!(tool_output_index, tool_call_index + 1);
-        assert!(
-            !input[recovery_index + 1..]
-                .iter()
-                .any(|item| item.get("role").and_then(Value::as_str) == Some("user")),
-            "request {request_index} placed historical user authority after the directive"
+        assert_eq!(
+            recovery_index + 1,
+            input.len(),
+            "request {request_index} appended a native tool batch after the recovery directive"
         );
     }
 

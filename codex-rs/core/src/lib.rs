@@ -29,7 +29,6 @@ pub use turn_metadata::detached_memory_responses_metadata;
 pub use user_message_admission::UserMessageAdmission;
 pub use user_message_admission::UserMessageAdmissionError;
 mod codex_thread;
-mod compact_continuity_tail;
 mod compact_model_fallback;
 mod compact_remote;
 mod compact_remote_history;

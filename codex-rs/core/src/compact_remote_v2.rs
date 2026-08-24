@@ -11,7 +11,6 @@ use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
-use crate::compact_continuity_tail::append_remote_v2_mid_turn_continuity_tail_enveloped;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::should_keep_compacted_history_item;
@@ -297,18 +296,8 @@ async fn run_remote_compact_task_inner_impl(
     let (initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection, new_window_ids)
             .await;
-    let mut new_history =
+    let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
-    if matches!(
-        initial_context_injection,
-        InitialContextInjection::BeforeLastUserMessage { .. }
-    ) {
-        append_remote_v2_mid_turn_continuity_tail_enveloped(
-            &mut new_history,
-            &prompt_input,
-            compaction_turn_context.as_ref(),
-        );
-    }
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
