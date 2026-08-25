@@ -156,6 +156,9 @@ pub struct GuardianV2TranscriptConfigToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuardianV2ReviewScopeConfigToml {
+    /// Restrict asynchronous classification and fast approvals to browser and computer-use tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computer_use_only: Option<bool>,
     /// Include sandboxed shell command calls in Guardian v2 classification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandboxed_exec_commands: Option<bool>,
@@ -338,6 +341,9 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
 pub struct TokenBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Whether to expose the built-in history and notes extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_history_notes_extension: Option<bool>,
     /// Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
@@ -469,6 +475,8 @@ pub struct NetworkProxyConfigToml {
     pub unix_sockets: Option<BTreeMap<String, NetworkProxyUnixSocketPermissionToml>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_local_binding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_broker: Option<bool>,
 }
 
 impl FeatureConfig for NetworkProxyConfigToml {

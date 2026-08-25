@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/compact_remote.rs
+assertion_line: 3650
 expression: "format_labeled_requests_snapshot(\"Remote pre-turn auto-compaction while realtime remains active: compaction clears the reference baseline, so the follow-up request restates realtime-start instructions.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", post_compact_request),])"
 ---
 Scenario: Remote pre-turn auto-compaction while realtime remains active: compaction clears the reference baseline, so the follow-up request restates realtime-start instructions.
@@ -14,9 +15,10 @@ Scenario: Remote pre-turn auto-compaction while realtime remains active: compact
 
 ## Remote Post-Compaction History Layout
 00:compaction:encrypted=true
-01:message/developer:<POST_COMPACT_RECOVERY>
-02:message/developer[2]:
+01:message/assistant:<POST_COMPACT_RECALL>
+02:message/developer:<POST_COMPACT_RECOVERY>
+03:message/developer[2]:
     [01] <realtime_conversation>\nRealtime conversation started.\n\nYou a...
     [02] <PERMISSIONS_INSTRUCTIONS>
-03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
-04:message/user:USER_TWO
+04:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+05:message/user:USER_TWO

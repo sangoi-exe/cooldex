@@ -404,6 +404,7 @@ mod tests {
         let first = RolloutItem::Compacted(CompactedItem {
             message: "first".to_string(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
@@ -413,6 +414,7 @@ mod tests {
         let second = RolloutItem::Compacted(CompactedItem {
             message: "second".to_string(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: None,
             previous_window_id: None,
@@ -477,6 +479,7 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "durable despite metadata failure".to_string(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
@@ -527,6 +530,7 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "must not become visible".to_string(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
@@ -564,6 +568,7 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "flush must fail before metadata projection".to_string(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,

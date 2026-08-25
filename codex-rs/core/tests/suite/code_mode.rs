@@ -3557,36 +3557,6 @@ Total\ output\ lines:\ 1\n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_can_output_serialized_text_via_global_helper() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return structured text",
-        r#"
-text({ json: true });
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let (output, success) = custom_tool_output_body_and_success(&req, "call-1");
-    eprintln!(
-        "hidden dynamic tool raw output: {}",
-        req.custom_tool_call_output("call-1")
-    );
-    assert_ne!(
-        success,
-        Some(false),
-        "exec call failed unexpectedly: {output}"
-    );
-    assert_eq!(output, r#"{"json":true}"#);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_resume_after_set_timeout() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3869,89 +3839,6 @@ async fn code_mode_unified_image_budget_preserves_legacy_contract_for_unsupporte
         .expect("the model request should contain the code-mode exec tool");
     assert!(exec_description.contains("codex/imageDetail"));
     assert!(exec_description.contains("detail?:"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return a remote image",
-        r#"image("https://example.com/image.jpg");"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(true),
-        "code_mode remote image URL unexpectedly succeeded"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        concat!(
-            "Script error:\n",
-            "Tool call failed: remote image URLs are not supported in tool outputs. ",
-            "Pass a base64 data URI instead"
-        )
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_image_helper_rejects_invalid_image_output() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn(
-        &server,
-        "use exec to return an image",
-        r#"
-const s = "Error executing tool exec: Expected at least one message to convert to CallToolResult";
-image(s.trim(), "original");
-"#,
-    )
-    .await?;
-
-    let req = second_mock.single_request();
-    let items = custom_tool_output_items(&req, "call-1");
-    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
-    assert_ne!(
-        success,
-        Some(true),
-        "code_mode invalid image output unexpectedly succeeded"
-    );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"Script failed\nWall time \d+\.\d seconds\nOutput:\n\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
-    assert_eq!(
-        text_item(&items, /*index*/ 1),
-        concat!(
-            "Script error:\n",
-            "Tool call failed: invalid image output. ",
-            "Pass a base64 data URI instead"
-        )
-    );
 
     Ok(())
 }
@@ -4267,8 +4154,11 @@ contentLength=0"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transcript_flags()
--> Result<()> {
+#[test_case("node_repl"; "node_repl")]
+#[test_case("cua_repl"; "cua_repl")]
+async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transcript_flags(
+    repl_server: &'static str,
+) -> Result<()> {
     skip_if_wine_exec!(
         Ok(()),
         "requires a Windows test_stdio_server in the Wine-exec environment"
@@ -4289,14 +4179,14 @@ async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transc
             "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
             "omit_tools_from": ["deferred"],
         }))
-        .expect("valid node_repl MCP server config");
+        .expect("valid REPL MCP server config");
         config
             .mcp_servers
-            .set(HashMap::from([("node_repl".to_owned(), mcp)]))
-            .expect("configure node_repl MCP server");
+            .set(HashMap::from([(repl_server.to_owned(), mcp)]))
+            .expect("configure REPL MCP server");
     });
     let test = builder.build_with_auto_env(&server).await?;
-    core_test_support::wait_for_mcp_server(&test.codex, "node_repl").await?;
+    core_test_support::wait_for_mcp_server(&test.codex, repl_server).await?;
     let evidence = test
         .codex
         .thread_extension_data()
@@ -4310,7 +4200,8 @@ async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transc
                 ev_custom_tool_call(
                     "node-repl-image",
                     "exec",
-                    r#"for (let index = 0; index < 2; index++) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });"#,
+                    &r#"for (let index = 0; index < 2; index++) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });"#
+                        .replace("node_repl", repl_server),
                 ),
                 ev_completed("response-node-repl"),
             ]),
@@ -4339,7 +4230,11 @@ async fn code_mode_node_repl_screenshots_can_be_captured_without_guardian_transc
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled() -> Result<()> {
+#[test_case("node_repl"; "node_repl")]
+#[test_case("cua_repl"; "cua_repl")]
+async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled(
+    repl_server: &'static str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
     skip_if_wine_exec!(
@@ -4377,24 +4272,25 @@ async fn code_mode_node_repl_image_flag_without_enhanced_stays_disabled() -> Res
                 "env": { "MCP_TEST_ENABLE_NODE_REPL_JS": "1" },
                 "omit_tools_from": ["deferred"],
             }))
-            .expect("valid node_repl MCP server config");
+            .expect("valid REPL MCP server config");
             config
                 .mcp_servers
-                .set(HashMap::from([("node_repl".to_owned(), mcp)]))
-                .expect("configure node_repl MCP server");
+                .set(HashMap::from([(repl_server.to_owned(), mcp)]))
+                .expect("configure REPL MCP server");
         });
     let test = builder.build_with_auto_env(&server).await?;
-    wait_for_mcp_server(&test.codex, "node_repl").await?;
+    wait_for_mcp_server(&test.codex, repl_server).await?;
 
     let code = r#"
 await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
 await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
-"#;
+"#
+    .replace("node_repl", repl_server);
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
             sse(vec![
-                ev_custom_tool_call("code-mode-call", "exec", code),
+                ev_custom_tool_call("code-mode-call", "exec", &code),
                 ev_completed("resp-parent"),
             ]),
             sse(vec![
@@ -4405,7 +4301,7 @@ await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated"
         ],
     )
     .await;
-    test.submit_text_turn("review a nested node_repl screenshot")
+    test.submit_text_turn(&format!("review a nested {repl_server} screenshot"))
         .await?;
 
     let requests = response_mock.requests();
@@ -4433,15 +4329,24 @@ await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated"
 
 #[cfg_attr(windows, ignore = "no exec_command on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(false, false, false, None; "disabled")]
-#[test_case(true, false, false, None; "manually_enabled_text_only")]
-#[test_case(true, true, false, None; "manually_enabled_multimodal")]
-#[test_case(false, false, true, None; "required_model_forces_multimodal")]
-#[test_case(true, true, false, Some("unsupported"); "text_fallback_without_image_support")]
-#[test_case(true, true, false, Some("unbounded"); "text_fallback_without_context_bound")]
-#[test_case(true, true, false, Some("small"); "text_fallback_with_insufficient_context")]
-#[test_case(true, true, false, Some("large_prompt"); "images_resume_after_prompt_pressure")]
+#[test_case("node_repl", false, false, false, None; "disabled")]
+#[test_case("node_repl", true, false, false, None; "manually_enabled_text_only")]
+#[test_case("node_repl", true, true, false, None; "manually_enabled_multimodal")]
+#[test_case("node_repl", false, false, true, None; "required_model_forces_multimodal")]
+#[test_case("node_repl", true, true, false, Some("unsupported"); "text_fallback_without_image_support")]
+#[test_case("node_repl", true, true, false, Some("unbounded"); "text_fallback_without_context_bound")]
+#[test_case("node_repl", true, true, false, Some("small"); "text_fallback_with_insufficient_context")]
+#[test_case("node_repl", true, true, false, Some("large_prompt"); "images_resume_after_prompt_pressure")]
+#[test_case("cua_repl", false, false, false, None; "cua_disabled")]
+#[test_case("cua_repl", true, false, false, None; "cua_manually_enabled_text_only")]
+#[test_case("cua_repl", true, true, false, None; "cua_manually_enabled_multimodal")]
+#[test_case("cua_repl", false, false, true, None; "cua_required_model_forces_multimodal")]
+#[test_case("cua_repl", true, true, false, Some("unsupported"); "cua_text_fallback_without_image_support")]
+#[test_case("cua_repl", true, true, false, Some("unbounded"); "cua_text_fallback_without_context_bound")]
+#[test_case("cua_repl", true, true, false, Some("small"); "cua_text_fallback_with_insufficient_context")]
+#[test_case("cua_repl", true, true, false, Some("large_prompt"); "cua_images_resume_after_prompt_pressure")]
 async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+    repl_server: &'static str,
     enhanced_transcripts: bool,
     transcript_images: bool,
     auto_review_required: bool,
@@ -4523,15 +4428,15 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
             config
                 .mcp_servers
                 .set(
-                    ["node_repl", "node_repl_"]
+                    [repl_server.to_owned(), format!("{repl_server}_")]
                         .into_iter()
-                        .map(|name| (name.into(), mcp.clone()))
+                        .map(|name| (name, mcp.clone()))
                         .collect(),
                 )
                 .expect("configure MCP servers");
         });
     let test = builder.build_with_auto_env(&server).await?;
-    wait_for_mcp_server(&test.codex, "node_repl").await?;
+    wait_for_mcp_server(&test.codex, repl_server).await?;
     let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
     let reviewer_images = images_enabled && reviewer_constraint.is_none();
     let snapshot_padding = if images_enabled && reviewer_constraint != Some("large_prompt") {
@@ -4566,6 +4471,7 @@ await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.scree
 if (LARGE_IMAGE) await tools.mcp__node_repl__image({});
 await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_escalated", justification: "review again" });
 "#
+    .replace("node_repl", repl_server)
     .replace("SNAPSHOT_PADDING", &snapshot_padding.to_string())
     .replace("LARGE_IMAGE", &check_detail.to_string());
     let response_mock = responses::mount_sse_sequence(
@@ -4574,7 +4480,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             sse(vec![
                 responses::ev_function_call_with_namespace(
                     "node-repl-call",
-                    "mcp__node_repl",
+                    &format!("mcp__{repl_server}"),
                     "echo",
                     &snapshot_args(DIRECT_NODE_REPL_MIDDLE),
                 ),
@@ -4583,7 +4489,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             sse(vec![
                 responses::ev_function_call_with_namespace(
                     "unrelated-call",
-                    "mcp__node_repl_",
+                    &format!("mcp__{repl_server}_"),
                     "echo",
                     &snapshot_args(DIRECT_UNRELATED_MIDDLE),
                 ),
@@ -4605,7 +4511,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
         ],
     )
     .await;
-    test.submit_text_turn("review a nested node_repl tool response")
+    test.submit_text_turn(&format!("review a nested {repl_server} tool response"))
         .await?;
     let requests = response_mock.requests();
     let guardian_requests = requests
@@ -4617,6 +4523,11 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
     assert_eq!(guardian_requests.len(), 2);
     let guardian_text = guardian_requests[0].message_input_texts("user").concat();
     let evidence_enabled = enhanced_transcripts || auto_review_required;
+    assert_eq!(
+        guardian_text.contains(&format!("tool={repl_server}.js")),
+        evidence_enabled,
+        "private evidence must identify its originating REPL server"
+    );
     for included in [
         DIRECT_NODE_REPL_MIDDLE,
         NODE_REPL_DOM_MIDDLE,

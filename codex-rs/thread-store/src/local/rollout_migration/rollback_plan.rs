@@ -219,7 +219,9 @@ impl RollbackPlanner {
                     self.pending_turn_records.push(index);
                 }
             }
-            RolloutItem::PostCompactRecoveryApplied(_) | RolloutItem::WorldState(_) => {}
+            RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::RealtimeItem(_)
+            | RolloutItem::WorldState(_) => {}
             RolloutItem::SecurityRiskScore(_) => self.record_boundaries[index] = None,
         }
 

@@ -1,6 +1,8 @@
 use super::*;
 use crate::context::ContextualUserFragment;
 use crate::context::RecallContext;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -39,6 +41,14 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
     assert_eq!(context.role(), "developer");
     assert_eq!(recall_context.role(), "assistant");
     assert_eq!(
+        context.content_kind(),
+        ContentItemKind("compaction.post_compact_recovery".to_string())
+    );
+    assert_eq!(
+        recall_context.content_kind(),
+        ContentItemKind("compaction.post_compact_recall".to_string())
+    );
+    assert_eq!(
         recall_item,
         ResponseItem::Message {
             id: None,
@@ -47,7 +57,14 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
                 text: recall_rendered.clone(),
             }],
             phase: None,
-            internal_chat_message_metadata_passthrough: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "compaction.post_compact_recall".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+            ),
         }
     );
     assert_eq!(

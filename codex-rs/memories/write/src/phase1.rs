@@ -417,6 +417,7 @@ mod job {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::PostCompactRecoveryApplied(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,

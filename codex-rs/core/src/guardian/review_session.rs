@@ -17,6 +17,7 @@ use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::items::TurnItem;
+use codex_protocol::mcp::is_node_repl_backed_server;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
@@ -62,6 +63,7 @@ use crate::session::GitEnrichmentPolicy;
 use crate::session::SessionIo;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::state::TurnState;
 use codex_config::types::McpServerConfig;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
@@ -955,7 +957,7 @@ async fn run_review_on_session(
                 && matches!(
                     &params.request,
                     GuardianApprovalRequest::McpToolCall { server, tool_name, .. }
-                        if server == "node_repl" && tool_name == "js"
+                        if is_node_repl_backed_server(server) && tool_name == "js"
                 )
             {
                 let policy = GuardianNodeReplPolicy;
@@ -1273,6 +1275,13 @@ async fn wait_for_guardian_review(
     external_cancel: Option<&CancellationToken>,
     analytics_result: &mut GuardianReviewAnalyticsResult,
 ) -> (GuardianReviewSessionOutcome, bool, bool) {
+    let expected_turn_state = review_session
+        .session
+        .active_turn
+        .lock()
+        .await
+        .turn_state()
+        .cloned();
     let timeout = tokio::time::sleep_until(deadline);
     tokio::pin!(timeout);
     let mut last_error: Option<ErrorEvent> = None;
@@ -1283,6 +1292,7 @@ async fn wait_for_guardian_review(
                 let keep_review_session = interrupt_and_drain_turn(
                     review_session,
                     expected_turn_id,
+                    expected_turn_state.as_ref(),
                 )
                 .await
                 .is_ok();
@@ -1298,6 +1308,7 @@ async fn wait_for_guardian_review(
                 let keep_review_session = interrupt_and_drain_turn(
                     review_session,
                     expected_turn_id,
+                    expected_turn_state.as_ref(),
                 )
                 .await
                 .is_ok();
@@ -1314,6 +1325,12 @@ async fn wait_for_guardian_review(
                             analytics_result.time_to_first_token_ms = turn_complete
                                 .time_to_first_token_ms
                                 .and_then(|ms| u64::try_from(ms).ok());
+                            let keep_review_session =
+                                guardian_turn_retired_before_reuse(
+                                    review_session,
+                                    expected_turn_state.as_ref(),
+                                )
+                                .await;
                             if turn_complete.last_agent_message.is_none()
                                 && let Some(error) = last_error
                             {
@@ -1322,13 +1339,13 @@ async fn wait_for_guardian_review(
                                         error: anyhow!(error.message),
                                         error_info: error.codex_error_info,
                                     },
-                                    true,
+                                    keep_review_session,
                                     true,
                                 );
                             }
                             return (
                                 GuardianReviewSessionOutcome::Completed(Ok(turn_complete.last_agent_message)),
-                                true,
+                                keep_review_session,
                                 true,
                             );
                         }
@@ -1336,7 +1353,17 @@ async fn wait_for_guardian_review(
                             last_error = Some(error);
                         }
                         EventMsg::TurnAborted(_) => {
-                            return (GuardianReviewSessionOutcome::Aborted, true, false);
+                            let keep_review_session =
+                                guardian_turn_retired_before_reuse(
+                                    review_session,
+                                    expected_turn_state.as_ref(),
+                                )
+                                .await;
+                            return (
+                                GuardianReviewSessionOutcome::Aborted,
+                                keep_review_session,
+                                false,
+                            );
                         }
                         _ => {}
                     },
@@ -1350,6 +1377,58 @@ async fn wait_for_guardian_review(
                 }
             }
         }
+    }
+}
+
+async fn guardian_turn_retired_before_reuse(
+    review_session: &GuardianReviewSession,
+    expected_turn_state: Option<&Arc<Mutex<TurnState>>>,
+) -> bool {
+    match tokio::time::timeout(
+        GUARDIAN_INTERRUPT_DRAIN_TIMEOUT,
+        wait_for_guardian_turn_retirement(review_session, expected_turn_state),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            warn!(%err, "guardian review session is not reusable after terminal event");
+            false
+        }
+        Err(_) => {
+            warn!("timed out waiting for guardian reviewer turn retirement");
+            false
+        }
+    }
+}
+
+async fn wait_for_guardian_turn_retirement(
+    review_session: &GuardianReviewSession,
+    expected_turn_state: Option<&Arc<Mutex<TurnState>>>,
+) -> anyhow::Result<()> {
+    let Some(expected_turn_state) = expected_turn_state else {
+        return Ok(());
+    };
+
+    loop {
+        let mut generation_rx = {
+            let slot = review_session.session.active_turn.lock().await;
+            if slot.is_idle() {
+                return Ok(());
+            }
+            let active_turn_state = slot.turn_state().ok_or_else(|| {
+                anyhow!("active guardian turn slot has no turn state during retirement")
+            })?;
+            if !Arc::ptr_eq(active_turn_state, expected_turn_state) {
+                return Err(anyhow!(
+                    "guardian review session advanced to another active turn before the reviewer turn retired"
+                ));
+            }
+            slot.subscribe_generation()
+        };
+        generation_rx.changed().await.map_err(|_| {
+            anyhow!("guardian turn-slot generation channel closed during retirement")
+        })?;
     }
 }
 
@@ -1495,6 +1574,7 @@ async fn run_before_review_deadline_with_cancel<T>(
 async fn interrupt_and_drain_turn(
     review_session: &GuardianReviewSession,
     expected_turn_id: &str,
+    expected_turn_state: Option<&Arc<Mutex<TurnState>>>,
 ) -> anyhow::Result<()> {
     let _ = review_session.io.submit(Op::Interrupt).await;
 
@@ -1509,6 +1589,7 @@ async fn interrupt_and_drain_turn(
                 event.msg,
                 EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
             ) {
+                wait_for_guardian_turn_retirement(review_session, expected_turn_state).await?;
                 return Ok::<(), anyhow::Error>(());
             }
         }
@@ -2301,6 +2382,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_guardian_review_waits_for_exact_turn_retirement() {
+        let (review_session, tx_event, _rx_sub) = test_review_session().await;
+        let session = Arc::clone(&review_session.session);
+        session
+            .active_turn
+            .lock()
+            .await
+            .claim_start("current-turn".to_string())
+            .expect("claim current Guardian turn");
+        tx_event
+            .send(turn_complete_event("current-turn", Some("fresh"), Some(42)))
+            .await
+            .expect("queue current turn completion");
+
+        let review = tokio::spawn(async move {
+            let mut analytics_result = GuardianReviewAnalyticsResult::without_session();
+            let result = wait_for_guardian_review(
+                &review_session,
+                "current-turn",
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                /*external_cancel*/ None,
+                &mut analytics_result,
+            )
+            .await;
+            (result, analytics_result)
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !tx_event.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Guardian completion event should be consumed");
+        assert!(
+            !review.is_finished(),
+            "terminal event must not make the Guardian session reusable before turn retirement"
+        );
+
+        let retired_turn_id = session
+            .active_turn
+            .lock()
+            .await
+            .cancel_unopened_start()
+            .expect("retire current Guardian turn");
+        assert_eq!(retired_turn_id, "current-turn");
+
+        let ((outcome, keep_review_session, capture_token_usage), analytics_result) = review
+            .await
+            .expect("Guardian wait task should complete after turn retirement");
+        let GuardianReviewSessionOutcome::Completed(Ok(last_agent_message)) = outcome else {
+            panic!("expected current turn completion");
+        };
+        assert_eq!(last_agent_message.as_deref(), Some("fresh"));
+        assert_eq!(analytics_result.time_to_first_token_ms, Some(42));
+        assert!(keep_review_session);
+        assert!(capture_token_usage);
+    }
+
+    #[tokio::test]
     async fn wait_for_guardian_review_ignores_prior_turn_errors() {
         let (review_session, tx_event, _rx_sub) = test_review_session().await;
         tx_event
@@ -2497,9 +2637,13 @@ mod tests {
             .await
             .expect("queue current turn abort");
 
-        interrupt_and_drain_turn(&review_session, "current-turn")
-            .await
-            .expect("drain current turn");
+        interrupt_and_drain_turn(
+            &review_session,
+            "current-turn",
+            /*expected_turn_state*/ None,
+        )
+        .await
+        .expect("drain current turn");
 
         assert!(review_session.io.rx_event.try_recv().is_err());
     }

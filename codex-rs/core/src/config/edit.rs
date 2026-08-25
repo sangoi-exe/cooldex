@@ -2,6 +2,7 @@ use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::is_structured_feature_path;
 use codex_config::types::McpServerConfig;
 use codex_config::types::ResumeCwdMode;
 use codex_config::types::SessionPickerViewMode;
@@ -25,6 +26,7 @@ use toml_edit::value;
 
 const NOTICE_TABLE_KEY: &str = "notice";
 
+mod bedrock;
 mod document_helpers;
 
 /// Discrete config mutations supported by the persistence engine.
@@ -323,7 +325,7 @@ impl ConfigDocument {
                 Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
             }
             ConfigEdit::SetPath { segments, value } => {
-                if preserves_nested_feature_config_path(segments) && value.as_bool().is_some() {
+                if is_structured_feature_path(segments) && value.as_bool().is_some() {
                     let mut existing = Some(self.doc.as_item());
                     for segment in segments {
                         existing = existing.and_then(|item| item.as_table_like()?.get(segment));
@@ -336,7 +338,26 @@ impl ConfigDocument {
                 }
                 Ok(self.insert(segments, value.clone()))
             }
-            ConfigEdit::ClearPath { segments } => Ok(self.clear_owned(segments)),
+            ConfigEdit::ClearPath { segments } => {
+                let preserves_broker_settings = is_structured_feature_path(segments)
+                    && segments
+                        .last()
+                        .is_some_and(|feature| feature == "network_proxy")
+                    && segments
+                        .iter()
+                        .try_fold(self.doc.as_item(), |item, segment| {
+                            item.as_table_like()?.get(segment)
+                        })
+                        .and_then(TomlItem::as_table_like)
+                        .is_some_and(|feature| feature.contains_key("credential_broker"));
+                if preserves_broker_settings {
+                    let mut enabled_segments = segments.clone();
+                    enabled_segments.push("enabled".to_string());
+                    Ok(self.insert(&enabled_segments, value(false)))
+                } else {
+                    Ok(self.clear_owned(segments))
+                }
+            }
             ConfigEdit::SetProjectTrustLevel { path, level } => {
                 // Delegate to the existing, tested logic in config.rs to
                 // ensure tables are explicit and migration is preserved.
@@ -618,7 +639,7 @@ impl ConfigDocument {
                     }
 
                     let item = current.get_mut(segment.as_str())?;
-                    if preserves_nested_feature_config_path(&segments[..=index])
+                    if is_structured_feature_path(&segments[..=index])
                         && let Some(enabled) = item.as_bool()
                     {
                         let mut feature = document_helpers::new_implicit_table();
@@ -666,20 +687,6 @@ impl ConfigDocument {
             }
             _ => {}
         }
-    }
-}
-
-fn preserves_nested_feature_config_path(segments: &[String]) -> bool {
-    match segments {
-        [features, feature] => {
-            features == "features" && matches!(feature.as_str(), "multi_agent_v2" | "computer_use")
-        }
-        [profiles, _, features, feature] => {
-            profiles == "profiles"
-                && features == "features"
-                && matches!(feature.as_str(), "multi_agent_v2" | "computer_use")
-        }
-        _ => false,
     }
 }
 
@@ -872,7 +879,7 @@ impl ConfigEditsBuilder {
     /// preserve nested options by writing `enabled = false` when needed.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
         let mut segments = vec!["features".to_string(), key.to_string()];
-        if !enabled && preserves_nested_feature_config_path(&segments) {
+        if !enabled && key != "network_proxy" && is_structured_feature_path(&segments) {
             segments.push("enabled".to_string());
             self.edits.push(ConfigEdit::SetPath {
                 segments,

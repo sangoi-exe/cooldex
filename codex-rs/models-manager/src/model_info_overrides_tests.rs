@@ -13,13 +13,10 @@ use super::remote_model;
 fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
     sol.use_responses_lite = true;
-    sol.supports_parallel_tool_calls = true;
     let mut terra = remote_model("gpt-5.6-terra", "GPT-5.6 Terra", /*priority*/ 9);
     terra.use_responses_lite = true;
-    terra.supports_parallel_tool_calls = true;
     let mut luna = remote_model("gpt-5.6-luna", "GPT-5.6 Luna", /*priority*/ 8);
     luna.use_responses_lite = true;
-    luna.supports_parallel_tool_calls = true;
     let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 7);
     unrelated.use_responses_lite = true;
     let candidates = [sol.clone(), terra.clone(), luna.clone(), unrelated.clone()];

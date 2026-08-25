@@ -1,5 +1,6 @@
 use super::ContextualUserFragment;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -79,6 +80,10 @@ fn built_in_mode_text(multi_agent_mode: &MultiAgentMode) -> &'static str {
 }
 
 impl ContextualUserFragment for MultiAgentModeInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("multi_agent.mode_instructions".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }

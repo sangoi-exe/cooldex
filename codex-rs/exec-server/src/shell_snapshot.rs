@@ -16,6 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::time::Instant;
 
 use crate::FileSystemSandboxContext;
 use crate::local_process::shell_environment_policy;
@@ -31,6 +32,8 @@ const MAX_SNAPSHOT_BYTES: usize = 512 * 1024;
 const MAX_SNAPSHOT_ENV_VALUE_BYTES: usize = 60 * 1024;
 const MAX_SNAPSHOT_SCOPE_BYTES: usize = 256;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 pub(crate) struct ShellSnapshotCache {
@@ -42,7 +45,9 @@ struct CachedShellSnapshot {
     cwd: PathUri,
     env_policy: Option<ExecEnvPolicy>,
     sandbox: Option<FileSystemSandboxContext>,
-    snapshot: Arc<OnceCell<Option<ShellSnapshot>>>,
+    attempts: usize,
+    // Failed captures store the earliest time another attempt may start.
+    snapshot: Arc<OnceCell<Result<ShellSnapshot, Instant>>>,
 }
 
 struct ShellSnapshot {
@@ -93,7 +98,16 @@ impl ShellSnapshotCache {
                     && entry.sandbox == params.sandbox
             });
             let cached = position.and_then(|position| {
-                let entry = entries.remove(position)?;
+                let mut entry = entries.remove(position)?;
+                // Share each failed attempt during backoff. After the retry
+                // budget is exhausted, keep falling back until eviction.
+                if entry.attempts < MAX_SNAPSHOT_ATTEMPTS
+                    && let Some(Err(retry_at)) = entry.snapshot.get()
+                    && Instant::now() >= *retry_at
+                {
+                    entry.attempts += 1;
+                    entry.snapshot = Arc::new(OnceCell::new());
+                }
                 let snapshot = Arc::clone(&entry.snapshot);
                 entries.push_back(entry);
                 Some(snapshot)
@@ -107,6 +121,7 @@ impl ShellSnapshotCache {
                     cwd: params.cwd.clone(),
                     env_policy: params.env_policy.clone(),
                     sandbox: params.sandbox.clone(),
+                    attempts: 1,
                     snapshot: Arc::clone(&snapshot),
                 };
                 entries.push_back(entry);
@@ -117,30 +132,23 @@ impl ShellSnapshotCache {
                 snapshot
             }
         };
-        let Some(snapshot) = snapshot
+        let Ok(snapshot) = snapshot
             .get_or_init(|| async {
-                match capture_snapshot(params, prepared, shell_type).await {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(err) => {
+                capture_snapshot(params, prepared, shell_type)
+                    .await
+                    .map_err(|err| {
                         tracing::warn!("failed to capture shell snapshot: {err:?}");
-                        None
-                    }
-                }
+                        Instant::now() + SNAPSHOT_RETRY_BACKOFF
+                    })
             })
             .await
         else {
             return Ok(());
         };
 
-        let restore_snapshot_path = snapshot.environment.contains_key("PATH")
-            && params
-                .env_policy
-                .as_ref()
-                .is_none_or(|policy| !policy.r#set.contains_key("PATH"));
         let request_overrides = params
             .env
             .iter()
-            .filter(|(name, _)| name.as_str() != "PATH" || !restore_snapshot_path)
             .map(|(name, value)| {
                 (
                     name.clone(),
@@ -155,20 +163,6 @@ impl ShellSnapshotCache {
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
         prepared.env.extend(request_overrides);
-        if restore_snapshot_path && let Some(path) = prepared.env.get_mut("PATH") {
-            for entry in &request.runtime_path_prepends {
-                if entry.is_empty() {
-                    continue;
-                }
-                *path = std::iter::once(entry.as_str())
-                    .chain(
-                        path.split(':')
-                            .filter(|existing| !existing.is_empty() && *existing != entry),
-                    )
-                    .collect::<Vec<_>>()
-                    .join(":");
-            }
-        }
         prepared
             .env
             .retain(|name, _| !shell_environment::is_non_inheritable_env_var(name));
@@ -192,9 +186,17 @@ impl ShellSnapshotCache {
             .collect::<String>();
         let state_variables = state_variables.join(" ");
         let shell_start = prepared.command.len() - params.argv.len();
-        prepared.command[shell_start + 1] = "-c".to_string();
+        // Automatic startup files run before the restoration script and could
+        // reintroduce environment variables that the snapshot already filtered.
+        let (shell_flag, startup) = match shell_type {
+            ShellType::Bash => ("-pc", "set +o privileged\n"),
+            ShellType::Zsh => ("-fc", "setopt RCS\n"),
+            ShellType::Sh => ("-c", ""),
+            ShellType::PowerShell | ShellType::Cmd => unreachable!(),
+        };
+        prepared.command[shell_start + 1] = shell_flag.to_string();
         prepared.command[shell_start + 2] = format!(
-            "if ! eval \"unset {state_variables}\n{state_expansion}\" >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
+            "{startup}if ! eval \"unset {state_variables}\n{state_expansion}\" >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
             params.argv[2]
         );
 

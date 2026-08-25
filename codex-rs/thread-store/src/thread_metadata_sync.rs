@@ -304,9 +304,10 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::PostCompactRecoveryApplied(_) => {}
-                RolloutItem::SecurityRiskScore(_) => {}
+                | RolloutItem::PostCompactRecoveryApplied(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::WorldState(_) => {}
             }
         }
         Some(update)
@@ -659,6 +660,7 @@ mod tests {
                             developer_instructions: None,
                         },
                     },
+                    shell_tool_enabled: None,
                 },
             },
         ));

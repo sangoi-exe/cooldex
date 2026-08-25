@@ -168,16 +168,20 @@ async fn handle_spawn_agent(
     }
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
-    let source_role = if is_full_history_fork {
-        None
-    } else {
-        role_name
-    };
+    // Remember an applied configured default so cold reload reapplies its restrictions.
+    let persisted_role_name = role_name.or_else(|| {
+        (!is_full_history_fork
+            && config
+                .agent_roles
+                .get(DEFAULT_ROLE_NAME)
+                .is_some_and(|role| role.config_file.is_some()))
+        .then_some(DEFAULT_ROLE_NAME)
+    });
     let mut spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        source_role,
+        persisted_role_name,
         Some(args.task_name.clone()),
     )?;
     if let Some(identity) = expected_identity.as_ref() {

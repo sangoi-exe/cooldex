@@ -1,4 +1,5 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItemKind;
 
 /// One bounded historical context result returned by the explicit `recall` tool.
 pub(crate) struct RecallContext {
@@ -31,6 +32,10 @@ impl RecallContext {
 }
 
 impl ContextualUserFragment for RecallContext {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("recall.context".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "user"
     }

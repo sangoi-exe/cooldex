@@ -659,8 +659,7 @@ async fn apply_role_rejects_multi_agent_v2_subagent_instructions_file_override()
         &home,
         "invalid-subagent-instructions-role.toml",
         &format!(
-            "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = {:?}",
-            child_instructions_path
+            "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = {child_instructions_path:?}"
         ),
     )
     .await;

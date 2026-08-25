@@ -28,6 +28,7 @@ pub fn apply_rollout_item(
         RolloutItem::WorldState(_) => {}
         RolloutItem::PostCompactRecoveryApplied(_) => {}
         RolloutItem::SecurityRiskScore(_) => {}
+        RolloutItem::RealtimeItem(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -55,6 +56,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
         | RolloutItem::PostCompactRecoveryApplied(_)
+        | RolloutItem::RealtimeItem(_)
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::WorldState(_) => false,
     }
@@ -615,6 +617,7 @@ mod tests {
                             developer_instructions: None,
                         },
                     },
+                    shell_tool_enabled: None,
                 },
             },
         ));

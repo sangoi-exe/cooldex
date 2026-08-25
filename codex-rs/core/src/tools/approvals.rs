@@ -7,6 +7,7 @@ use crate::guardian::GuardianReviewOptions;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
+use crate::guardian::review_approval_request_with_cancel;
 use crate::guardian::routes_approval_policy_to_guardian;
 use crate::guardian::spawn_approval_request_review;
 use crate::hook_runtime::run_permission_request_hooks;
@@ -52,6 +53,7 @@ use tracing::warn;
 #[derive(Clone)]
 pub(crate) struct ApprovalContext {
     pub(crate) review_context: GuardianReviewContext,
+    pub(crate) cancellation_token: Option<CancellationToken>,
     pub(crate) call_id: String,
     pub(crate) tool_name: ToolName,
     pub(crate) strict_auto_review: bool,
@@ -517,10 +519,7 @@ impl Session {
         };
 
         let decision = match reviewer {
-            ApprovalReviewer::Guardian => {
-                self.request_guardian_approval(action, ctx, /*cancellation_token*/ None)
-                    .await
-            }
+            ApprovalReviewer::Guardian => self.request_guardian_approval(action, ctx).await,
             ApprovalReviewer::User => self.request_user_approval(&action, ctx).await,
         };
         let source = match reviewer {
@@ -534,7 +533,6 @@ impl Session {
         self: &Arc<Self>,
         action: ApprovalAction,
         ctx: &ApprovalContext,
-        cancellation_token: Option<CancellationToken>,
     ) -> ReviewDecision {
         let is_network_approval = matches!(&action, ApprovalAction::NetworkAccess { .. });
         let review_id = new_guardian_review_id();
@@ -548,13 +546,16 @@ impl Session {
             }
         };
 
-        if let Some(cancellation_token) = cancellation_token {
+        if let Some(cancellation_token) = &ctx.cancellation_token {
             let review = spawn_approval_request_review(
                 Arc::clone(self),
                 ctx.review_context.clone(),
                 review_id,
                 action,
-                ctx.retry_reason.clone(),
+                ApprovalRequestReasons {
+                    approval: ctx.approval_reason.clone(),
+                    retry: ctx.retry_reason.clone(),
+                },
                 GuardianReviewOptions {
                     plugin_attribution_override: None,
                     approval_request_source: GuardianApprovalRequestSource::MainTurn,
@@ -567,20 +568,26 @@ impl Session {
         } else if is_network_approval {
             let review_cancel = CancellationToken::new();
             let review_cancel_guard = review_cancel.clone().drop_guard();
-            let review = spawn_approval_request_review(
-                Arc::clone(self),
-                ctx.review_context.clone(),
-                review_id,
-                action,
-                ctx.retry_reason.clone(),
-                GuardianReviewOptions {
-                    plugin_attribution_override: None,
-                    approval_request_source: GuardianApprovalRequestSource::MainTurn,
-                    external_cancel: Some(review_cancel),
-                },
-            );
-            let decision = review.await.unwrap_or_else(|_| {
-                warn!("network Guardian review task failed");
+            let review_session = Arc::clone(self);
+            let review_context = ctx.review_context.clone();
+            let retry_reason = ctx.retry_reason.clone();
+            let review = tokio::spawn(async move {
+                review_approval_request_with_cancel(
+                    &review_session,
+                    review_context,
+                    review_id,
+                    action,
+                    retry_reason,
+                    GuardianReviewOptions {
+                        plugin_attribution_override: None,
+                        approval_request_source: GuardianApprovalRequestSource::MainTurn,
+                        external_cancel: Some(review_cancel),
+                    },
+                )
+                .await
+            });
+            let decision = review.await.unwrap_or_else(|error| {
+                warn!(%error, "network Guardian review task failed");
                 ReviewDecision::denied("automatic approval review could not complete")
             });
             drop(review_cancel_guard.disarm());

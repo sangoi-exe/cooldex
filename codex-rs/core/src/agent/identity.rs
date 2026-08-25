@@ -1,4 +1,5 @@
 use crate::config::Config;
+use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::error::CodexErr;
@@ -26,6 +27,7 @@ pub(crate) struct AgentIdentitySnapshot {
     base_instructions: Arc<str>,
     developer_instructions: Option<Arc<str>>,
     service_tier: Option<String>,
+    shell_tool_enabled: Option<bool>,
 }
 
 impl AgentIdentitySnapshot {
@@ -40,6 +42,7 @@ impl AgentIdentitySnapshot {
         base_instructions: String,
         developer_instructions: Option<String>,
         service_tier: Option<String>,
+        shell_tool_enabled: Option<bool>,
     ) -> Self {
         Self {
             agent_role,
@@ -53,6 +56,7 @@ impl AgentIdentitySnapshot {
             base_instructions: Arc::from(base_instructions),
             developer_instructions: developer_instructions.map(Arc::from),
             service_tier,
+            shell_tool_enabled,
         }
     }
 
@@ -83,6 +87,16 @@ impl AgentIdentitySnapshot {
             .as_ref()
             .map(ToString::to_string);
         config.service_tier.clone_from(&self.service_tier);
+        if let Some(shell_tool_enabled) = self.shell_tool_enabled {
+            config
+                .features
+                .set_enabled(Feature::ShellTool, shell_tool_enabled)
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to restore V2 child shell-tool state: {error}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 }
@@ -103,6 +117,7 @@ impl fmt::Debug for AgentIdentitySnapshot {
                 &self.developer_instructions.as_ref().map(|_| "<redacted>"),
             )
             .field("service_tier", &self.service_tier)
+            .field("shell_tool_enabled", &self.shell_tool_enabled)
             .finish()
     }
 }

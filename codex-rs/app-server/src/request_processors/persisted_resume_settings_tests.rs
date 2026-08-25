@@ -48,6 +48,7 @@ fn settings_item(
                         developer_instructions: None,
                     },
                 },
+                shell_tool_enabled: None,
             },
         },
     ))

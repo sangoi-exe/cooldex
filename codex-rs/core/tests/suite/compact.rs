@@ -17,7 +17,6 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
@@ -552,10 +551,16 @@ async fn summarize_context_three_requests_and_instructions() {
 
     // 1) Normal user input – should hit server once.
     codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello world".into(),
-            text_elements: Vec::new(),
-        }]))
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "hello world".into(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Text {
+                text: " second fragment".into(),
+                text_elements: Vec::new(),
+            },
+        ]))
         .await
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -642,9 +647,27 @@ async fn summarize_context_three_requests_and_instructions() {
         }
     }
 
-    // No previous assistant messages should remain and the new user message is present.
-    let assistant_count = messages.iter().filter(|(r, _)| r == "assistant").count();
-    assert_eq!(assistant_count, 0, "assistant history should be cleared");
+    // No previous assistant messages should remain. The runtime injects one
+    // assistant recall carrier between compacted history and recovery guidance.
+    let assistant_messages = input3
+        .iter()
+        .filter(|item| item.get("role").and_then(|role| role.as_str()) == Some("assistant"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_messages.len(),
+        1,
+        "only the post-compact recall carrier should remain as assistant history"
+    );
+    assert_eq!(
+        assistant_messages[0]["content"][0]["type"], "output_text",
+        "post-compact recall should use assistant output text"
+    );
+    assert!(
+        assistant_messages[0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("<post_compact_recall>")),
+        "assistant history should contain only the post-compact recall carrier"
+    );
     assert!(
         messages
             .iter()
@@ -654,7 +677,7 @@ async fn summarize_context_three_requests_and_instructions() {
     assert!(
         messages
             .iter()
-            .any(|(r, t)| r == "user" && t == "hello world"),
+            .any(|(r, t)| r == "user" && t == "hello world second fragment"),
         "third request should include the original user message"
     );
     assert!(
@@ -673,6 +696,28 @@ async fn summarize_context_three_requests_and_instructions() {
     // Shut down Codex to flush rollout entries before inspecting the file.
     codex.submit(Op::Shutdown).await.unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;
+
+    let replacement_history = replacement_history_from_rollout(&rollout_path)
+        .expect("local compaction should persist replacement history");
+    let compacted_user_message = replacement_history
+        .iter()
+        .find(|item| item["content"][0]["text"] == "hello world second fragment")
+        .expect("persisted replacement history should contain the compacted user message");
+    assert_eq!(
+        json!({
+            "type": compacted_user_message["type"],
+            "role": compacted_user_message["role"],
+            "content": compacted_user_message["content"],
+            "content_item_kinds": compacted_user_message
+                ["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+        }),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello world second fragment"}],
+            "content_item_kinds": ["user.text"],
+        }),
+    );
 
     // Verify rollout contains user-turn TurnContext entries and a Compacted entry.
     println!("rollout path: {}", rollout_path.display());
@@ -703,6 +748,29 @@ async fn summarize_context_three_requests_and_instructions() {
                     .and_then(|item| item.id())
                     .expect("local compaction replacement boundary");
                 assert_eq!(marker.boundary_item_id, boundary.as_str());
+                let summary_item = ci
+                    .replacement_history
+                    .as_ref()
+                    .and_then(|history| history.last())
+                    .expect("compacted history should retain its summary");
+                let summary_item =
+                    serde_json::to_value(&summary_item.item).expect("serialize compacted summary");
+                assert_eq!(
+                    json!({
+                        "role": summary_item["role"],
+                        "content": summary_item["content"],
+                        "content_item_kinds": summary_item
+                            ["internal_chat_message_metadata_passthrough"]["content_item_kinds"],
+                    }),
+                    json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": expected_summary_message,
+                        }],
+                        "content_item_kinds": ["compaction.summary"],
+                    })
+                );
                 saw_compacted_summary = true;
             }
             _ => {}

@@ -194,6 +194,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -296,6 +297,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
     }))?;
 
     let LegacyRolloutItem::Compacted(legacy) =
@@ -368,6 +370,16 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
             "type": "event_msg",
             "payload": { "type": "warning", "message": "heads up" },
         }),
+        json!({
+            "type": "realtime_item",
+            "payload": {
+                "id": "segment-1",
+                "realtime_session_id": "session-1",
+                "type": "transcript_segment",
+                "role": "assistant",
+                "text": "hello",
+            },
+        }),
     ];
 
     for expected in fixtures {
@@ -382,7 +394,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 9);
+    assert_eq!(variants.len(), 11);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
@@ -492,7 +504,7 @@ fn post_compact_recovery_marker_only_locked_old_reader_ignores_marker() -> Resul
         #[serde(default)]
         previous_window_id: Option<String>,
         #[serde(default)]
-        window_id: Option<SerializedWindowId>,
+        window_id: Option<String>,
     }
 
     let current = json!({
@@ -526,7 +538,7 @@ fn post_compact_recovery_marker_only_locked_old_reader_ignores_marker() -> Resul
         previous_window_id.as_deref(),
         Some("019b3f6e-0000-7000-8000-000000000001")
     );
-    let Some(SerializedWindowId::Id(window_id)) = window_id else {
+    let Some(window_id) = window_id else {
         panic!("locked reader should preserve the current string window id");
     };
     assert_eq!(window_id, "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001");

@@ -161,43 +161,57 @@ max_concurrent_threads_per_session = 7
     assert_eq!(base, expected);
 }
 
-/// Feature tables added above legacy toggles retain the lower layer's enabled state.
+/// Structured feature tables added above legacy toggles retain the lower layer's enabled state.
 #[test]
-fn merge_multi_agent_v2_table_preserves_legacy_boolean_toggle() {
-    for feature_path in ["features", "profiles.work.features"] {
-        let mut base = parse_toml(&format!("[{feature_path}]\nmulti_agent_v2 = true\n"));
-        let overlay = parse_toml(&format!(
-            "[{feature_path}.multi_agent_v2]\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
-        ));
+fn merge_structured_feature_table_preserves_legacy_boolean_toggle() {
+    for (feature, nested_setting) in [
+        (
+            "multi_agent_v2",
+            "subagent_usage_hint_text = \"Delegate carefully.\"",
+        ),
+        ("computer_use", "xvfb = \"/usr/bin/Xvfb\""),
+    ] {
+        for feature_path in ["features", "profiles.work.features"] {
+            let mut base = parse_toml(&format!("[{feature_path}]\n{feature} = true\n"));
+            let overlay = parse_toml(&format!("[{feature_path}.{feature}]\n{nested_setting}\n"));
 
-        merge_toml_values(&mut base, &overlay);
+            merge_toml_values(&mut base, &overlay);
 
-        assert_eq!(
-            base,
-            parse_toml(&format!(
-                "[{feature_path}.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
-            ))
-        );
+            assert_eq!(
+                base,
+                parse_toml(&format!(
+                    "[{feature_path}.{feature}]\nenabled = true\n{nested_setting}\n",
+                ))
+            );
+        }
     }
 }
 
-/// Legacy feature toggles update enabled state without discarding nested configuration.
+/// Legacy structured-feature toggles update enabled state without discarding nested configuration.
 #[test]
-fn merge_multi_agent_v2_boolean_preserves_existing_feature_table() {
-    for feature_path in ["features", "profiles.work.features"] {
-        let mut base = parse_toml(&format!(
-            "[{feature_path}.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
-        ));
-        let overlay = parse_toml(&format!("[{feature_path}]\nmulti_agent_v2 = false\n"));
+fn merge_structured_feature_boolean_preserves_existing_feature_table() {
+    for (feature, nested_setting) in [
+        (
+            "multi_agent_v2",
+            "subagent_usage_hint_text = \"Delegate carefully.\"",
+        ),
+        ("computer_use", "xvfb = \"/usr/bin/Xvfb\""),
+    ] {
+        for feature_path in ["features", "profiles.work.features"] {
+            let mut base = parse_toml(&format!(
+                "[{feature_path}.{feature}]\nenabled = true\n{nested_setting}\n",
+            ));
+            let overlay = parse_toml(&format!("[{feature_path}]\n{feature} = false\n"));
 
-        merge_toml_values(&mut base, &overlay);
+            merge_toml_values(&mut base, &overlay);
 
-        assert_eq!(
-            base,
-            parse_toml(&format!(
-                "[{feature_path}.multi_agent_v2]\nenabled = false\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
-            ))
-        );
+            assert_eq!(
+                base,
+                parse_toml(&format!(
+                    "[{feature_path}.{feature}]\nenabled = false\n{nested_setting}\n",
+                ))
+            );
+        }
     }
 }
 
@@ -224,35 +238,75 @@ fn merge_multi_agent_v2_compatibility_excludes_opaque_desktop_paths() {
     }
 }
 
-/// CLI overrides preserve the multi-agent toggle and nested options in either ordering.
+/// CLI overrides preserve structured-feature toggles and nested options in either ordering.
 #[test]
-fn multi_agent_v2_cli_overrides_preserve_boolean_and_nested_configuration() {
-    for feature_path in ["features", "profiles.work.features"] {
-        let instructions = (
-            format!("{feature_path}.multi_agent_v2.subagent_usage_hint_text"),
+fn structured_feature_cli_overrides_preserve_boolean_and_nested_configuration() {
+    for (feature, nested_key, nested_setting, nested_value) in [
+        (
+            "multi_agent_v2",
+            "subagent_usage_hint_text",
+            "subagent_usage_hint_text = \"Delegate carefully.\"",
             TomlValue::String("Delegate carefully.".to_string()),
-        );
-        let enabled = (
-            format!("{feature_path}.multi_agent_v2"),
-            TomlValue::Boolean(true),
-        );
-        let feature_table = (
-            format!("{feature_path}.multi_agent_v2"),
-            parse_toml("subagent_usage_hint_text = \"Delegate carefully.\"\n"),
-        );
-        let expected = parse_toml(&format!(
-            "[{feature_path}.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"Delegate carefully.\"\n",
-        ));
+        ),
+        (
+            "computer_use",
+            "xvfb",
+            "xvfb = \"/usr/bin/Xvfb\"",
+            TomlValue::String("/usr/bin/Xvfb".to_string()),
+        ),
+    ] {
+        for feature_path in ["features", "profiles.work.features"] {
+            let nested_config = (
+                format!("{feature_path}.{feature}.{nested_key}"),
+                nested_value.clone(),
+            );
+            let enabled = (
+                format!("{feature_path}.{feature}"),
+                TomlValue::Boolean(true),
+            );
+            let feature_table = (
+                format!("{feature_path}.{feature}"),
+                parse_toml(nested_setting),
+            );
+            let expected = parse_toml(&format!(
+                "[{feature_path}.{feature}]\nenabled = true\n{nested_setting}\n",
+            ));
 
-        for overrides in [
-            vec![enabled.clone(), instructions.clone()],
-            vec![instructions, enabled.clone()],
-            vec![enabled.clone(), feature_table.clone()],
-            vec![feature_table, enabled],
-        ] {
-            assert_eq!(crate::build_cli_overrides_layer(&overrides), expected);
+            for overrides in [
+                vec![enabled.clone(), nested_config.clone()],
+                vec![nested_config, enabled.clone()],
+                vec![enabled.clone(), feature_table.clone()],
+                vec![feature_table, enabled],
+            ] {
+                assert_eq!(crate::build_cli_overrides_layer(&overrides), expected);
+            }
         }
     }
+}
+
+#[test]
+fn network_proxy_feature_overrides_preserve_credential_broker_configuration() {
+    let enabled = (
+        "features.network_proxy".to_string(),
+        TomlValue::Boolean(true),
+    );
+    let broker = (
+        "features.network_proxy.credential_broker".to_string(),
+        TomlValue::Boolean(true),
+    );
+    let expected =
+        parse_toml("[features.network_proxy]\nenabled = true\ncredential_broker = true\n");
+
+    for overrides in [vec![enabled.clone(), broker.clone()], vec![broker, enabled]] {
+        assert_eq!(crate::build_cli_overrides_layer(&overrides), expected);
+    }
+
+    let mut base = parse_toml("[features]\nnetwork_proxy = true\n");
+    merge_toml_values(
+        &mut base,
+        &parse_toml("[features.network_proxy]\ncredential_broker = true\n"),
+    );
+    assert_eq!(base, expected);
 }
 
 /// Repeated opaque desktop overrides continue to replace their previous value.
