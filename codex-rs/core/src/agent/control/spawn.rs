@@ -15,8 +15,6 @@ use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
-use codex_protocol::protocol::ThreadSettingsSnapshot;
-use codex_protocol::protocol::TurnContextItem;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashSet;
 
@@ -25,6 +23,17 @@ const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
     exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+}
+
+enum V2AgentMetadataRestoreError {
+    MissingThreadSettingsSnapshot { thread_id: ThreadId },
+    Other(CodexErr),
+}
+
+impl From<CodexErr> for V2AgentMetadataRestoreError {
+    fn from(error: CodexErr) -> Self {
+        Self::Other(error)
+    }
 }
 
 /// Initial input delivered after a spawned agent acquires execution capacity.
@@ -211,27 +220,11 @@ fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<Str
     None
 }
 
-fn latest_turn_context_item(history: &[RolloutItem]) -> Option<&TurnContextItem> {
-    history.iter().rev().find_map(|item| match item {
-        RolloutItem::TurnContext(turn_context) => Some(turn_context),
-        _ => None,
-    })
-}
-
-fn latest_thread_settings_snapshot(history: &[RolloutItem]) -> Option<ThreadSettingsSnapshot> {
-    history.iter().rev().find_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
-            Some(event.thread_settings.clone())
-        }
-        _ => None,
-    })
-}
-
 async fn restore_v2_identity_snapshot(
     state: &ThreadManagerState,
     config: &Config,
     stored_thread: &codex_thread_store::StoredThread,
-) -> CodexResult<AgentIdentitySnapshot> {
+) -> Result<AgentIdentitySnapshot, V2AgentMetadataRestoreError> {
     let history = load_agent_model_context(
         state,
         stored_thread.thread_id,
@@ -249,12 +242,16 @@ async fn restore_v2_identity_snapshot(
         history: Arc::new(history.clone()),
         rollout_path: stored_thread.rollout_path.clone(),
     });
-    let latest_turn_context = latest_turn_context_item(&history);
-    let latest_thread_settings = latest_thread_settings_snapshot(&history);
-    let model_provider_id = latest_thread_settings
-        .as_ref()
-        .map(|thread_settings| thread_settings.model_provider_id.clone())
-        .unwrap_or_else(|| stored_thread.model_provider.clone());
+    let latest_thread_settings = state
+        .load_latest_thread_settings_snapshot(LoadThreadHistoryParams {
+            thread_id: stored_thread.thread_id,
+            include_archived: true,
+        })
+        .await?
+        .ok_or(V2AgentMetadataRestoreError::MissingThreadSettingsSnapshot {
+            thread_id: stored_thread.thread_id,
+        })?;
+    let model_provider_id = latest_thread_settings.model_provider_id.clone();
     let model_provider = if config.model_provider_id == model_provider_id {
         config.model_provider.clone()
     } else {
@@ -266,28 +263,9 @@ async fn restore_v2_identity_snapshot(
                 CodexErr::InvalidRequest(format!("Model provider `{model_provider_id}` not found"))
             })?
     };
-    let model = latest_thread_settings
-        .as_ref()
-        .map(|thread_settings| thread_settings.model.clone())
-        .or_else(|| stored_thread.model.clone())
-        .or_else(|| latest_turn_context.map(|turn_context| turn_context.model.clone()))
-        .or_else(|| config.model.clone())
-        .ok_or_else(|| {
-            CodexErr::InvalidRequest(format!(
-                "agent {} is missing a persisted model required to restore its identity snapshot",
-                stored_thread.thread_id
-            ))
-        })?;
-    let reasoning_effort = latest_thread_settings
-        .as_ref()
-        .and_then(|thread_settings| thread_settings.reasoning_effort.clone())
-        .or(stored_thread.reasoning_effort.clone())
-        .or_else(|| latest_turn_context.and_then(|turn_context| turn_context.effort.clone()));
-    let reasoning_summary = latest_thread_settings
-        .as_ref()
-        .and_then(|thread_settings| thread_settings.reasoning_summary)
-        .or_else(|| latest_turn_context.map(|turn_context| turn_context.summary))
-        .or(config.model_reasoning_summary);
+    let model = latest_thread_settings.model.clone();
+    let reasoning_effort = latest_thread_settings.reasoning_effort.clone();
+    let reasoning_summary = latest_thread_settings.reasoning_summary;
     let base_instructions = initial_history
         .get_base_instructions()
         .map(|base_instructions| base_instructions.text)
@@ -298,13 +276,8 @@ async fn restore_v2_identity_snapshot(
                 stored_thread.thread_id
             ))
         })?;
-    let service_tier = latest_thread_settings
-        .as_ref()
-        .and_then(|thread_settings| thread_settings.service_tier.clone())
-        .or_else(|| config.service_tier.clone());
-    let shell_tool_enabled = latest_thread_settings
-        .as_ref()
-        .and_then(|thread_settings| thread_settings.shell_tool_enabled);
+    let service_tier = latest_thread_settings.service_tier.clone();
+    let shell_tool_enabled = latest_thread_settings.shell_tool_enabled;
     let session_source = initial_history
         .get_resumed_session_sources()
         .map(|(session_source, _)| session_source)
@@ -345,12 +318,13 @@ impl AgentControl {
         config: &Config,
         root_thread_id: ThreadId,
     ) {
-        self.restore_v2_agent_metadata_inner(
-            config,
-            root_thread_id,
-            /*restore_identity_snapshots*/ false,
-        )
-        .await;
+        let _ = self
+            .restore_v2_agent_metadata_inner(
+                config,
+                root_thread_id,
+                /*restore_identity_snapshots*/ false,
+            )
+            .await;
     }
 
     /// Restore persisted V2 descendant metadata for a resumed root, including
@@ -360,13 +334,13 @@ impl AgentControl {
         &self,
         config: &Config,
         root_thread_id: ThreadId,
-    ) {
+    ) -> CodexResult<()> {
         self.restore_v2_agent_metadata_inner(
             config,
             root_thread_id,
             /*restore_identity_snapshots*/ true,
         )
-        .await;
+        .await
     }
 
     async fn restore_v2_agent_metadata_inner(
@@ -374,14 +348,14 @@ impl AgentControl {
         config: &Config,
         root_thread_id: ThreadId,
         restore_identity_snapshots: bool,
-    ) {
+    ) -> CodexResult<()> {
         self.state.register_root_thread(root_thread_id);
 
         let Ok(state) = self.upgrade() else {
-            return;
+            return Ok(());
         };
         let Some(agent_graph_store) = state.agent_graph_store() else {
-            return;
+            return Ok(());
         };
         let descendant_ids = match agent_graph_store
             .list_thread_spawn_descendants(
@@ -393,7 +367,7 @@ impl AgentControl {
             Ok(descendant_ids) => descendant_ids,
             Err(err) => {
                 warn!("failed to restore persisted V2 agent metadata for {root_thread_id}: {err}");
-                return;
+                return Ok(());
             }
         };
 
@@ -437,13 +411,22 @@ impl AgentControl {
                 metadata.identity_snapshot = restored_identity_snapshot;
                 metadata.agent_id = Some(thread_id);
                 reservation.commit(metadata);
-                Ok::<(), CodexErr>(())
+                Ok::<(), V2AgentMetadataRestoreError>(())
             }
             .await;
-            if let Err(err) = restore_result {
-                warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
+            match restore_result {
+                Ok(()) => {}
+                Err(V2AgentMetadataRestoreError::MissingThreadSettingsSnapshot { thread_id }) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} is missing a persisted thread settings snapshot required to restore its identity snapshot"
+                    )));
+                }
+                Err(V2AgentMetadataRestoreError::Other(err)) => {
+                    warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
+                }
             }
         }
+        Ok(())
     }
 
     /// Spawn a new agent thread and submit the initial prompt.

@@ -763,18 +763,47 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    check_v2_agent_reload(V2ReloadRoute::Sender).await;
+    check_v2_agent_reload(V2ReloadRoute::Sender, V2ReloadExpectation::FullIdentity).await;
 }
 
 #[tokio::test]
 async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
-    check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
+    check_v2_agent_reload(
+        V2ReloadRoute::NestedParent,
+        V2ReloadExpectation::FullIdentity,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_recovers_settings_outside_bounded_model_context() {
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::BoundedModelContext,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_rejects_absent_persisted_settings_snapshot() {
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::MissingSettingsSnapshot,
+    )
+    .await;
 }
 
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,
     NestedParent,
+}
+
+#[derive(Clone, Copy)]
+enum V2ReloadExpectation {
+    FullIdentity,
+    BoundedModelContext,
+    MissingSettingsSnapshot,
 }
 
 async fn spawn_v2_reload_test_child(
@@ -806,7 +835,7 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
-async fn check_v2_agent_reload(route: V2ReloadRoute) {
+async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpectation) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
@@ -839,14 +868,15 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         })
         .await
         .expect("start root thread");
-    let control = root.thread.session.services.agent_control.clone();
+    let root_thread = root.thread;
+    let control = root_thread.session.services.agent_control.clone();
     let parent_thread = match route {
-        V2ReloadRoute::Sender => root.thread,
+        V2ReloadRoute::Sender => std::sync::Arc::clone(&root_thread),
         V2ReloadRoute::NestedParent => {
             let parent = spawn_v2_reload_test_child(
                 &control,
                 harness.config.clone(),
-                &root.thread,
+                &root_thread,
                 "parent",
                 /*agent_role*/ None,
             )
@@ -891,6 +921,44 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         )])
         .await
         .expect("child rollout should persist with v2 metadata");
+    if matches!(expectation, V2ReloadExpectation::BoundedModelContext) {
+        let bounded_turn_context = child_thread.session.new_default_turn().await;
+        let bounded_turn_id = bounded_turn_context.sub_id.clone();
+        child_thread
+            .session
+            .persist_rollout_items(&[
+                RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: bounded_turn_id.clone(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: Some(128_000),
+                    collaboration_mode_kind: ModeKind::Default,
+                })),
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                    thread_id: spawned_agent.thread_id,
+                    turn_id: bounded_turn_id,
+                    item: TurnItem::UserMessage(UserMessageItem {
+                        id: "bounded-context-user".to_string(),
+                        client_id: None,
+                        content: Vec::new(),
+                    }),
+                    started_at_ms: Some(0),
+                    completed_at_ms: 1,
+                })),
+                RolloutItem::TurnContext(bounded_turn_context.to_turn_context_item()),
+                RolloutItem::Compacted(CompactedItem {
+                    message: "bounded child context".to_string(),
+                    replacement_history: Some(Vec::new()),
+                    mcp_resource_origins: None,
+                    window_number: Some(1),
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                    post_compact_recovery: None,
+                }),
+            ])
+            .await;
+    }
     child_thread
         .shutdown_and_wait()
         .await
@@ -902,6 +970,91 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .await
         .expect("child metadata should be readable");
     assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
+    if matches!(expectation, V2ReloadExpectation::MissingSettingsSnapshot) {
+        assert!(matches!(route, V2ReloadRoute::Sender));
+        let child_rollout_path = stored_child
+            .rollout_path
+            .clone()
+            .expect("persisted child rollout path");
+        let original_lines =
+            std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
+        let original_line_count = original_lines.lines().count();
+        let retained_lines = original_lines
+            .lines()
+            .filter(|raw_line| {
+                let value = serde_json::from_str(raw_line).expect("parse child rollout line");
+                !matches!(
+                    codex_rollout::decode_rollout_line(value)
+                        .expect("decode child rollout line")
+                        .item,
+                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        let removed_snapshots = original_line_count - retained_lines.len();
+        std::fs::write(
+            &child_rollout_path,
+            format!("{}\n", retained_lines.join("\n")),
+        )
+        .expect("remove child settings snapshots");
+        assert!(
+            removed_snapshots > 0,
+            "child rollout should contain a persisted settings snapshot"
+        );
+
+        root_thread.ensure_rollout_materialized().await;
+        root_thread
+            .flush_rollout()
+            .await
+            .expect("root rollout should flush");
+        let root_rollout_path = root_thread
+            .read_thread(
+                /*include_archived*/ true, /*include_history*/ false,
+            )
+            .await
+            .expect("root metadata should be readable")
+            .rollout_path
+            .expect("persisted root rollout path");
+        let report = harness
+            .manager
+            .shutdown_all_threads_bounded(Duration::from_secs(5))
+            .await;
+        assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
+        assert_eq!(report.timed_out, Vec::<ThreadId>::new());
+
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+        let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+            CodexAuth::from_api_key("dummy"),
+            harness.config.model_provider.clone(),
+            harness.config.codex_home.to_path_buf(),
+            std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            harness.state_db.clone(),
+        );
+        let root_history = codex_rollout::RolloutRecorder::get_rollout_history(&root_rollout_path)
+            .await
+            .expect("load root rollout history");
+        let error = match resumed_manager
+            .resume_thread_with_history(
+                harness.config.clone(),
+                root_history,
+                auth_manager,
+                /*parent_trace*/ None,
+                client_mcp_extensions,
+            )
+            .await
+        {
+            Ok(_) => panic!("root resume must reject a child without persisted settings"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "agent {} is missing a persisted thread settings snapshot required to restore its identity snapshot",
+                spawned_agent.thread_id
+            )
+        );
+        return;
+    }
 
     assert!(
         harness
@@ -1011,10 +1164,12 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
             &parent_thread.session.services.exec_policy,
         ));
     }
-    assert_eq!(
-        reloaded_child.session.agent_identity_snapshot().await,
-        expected_identity
-    );
+    if matches!(expectation, V2ReloadExpectation::FullIdentity) {
+        assert_eq!(
+            reloaded_child.session.agent_identity_snapshot().await,
+            expected_identity
+        );
+    }
     let reloaded_snapshot = reloaded_child.config_snapshot().await;
     if matches!(route, V2ReloadRoute::Sender) {
         assert_eq!(reloaded_snapshot.approval_policy, AskForApproval::Never);
@@ -1049,6 +1204,18 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         ),
         "residency reload must preserve the worker provider instead of inheriting its sender's provider",
     );
+    if matches!(expectation, V2ReloadExpectation::BoundedModelContext) {
+        assert!(
+            !reloaded_child
+                .session
+                .new_default_turn()
+                .await
+                .config
+                .features
+                .enabled(Feature::ShellTool),
+            "identity reload must recover the disabled shell tool from settings outside bounded model context"
+        );
+    }
 
     let communication = InterAgentCommunication::new(
         AgentPath::root(),

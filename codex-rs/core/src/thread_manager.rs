@@ -61,6 +61,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -1065,7 +1066,7 @@ impl ThreadManager {
         {
             agent_control
                 .restore_v2_root_agent_metadata(&config, resumed.conversation_id)
-                .await;
+                .await?;
         }
         let options = StartThreadOptions {
             initial_history,
@@ -1486,6 +1487,24 @@ impl ThreadManagerState {
                 }
                 err => CodexErr::Fatal(format!(
                     "failed to load model context for thread {thread_id}: {err}"
+                )),
+            })
+    }
+
+    pub(crate) async fn load_latest_thread_settings_snapshot(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> CodexResult<Option<ThreadSettingsSnapshot>> {
+        let thread_id = params.thread_id;
+        self.thread_store
+            .load_latest_thread_settings_snapshot(params)
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                err => CodexErr::Fatal(format!(
+                    "failed to load thread settings snapshot for thread {thread_id}: {err}"
                 )),
             })
     }
