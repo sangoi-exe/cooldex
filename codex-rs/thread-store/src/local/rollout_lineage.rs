@@ -238,12 +238,23 @@ pub(super) async fn validate_cutoff_bounds(
             "cutoff cannot include source session metadata",
         ));
     }
-    let file_len = tokio::fs::metadata(rollout_path)
+    let physical_rollout_path = codex_rollout::existing_rollout_path(rollout_path)
+        .await
+        .unwrap_or_else(|| rollout_path.to_path_buf());
+    if is_compressed_rollout(physical_rollout_path.as_path()) {
+        return validate_compressed_cutoff_bounds(
+            requested_thread_id,
+            physical_rollout_path.as_path(),
+            end,
+        )
+        .await;
+    }
+    let file_len = tokio::fs::metadata(physical_rollout_path.as_path())
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!(
                 "failed to read lineage metadata {}: {err}",
-                rollout_path.display()
+                physical_rollout_path.display()
             ),
         })?
         .len();
@@ -254,6 +265,76 @@ pub(super) async fn validate_cutoff_bounds(
         ));
     }
     Ok(())
+}
+
+async fn validate_compressed_cutoff_bounds(
+    requested_thread_id: ThreadId,
+    rollout_path: &Path,
+    end: &HistoryPosition,
+) -> ThreadStoreResult<()> {
+    let expected_ordinal = end
+        .end_ordinal_exclusive
+        .checked_sub(1)
+        .ok_or_else(|| malformed_lineage(requested_thread_id, "source ordinal underflow"))?;
+    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to open compressed lineage source {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+
+    while let Some(raw_line) =
+        reader
+            .next_line()
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to read compressed lineage source {}: {err}",
+                    rollout_path.display()
+                ),
+            })?
+    {
+        let raw_line = raw_line.trim();
+        if raw_line.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(raw_line).map_err(|err| ThreadStoreError::Internal {
+            message: format!(
+                "failed to parse compressed lineage source {}: {err}",
+                rollout_path.display()
+            ),
+        })?;
+        let line = codex_rollout::decode_rollout_line(value).map_err(|err| {
+            ThreadStoreError::Internal {
+                message: format!(
+                    "failed to decode compressed lineage source {}: {err}",
+                    rollout_path.display()
+                ),
+            }
+        })?;
+        let ordinal = line.ordinal.ok_or_else(|| {
+            malformed_lineage(
+                requested_thread_id,
+                "compressed source rollout is missing an ordinal",
+            )
+        })?;
+        if ordinal == expected_ordinal {
+            return Ok(());
+        }
+    }
+
+    Err(malformed_lineage(
+        requested_thread_id,
+        "cutoff ordinal is past the source rollout",
+    ))
+}
+
+fn is_compressed_rollout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {

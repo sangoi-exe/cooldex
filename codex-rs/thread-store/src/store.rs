@@ -1,5 +1,8 @@
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_rollout::RolloutItem;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -158,6 +161,25 @@ pub trait ThreadStore: Any + Send + Sync {
             Err(ThreadStoreError::Unsupported {
                 operation: "load_latest_model_context",
             })
+        })
+    }
+
+    /// Loads the newest persisted thread settings snapshot.
+    ///
+    /// Implementations with a targeted persisted-history reader should override this method.
+    /// Other stores can reconstruct the snapshot from their complete stored history.
+    fn load_latest_thread_settings_snapshot(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, Option<ThreadSettingsSnapshot>> {
+        Box::pin(async move {
+            let history = self.load_history(params).await?;
+            Ok(history.items.into_iter().rev().find_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                    Some(event.thread_settings)
+                }
+                _ => None,
+            }))
         })
     }
 

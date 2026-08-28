@@ -13,11 +13,13 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_rollout::RolloutItem;
 use codex_rollout::persisted_rollout_items;
 
@@ -681,6 +683,7 @@ pub struct InMemoryThreadStoreCalls {
     pub discard_thread: usize,
     pub load_history: usize,
     pub load_latest_model_context: usize,
+    pub load_latest_thread_settings_snapshot: usize,
     pub load_rollout_tail: usize,
     pub read_thread: usize,
     pub read_thread_with_history: usize,
@@ -869,6 +872,27 @@ impl InMemoryThreadStore {
             thread_id: params.thread_id,
             items: items.clone(),
         })
+    }
+
+    async fn load_latest_thread_settings_snapshot(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreResult<Option<ThreadSettingsSnapshot>> {
+        let mut state = self.state.lock().await;
+        state.calls.load_latest_thread_settings_snapshot += 1;
+        let items =
+            state
+                .histories
+                .get(&params.thread_id)
+                .ok_or(ThreadStoreError::ThreadNotFound {
+                    thread_id: params.thread_id,
+                })?;
+        Ok(items.iter().rev().find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some(event.thread_settings.clone())
+            }
+            _ => None,
+        }))
     }
 
     async fn load_rollout_tail(
@@ -1190,6 +1214,15 @@ impl ThreadStore for InMemoryThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(InMemoryThreadStore::load_latest_model_context(self, params))
+    }
+
+    fn load_latest_thread_settings_snapshot(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, Option<ThreadSettingsSnapshot>> {
+        Box::pin(InMemoryThreadStore::load_latest_thread_settings_snapshot(
+            self, params,
+        ))
     }
 
     fn load_rollout_tail(

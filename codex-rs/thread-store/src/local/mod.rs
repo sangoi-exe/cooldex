@@ -21,6 +21,7 @@ mod thread_history;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
 mod thread_sections;
+mod thread_settings_snapshot;
 mod unarchive_thread;
 mod update_thread_metadata;
 mod writer_lock;
@@ -33,6 +34,7 @@ mod test_support;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
 use codex_state::SqliteConfig;
@@ -502,6 +504,15 @@ impl ThreadStore for LocalThreadStore {
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, StoredModelContext> {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
+    }
+
+    fn load_latest_thread_settings_snapshot(
+        &self,
+        params: LoadThreadHistoryParams,
+    ) -> ThreadStoreFuture<'_, Option<ThreadSettingsSnapshot>> {
+        Box::pin(async move {
+            thread_settings_snapshot::load_latest_thread_settings_snapshot(self, params).await
+        })
     }
 
     fn load_rollout_tail(
