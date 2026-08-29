@@ -300,20 +300,15 @@ async fn validate_compressed_cutoff_bounds(
         if raw_line.is_empty() {
             continue;
         }
-        let value = serde_json::from_str(raw_line).map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to parse compressed lineage source {}: {err}",
-                rollout_path.display()
-            ),
-        })?;
-        let line = codex_rollout::decode_rollout_line(value).map_err(|err| {
-            ThreadStoreError::Internal {
-                message: format!(
-                    "failed to decode compressed lineage source {}: {err}",
-                    rollout_path.display()
-                ),
-            }
-        })?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_line) else {
+            continue;
+        };
+        if value.get("ordinal").and_then(serde_json::Value::as_u64) == Some(expected_ordinal) {
+            return Ok(());
+        }
+        let Ok(line) = codex_rollout::decode_rollout_line(value) else {
+            continue;
+        };
         let ordinal = line.ordinal.ok_or_else(|| {
             malformed_lineage(
                 requested_thread_id,

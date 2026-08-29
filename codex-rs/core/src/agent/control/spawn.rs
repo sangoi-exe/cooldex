@@ -13,6 +13,7 @@ use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
+use codex_features::Feature;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
@@ -277,7 +278,11 @@ async fn restore_v2_identity_snapshot(
             ))
         })?;
     let service_tier = latest_thread_settings.service_tier.clone();
-    let shell_tool_enabled = latest_thread_settings.shell_tool_enabled;
+    let shell_tool_enabled = Some(
+        latest_thread_settings
+            .shell_tool_enabled
+            .unwrap_or_else(|| config.features.enabled(Feature::ShellTool)),
+    );
     let session_source = initial_history
         .get_resumed_session_sources()
         .map(|(session_source, _)| session_source)

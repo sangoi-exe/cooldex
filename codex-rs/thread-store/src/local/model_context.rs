@@ -26,13 +26,13 @@ mod tests;
 
 /// Loads rollout items needed to reconstruct the latest model-visible context.
 ///
-/// Plain paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
-/// history checkpoint and the completed user-turn context needed for resume metadata, the returned
-/// replay starts with the canonical `SessionMeta` followed by that newest suffix. When no
-/// bounded cutoff is available, the scan continues to the beginning and returns the complete
-/// replay it already accumulated.
+/// Plain paginated leaf rollouts use a reverse scan after referenced ancestors are materialized as
+/// plain JSONL. When the scan finds both a usable replacement-history checkpoint and the completed
+/// user-turn context needed for resume metadata, the returned replay starts with the canonical
+/// `SessionMeta` followed by that newest suffix. When no bounded cutoff is available, the scan
+/// continues to the beginning and returns the complete replay it already accumulated.
 ///
-/// Legacy and compressed rollout shapes keep the existing full-history path.
+/// Legacy and compressed leaf rollouts keep the existing full-history path.
 pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
@@ -71,7 +71,9 @@ pub(super) async fn load_latest_model_context(
             .and_then(|file_name| file_name.to_str())
             .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"))
     {
-        let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+        let lineage = store
+            .resolve_rollout_lineage_for_reference(params.thread_id)
+            .await?;
         scan_model_context_from_lineage(lineage, session_meta).await?
     } else {
         read_thread::load_history_items(path.as_path()).await?

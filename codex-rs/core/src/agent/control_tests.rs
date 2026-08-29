@@ -53,6 +53,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::SessionSource;
@@ -793,6 +794,24 @@ async fn ensure_v2_agent_loaded_rejects_absent_persisted_settings_snapshot() {
     .await;
 }
 
+#[tokio::test]
+async fn ensure_v2_agent_loaded_normalizes_legacy_missing_shell_state() {
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::LegacyMissingShellState,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_restores_child_with_compressed_ancestor() {
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::CompressedAncestor,
+    )
+    .await;
+}
+
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,
@@ -804,6 +823,8 @@ enum V2ReloadExpectation {
     FullIdentity,
     BoundedModelContext,
     MissingSettingsSnapshot,
+    LegacyMissingShellState,
+    CompressedAncestor,
 }
 
 async fn spawn_v2_reload_test_child(
@@ -839,6 +860,15 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
+    if matches!(
+        expectation,
+        V2ReloadExpectation::LegacyMissingShellState | V2ReloadExpectation::CompressedAncestor
+    ) {
+        config
+            .features
+            .enable(Feature::ShellTool)
+            .expect("root shell tool should be enabled");
+    }
     config.model = Some("gpt-5.6-sol".to_string());
     let role_path = config.codex_home.join("worker.toml");
     std::fs::write(&role_path, "model = \"role-file-model\"\n").expect("write worker role config");
@@ -970,44 +1000,23 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         .await
         .expect("child metadata should be readable");
     assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
-    if matches!(expectation, V2ReloadExpectation::MissingSettingsSnapshot) {
+    if matches!(
+        expectation,
+        V2ReloadExpectation::MissingSettingsSnapshot
+            | V2ReloadExpectation::LegacyMissingShellState
+            | V2ReloadExpectation::CompressedAncestor
+    ) {
         assert!(matches!(route, V2ReloadRoute::Sender));
         let child_rollout_path = stored_child
             .rollout_path
             .clone()
             .expect("persisted child rollout path");
-        let original_lines =
-            std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
-        let original_line_count = original_lines.lines().count();
-        let retained_lines = original_lines
-            .lines()
-            .filter(|raw_line| {
-                let value = serde_json::from_str(raw_line).expect("parse child rollout line");
-                !matches!(
-                    codex_rollout::decode_rollout_line(value)
-                        .expect("decode child rollout line")
-                        .item,
-                    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
-                )
-            })
-            .collect::<Vec<_>>();
-        let removed_snapshots = original_line_count - retained_lines.len();
-        std::fs::write(
-            &child_rollout_path,
-            format!("{}\n", retained_lines.join("\n")),
-        )
-        .expect("remove child settings snapshots");
-        assert!(
-            removed_snapshots > 0,
-            "child rollout should contain a persisted settings snapshot"
-        );
-
         root_thread.ensure_rollout_materialized().await;
         root_thread
             .flush_rollout()
             .await
             .expect("root rollout should flush");
-        let root_rollout_path = root_thread
+        let mut root_rollout_path = root_thread
             .read_thread(
                 /*include_archived*/ true, /*include_history*/ false,
             )
@@ -1022,6 +1031,136 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
         assert_eq!(report.timed_out, Vec::<ThreadId>::new());
 
+        match expectation {
+            V2ReloadExpectation::MissingSettingsSnapshot => {
+                let original_lines =
+                    std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
+                let original_line_count = original_lines.lines().count();
+                let retained_lines = original_lines
+                    .lines()
+                    .filter(|raw_line| {
+                        let value =
+                            serde_json::from_str(raw_line).expect("parse child rollout line");
+                        !matches!(
+                            codex_rollout::decode_rollout_line(value)
+                                .expect("decode child rollout line")
+                                .item,
+                            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let removed_snapshots = original_line_count - retained_lines.len();
+                std::fs::write(
+                    &child_rollout_path,
+                    format!("{}\n", retained_lines.join("\n")),
+                )
+                .expect("remove child settings snapshots");
+                assert!(
+                    removed_snapshots > 0,
+                    "child rollout should contain a persisted settings snapshot"
+                );
+            }
+            V2ReloadExpectation::LegacyMissingShellState => {
+                let original_lines =
+                    std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
+                let mut removed_shell_states = 0;
+                let updated_lines = original_lines
+                    .lines()
+                    .map(|raw_line| {
+                        let mut value: serde_json::Value =
+                            serde_json::from_str(raw_line).expect("parse child rollout line");
+                        if value
+                            .pointer("/payload/type")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("thread_settings_applied")
+                        {
+                            let thread_settings = value
+                                .pointer_mut("/payload/thread_settings")
+                                .and_then(serde_json::Value::as_object_mut)
+                                .expect("thread settings payload");
+                            removed_shell_states +=
+                                usize::from(thread_settings.remove("shell_tool_enabled").is_some());
+                        }
+                        serde_json::to_string(&value).expect("serialize child rollout line")
+                    })
+                    .collect::<Vec<_>>();
+                std::fs::write(
+                    &child_rollout_path,
+                    format!("{}\n", updated_lines.join("\n")),
+                )
+                .expect("remove persisted shell-tool state");
+                assert!(
+                    removed_shell_states > 0,
+                    "child rollout should contain a persisted shell-tool state"
+                );
+            }
+            V2ReloadExpectation::CompressedAncestor => {
+                let root_contents =
+                    std::fs::read_to_string(&root_rollout_path).expect("read root rollout");
+                let root_last_ordinal = root_contents
+                    .lines()
+                    .map(|raw_line| {
+                        let value =
+                            serde_json::from_str(raw_line).expect("parse root rollout line");
+                        codex_rollout::decode_rollout_line(value)
+                            .expect("decode root rollout line")
+                            .ordinal
+                            .expect("paginated root ordinal")
+                    })
+                    .next_back()
+                    .expect("root rollout record");
+                let history_base = HistoryPosition {
+                    thread_id: root_thread.session.thread_id,
+                    end_ordinal_exclusive: root_last_ordinal
+                        .checked_add(1)
+                        .expect("root history ordinal"),
+                    end_byte_offset: u64::try_from(root_contents.len())
+                        .expect("root rollout length"),
+                };
+                let child_contents =
+                    std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
+                let updated_lines = child_contents
+                    .lines()
+                    .enumerate()
+                    .map(|(index, raw_line)| {
+                        let value =
+                            serde_json::from_str(raw_line).expect("parse child rollout line");
+                        let mut line = codex_rollout::decode_rollout_line(value)
+                            .expect("decode child rollout line");
+                        line.ordinal = Some(
+                            history_base
+                                .end_ordinal_exclusive
+                                .checked_add(u64::try_from(index).expect("child rollout index"))
+                                .expect("child rollout ordinal"),
+                        );
+                        if let RolloutItem::SessionMeta(session_meta) = &mut line.item {
+                            session_meta.meta.history_base = Some(history_base);
+                        }
+                        serde_json::to_string(&line).expect("serialize child rollout line")
+                    })
+                    .collect::<Vec<_>>();
+                std::fs::write(
+                    &child_rollout_path,
+                    format!("{}\n", updated_lines.join("\n")),
+                )
+                .expect("write referenced child rollout");
+
+                let root_contents =
+                    std::fs::read(&root_rollout_path).expect("read root rollout bytes");
+                let compressed_contents =
+                    zstd::stream::encode_all(root_contents.as_slice(), /*level*/ 3)
+                        .expect("compress root rollout");
+                let compressed_root_path = root_rollout_path.with_extension("jsonl.zst");
+                std::fs::write(&compressed_root_path, compressed_contents)
+                    .expect("write compressed root rollout");
+                std::fs::remove_file(&root_rollout_path).expect("remove plain root rollout");
+                root_rollout_path = compressed_root_path;
+            }
+            V2ReloadExpectation::FullIdentity | V2ReloadExpectation::BoundedModelContext => {
+                unreachable!("fresh-manager branch only handles persisted rollout fixtures")
+            }
+        }
+
         let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
         let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
             CodexAuth::from_api_key("dummy"),
@@ -1033,7 +1172,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         let root_history = codex_rollout::RolloutRecorder::get_rollout_history(&root_rollout_path)
             .await
             .expect("load root rollout history");
-        let error = match resumed_manager
+        let resume_result = resumed_manager
             .resume_thread_with_history(
                 harness.config.clone(),
                 root_history,
@@ -1041,18 +1180,64 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                 /*parent_trace*/ None,
                 client_mcp_extensions,
             )
-            .await
-        {
-            Ok(_) => panic!("root resume must reject a child without persisted settings"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "agent {} is missing a persisted thread settings snapshot required to restore its identity snapshot",
-                spawned_agent.thread_id
-            )
-        );
+            .await;
+        match expectation {
+            V2ReloadExpectation::MissingSettingsSnapshot => {
+                let error = match resume_result {
+                    Ok(_) => panic!("root resume must reject a child without persisted settings"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "agent {} is missing a persisted thread settings snapshot required to restore its identity snapshot",
+                        spawned_agent.thread_id
+                    )
+                );
+            }
+            V2ReloadExpectation::LegacyMissingShellState
+            | V2ReloadExpectation::CompressedAncestor => {
+                let resumed_root =
+                    resume_result.expect("root resume should restore child metadata");
+                let resumed_control = resumed_root.thread.session.services.agent_control.clone();
+                assert!(
+                    resumed_control
+                        .ensure_agent_known(spawned_agent.thread_id)
+                        .is_ok(),
+                    "restored child should remain registered"
+                );
+                assert_thread_not_loaded(&resumed_manager, spawned_agent.thread_id).await;
+                for access in 1..=2 {
+                    resumed_control
+                        .ensure_v2_agent_loaded(
+                            harness.config.clone(),
+                            spawned_agent.thread_id,
+                            /*parent*/ None,
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("restored child access {access} should succeed: {error}")
+                        });
+                }
+                let restored_child = resumed_manager
+                    .get_thread(spawned_agent.thread_id)
+                    .await
+                    .expect("restored child should be loaded");
+                assert_eq!(
+                    restored_child
+                        .session
+                        .new_default_turn()
+                        .await
+                        .config
+                        .features
+                        .enabled(Feature::ShellTool),
+                    matches!(expectation, V2ReloadExpectation::LegacyMissingShellState),
+                );
+            }
+            V2ReloadExpectation::FullIdentity | V2ReloadExpectation::BoundedModelContext => {
+                unreachable!("fresh-manager branch only handles persisted rollout fixtures")
+            }
+        }
         return;
     }
 

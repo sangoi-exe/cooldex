@@ -286,7 +286,7 @@ async fn ignores_contextual_user_messages_when_selecting_turn_context() {
 }
 
 #[tokio::test]
-async fn replays_nested_archived_lineage_from_frozen_prefix() {
+async fn replays_nested_archived_lineage_with_compressed_ancestor() {
     let home = TempDir::new().expect("temp dir");
     let root_uuid = Uuid::from_u128(/*v*/ 2001);
     let root_id = ThreadId::from_string(&root_uuid.to_string()).expect("root id");
@@ -331,6 +331,12 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
             /*end_ordinal_exclusive*/ 3,
         ),
     );
+    let compressed_root = archived_root.with_extension("jsonl.zst");
+    let root_contents = std::fs::read(archived_root.as_path()).expect("read archived root");
+    let compressed_contents = zstd::stream::encode_all(root_contents.as_slice(), /*level*/ 3)
+        .expect("compress archived root");
+    std::fs::write(compressed_root, compressed_contents).expect("write compressed root");
+    std::fs::remove_file(archived_root).expect("remove plain archived root");
 
     let child_uuid = Uuid::from_u128(/*v*/ 2003);
     let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");

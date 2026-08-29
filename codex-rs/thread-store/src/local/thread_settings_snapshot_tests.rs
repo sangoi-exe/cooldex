@@ -91,6 +91,29 @@ async fn loads_snapshot_from_compressed_ancestor_without_crossing_cutoff() {
             )),
         ],
     );
+    let original = fs::read_to_string(root_path.as_path()).expect("read root rollout");
+    let mut original_lines = original.lines();
+    let session_meta = original_lines.next().expect("root session metadata");
+    let before_cutoff = original_lines.next().expect("before-cutoff snapshot");
+    let after_cutoff = original_lines.next().expect("after-cutoff snapshot");
+    let rejected_before_cutoff = serde_json::json!({
+        "timestamp": "2026-08-26T00:00:00Z",
+        "type": "future_item",
+        "payload": {},
+    });
+    let rejected_at_cutoff = serde_json::json!({
+        "timestamp": "2026-08-26T00:00:00Z",
+        "ordinal": 2,
+        "type": "future_item",
+        "payload": {},
+    });
+    fs::write(
+        root_path.as_path(),
+        format!(
+            "{session_meta}\n{{\n{rejected_before_cutoff}\n{before_cutoff}\n{rejected_at_cutoff}\n{after_cutoff}\n"
+        ),
+    )
+    .expect("insert rejected rollout records");
     let inherited_prefix = history_position(
         root_path.as_path(),
         root_id,
@@ -182,8 +205,9 @@ fn write_paginated_rollout(
     let directory = home.join("sessions/2026/08/26");
     fs::create_dir_all(directory.as_path()).expect("create rollout directory");
     let path = directory.join(format!("rollout-2026-08-26T00-00-00-{thread_id}.jsonl"));
+    let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
     let mut lines = vec![rollout_line(
-        /*ordinal*/ 0,
+        initial_ordinal,
         RolloutItem::SessionMeta(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
@@ -196,7 +220,13 @@ fn write_paginated_rollout(
         }),
     )];
     lines.extend(items.into_iter().enumerate().map(|(index, item)| {
-        rollout_line(u64::try_from(index).expect("fixture ordinal") + 1, item)
+        rollout_line(
+            initial_ordinal
+                .checked_add(u64::try_from(index).expect("fixture ordinal"))
+                .and_then(|ordinal| ordinal.checked_add(1))
+                .expect("fixture ordinal"),
+            item,
+        )
     }));
     fs::write(path.as_path(), format!("{}\n", lines.join("\n"))).expect("write rollout");
     path
@@ -219,9 +249,13 @@ fn history_position(
             end_byte_offset += line_len;
             continue;
         }
-        let value = serde_json::from_str(raw_line).expect("parse rollout line");
-        let line = codex_rollout::decode_rollout_line(value).expect("decode rollout line");
         end_byte_offset += line_len;
+        let Ok(value) = serde_json::from_str(raw_line) else {
+            continue;
+        };
+        let Ok(line) = codex_rollout::decode_rollout_line(value) else {
+            continue;
+        };
         if line.ordinal == Some(expected_ordinal) {
             return HistoryPosition {
                 thread_id,
