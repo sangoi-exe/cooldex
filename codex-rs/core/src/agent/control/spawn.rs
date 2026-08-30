@@ -13,7 +13,6 @@ use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
-use codex_features::Feature;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
@@ -28,6 +27,7 @@ struct SpawnAgentThreadInheritance {
 
 enum V2AgentMetadataRestoreError {
     MissingThreadSettingsSnapshot { thread_id: ThreadId },
+    MissingShellToolState { thread_id: ThreadId },
     Other(CodexErr),
 }
 
@@ -278,11 +278,11 @@ async fn restore_v2_identity_snapshot(
             ))
         })?;
     let service_tier = latest_thread_settings.service_tier.clone();
-    let shell_tool_enabled = Some(
-        latest_thread_settings
-            .shell_tool_enabled
-            .unwrap_or_else(|| config.features.enabled(Feature::ShellTool)),
-    );
+    let shell_tool_enabled = latest_thread_settings.shell_tool_enabled.ok_or(
+        V2AgentMetadataRestoreError::MissingShellToolState {
+            thread_id: stored_thread.thread_id,
+        },
+    )?;
     let session_source = initial_history
         .get_resumed_session_sources()
         .map(|(session_source, _)| session_source)
@@ -298,7 +298,7 @@ async fn restore_v2_identity_snapshot(
         base_instructions,
         first_persisted_developer_instructions(&history),
         service_tier,
-        shell_tool_enabled,
+        Some(shell_tool_enabled),
     ))
 }
 
@@ -424,6 +424,11 @@ impl AgentControl {
                 Err(V2AgentMetadataRestoreError::MissingThreadSettingsSnapshot { thread_id }) => {
                     return Err(CodexErr::InvalidRequest(format!(
                         "agent {thread_id} is missing a persisted thread settings snapshot required to restore its identity snapshot"
+                    )));
+                }
+                Err(V2AgentMetadataRestoreError::MissingShellToolState { thread_id }) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} is missing a persisted shell_tool_enabled value required to restore its identity snapshot"
                     )));
                 }
                 Err(V2AgentMetadataRestoreError::Other(err)) => {

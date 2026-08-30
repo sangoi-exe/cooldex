@@ -795,10 +795,10 @@ async fn ensure_v2_agent_loaded_rejects_absent_persisted_settings_snapshot() {
 }
 
 #[tokio::test]
-async fn ensure_v2_agent_loaded_normalizes_legacy_missing_shell_state() {
+async fn ensure_v2_agent_loaded_rejects_legacy_missing_shell_state() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
-        V2ReloadExpectation::LegacyMissingShellState,
+        V2ReloadExpectation::MissingShellState,
     )
     .await;
 }
@@ -823,7 +823,7 @@ enum V2ReloadExpectation {
     FullIdentity,
     BoundedModelContext,
     MissingSettingsSnapshot,
-    LegacyMissingShellState,
+    MissingShellState,
     CompressedAncestor,
 }
 
@@ -862,7 +862,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     let _ = config.features.enable(Feature::Sqlite);
     if matches!(
         expectation,
-        V2ReloadExpectation::LegacyMissingShellState | V2ReloadExpectation::CompressedAncestor
+        V2ReloadExpectation::MissingShellState | V2ReloadExpectation::CompressedAncestor
     ) {
         config
             .features
@@ -1003,7 +1003,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     if matches!(
         expectation,
         V2ReloadExpectation::MissingSettingsSnapshot
-            | V2ReloadExpectation::LegacyMissingShellState
+            | V2ReloadExpectation::MissingShellState
             | V2ReloadExpectation::CompressedAncestor
     ) {
         assert!(matches!(route, V2ReloadRoute::Sender));
@@ -1060,7 +1060,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                     "child rollout should contain a persisted settings snapshot"
                 );
             }
-            V2ReloadExpectation::LegacyMissingShellState => {
+            V2ReloadExpectation::MissingShellState => {
                 let original_lines =
                     std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
                 let mut removed_shell_states = 0;
@@ -1195,8 +1195,22 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                     )
                 );
             }
-            V2ReloadExpectation::LegacyMissingShellState
-            | V2ReloadExpectation::CompressedAncestor => {
+            V2ReloadExpectation::MissingShellState => {
+                let error = match resume_result {
+                    Ok(_) => {
+                        panic!("root resume must reject a child without persisted shell state")
+                    }
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "agent {} is missing a persisted shell_tool_enabled value required to restore its identity snapshot",
+                        spawned_agent.thread_id
+                    )
+                );
+            }
+            V2ReloadExpectation::CompressedAncestor => {
                 let resumed_root =
                     resume_result.expect("root resume should restore child metadata");
                 let resumed_control = resumed_root.thread.session.services.agent_control.clone();
@@ -1223,15 +1237,14 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                     .get_thread(spawned_agent.thread_id)
                     .await
                     .expect("restored child should be loaded");
-                assert_eq!(
-                    restored_child
+                assert!(
+                    !restored_child
                         .session
                         .new_default_turn()
                         .await
                         .config
                         .features
-                        .enabled(Feature::ShellTool),
-                    matches!(expectation, V2ReloadExpectation::LegacyMissingShellState),
+                        .enabled(Feature::ShellTool)
                 );
             }
             V2ReloadExpectation::FullIdentity | V2ReloadExpectation::BoundedModelContext => {
