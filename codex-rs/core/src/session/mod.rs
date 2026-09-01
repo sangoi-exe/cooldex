@@ -3756,26 +3756,31 @@ impl Session {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
-        if items
-            .iter()
-            .any(|envelope| envelope.item.id().is_none_or(|id| id.is_empty()))
-        {
-            return Err(CodexErr::Fatal(
-                "compaction replacement history contains an item without a stable ID".to_string(),
-            ));
-        }
-        let boundary_item_id = items
-            .last()
-            .and_then(|envelope| envelope.item.id())
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                CodexErr::Fatal(
-                    "compaction replacement history has no stable boundary item".to_string(),
-                )
-            })?;
-        let recovery_identity = PostCompactRecoveryIdentity {
-            compaction_window_id: metadata.window_ids.window_id.to_string(),
-            boundary_item_id: boundary_item_id.clone(),
+        let recovery_identity = if self.live_thread().is_some() {
+            if items
+                .iter()
+                .any(|envelope| envelope.item.id().is_none_or(|id| id.is_empty()))
+            {
+                return Err(CodexErr::Fatal(
+                    "compaction replacement history contains an item without a stable ID"
+                        .to_string(),
+                ));
+            }
+            let boundary_item_id = items
+                .last()
+                .and_then(|envelope| envelope.item.id())
+                .map(ToString::to_string)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(
+                        "compaction replacement history has no stable boundary item".to_string(),
+                    )
+                })?;
+            Some(PostCompactRecoveryIdentity {
+                compaction_window_id: metadata.window_ids.window_id.to_string(),
+                boundary_item_id,
+            })
+        } else {
+            None
         };
         let compacted_item = CompactedItem {
             message: metadata.message,
@@ -3788,7 +3793,11 @@ impl Session {
                 .previous_window_id
                 .map(|id| id.to_string()),
             window_id: Some(metadata.window_ids.window_id.to_string()),
-            post_compact_recovery: Some(PostCompactRecoveryMarker { boundary_item_id }),
+            post_compact_recovery: recovery_identity.as_ref().map(|identity| {
+                PostCompactRecoveryMarker {
+                    boundary_item_id: identity.boundary_item_id.clone(),
+                }
+            }),
         };
 
         // Wait for accepted updates to finish persisting, then keep later updates from
@@ -3812,28 +3821,44 @@ impl Session {
             thread_settings::applied_event(self).await,
         ));
 
-        {
+        let recovery_identity = {
             let mut state = self.state.lock().await;
             if let Some(failure) = state.post_compact_recovery.blocked_failure() {
                 return Err(CodexErr::Fatal(format!(
                     "post-compact recovery is blocked: {failure}"
                 )));
             }
-            if !state.can_install_auto_compact_window(metadata.window_number, metadata.window_ids) {
-                return Err(CodexErr::Fatal(
-                    "prepared auto-compact window no longer matches live session state".to_string(),
-                ));
+            if let Some(recovery_identity) = recovery_identity {
+                if !state
+                    .can_install_auto_compact_window(metadata.window_number, metadata.window_ids)
+                {
+                    return Err(CodexErr::Fatal(
+                        "prepared auto-compact window no longer matches live session state"
+                            .to_string(),
+                    ));
+                }
+                recovery_identity
+            } else {
+                if !state.install_auto_compact_window(metadata.window_number, metadata.window_ids) {
+                    return Err(CodexErr::Fatal(
+                        "prepared auto-compact window no longer matches live session state"
+                            .to_string(),
+                    ));
+                }
+                state.replace_annotated_history(
+                    items,
+                    reference_context_item,
+                    HistoryReplacement::Compaction,
+                );
+                if let Some(snapshot) = world_state_snapshot {
+                    state.history.set_world_state_baseline(snapshot);
+                }
+                state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+                drop(state);
+                self.persist_rollout_items(&rollout_items).await;
+                return Ok(());
             }
-            state.replace_annotated_history(
-                items.clone(),
-                reference_context_item.clone(),
-                HistoryReplacement::Compaction,
-            );
-            if let Some(snapshot) = world_state_snapshot.as_ref() {
-                state.history.set_world_state_baseline(snapshot.clone());
-            }
-        }
-
+        };
         let live_thread = self
             .live_thread_for_persistence("install compacted history")
             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
