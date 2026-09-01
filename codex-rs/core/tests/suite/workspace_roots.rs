@@ -479,15 +479,11 @@ async fn workspace_roots_deny_file_and_command_writes_outside_roots() -> Result<
         "patch should be denied outside the workspace roots, got {patch_output:?}"
     );
 
-    let (command_output, _) = request
+    let (command_output, command_success) = request
         .function_call_output_content_and_success(COMMAND_CALL_ID)
         .context("denied command result should be present")?;
-    let command_output = command_output.context("denied command output should be present")?;
-    assert!(
-        command_output.contains("Access is denied")
-            || command_output.contains(&command_path_display),
-        "outside command should be denied, got {command_output:?}"
-    );
+    assert_ne!(command_success, Some(true));
+    command_output.context("denied command output should be present")?;
     assert!(
         test.fs()
             .read_file(&patch_path, Default::default(), /*sandbox*/ None)
