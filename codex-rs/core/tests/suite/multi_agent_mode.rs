@@ -32,7 +32,9 @@ const PROACTIVE_TEXT: &str = "Proactive multi-agent delegation is active.";
 const CUSTOM_MODE_HINT_TEXT: &str = "Use the configured delegation policy.";
 const CATALOG_MODE_HINT_TEXT: &str = "Use the model catalog delegation policy.";
 const CATALOG_EXPLICIT_TEXT: &str = "Use explicit delegation from the model catalog.";
+const CATALOG_PROACTIVE_TEXT: &str = "Use proactive delegation from the model catalog.";
 const SECOND_MODEL_EXPLICIT_TEXT: &str = "Second model explicit mode.";
+const SECOND_MODEL_PROACTIVE_TEXT: &str = "Second model proactive mode.";
 const FIRST_MODEL_ROOT_ROLE_TEXT: &str = "First model root role.";
 const SECOND_MODEL_ROOT_ROLE_TEXT: &str = "Second model root role.";
 const ROOT_USAGE_HINT_TEXT: &str = "Root usage hint.";
@@ -46,6 +48,7 @@ enum ModeHintSource {
 fn set_multi_agent_mode(
     model_info: &mut ModelInfo,
     explicit: &str,
+    proactive: Option<&str>,
     hint_text: Option<&str>,
     root_role: Option<&str>,
 ) {
@@ -57,6 +60,7 @@ fn set_multi_agent_mode(
             }),
             mode: Some(MultiAgentModeMessages {
                 explicit: Some(explicit.to_string()),
+                proactive: proactive.map(str::to_string),
                 hint_text: hint_text.map(str::to_string),
             }),
         });
@@ -130,7 +134,8 @@ async fn submit_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ultra_reasoning_uses_max_without_changing_the_default_policy() -> Result<()> {
+async fn ultra_reasoning_uses_highest_non_ultra_without_changing_the_default_policy() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -150,7 +155,7 @@ async fn ultra_reasoning_uses_max_without_changing_the_default_policy() -> Resul
     let request = response.single_request();
     assert_eq!(
         request.body_json()["reasoning"]["effort"].as_str(),
-        Some("max")
+        Some("xhigh")
     );
     let input = request.input();
     let texts = developer_texts(&input);
@@ -192,6 +197,7 @@ async fn mode_hints_keep_explicit_policy_across_reasoning_efforts(
             set_multi_agent_mode(
                 model_info,
                 CATALOG_EXPLICIT_TEXT,
+                Some(CATALOG_PROACTIVE_TEXT),
                 Some(CATALOG_MODE_HINT_TEXT),
                 /*root_role*/ None,
             );
@@ -220,8 +226,9 @@ async fn mode_hints_keep_explicit_policy_across_reasoning_efforts(
                 count_containing(texts, expected_hint),
                 count_containing(texts, NO_SPAWN_TEXT),
                 count_containing(texts, PROACTIVE_TEXT),
+                count_containing(texts, CATALOG_PROACTIVE_TEXT),
             ),
-            (1, 1, 0)
+            (1, 1, 0, 0)
         );
         assert_eq!(count_containing(texts, suppressed_hint), 0);
     }
@@ -229,8 +236,64 @@ async fn mode_hints_keep_explicit_policy_across_reasoning_efforts(
     Ok(())
 }
 
+#[test_case(MultiAgentV2Policy::Proactive, Some(CATALOG_PROACTIVE_TEXT), CATALOG_PROACTIVE_TEXT; "proactive policy uses catalog explanation")]
+#[test_case(MultiAgentV2Policy::ExplicitRequestOnly, Some(CATALOG_PROACTIVE_TEXT), CATALOG_EXPLICIT_TEXT; "explicit policy ignores proactive explanation")]
+#[test_case(MultiAgentV2Policy::Proactive, None, PROACTIVE_TEXT; "proactive policy falls back to built in")]
+#[test_case(MultiAgentV2Policy::Proactive, Some(""), PROACTIVE_TEXT; "empty proactive explanation keeps built in policy")]
+#[test_case(MultiAgentV2Policy::ExplicitRequestOnly, Some(""), CATALOG_EXPLICIT_TEXT; "empty proactive explanation leaves explicit policy unchanged")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_switch_refreshes_catalog_role_and_explicit_mode() -> Result<()> {
+async fn catalog_mode_text_follows_the_selected_policy(
+    policy: MultiAgentV2Policy,
+    proactive: Option<&'static str>,
+    expected_hint: &str,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.4", move |model_info| {
+            add_ultra_reasoning(model_info);
+            set_multi_agent_mode(
+                model_info,
+                CATALOG_EXPLICIT_TEXT,
+                proactive,
+                /*hint_text*/ None,
+                /*root_role*/ None,
+            );
+        })
+        .with_config(move |config| {
+            configure_multi_agent_v2(config);
+            config.multi_agent_v2.policy = policy;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    submit_turn(&test.codex, "hello", Some(ReasoningEffort::High)).await?;
+
+    let input = response.single_request().input();
+    let texts = developer_texts(&input);
+    assert_eq!(count_containing(&texts, MULTI_AGENT_MODE_OPEN_TAG), 1);
+    assert_eq!(count_containing(&texts, expected_hint), 1);
+    assert_eq!(
+        count_containing(&texts, CATALOG_PROACTIVE_TEXT),
+        usize::from(expected_hint == CATALOG_PROACTIVE_TEXT)
+    );
+
+    Ok(())
+}
+
+#[test_case(MultiAgentV2Policy::ExplicitRequestOnly, [CATALOG_EXPLICIT_TEXT, SECOND_MODEL_EXPLICIT_TEXT]; "explicit policy")]
+#[test_case(MultiAgentV2Policy::Proactive, [CATALOG_PROACTIVE_TEXT, SECOND_MODEL_PROACTIVE_TEXT]; "proactive policy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_switch_refreshes_catalog_role_and_mode(
+    policy: MultiAgentV2Policy,
+    expected_hints: [&str; 2],
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -248,22 +311,29 @@ async fn model_switch_refreshes_catalog_role_and_explicit_mode() -> Result<()> {
     .await;
     let test = test_codex()
         .with_model_info_override("gpt-5.2", |model_info| {
+            add_ultra_reasoning(model_info);
             set_multi_agent_mode(
                 model_info,
                 SECOND_MODEL_EXPLICIT_TEXT,
+                Some(SECOND_MODEL_PROACTIVE_TEXT),
                 /*hint_text*/ None,
                 Some(SECOND_MODEL_ROOT_ROLE_TEXT),
             );
         })
         .with_model_info_override("gpt-5.4", |model_info| {
+            add_ultra_reasoning(model_info);
             set_multi_agent_mode(
                 model_info,
                 CATALOG_EXPLICIT_TEXT,
+                Some(CATALOG_PROACTIVE_TEXT),
                 /*hint_text*/ None,
                 Some(FIRST_MODEL_ROOT_ROLE_TEXT),
             );
         })
-        .with_config(configure_multi_agent_v2)
+        .with_config(move |config| {
+            configure_multi_agent_v2(config);
+            config.multi_agent_v2.policy = policy;
+        })
         .build_with_auto_env(&server)
         .await?;
     submit_turn(&test.codex, "first model", Some(ReasoningEffort::High)).await?;
@@ -283,8 +353,8 @@ async fn model_switch_refreshes_catalog_role_and_explicit_mode() -> Result<()> {
         let texts = developer_texts(&input);
         assert_eq!(
             (
-                count_containing(&texts, CATALOG_EXPLICIT_TEXT),
-                count_containing(&texts, SECOND_MODEL_EXPLICIT_TEXT),
+                count_containing(&texts, expected_hints[0]),
+                count_containing(&texts, expected_hints[1]),
                 count_containing(&texts, NO_SPAWN_TEXT),
                 count_containing(&texts, PROACTIVE_TEXT),
             ),
@@ -373,11 +443,21 @@ async fn empty_configured_explanation_still_emits_the_selected_policy() -> Resul
     )
     .await;
     let test = test_codex()
+        .with_model_info_override("gpt-5.4", |model_info| {
+            add_ultra_reasoning(model_info);
+            set_multi_agent_mode(
+                model_info,
+                CATALOG_EXPLICIT_TEXT,
+                Some(CATALOG_PROACTIVE_TEXT),
+                Some(CATALOG_MODE_HINT_TEXT),
+                /*root_role*/ None,
+            );
+        })
         .with_config(|config| {
             configure_multi_agent_v2(config);
             config.multi_agent_v2.multi_agent_mode_hint_text = Some(String::new());
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
 
     submit_turn(&test.codex, "hello", Some(ReasoningEffort::High)).await?;
@@ -570,7 +650,7 @@ async fn policy_change_after_cold_resume_emits_explicit_mode() -> Result<()> {
                 .as_str()
                 .map(str::to_string),
         ),
-        (Some("max".to_string()), Some("high".to_string()))
+        (Some("xhigh".to_string()), Some("high".to_string()))
     );
     let resumed_input = requests[1].input();
     let texts = developer_texts(&resumed_input);
@@ -587,7 +667,7 @@ async fn policy_change_after_cold_resume_emits_explicit_mode() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<()> {
+async fn ultra_on_multi_agent_v1_uses_highest_non_ultra_without_mode_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -609,7 +689,7 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
     let request = response.single_request();
     assert_eq!(
         request.body_json()["reasoning"]["effort"].as_str(),
-        Some("max")
+        Some("xhigh")
     );
     let input = request.input();
     let texts = developer_texts(&input);

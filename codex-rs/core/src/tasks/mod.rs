@@ -13,6 +13,7 @@ use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +35,7 @@ use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
+use crate::session::turn_context::NewTurnContextOptions;
 use crate::session::turn_context::TurnContext;
 use crate::state::PostCompactRecoveryIdentity;
 use crate::state::RetiredTurn;
@@ -43,6 +45,7 @@ use crate::state::TaskKind;
 use crate::state::TerminalTransitionKind;
 use crate::state::TurnSlotError;
 use crate::state::TurnStartClaim;
+use crate::state::TurnState;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_context_fragments::RenderedFragment;
@@ -253,7 +256,7 @@ async fn emit_standard_turn_started(session: Arc<SessionTaskContext>, ctx: Arc<T
         trace_id: ctx.trace_id.clone(),
         started_at: ctx.turn_timing_state.started_at_unix_secs().await,
         model_context_window: ctx.model_context_window(),
-        collaboration_mode_kind: ctx.mode,
+        collaboration_mode_kind: ctx.mode(),
     });
     session
         .clone_session()
@@ -612,10 +615,10 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let (pending_items, parent_turn_id, root_turn_id) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
+        // Reserved turn input already has its context; only newly arriving mail can change lineage.
+        let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
         if let MailboxParentProvenance::Attribute = mailbox_parent_provenance {
-            if let Some(id) = parent_turn_id {
+            if let Some(id) = start_options.parent_turn_id.as_ref() {
                 if let Some(initiating_agent_path) = pending_items.iter().find_map(|item| {
                     let TurnInput::InterAgentCommunication(communication) = item else {
                         return None;
@@ -628,17 +631,22 @@ impl Session {
                         .turn_metadata_state
                         .set_initiating_agent_path(initiating_agent_path);
                 }
-                turn_context.turn_metadata_state.set_parent_turn_id(id);
+                turn_context
+                    .turn_metadata_state
+                    .set_parent_turn_id(id.clone());
             }
-            if let Some(id) = root_turn_id {
-                turn_context.turn_metadata_state.set_root_turn_id(id);
+            if let Some(id) = start_options.root_turn_id.as_ref() {
+                turn_context
+                    .turn_metadata_state
+                    .set_root_turn_id(id.clone());
             }
         } else if pending_items.iter().any(|item| {
             matches!(
                 item,
                 TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
             )
-        }) && turn_context.turn_metadata_state.root_turn_id() != root_turn_id
+        }) && turn_context.turn_metadata_state.root_turn_id()
+            != start_options.root_turn_id
         {
             turn_context.turn_metadata_state.mark_root_turn_ambiguous();
         }
@@ -673,7 +681,7 @@ impl Session {
             otel.name = span_name,
             thread.id = %self.thread_id,
             turn.id = %turn_context.sub_id,
-            model = %turn_context.model_info.slug,
+            model = %turn_context.model_info().slug,
             codex.turn.reasoning_effort = %reasoning_effort,
             codex.turn.token_usage.input_tokens = field::Empty,
             codex.turn.token_usage.cached_input_tokens = field::Empty,
@@ -886,9 +894,56 @@ impl Session {
         let session = Arc::clone(self);
         let startup = tokio::spawn(
             async move {
-                let turn_context = session.new_default_turn_with_sub_id(sub_id).await;
+                let (input, mut start_options) = session
+                    .input_queue
+                    .get_pending_input(&session.active_turn)
+                    .await;
+                if !input.iter().any(|item| {
+                    matches!(
+                        item,
+                        TurnInput::InterAgentCommunication(mail) if mail.trigger_turn
+                    )
+                }) {
+                    // Queue-only mail wakes durable sleep without selecting a new task's settings.
+                    start_options.cyber_access_program = session
+                        .reference_context_item()
+                        .await
+                        .and_then(|context| context.cyber_access_program);
+                }
+                let turn_context = session
+                    .new_turn_with_default_settings(
+                        sub_id,
+                        NewTurnContextOptions {
+                            final_output_json_schema: start_options.final_output_json_schema.take(),
+                            cyber_access_program: start_options.cyber_access_program.take(),
+                        },
+                    )
+                    .await;
+                if let Some(id) = start_options.parent_turn_id.take() {
+                    if let Some(initiating_agent_path) = input.iter().find_map(|item| {
+                        let TurnInput::InterAgentCommunication(communication) = item else {
+                            return None;
+                        };
+                        communication
+                            .trigger_turn
+                            .then(|| communication.author.clone())
+                    }) {
+                        turn_context
+                            .turn_metadata_state
+                            .set_initiating_agent_path(initiating_agent_path);
+                    }
+                    turn_context.turn_metadata_state.set_parent_turn_id(id);
+                }
+                if let Some(id) = start_options.root_turn_id.take() {
+                    turn_context.turn_metadata_state.set_root_turn_id(id);
+                }
                 session
                     .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                    .await;
+                // Task completion must still save this mail if pre-turn compaction fails.
+                session
+                    .input_queue
+                    .extend_pending_input_for_turn_state(claim.turn_state.as_ref(), input)
                     .await;
                 session
                     .start_claimed_regular_task_with_options(
@@ -1114,15 +1169,18 @@ impl Session {
         retired_turn: RetiredTurn,
         reason: TurnAbortReason,
     ) {
-        let turn_context = Arc::clone(&retired_turn.task.turn_context);
-        self.handle_task_abort(retired_turn.task, reason.clone())
+        let RetiredTurn {
+            task, turn_state, ..
+        } = retired_turn;
+        let turn_context = Arc::clone(&task.turn_context);
+        self.handle_task_abort(task, reason.clone(), turn_state.as_ref())
             .await;
         self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
             .await;
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue
-            .clear_pending_for_turn_state(retired_turn.turn_state.as_ref())
+            .clear_pending_for_turn_state(turn_state.as_ref())
             .await;
     }
 
@@ -1423,7 +1481,7 @@ impl Session {
         };
         let event = if let Some(reason) = abort_reason {
             if reason == TurnAbortReason::Interrupted {
-                run_turn_interrupt_hooks(self, &turn_context).await;
+                run_turn_interrupt_hooks(self, &turn_context, &turn_state).await;
             }
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -1493,7 +1551,12 @@ impl Session {
             .await
     }
 
-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
+    async fn handle_task_abort(
+        self: &Arc<Self>,
+        task: RunningTask,
+        reason: TurnAbortReason,
+        turn_state: &Mutex<TurnState>,
+    ) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
             return;
@@ -1553,7 +1616,7 @@ impl Session {
         }
 
         if reason == TurnAbortReason::Interrupted {
-            run_turn_interrupt_hooks(self, &task.turn_context).await;
+            run_turn_interrupt_hooks(self, &task.turn_context, turn_state).await;
         }
 
         let started_at = task

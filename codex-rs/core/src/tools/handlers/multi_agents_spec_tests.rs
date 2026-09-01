@@ -139,9 +139,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         properties
             .get("service_tier")
             .and_then(|schema| schema.description.as_deref()),
-        Some(
-            "Service tier override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
-        )
+        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
     );
     assert_eq!(
         parameters.required.as_ref(),
@@ -203,12 +201,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
             .and_then(|schema| schema.description.as_deref()),
         Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
     );
-    assert_eq!(
-        properties
-            .get("service_tier")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
-    );
+    assert!(!properties.contains_key("service_tier"));
 }
 
 #[test]

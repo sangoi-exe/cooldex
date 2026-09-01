@@ -336,7 +336,7 @@ async fn replays_nested_archived_lineage_with_compressed_ancestor() {
     let compressed_contents = zstd::stream::encode_all(root_contents.as_slice(), /*level*/ 3)
         .expect("compress archived root");
     std::fs::write(compressed_root, compressed_contents).expect("write compressed root");
-    std::fs::remove_file(archived_root).expect("remove plain archived root");
+    std::fs::remove_file(&archived_root).expect("remove plain archived root");
 
     let child_uuid = Uuid::from_u128(/*v*/ 2003);
     let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
@@ -392,8 +392,33 @@ async fn replays_nested_archived_lineage_with_compressed_ancestor() {
         turn_complete("child-turn"),
     ];
     assert_eq!(
-        serde_json::to_value(context.items).expect("serialize context"),
+        serde_json::to_value(&context.items).expect("serialize context"),
+        serde_json::to_value(&expected).expect("serialize expected context")
+    );
+    // The same frozen lineage must replay from compressed files, without materializing or
+    // accidentally including the archived root's records after the inherited cutoff.
+    for path in [&middle_path, &child_path] {
+        let input = std::fs::File::open(path).expect("open rollout");
+        let output = std::fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        std::fs::remove_file(path).expect("remove plain rollout");
+    }
+    let compressed_context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id: child_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load compressed lineage model context");
+    assert_eq!(
+        serde_json::to_value(compressed_context.items).expect("serialize compressed context"),
         serde_json::to_value(expected).expect("serialize expected context")
+    );
+    assert!(
+        [archived_root, middle_path, child_path]
+            .iter()
+            .all(|path| !path.exists())
     );
 }
 
@@ -619,6 +644,7 @@ fn turn_context(root: &Path, turn_id: &str) -> RolloutItem {
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: None,
+        cyber_access_program: None,
         effort: None,
         summary: ReasoningSummary::Auto,
     })

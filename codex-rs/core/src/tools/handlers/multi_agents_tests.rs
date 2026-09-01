@@ -11,6 +11,7 @@ use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::session::SessionSettingsUpdate;
 use crate::session::step_context::StepContext;
+use crate::session::step_settings::StepSettingsUpdate;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
@@ -386,11 +387,9 @@ async fn multi_agent_v2_full_history_rejects_every_identity_override_before_spaw
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    let turn = TurnContext {
-        config: Arc::new(config),
-        multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
-        ..turn
-    };
+    let mut turn = turn;
+    turn.config = Arc::new(config);
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
 
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -439,11 +438,8 @@ async fn multi_agent_v2_full_history_child_matches_parent_identity() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    let turn = TurnContext {
-        config: Arc::new(config.clone()),
-        multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
-        ..turn
-    };
+    let mut turn = turn;
+    set_turn_config(&mut turn, config.clone());
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new(config))
@@ -491,106 +487,35 @@ async fn multi_agent_v2_full_history_child_matches_parent_identity() {
 }
 
 #[tokio::test]
-async fn spawn_agent_service_tier_override_validates_the_effective_child_model() {
-    #[derive(Debug, Deserialize)]
-    struct SpawnAgentResult {
-        agent_id: String,
-    }
+async fn spawn_agent_service_tier_uses_root_preference_when_root_model_cannot_support_it() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.model = Some("gpt-5.4-mini".to_string());
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("root thread should start");
+    assert_eq!(root.thread.config_snapshot().await.service_tier, None);
 
-    {
-        let (mut session, turn) = make_session_and_context().await;
-        let manager = thread_manager();
-        let root = manager
-            .start_thread(StartThreadOptions::new((*turn.config).clone()))
-            .await
-            .expect("root thread should start");
-        session.services.agent_control = manager.agent_control();
-        session.thread_id = root.thread_id;
+    config.model = Some("gpt-5.4".to_string());
+    apply_spawn_agent_service_tier(
+        root.thread.session.as_ref(),
+        &mut config,
+        /*requested_service_tier*/ None,
+    )
+    .await
+    .expect("root preference should be resolved against the child model");
 
-        let output = SpawnAgentHandler::default()
-            .handle(invocation(
-                Arc::new(session),
-                Arc::new(turn),
-                "spawn_agent",
-                function_payload(json!({
-                    "message": "inspect this repo",
-                    "model": "gpt-5.4",
-                    "service_tier": ServiceTier::Fast.request_value()
-                })),
-            ))
-            .await
-            .expect("spawn_agent should accept a supported explicit service tier");
-        let (content, _) = expect_text_output(output);
-        let result: SpawnAgentResult =
-            serde_json::from_str(&content).expect("spawn_agent result should be json");
-        let snapshot = manager
-            .get_thread(parse_agent_id(&result.agent_id))
-            .await
-            .expect("spawned agent thread should exist")
-            .config_snapshot()
-            .await;
-
-        assert_eq!(
-            snapshot.service_tier,
-            Some(ServiceTier::Fast.request_value().to_string())
-        );
-    }
-
-    {
-        let (session, turn) = make_session_and_context().await;
-        let err = SpawnAgentHandler::default()
-            .handle(invocation(
-                Arc::new(session),
-                Arc::new(turn),
-                "spawn_agent",
-                function_payload(json!({
-                    "message": "inspect this repo",
-                    "model": "gpt-5.4",
-                    "service_tier": "turbo"
-                })),
-            ))
-            .await
-            .err()
-            .expect("unknown service tier should be rejected");
-
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
-                    .to_string()
-            )
-        );
-    }
-
-    {
-        let (session, turn) = make_session_and_context().await;
-        let err = SpawnAgentHandler::default()
-            .handle(invocation(
-                Arc::new(session),
-                Arc::new(turn),
-                "spawn_agent",
-                function_payload(json!({
-                    "message": "inspect this repo",
-                    "model": "gpt-5.4-mini",
-                    "service_tier": ServiceTier::Fast.request_value()
-                })),
-            ))
-            .await
-            .err()
-            .expect("tier unsupported by the final child model should be rejected");
-
-        assert_eq!(
-            err,
-            FunctionCallError::RespondToModel(
-                "Service tier `priority` is not supported for model `gpt-5.4-mini`. Supported service tiers: none"
-                    .to_string()
-            )
-        );
-    }
+    assert_eq!(
+        config.service_tier,
+        Some(ServiceTier::Fast.request_value().to_string())
+    );
 }
 
 #[tokio::test]
-async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_tiers() {
+async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_model() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -609,7 +534,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
             .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
-        session.services.agent_control = manager.agent_control();
+        session.services.agent_control = root.thread.session.services.agent_control.clone();
         session.thread_id = root.thread_id;
 
         let output = SpawnAgentHandler::default()
@@ -650,7 +575,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
             .start_thread(StartThreadOptions::new((*turn.config).clone()))
             .await
             .expect("root thread should start");
-        session.services.agent_control = manager.agent_control();
+        session.services.agent_control = root.thread.session.services.agent_control.clone();
         session.thread_id = root.thread_id;
 
         let output = SpawnAgentHandler::default()
@@ -727,7 +652,7 @@ service_tier = "priority"
                 })),
             ))
             .await
-            .expect("spawn_agent should preserve the child role service tier");
+            .expect("spawn_agent should ignore the child role service tier");
         let (content, _) = expect_text_output(output);
         let result: SpawnAgentResult =
             serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -738,15 +663,12 @@ service_tier = "priority"
             .config_snapshot()
             .await;
 
-        assert_eq!(
-            snapshot.service_tier,
-            Some(ServiceTier::Fast.request_value().to_string())
-        );
+        assert_eq!(snapshot.service_tier, None);
     }
 }
 
 #[tokio::test]
-async fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier() {
+async fn spawn_agent_role_service_tier_cannot_override_root_preference() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -786,7 +708,7 @@ service_tier = "turbo"
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    session.services.agent_control = root.thread.session.services.agent_control.clone();
     session.thread_id = root.thread_id;
 
     let output = SpawnAgentHandler::default()
@@ -818,72 +740,25 @@ service_tier = "turbo"
 }
 
 #[tokio::test]
-async fn spawn_agent_role_service_tier_does_not_hide_invalid_spawn_request() {
-    let (session, mut turn) = make_session_and_context().await;
-    tokio::fs::create_dir_all(&turn.config.codex_home)
-        .await
-        .expect("codex home should be created");
-    let role_config_path = turn.config.codex_home.as_path().join("tiered-role.toml");
-    tokio::fs::write(
-        &role_config_path,
-        r#"model = "gpt-5.4"
-service_tier = "priority"
-"#,
-    )
-    .await
-    .expect("role config should be written");
-
-    let role_name = "tiered-role".to_string();
-    let mut config = (*turn.config).clone();
-    config.agent_roles.insert(
-        role_name.clone(),
-        AgentRoleConfig {
-            description: Some("Role with a supported child tier".to_string()),
-            config_file: Some(role_config_path),
-            nickname_candidates: None,
-        },
-    );
-    turn.config = Arc::new(config);
-
-    let result = SpawnAgentHandler::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "agent_type": role_name,
-                "service_tier": "turbo"
-            })),
-        ))
-        .await;
-
-    assert_eq!(
-        result.err(),
-        Some(FunctionCallError::RespondToModel(
-            "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
-                .to_string()
-        ))
-    );
-}
-
-#[tokio::test]
-async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
+async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
     }
 
     let (mut session, turn) = make_session_and_context().await;
-    let turn = turn
+    let mut turn = turn
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
+    let mut config = (*turn.config).clone();
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    turn.config = Arc::new(config);
     let manager = thread_manager();
     let root = manager
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    session.services.agent_control = root.thread.session.services.agent_control.clone();
     session.thread_id = root.thread_id;
 
     let output = SpawnAgentHandler::default()
@@ -893,12 +768,11 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "fork_context": true,
-                "service_tier": ServiceTier::Fast.request_value()
+                "fork_context": true
             })),
         ))
         .await
-        .expect("full-history fork should accept explicit service tier");
+        .expect("full-history fork should inherit the root service tier");
     let (content, _) = expect_text_output(output);
     let result: SpawnAgentResult =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -927,6 +801,7 @@ async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
         .with_model("gpt-5.4".to_string(), &session.services.models_manager)
         .await;
     let mut config = (*turn.config).clone();
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -937,7 +812,7 @@ async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    session.services.agent_control = root.thread.session.services.agent_control.clone();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -983,6 +858,72 @@ async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
 }
 
 #[tokio::test]
+async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        task_name: String,
+    }
+
+    let (mut session, turn) = make_session_and_context().await;
+    let mut turn = turn
+        .with_model("gpt-5.4".to_string(), &session.services.models_manager)
+        .await;
+    let mut config = (*turn.config).clone();
+    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = root.thread.session.services.agent_control.clone();
+    session.thread_id = root.thread_id;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "full_history_with_tier"
+            })),
+        ))
+        .await
+        .expect("multi-agent v2 full-history fork should inherit the root service tier");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let child_thread_id = session
+        .services
+        .agent_control
+        .resolve_agent_reference(
+            session.thread_id,
+            &turn.session_source,
+            result.task_name.as_str(),
+        )
+        .await
+        .expect("spawned task name should resolve");
+    let snapshot = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(
+        snapshot.service_tier,
+        Some(ServiceTier::Fast.request_value().to_string())
+    );
+}
+
+#[tokio::test]
 async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
@@ -998,11 +939,9 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
-    let turn = TurnContext {
-        config: Arc::new(config),
-        multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
-        ..turn
-    };
+    let mut turn = turn;
+    turn.config = Arc::new(config);
+    turn.multi_agent_version = codex_protocol::protocol::MultiAgentVersion::V2;
     let parent_provider_id = turn.config.model_provider_id.clone();
 
     let output = SpawnAgentHandlerV2::default()
@@ -1219,7 +1158,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         *id == child_thread_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.author == AgentPath::root()
                         && communication.recipient.as_str() == "/root/test_process"
                         && communication.other_recipients.is_empty()
@@ -1246,7 +1185,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         *id == child_thread_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.author == AgentPath::root()
                         && communication.recipient.as_str() == "/root/test_process"
                         && communication.other_recipients.is_empty()
@@ -1442,7 +1381,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         *id == root.thread_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.author == child_path
                         && communication.recipient == AgentPath::root()
                         && communication.other_recipients.is_empty()
@@ -1956,7 +1895,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
     assert!(!ops_for_agent.iter().any(|op| matches!(op, Op::Interrupt)));
     assert!(!ops_for_agent.iter().any(|op| matches!(
         op,
-        Op::InterAgentCommunication { communication }
+        Op::InterAgentCommunication { communication, .. }
             if communication.author == AgentPath::root()
                 && communication.recipient.as_str() == "/root/worker"
                 && communication.other_recipients.is_empty()
@@ -2043,7 +1982,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         *id == agent_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.author == AgentPath::root()
                         && communication.recipient == worker_path
                         && communication.encrypted_content.as_deref() == Some("continue")
@@ -2090,7 +2029,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                     (id == root.thread_id)
                         .then_some(op)
                         .and_then(|op| match op {
-                            Op::InterAgentCommunication { communication }
+                            Op::InterAgentCommunication { communication, .. }
                                 if communication.author == worker_path
                                     && communication.recipient == AgentPath::root()
                                     && communication.other_recipients.is_empty()
@@ -2211,7 +2150,7 @@ async fn multi_agent_v2_followup_task_rejects_loaded_agent_without_tree_identity
         *thread_id == agent_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.encrypted_content.as_deref() == Some("continue")
                         && communication.trigger_turn
             )
@@ -2262,7 +2201,10 @@ async fn multi_agent_v2_followup_task_rejects_loaded_agent_with_mismatched_ident
     worker
         .session
         .update_settings(SessionSettingsUpdate {
-            service_tier: Some(Some("identity-drift-tier".to_string())),
+            step_settings: StepSettingsUpdate {
+                service_tier: Some(Some("identity-drift-tier".to_string())),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await
@@ -2293,7 +2235,7 @@ async fn multi_agent_v2_followup_task_rejects_loaded_agent_with_mismatched_ident
         *thread_id == agent_id
             && matches!(
                 op,
-                Op::InterAgentCommunication { communication }
+                Op::InterAgentCommunication { communication, .. }
                     if communication.encrypted_content.as_deref() == Some("continue")
                         && communication.trigger_turn
             )
@@ -2414,7 +2356,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
             (id == root.thread_id)
                 .then_some(op)
                 .and_then(|op| match op {
-                    Op::InterAgentCommunication { communication }
+                    Op::InterAgentCommunication { communication, .. }
                         if communication.author.as_str() == "/root/worker"
                             && communication.recipient == AgentPath::root()
                             && communication.other_recipients.is_empty()
@@ -3284,8 +3226,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
                 "hello from worker".to_string(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await;
 
@@ -3789,8 +3730,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
                 "completed".to_string(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await;
 
@@ -3866,8 +3806,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
                 "already queued".to_string(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await;
 
@@ -3969,8 +3908,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
                 "from worker b".to_string(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await;
 
@@ -4061,8 +3999,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
                 "sensitive child output".to_string(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            Default::default(),
         )
         .await;
 
@@ -4795,7 +4732,7 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     let base_instructions = BaseInstructions {
         text: "base".to_string(),
         provenance: Some(BaseInstructionsProvenance::Model {
-            model: turn.model_info.slug.clone(),
+            model: turn.model_info().slug.clone(),
         }),
     };
     turn.developer_instructions = Some("dev".to_string());
@@ -4842,10 +4779,10 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
     let mut expected = (*turn.config).clone();
     expected.base_instructions_provenance = base_instructions.provenance.clone();
     expected.base_instructions = Some(base_instructions.text);
-    expected.model = Some(turn.model_info.slug.clone());
+    expected.model = Some(turn.model_info().slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort.clone();
-    expected.model_reasoning_summary = Some(turn.reasoning_summary);
+    expected.model_reasoning_effort = turn.reasoning_effort().cloned();
+    expected.model_reasoning_summary = Some(turn.reasoning_summary());
     expected.developer_instructions = turn.developer_instructions.clone();
     #[allow(deprecated)]
     {
@@ -4865,7 +4802,7 @@ async fn build_agent_resume_config_clears_base_instructions() {
     let mut base_config = (*turn.config).clone();
     base_config.base_instructions = Some("caller-base".to_string());
     base_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
-        model: turn.model_info.slug.clone(),
+        model: turn.model_info().slug.clone(),
     });
     turn.config = Arc::new(base_config);
     Arc::make_mut(&mut turn.config)
@@ -4895,10 +4832,10 @@ async fn build_agent_resume_config_clears_base_instructions() {
     let mut expected = (*turn.config).clone();
     expected.base_instructions = None;
     expected.base_instructions_provenance = None;
-    expected.model = Some(turn.model_info.slug.clone());
+    expected.model = Some(turn.model_info().slug.clone());
     expected.model_provider = turn.provider.info().clone();
-    expected.model_reasoning_effort = turn.reasoning_effort.clone();
-    expected.model_reasoning_summary = Some(turn.reasoning_summary);
+    expected.model_reasoning_effort = turn.reasoning_effort().cloned();
+    expected.model_reasoning_summary = Some(turn.reasoning_summary());
     expected.developer_instructions = turn.developer_instructions.clone();
     #[allow(deprecated)]
     {

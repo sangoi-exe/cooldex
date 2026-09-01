@@ -323,7 +323,7 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
 
     let replacement_turn_id = "intended-replacement".to_string();
     let replacement_context = session
-        .new_default_turn_with_sub_id(replacement_turn_id.clone())
+        .new_turn_with_default_settings(replacement_turn_id.clone(), Default::default())
         .await;
     let replacement_caller = tokio::spawn({
         let session = Arc::clone(&session);
@@ -447,10 +447,10 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
 async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
     let (session, first_context, rx) = make_session_and_context_with_rx().await;
     let second_context = session
-        .new_default_turn_with_sub_id("second-no-id-input".to_string())
+        .new_turn_with_default_settings("second-no-id-input".to_string(), Default::default())
         .await;
     let third_context = session
-        .new_default_turn_with_sub_id("third-no-id-input".to_string())
+        .new_turn_with_default_settings("third-no-id-input".to_string(), Default::default())
         .await;
     let _startup_prewarm_release = install_blocked_startup_prewarm(session.as_ref()).await;
     let state_guard = session.state.lock().await;

@@ -41,7 +41,7 @@ impl SessionTask for BlockingTurnStartedTask {
                         trace_id: ctx.trace_id.clone(),
                         started_at: ctx.turn_timing_state.started_at_unix_secs().await,
                         model_context_window: ctx.model_context_window(),
-                        collaboration_mode_kind: ctx.mode,
+                        collaboration_mode_kind: ctx.mode(),
                     }),
                 )
                 .await;
@@ -138,7 +138,7 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
 
     let replacement_turn_id = "replacement-with-blocked-start-event".to_string();
     let replacement_context = session
-        .new_default_turn_with_sub_id(replacement_turn_id.clone())
+        .new_turn_with_default_settings(replacement_turn_id.clone(), Default::default())
         .await;
     let (start_event_entered_tx, start_event_entered_rx) = async_channel::bounded(1);
     let (start_event_release_tx, start_event_release_rx) = async_channel::bounded(1);

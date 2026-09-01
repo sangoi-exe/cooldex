@@ -279,6 +279,7 @@ fn rollout_line(ordinal: u64, item: RolloutItem) -> String {
 fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
+            thread_id: None,
             thread_settings: snapshot,
         },
     ))

@@ -94,21 +94,11 @@ impl LocalThreadStore {
             }
             let rollout_path = match representation {
                 LineageRepresentation::Existing => rollout_path,
-                LineageRepresentation::PlainForReference => {
-                    let rollout_path = super::helpers::scoped_rollout_path(
-                        self.config.codex_home.clone(),
-                        rollout_path.as_path(),
-                        "Codex home",
-                    )?;
-                    codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
-                        .await
-                        .map_err(|err| ThreadStoreError::Internal {
-                            message: format!(
-                                "failed to materialize referenced rollout {}: {err}",
-                                rollout_path.display()
-                            ),
-                        })?
-                }
+                LineageRepresentation::PlainForReference => super::helpers::scoped_rollout_path(
+                    self.config.codex_home.clone(),
+                    rollout_path.as_path(),
+                    "Codex home",
+                )?,
             };
             let meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
                 .await
@@ -130,6 +120,26 @@ impl LocalThreadStore {
                     "source rollout is not paginated",
                 ));
             }
+            let rollout_path = match representation {
+                LineageRepresentation::Existing => rollout_path,
+                LineageRepresentation::PlainForReference
+                    if next_rollout_id.is_none() && meta.meta.history_base.is_none() =>
+                {
+                    // A newly shared standalone source must remain readable by older binaries.
+                    codex_rollout::materialize_rollout_for_reference(rollout_path.as_path())
+                        .await
+                        .map_err(|err| ThreadStoreError::Internal {
+                            message: format!(
+                                "failed to materialize referenced rollout {}: {err}",
+                                rollout_path.display()
+                            ),
+                        })?
+                }
+                // Already-shared compressed history requires a compatible reader regardless of
+                // new forks. Read it without publishing decoded copies into ancestors' folders;
+                // their owners may concurrently archive or unarchive those immutable files.
+                LineageRepresentation::PlainForReference => rollout_path,
+            };
             if let Some(end) = end {
                 validate_cutoff_bounds(requested_thread_id, rollout_path.as_path(), &end).await?;
             }
@@ -238,98 +248,28 @@ pub(super) async fn validate_cutoff_bounds(
             "cutoff cannot include source session metadata",
         ));
     }
-    let physical_rollout_path = codex_rollout::existing_rollout_path(rollout_path)
-        .await
-        .unwrap_or_else(|| rollout_path.to_path_buf());
-    if is_compressed_rollout(physical_rollout_path.as_path()) {
-        return validate_compressed_cutoff_bounds(
-            requested_thread_id,
-            physical_rollout_path.as_path(),
-            end,
-        )
-        .await;
-    }
-    let file_len = tokio::fs::metadata(physical_rollout_path.as_path())
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to read lineage metadata {}: {err}",
-                physical_rollout_path.display()
-            ),
-        })?
-        .len();
-    if end.end_byte_offset > file_len {
+    let path = rollout_path.to_path_buf();
+    let end_byte_offset = end.end_byte_offset;
+    let contains_prefix = tokio::task::spawn_blocking(move || {
+        codex_rollout::rollout_contains_prefix(&path, end_byte_offset)
+    })
+    .await
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!("failed to join rollout prefix validation: {err}"),
+    })?
+    .map_err(|err| ThreadStoreError::Internal {
+        message: format!(
+            "failed to read lineage metadata {}: {err}",
+            rollout_path.display()
+        ),
+    })?;
+    if !contains_prefix {
         return Err(malformed_lineage(
             requested_thread_id,
             "cutoff byte offset is past the source rollout",
         ));
     }
     Ok(())
-}
-
-async fn validate_compressed_cutoff_bounds(
-    requested_thread_id: ThreadId,
-    rollout_path: &Path,
-    end: &HistoryPosition,
-) -> ThreadStoreResult<()> {
-    let expected_ordinal = end
-        .end_ordinal_exclusive
-        .checked_sub(1)
-        .ok_or_else(|| malformed_lineage(requested_thread_id, "source ordinal underflow"))?;
-    let mut reader = codex_rollout::open_rollout_line_reader(rollout_path)
-        .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!(
-                "failed to open compressed lineage source {}: {err}",
-                rollout_path.display()
-            ),
-        })?;
-
-    while let Some(raw_line) =
-        reader
-            .next_line()
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!(
-                    "failed to read compressed lineage source {}: {err}",
-                    rollout_path.display()
-                ),
-            })?
-    {
-        let raw_line = raw_line.trim();
-        if raw_line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_line) else {
-            continue;
-        };
-        if value.get("ordinal").and_then(serde_json::Value::as_u64) == Some(expected_ordinal) {
-            return Ok(());
-        }
-        let Ok(line) = codex_rollout::decode_rollout_line(value) else {
-            continue;
-        };
-        let ordinal = line.ordinal.ok_or_else(|| {
-            malformed_lineage(
-                requested_thread_id,
-                "compressed source rollout is missing an ordinal",
-            )
-        })?;
-        if ordinal == expected_ordinal {
-            return Ok(());
-        }
-    }
-
-    Err(malformed_lineage(
-        requested_thread_id,
-        "cutoff ordinal is past the source rollout",
-    ))
-}
-
-fn is_compressed_rollout(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
 fn malformed_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {

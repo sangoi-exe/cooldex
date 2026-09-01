@@ -44,6 +44,41 @@ impl Session {
         Ok(())
     }
 
+    /// Injects hook context while classifying its actual receiving turn atomically.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn provenance and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn inject_hook_context_if_running(
+        &self,
+        input: Vec<ResponseItem>,
+        source_turn_id: Option<&str>,
+    ) -> Result<(), Vec<ResponseItem>> {
+        let slot = self.active_turn.lock().await;
+        let Some(task) = slot.running_task() else {
+            return Err(input);
+        };
+        let Some(turn_state) = slot.turn_state() else {
+            return Err(input);
+        };
+        if source_turn_id != Some(task.turn_context.sub_id.as_str()) {
+            task.turn_context
+                .turn_metadata_state
+                .mark_root_turn_ambiguous();
+        }
+        self.input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                turn_state.as_ref(),
+                input
+                    .into_iter()
+                    .map(ResponseItemEnvelope::new)
+                    .map(TurnInput::ResponseItem)
+                    .collect(),
+            )
+            .await;
+        Ok(())
+    }
+
     /// Preserves trusted client provenance while items wait for an active turn.
     #[expect(
         clippy::await_holding_invalid_type,
@@ -58,19 +93,36 @@ impl Session {
             .into_iter()
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
-        let slot = self.active_turn.lock().await;
-        if let Some(turn_state) = slot.turn_state() {
-            self.input_queue
-                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                    turn_state.as_ref(),
-                    items.into_iter().map(TurnInput::ResponseItem).collect(),
-                )
+        loop {
+            let slot = self.active_turn.lock().await;
+            if slot.is_transitioning() {
+                let mut generation_rx = slot.subscribe_generation();
+                drop(slot);
+                generation_rx
+                    .changed()
+                    .await
+                    .expect("turn-slot generation sender remains live while the session is active");
+                continue;
+            }
+            if let Some(turn_state) = slot.turn_state() {
+                if let Some(task) = slot.running_task() {
+                    task.turn_context
+                        .turn_metadata_state
+                        .mark_root_turn_ambiguous();
+                }
+                self.input_queue
+                    .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                        turn_state.as_ref(),
+                        items.into_iter().map(TurnInput::ResponseItem).collect(),
+                    )
+                    .await;
+                return;
+            }
+            drop(slot);
+            self.record_annotated_conversation_items(turn_context, items)
                 .await;
             return;
         }
-        drop(slot);
-        self.record_annotated_conversation_items(turn_context, items)
-            .await;
     }
 
     pub(crate) fn annotate_client_response_item(&self, item: ResponseItem) -> ResponseItemEnvelope {
@@ -78,6 +130,7 @@ impl Session {
             && matches!(&item, ResponseItem::Message { role, .. } if role == "developer"))
         .then_some(CodexHarnessMetadata {
             client_authored: true,
+            ..Default::default()
         });
 
         ResponseItemEnvelope { item, metadata }
@@ -88,9 +141,7 @@ impl Session {
         turn_context: &TurnContext,
         items: Vec<ResponseItemEnvelope>,
     ) {
-        if !self.enabled(Feature::RetainClientDeveloperMessages)
-            || items.iter().all(|item| item.metadata.is_none())
-        {
+        if items.iter().all(|item| item.metadata.is_none()) {
             let items = items
                 .into_iter()
                 .map(ResponseItemEnvelope::into_item)
@@ -206,8 +257,10 @@ impl Session {
             ));
         }
 
-        let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
-        if !has_user_input && turn_context.mode == ModeKind::Plan {
+        let turn_context = self
+            .new_turn_with_default_settings(sub_id, Default::default())
+            .await;
+        if !has_user_input && turn_context.mode() == ModeKind::Plan {
             self.cancel_claimed_start(&claim).await;
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(

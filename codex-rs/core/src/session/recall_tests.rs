@@ -1138,6 +1138,7 @@ async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
                     RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
                         message: RECEIPT_SENTINEL.to_string(),
                         codex_error_info: None,
+                        misalignment: None,
                     })),
                     RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
                         compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),

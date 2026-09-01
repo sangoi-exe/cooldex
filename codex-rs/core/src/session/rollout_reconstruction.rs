@@ -95,6 +95,16 @@ fn finalize_active_segment<'a>(
     }
 
     let recovery_turn_id = active_segment.turn_id.clone();
+    // Full world-state snapshots are persisted after installing initial context. They still
+    // establish a baseline when a child fork removes the parent turn's agent message. Do not
+    // count these context-only segments as user turns for rollback, or use a snapshot from
+    // before the segment's latest compaction.
+    let has_context_baseline = active_segment.counts_as_user_turn
+        || active_segment
+            .world_state_replay
+            .iter()
+            .take_while(|item| !matches!(item, RolloutItem::Compacted(_)))
+            .any(|item| matches!(item, RolloutItem::WorldState(state) if state.full));
     world_state_replay.extend(active_segment.world_state_replay);
     post_compact_recovery_replay.extend(
         active_segment
@@ -119,15 +129,15 @@ fn finalize_active_segment<'a>(
         surviving_compaction.latest_index = active_segment.latest_compaction_index;
     }
 
-    // `previous_turn_settings` come from the newest surviving user turn that established them.
-    if previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
+    // Restore settings from the newest surviving context baseline.
+    if previous_turn_settings.is_none() && has_context_baseline {
         *previous_turn_settings = active_segment.previous_turn_settings;
     }
 
-    // `reference_context_item` comes from the newest surviving user turn baseline, or
+    // `reference_context_item` comes from the newest surviving context baseline, or
     // from a surviving compaction that explicitly cleared that baseline.
     if matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
-        && (active_segment.counts_as_user_turn
+        && (has_context_baseline
             || matches!(
                 active_segment.reference_context_item,
                 TurnReferenceContextItem::Cleared
@@ -373,14 +383,14 @@ impl Session {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_annotated_items(
                         std::slice::from_ref(response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
                     history.record_items(
                         std::iter::once(&response_item),
-                        turn_context.model_info.truncation_policy.into(),
+                        turn_context.model_info().truncation_policy.into(),
                     );
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. } => {}

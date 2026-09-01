@@ -75,7 +75,7 @@ pub(super) fn usage_hint_text(
     }
 
     let catalog = turn_context
-        .model_info
+        .model_info()
         .model_messages
         .as_ref()
         .and_then(|messages| messages.multi_agent.as_ref())
@@ -163,7 +163,7 @@ pub(crate) fn effective_multi_agent_mode(
     }
 
     let catalog_mode = turn_context
-        .model_info
+        .model_info()
         .model_messages
         .as_ref()
         .and_then(|messages| messages.multi_agent.as_ref())
@@ -184,9 +184,10 @@ fn effective_mode_explanation(
         .multi_agent_mode_hint_text
         .clone()
         .or_else(|| catalog.and_then(|mode| mode.hint_text.clone()))
-        .or_else(|| {
-            (config.policy == MultiAgentV2Policy::ExplicitRequestOnly)
-                .then(|| catalog.and_then(|mode| mode.explicit.clone()))
-                .flatten()
+        .or_else(|| match config.policy {
+            MultiAgentV2Policy::ExplicitRequestOnly => {
+                catalog.and_then(|mode| mode.explicit.clone())
+            }
+            MultiAgentV2Policy::Proactive => catalog.and_then(|mode| mode.proactive.clone()),
         })
 }

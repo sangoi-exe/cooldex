@@ -83,6 +83,14 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
+            // Terminal errors are already reported. Let task completion preserve pending
+            // input instead of restarting the failed turn for that same input.
+            if ctx.terminal_error.lock().await.is_some() {
+                return Ok(SessionTaskOutput {
+                    last_agent_message: turn_output.last_agent_message,
+                    post_compact_recovery: turn_output.post_compact_recovery,
+                });
+            }
             match sess
                 .seal_regular_task_if_no_pending_input(&ctx.sub_id)
                 .await?

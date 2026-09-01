@@ -8,6 +8,7 @@ use crate::context::CurrentTimeReminder;
 use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
+use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
@@ -18,7 +19,7 @@ use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashSet;
 
-const AGENT_NAMES: &str = include_str!("../agent_names.txt");
+const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
 
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
@@ -225,7 +226,7 @@ async fn restore_v2_identity_snapshot(
     state: &ThreadManagerState,
     config: &Config,
     stored_thread: &codex_thread_store::StoredThread,
-) -> Result<AgentIdentitySnapshot, V2AgentMetadataRestoreError> {
+) -> Result<Option<AgentIdentitySnapshot>, V2AgentMetadataRestoreError> {
     let history = load_agent_model_context(
         state,
         stored_thread.thread_id,
@@ -243,6 +244,9 @@ async fn restore_v2_identity_snapshot(
         history: Arc::new(history.clone()),
         rollout_path: stored_thread.rollout_path.clone(),
     });
+    if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
+        return Ok(None);
+    }
     let latest_thread_settings = state
         .load_latest_thread_settings_snapshot(LoadThreadHistoryParams {
             thread_id: stored_thread.thread_id,
@@ -288,7 +292,7 @@ async fn restore_v2_identity_snapshot(
         .map(|(session_source, _)| session_source)
         .unwrap_or_else(|| stored_thread.source.clone());
 
-    Ok(AgentIdentitySnapshot::capture(
+    Ok(Some(AgentIdentitySnapshot::capture(
         session_source.get_agent_role(),
         model_provider_id,
         model_provider,
@@ -299,7 +303,7 @@ async fn restore_v2_identity_snapshot(
         first_persisted_developer_instructions(&history),
         service_tier,
         Some(shell_tool_enabled),
-    ))
+    )))
 }
 
 async fn verify_loaded_v2_agent_identity(
@@ -389,7 +393,7 @@ impl AgentControl {
                     })
                     .await?;
                 let restored_identity_snapshot = if restore_identity_snapshots {
-                    Some(restore_v2_identity_snapshot(&state, config, &stored_thread).await?)
+                    restore_v2_identity_snapshot(&state, config, &stored_thread).await?
                 } else {
                     None
                 };
@@ -673,10 +677,10 @@ impl AgentControl {
                     let owner_environment = parent_environments
                         .turn_environments()
                         .find(|environment| {
-                            environment.selection.environment_id == *environment_id
-                                && environment.cwd() == &selection.cwd
-                                && environment.workspace_roots()
-                                    == selection.workspace_roots.as_slice()
+                            let parent_selection = &environment.selection;
+                            parent_selection.environment_id == selection.environment_id
+                                && parent_selection.cwd == selection.cwd
+                                && parent_selection.workspace_roots == selection.workspace_roots
                         })
                         .ok_or_else(|| {
                             invalid_environment("no longer matches a ready parent environment")
@@ -711,8 +715,8 @@ impl AgentControl {
                     let cwd = selection.cwd.to_abs_path().map_err(|_| {
                         invalid_environment("working directory is not a local absolute path")
                     })?;
-                    let roots = selection
-                        .workspace_roots
+                    let roots = owner_environment
+                        .workspace_roots()
                         .iter()
                         .map(PathUri::to_abs_path)
                         .collect::<Result<Vec<_>, _>>()
@@ -966,15 +970,16 @@ impl AgentControl {
         )
         .await;
 
+        let start_options = TurnStartOptions {
+            parent_turn_id: options.parent_turn_id,
+            root_turn_id: options.root_turn_id,
+            cyber_access_program: options.cyber_access_program,
+            ..Default::default()
+        };
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input(
-                    new_thread.thread_id,
-                    input,
-                    options.parent_turn_id,
-                    options.root_turn_id,
-                )
-                .await?;
+                self.send_input(new_thread.thread_id, input, start_options)
+                    .await?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 self.send_inter_agent_communication_after_capacity_check(
@@ -982,8 +987,7 @@ impl AgentControl {
                     &state,
                     communication,
                     context,
-                    options.parent_turn_id,
-                    options.root_turn_id,
+                    start_options,
                 )
                 .await?;
             }
@@ -1141,9 +1145,12 @@ impl AgentControl {
                     let ContentItem::InputText { text } = content_item.content_mut() else {
                         return true;
                     };
-                    if ManagedDeveloperInstructions::matches_text(text) {
+                    if ManagedDeveloperInstructions::matches_text(text)
+                        || PersistentModeState::matches_text(text)
+                    {
                         // If the child will rebuild its initial context, drop the inherited
-                        // managed instructions; startup will add the current requirements once.
+                        // instructions; startup will add the current requirements and effort
+                        // instructions once.
                         return preserve_reference_context_item;
                     }
                     if preserve_reference_context_item {

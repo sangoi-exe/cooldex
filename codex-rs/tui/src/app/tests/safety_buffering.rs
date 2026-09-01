@@ -399,6 +399,7 @@ stream_max_retries = 0
 
 [features]
 goals = true
+computer_use = false
 "#,
             server.uri()
         ),
@@ -418,6 +419,10 @@ goals = true
         .features
         .enable(Feature::Goals)
         .expect("test config should allow goals");
+    app.config
+        .features
+        .disable(Feature::ComputerUse)
+        .expect("test config should disable computer use");
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;

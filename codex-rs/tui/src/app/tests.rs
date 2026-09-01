@@ -17,11 +17,15 @@ mod patch_approval_tests;
 mod permission_shortcuts_tests;
 mod plugin_catalog;
 mod rate_limits;
+#[path = "tests/recap_generation_tests.rs"]
+mod recap_generation;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 mod session_summary;
 mod startup;
+#[path = "tests/stream_animation_tests.rs"]
+mod stream_animation_tests;
 #[path = "tests/thread_usage.rs"]
 mod thread_usage;
 #[path = "tests/turn_submission.rs"]
@@ -2244,6 +2248,8 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                     agent_role: Some("worker".to_string()),
                 }),
                 model_provider: Some(app.config.model_provider_id.clone()),
+                base_instructions: (multi_agent_version == MultiAgentVersion::V2)
+                    .then(codex_protocol::models::BaseInstructions::default),
                 multi_agent_version: Some(multi_agent_version),
                 ..SessionMeta::default()
             };
@@ -2251,11 +2257,54 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 "rollout-2026-01-01T00-00-0{index}-{child_thread_id}.jsonl"
             ));
             let session_meta_line = serde_json::json!({
-                "timestamp": timestamp,
+                "timestamp": timestamp.clone(),
                 "type": "session_meta",
                 "payload": serde_json::to_value(session_meta)?,
             });
-            std::fs::write(rollout_path, format!("{session_meta_line}\n"))?;
+            let mut rollout_lines = vec![session_meta_line];
+            if multi_agent_version == MultiAgentVersion::V2 {
+                let thread_settings = EventMsg::ThreadSettingsApplied(
+                    codex_protocol::protocol::ThreadSettingsAppliedEvent {
+                        thread_id: Some(child_thread_id),
+                        thread_settings: codex_protocol::protocol::ThreadSettingsSnapshot {
+                            model: app.chat_widget.current_model().to_string(),
+                            model_provider_id: app.config.model_provider_id.clone(),
+                            service_tier: app.config.service_tier.clone(),
+                            approval_policy: app.config.permissions.approval_policy.value(),
+                            approvals_reviewer: app.config.approvals_reviewer,
+                            permission_profile: app
+                                .config
+                                .permissions
+                                .effective_permission_profile(),
+                            active_permission_profile: app
+                                .config
+                                .permissions
+                                .active_permission_profile(),
+                            cwd: app.config.cwd.clone(),
+                            reasoning_effort: app.chat_widget.current_reasoning_effort(),
+                            reasoning_summary: app.config.model_reasoning_summary,
+                            personality: app.config.personality,
+                            collaboration_mode: app
+                                .chat_widget
+                                .current_collaboration_mode()
+                                .clone(),
+                            shell_tool_enabled: Some(
+                                app.config.features.enabled(Feature::ShellTool),
+                            ),
+                        },
+                    },
+                );
+                rollout_lines.push(serde_json::json!({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": serde_json::to_value(thread_settings)?,
+                }));
+            }
+            let rollout = rollout_lines
+                .into_iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            std::fs::write(rollout_path, rollout)?;
             child_thread_ids.push(child_thread_id);
         }
 
@@ -5433,7 +5482,7 @@ async fn make_test_app() -> App {
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
         key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-        commit_anim_running: Arc::new(AtomicBool::new(false)),
+        commit_animation: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         skill_load_warnings: SkillLoadWarningState::default(),
@@ -5468,6 +5517,7 @@ async fn make_test_app() -> App {
         rate_limit_hard_stop_generation: 0,
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
+        recap: recap::RecapState::default(),
     }
 }
 
@@ -5513,7 +5563,7 @@ async fn make_test_app_with_channels() -> (
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
             key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            commit_animation: None,
             status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
             skill_load_warnings: SkillLoadWarningState::default(),
@@ -5548,6 +5598,7 @@ async fn make_test_app_with_channels() -> (
             rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
+            recap: recap::RecapState::default(),
         },
         rx,
         op_rx,
@@ -6491,6 +6542,7 @@ fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {
 #[test]
 fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
     let turn_error = AppServerTurnError {
+        misalignment: None,
         message: "cannot steer a review turn".to_string(),
         codex_error_info: Some(AppServerCodexErrorInfo::ActiveTurnNotSteerable {
             turn_kind: AppServerNonSteerableTurnKind::Review,
@@ -7711,6 +7763,13 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
     let store_snapshot = store.snapshot();
     assert_eq!(store_snapshot.session, Some(resumed_session));
     assert_eq!(store_snapshot.turns, snapshot.turns);
+    assert_eq!(
+        store.recap_progress(),
+        recap::RecapProgress {
+            completed_turns: 1,
+            last_recapped_turn_count: None,
+        }
+    );
 }
 
 #[tokio::test]

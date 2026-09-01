@@ -62,11 +62,15 @@ pub(crate) enum UserShellCommandMode {
 #[derive(Clone)]
 pub(crate) struct UserShellCommandTask {
     command: String,
+    timeout_ms: Option<u64>,
 }
 
 impl UserShellCommandTask {
-    pub(crate) fn new(command: String) -> Self {
-        Self { command }
+    pub(crate) fn new(command: String, timeout_ms: Option<u64>) -> Self {
+        Self {
+            command,
+            timeout_ms,
+        }
     }
 }
 
@@ -98,6 +102,7 @@ impl SessionTask for UserShellCommandTask {
             session,
             turn_context,
             self.command.clone(),
+            self.timeout_ms,
             cancellation_token,
             UserShellCommandMode::StandaloneTurn,
         )
@@ -110,6 +115,7 @@ pub(crate) async fn execute_user_shell_command(
     session: Arc<Session>,
     turn_context: Arc<TurnContext>,
     command: String,
+    timeout_ms: Option<u64>,
     cancellation_token: CancellationToken,
     mode: UserShellCommandMode,
 ) {
@@ -117,7 +123,6 @@ pub(crate) async fn execute_user_shell_command(
         .services
         .session_telemetry
         .counter("codex.task.user_shell", /*inc*/ 1, &[]);
-
     let Some((turn_environment, environment_shell)) = turn_context
         .environments
         .local()
@@ -203,9 +208,7 @@ pub(crate) async fn execute_user_shell_command(
         // inherit a managed proxy from the surrounding session or turn.
         network: None,
         network_environment_id: None,
-        // TODO(zhao-oai): Now that we have ExecExpiration::Cancellation, we
-        // should use that instead of an "arbitrarily large" timeout here.
-        expiration: USER_SHELL_TIMEOUT_MS.into(),
+        expiration: timeout_ms.unwrap_or(USER_SHELL_TIMEOUT_MS).into(),
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,
         windows_sandbox_policy_cwd: cwd.clone().into(),
@@ -303,7 +306,7 @@ pub(crate) async fn execute_user_shell_command(
                         duration: Some(output.duration),
                         formatted_output: Some(format_exec_output_str(
                             &output,
-                            turn_context.model_info.truncation_policy.into(),
+                            turn_context.model_info().truncation_policy.into(),
                         )),
                     }),
                 )
@@ -344,7 +347,7 @@ pub(crate) async fn execute_user_shell_command(
                         duration: Some(exec_output.duration),
                         formatted_output: Some(format_exec_output_str(
                             &exec_output,
-                            turn_context.model_info.truncation_policy.into(),
+                            turn_context.model_info().truncation_policy.into(),
                         )),
                     }),
                 )
@@ -366,6 +369,7 @@ async fn send_user_shell_error(session: &Session, turn_context: &TurnContext, me
         .send_event(
             turn_context,
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: message.to_string(),
                 codex_error_info: None,
             }),
