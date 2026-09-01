@@ -815,7 +815,21 @@ mod tests {
                 .output()
                 .await
                 .expect("isolated AWS refresh test should run");
-            std::fs::remove_dir_all(&counter).expect("AWS command directory should be removed");
+            let mut cleanup_attempts = 0;
+            loop {
+                match std::fs::remove_dir_all(&counter) {
+                    Ok(()) => break,
+                    Err(error)
+                        if cfg!(windows)
+                            && error.raw_os_error() == Some(32)
+                            && cleanup_attempts < 100 =>
+                    {
+                        cleanup_attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("AWS command directory should be removed: {error}"),
+                }
+            }
             assert!(output.status.success(), "{output:?}");
             return;
         }
