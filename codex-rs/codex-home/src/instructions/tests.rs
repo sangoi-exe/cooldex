@@ -37,21 +37,30 @@ fn expected(
 }
 
 #[cfg(unix)]
-fn create_symlink_loop(path: &Path) {
+fn create_symlink_loop_if_supported(path: &Path) -> bool {
     std::os::unix::fs::symlink(
         path.file_name().expect("override path should have a name"),
         path,
     )
     .expect("create symlink loop");
+    true
 }
 
 #[cfg(windows)]
-fn create_symlink_loop(path: &Path) {
-    std::os::windows::fs::symlink_file(
+fn create_symlink_loop_if_supported(path: &Path) -> bool {
+    let linked = std::os::windows::fs::symlink_file(
         path.file_name().expect("override path should have a name"),
         path,
-    )
-    .expect("create symlink loop");
+    );
+    if linked
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        eprintln!("Skipping symlink test: Windows symlink privilege unavailable");
+        return false;
+    }
+    linked.expect("create symlink loop");
+    true
 }
 
 #[tokio::test]
@@ -67,7 +76,9 @@ async fn missing_files_return_no_instructions() {
 #[tokio::test]
 async fn exclude_returns_no_instructions_before_reading_candidates() {
     let home = TempDir::new().expect("temp dir");
-    create_symlink_loop(&home.path().join(LOCAL_AGENTS_MD_FILENAME));
+    if !create_symlink_loop_if_supported(&home.path().join(LOCAL_AGENTS_MD_FILENAME)) {
+        return;
+    }
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
     let provider = CodexHomeUserInstructionsProvider::new(
         AbsolutePathBuf::try_from(home.path().to_path_buf()).expect("absolute temp dir"),
@@ -129,7 +140,9 @@ async fn directory_override_falls_back_to_default() {
 async fn recoverable_override_read_error_warns_and_falls_back_to_default() {
     let home = TempDir::new().expect("temp dir");
     let override_path = home.path().join(LOCAL_AGENTS_MD_FILENAME);
-    create_symlink_loop(&override_path);
+    if !create_symlink_loop_if_supported(&override_path) {
+        return;
+    }
     fs::write(home.path().join(DEFAULT_AGENTS_MD_FILENAME), "default").expect("write default");
     let read_error = fs::read(&override_path).expect_err("symlink loop should not be readable");
     let warning = format!(

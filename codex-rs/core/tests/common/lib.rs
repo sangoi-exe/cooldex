@@ -124,6 +124,29 @@ pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
 }
 
 #[cfg(unix)]
+pub fn directory_symlink_creation_supported() -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub fn directory_symlink_creation_supported() -> bool {
+    let directory = TempDir::new().expect("create directory symlink capability probe");
+    let source = directory.path().join("source");
+    std::fs::create_dir(&source).expect("create directory symlink probe target");
+    let link = directory.path().join("link");
+    let linked = std::os::windows::fs::symlink_dir(&source, &link);
+    if linked
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        eprintln!("Skipping directory symlink test: Windows symlink privilege unavailable");
+        return false;
+    }
+    linked.expect("probe directory symlink creation");
+    true
+}
+
+#[cfg(unix)]
 #[allow(clippy::expect_used)]
 pub fn create_directory_symlink(source: &Path, link: &Path) {
     std::os::unix::fs::symlink(source, link).expect("create directory symlink");

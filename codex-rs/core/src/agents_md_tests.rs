@@ -37,6 +37,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::TempDirExt;
 use core_test_support::create_directory_symlink;
+use core_test_support::directory_symlink_creation_supported;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::io;
@@ -1476,6 +1477,10 @@ async fn project_layers_do_not_override_project_root_markers() {
 
 #[tokio::test]
 async fn agents_md_paths_preserve_symlinked_cwd() {
+    if !directory_symlink_creation_supported() {
+        return;
+    }
+
     let tmp = tempfile::tempdir().expect("tempdir");
     let target = tmp.path().join("target");
     fs::create_dir(&target).unwrap();

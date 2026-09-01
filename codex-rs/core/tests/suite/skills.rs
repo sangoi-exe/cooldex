@@ -24,6 +24,7 @@ use codex_skills_extension::install;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::create_directory_symlink;
+use core_test_support::directory_symlink_creation_supported;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -198,6 +199,9 @@ async fn user_turn_selects_symlinked_skill_by_advertised_discovery_path() -> Res
         Ok(()),
         "remote filesystems do not expose directory symlink creation"
     );
+    if !directory_symlink_creation_supported() {
+        return Ok(());
+    }
 
     let server = start_mock_server().await;
     let skill_body = "instructions from the canonical linked skill";

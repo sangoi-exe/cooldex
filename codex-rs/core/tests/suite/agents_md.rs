@@ -28,6 +28,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::create_directory_symlink;
+use core_test_support::directory_symlink_creation_supported;
 use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
@@ -343,6 +344,10 @@ async fn agents_docs_are_concatenated_from_project_root_to_cwd() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn symlinked_cwd_uses_logical_parent_for_agents_discovery() -> Result<()> {
+    if !directory_symlink_creation_supported() {
+        return Ok(());
+    }
+
     let server = start_mock_server().await;
     let resp_mock = mount_sse_once(
         &server,
