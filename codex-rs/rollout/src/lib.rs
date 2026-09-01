@@ -83,7 +83,9 @@ pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+pub use seekable_reader::SourceByteLimitedSeekableReader;
 pub use seekable_reader::open_rollout_seekable_reader;
+pub use seekable_reader::open_rollout_seekable_reader_with_source_byte_limit;
 pub use seekable_reader::rollout_contains_prefix;
 
 /// Materializes a compressed rollout as plain JSONL before another rollout references it.

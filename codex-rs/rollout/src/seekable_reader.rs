@@ -17,6 +17,18 @@ enum RolloutReader {
     Compressed(File),
 }
 
+/// Seekable rollout input opened under a physical source-byte limit.
+pub enum SourceByteLimitedSeekableReader {
+    /// The returned file is the physical rollout source. The caller must apply the byte limit to
+    /// reads from this file and count those reads as physical source bytes.
+    Direct(File),
+    /// The compressed source was fully consumed within the limit and decoded into the returned
+    /// anonymous file. Reads from the decoded file do not add physical source bytes.
+    Decoded { file: File, source_bytes_read: u64 },
+    /// The compressed source cannot be decoded without exceeding the physical source-byte limit.
+    LimitExceeded,
+}
+
 impl RolloutReader {
     fn open(path: &Path) -> io::Result<Self> {
         let plain_path = plain_rollout_path(path);
@@ -46,13 +58,40 @@ impl RolloutReader {
 pub fn open_rollout_seekable_reader(path: &Path) -> io::Result<File> {
     match RolloutReader::open(path)? {
         RolloutReader::Plain(file) => Ok(file),
+        RolloutReader::Compressed(file) => decode_rollout(file),
+    }
+}
+
+/// Opens the original JSONL bytes without exceeding a physical source-byte limit.
+///
+/// Plain files remain direct seekable inputs so their consumers can read only the required tail.
+/// Compressed files must be consumed from the beginning, so this returns
+/// [`SourceByteLimitedSeekableReader::LimitExceeded`] before decoding when the complete compressed
+/// source is larger than `max_source_bytes`.
+pub fn open_rollout_seekable_reader_with_source_byte_limit(
+    path: &Path,
+    max_source_bytes: u64,
+) -> io::Result<SourceByteLimitedSeekableReader> {
+    match RolloutReader::open(path)? {
+        RolloutReader::Plain(file) => Ok(SourceByteLimitedSeekableReader::Direct(file)),
         RolloutReader::Compressed(file) => {
-            let mut decoded = tempfile::tempfile()?;
-            io::copy(&mut zstd::stream::read::Decoder::new(file)?, &mut decoded)?;
-            decoded.rewind()?;
-            Ok(decoded)
+            let source_bytes_read = file.metadata()?.len();
+            if source_bytes_read > max_source_bytes {
+                return Ok(SourceByteLimitedSeekableReader::LimitExceeded);
+            }
+            Ok(SourceByteLimitedSeekableReader::Decoded {
+                file: decode_rollout(file)?,
+                source_bytes_read,
+            })
         }
     }
+}
+
+fn decode_rollout(file: File) -> io::Result<File> {
+    let mut decoded = tempfile::tempfile()?;
+    io::copy(&mut zstd::stream::read::Decoder::new(file)?, &mut decoded)?;
+    decoded.rewind()?;
+    Ok(decoded)
 }
 
 /// Checks a frozen prefix's byte bound using a blocking read of the logical JSONL representation.

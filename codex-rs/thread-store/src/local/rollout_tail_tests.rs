@@ -61,6 +61,15 @@ fn append_value(path: &std::path::Path, value: serde_json::Value) -> u64 {
     byte_offset
 }
 
+fn compress_rollout(path: &std::path::Path) -> u64 {
+    let source = fs::read(path).expect("read rollout before compression");
+    let compressed =
+        zstd::stream::encode_all(source.as_slice(), /*level*/ 3).expect("compress rollout");
+    fs::write(path.with_extension("jsonl.zst"), &compressed).expect("write compressed rollout");
+    fs::remove_file(path).expect("remove plain rollout");
+    u64::try_from(compressed.len()).expect("compressed rollout size")
+}
+
 #[tokio::test]
 async fn loads_complete_rollout_in_replay_order() {
     let home = TempDir::new().expect("temp dir");
@@ -214,6 +223,158 @@ async fn loads_frozen_parent_lineage_before_the_child_delta() {
     assert!(tail.reached_start);
     assert_eq!(tail.records_read, 5);
     assert_eq!(tail.segments_read, 2);
+}
+
+#[tokio::test]
+async fn loads_compressed_current_rollout_with_physical_byte_accounting() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 3022);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-02",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    append_line(path.as_path(), 1, message("compressed first"));
+    append_line(path.as_path(), 2, message("compressed second"));
+    let compressed_bytes = compress_rollout(path.as_path());
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let params = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: compressed_bytes,
+        max_records: 16,
+    };
+    let strict = store
+        .load_rollout_tail(params.clone())
+        .await
+        .expect("load strict compressed rollout tail");
+    let recall = store
+        .load_recall_rollout_tail(params)
+        .await
+        .expect("load recall compressed rollout tail");
+
+    let expected = serde_json::to_value(vec![
+        message("compressed first"),
+        message("compressed second"),
+    ])
+    .expect("serialize expected items");
+    assert_eq!(
+        serde_json::to_value(&strict.items).expect("serialize strict items"),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(&recall.items).expect("serialize recall items"),
+        expected
+    );
+    assert!(strict.reached_start);
+    assert!(recall.reached_start);
+    assert_eq!(strict.bytes_read, compressed_bytes);
+    assert_eq!(recall.bytes_read, compressed_bytes);
+    assert_eq!(strict.records_read, 3);
+    assert_eq!(recall.records_read, 3);
+    assert_eq!(strict.segments_read, 1);
+    assert_eq!(recall.segments_read, 1);
+    assert_eq!(recall.source_issue, None);
+
+    let limited = store
+        .load_recall_rollout_tail(LoadRolloutTailParams {
+            thread_id,
+            include_archived: false,
+            max_bytes: compressed_bytes - 1,
+            max_records: 16,
+        })
+        .await
+        .expect("report compressed source byte limit");
+    assert!(limited.items.is_empty());
+    assert!(!limited.reached_start);
+    assert_eq!(limited.bytes_read, 0);
+    assert_eq!(limited.records_read, 0);
+    assert_eq!(limited.segments_read, 1);
+    assert_eq!(limited.source_issue, None);
+}
+
+#[tokio::test]
+async fn loads_plain_child_with_compressed_parent_lineage() {
+    let home = TempDir::new().expect("temp dir");
+    let parent_uuid = Uuid::from_u128(/*v*/ 3023);
+    let parent_id = ThreadId::from_string(&parent_uuid.to_string()).expect("parent id");
+    let parent_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-03",
+        parent_uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write parent rollout");
+    append_line(parent_path.as_path(), 1, message("compressed parent"));
+    let parent_end = HistoryPosition {
+        thread_id: parent_id,
+        end_ordinal_exclusive: 2,
+        end_byte_offset: fs::metadata(parent_path.as_path())
+            .expect("parent metadata")
+            .len(),
+    };
+
+    let child_uuid = Uuid::from_u128(/*v*/ 3024);
+    let child_id = ThreadId::from_string(&child_uuid.to_string()).expect("child id");
+    let child_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-04",
+        child_uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write child rollout");
+    set_history_base(child_path.as_path(), parent_end);
+    append_line(child_path.as_path(), 1, message("plain child"));
+    let child_bytes = fs::metadata(child_path.as_path())
+        .expect("child metadata")
+        .len();
+    let compressed_parent_bytes = compress_rollout(parent_path.as_path());
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+
+    let tail = store
+        .load_recall_rollout_tail(LoadRolloutTailParams {
+            thread_id: child_id,
+            include_archived: false,
+            max_bytes: child_bytes + compressed_parent_bytes,
+            max_records: 16,
+        })
+        .await
+        .expect("load compressed parent lineage");
+
+    assert_eq!(
+        serde_json::to_value(&tail.items).expect("serialize actual lineage"),
+        serde_json::to_value(vec![message("compressed parent"), message("plain child")])
+            .expect("serialize expected lineage")
+    );
+    assert!(tail.reached_start);
+    assert_eq!(tail.bytes_read, child_bytes + compressed_parent_bytes);
+    assert_eq!(tail.records_read, 4);
+    assert_eq!(tail.segments_read, 2);
+    assert_eq!(tail.source_issue, None);
+
+    let limited = store
+        .load_recall_rollout_tail(LoadRolloutTailParams {
+            thread_id: child_id,
+            include_archived: false,
+            max_bytes: child_bytes + compressed_parent_bytes - 1,
+            max_records: 16,
+        })
+        .await
+        .expect("report compressed ancestor source byte limit");
+    assert_eq!(
+        serde_json::to_value(&limited.items).expect("serialize limited lineage"),
+        serde_json::to_value(vec![message("plain child")])
+            .expect("serialize expected limited lineage")
+    );
+    assert!(!limited.reached_start);
+    assert_eq!(limited.bytes_read, child_bytes);
+    assert_eq!(limited.records_read, 2);
+    assert_eq!(limited.segments_read, 2);
+    assert_eq!(limited.source_issue, None);
 }
 
 #[tokio::test]

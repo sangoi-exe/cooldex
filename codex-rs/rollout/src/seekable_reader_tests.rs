@@ -45,6 +45,35 @@ fn compressed_offsets_preserve_exact_bytes_and_open_snapshots() -> io::Result<()
 }
 
 #[test]
+fn source_byte_limit_gates_compressed_decoding_and_reports_physical_bytes() -> io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join("rollout.jsonl");
+    let compressed_path = path.with_extension("jsonl.zst");
+    let original = b"first\nsecond\nthird\n";
+    let compressed = zstd::stream::encode_all(original.as_slice(), /*level*/ 3)?;
+    let compressed_bytes = u64::try_from(compressed.len()).map_err(io::Error::other)?;
+    fs::write(&compressed_path, compressed)?;
+
+    assert!(matches!(
+        open_rollout_seekable_reader_with_source_byte_limit(&path, compressed_bytes - 1)?,
+        SourceByteLimitedSeekableReader::LimitExceeded
+    ));
+
+    let SourceByteLimitedSeekableReader::Decoded {
+        mut file,
+        source_bytes_read,
+    } = open_rollout_seekable_reader_with_source_byte_limit(&path, compressed_bytes)?
+    else {
+        panic!("compressed rollout should decode within its exact physical byte limit");
+    };
+    let mut decoded = Vec::new();
+    file.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, original);
+    assert_eq!(source_bytes_read, compressed_bytes);
+    Ok(())
+}
+
+#[test]
 fn prefix_bounds_support_sized_unsized_and_concatenated_frames() -> io::Result<()> {
     let home = tempfile::tempdir()?;
     let path = home.path().join("rollout.jsonl.zst");

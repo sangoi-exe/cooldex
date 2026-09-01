@@ -24,14 +24,17 @@ use codex_thread_store::PrepareForkParams;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use wiremock::MockServer;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -218,6 +221,47 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         "reading the ancestor must not materialize it"
     );
     assert!(parent_path.with_extension("jsonl.zst").exists());
+
+    let recall_requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("compressed-recall-response"),
+                ev_function_call("compressed-recall-call", "recall", "{}"),
+                ev_completed("compressed-recall-response"),
+            ]),
+            sse(vec![
+                ev_response_created("compressed-recall-complete"),
+                ev_assistant_message("compressed-recall-done", "recall complete"),
+                ev_completed("compressed-recall-complete"),
+            ]),
+        ],
+    )
+    .await;
+    resumed
+        .thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "shared-compression: recall inherited checkpoint".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&resumed.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = recall_requests.requests();
+    assert_eq!(requests.len(), 2);
+    let output = requests[1]
+        .function_call_output_text("compressed-recall-call")
+        .expect("recall function output");
+    let recall: Value = serde_json::from_str(&output)?;
+    assert_eq!(recall["availability"], "available");
+    assert_eq!(recall["source"]["segments_read"], 2);
+    assert_eq!(recall["source"]["reached_recall_origin"], true);
+    assert!(output.contains("OBSOLETE_PRE_CHECKPOINT_REPLY"));
+    assert!(parent_path.with_extension("jsonl.zst").exists());
+
     resumed.thread.shutdown_and_wait().await?;
     Ok(())
 }

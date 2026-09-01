@@ -12,10 +12,10 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ReverseJsonlScanner;
 use codex_rollout::ScanOutcome;
+use codex_rollout::SourceByteLimitedSeekableReader;
 use serde_json::Value;
 
 use super::LocalThreadStore;
-use super::rollout_lineage::validate_cutoff_bounds;
 use super::thread_rollout_resolver;
 use crate::LoadRolloutTailParams;
 use crate::RecallRolloutSourceIssue;
@@ -87,19 +87,19 @@ async fn scan_rollout_tail(
     let mut seen = HashSet::new();
     let mut segment_thread_id = params.thread_id;
     let mut segment_path = initial_path;
-    let mut segment_end = None;
+    let mut segment_end: Option<HistoryPosition> = None;
 
     loop {
         if !seen.insert(segment_thread_id) {
             return Err(invalid_lineage(params.thread_id, "cycle detected"));
         }
-        if is_compressed_rollout(segment_path.as_path()) {
-            break;
+        if segment_end.is_some_and(|end| end.end_ordinal_exclusive == 0) {
+            return Err(invalid_lineage(
+                params.thread_id,
+                "cutoff cannot include source session metadata",
+            ));
         }
         segments_read += 1;
-        if let Some(end) = segment_end {
-            validate_cutoff_bounds(params.thread_id, segment_path.as_path(), &end).await?;
-        }
         let remaining_bytes = params.max_bytes.saturating_sub(bytes_read);
         let remaining_records = params.max_records.saturating_sub(records_read);
         let path = segment_path.clone();
@@ -115,10 +115,21 @@ async fn scan_rollout_tail(
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to join bounded rollout scan: {err}"),
-        })?
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to scan bounded rollout tail: {err}"),
         })?;
+        let scan = match scan {
+            Ok(scan) => scan,
+            Err(SegmentScanError::CutoffPastSource) => {
+                return Err(invalid_lineage(
+                    params.thread_id,
+                    "cutoff byte offset is past the source rollout",
+                ));
+            }
+            Err(SegmentScanError::Io(err)) => {
+                return Err(ThreadStoreError::Internal {
+                    message: format!("failed to scan bounded rollout tail: {err}"),
+                });
+            }
+        };
         bytes_read = bytes_read.saturating_add(scan.bytes_read);
         records_read = records_read.saturating_add(scan.records_read);
         items_newest_first.extend(scan.items_newest_first);
@@ -214,13 +225,41 @@ struct SegmentScan {
     source_issue: Option<RecallRolloutSourceIssue>,
 }
 
+struct OpenedSegmentScanner {
+    scanner: ReverseJsonlScanner<File>,
+    source_bytes: SegmentSourceBytes,
+}
+
+#[derive(Clone, Copy)]
+enum SegmentSourceBytes {
+    Scanner,
+    Preloaded(u64),
+}
+
+impl SegmentSourceBytes {
+    fn total(self, scanner_bytes_read: u64) -> u64 {
+        match self {
+            Self::Scanner => scanner_bytes_read,
+            Self::Preloaded(source_bytes_read) => source_bytes_read,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SegmentScanError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error("cutoff byte offset is past the source rollout")]
+    CutoffPastSource,
+}
+
 fn scan_rollout_segment(
     path: &Path,
     end: Option<HistoryPosition>,
     max_bytes: u64,
     max_records: usize,
     projection: TailProjection,
-) -> io::Result<SegmentScan> {
+) -> Result<SegmentScan, SegmentScanError> {
     match projection {
         TailProjection::Strict => scan_strict_rollout_segment(path, end, max_bytes, max_records),
         TailProjection::Recall => scan_recall_rollout_segment(path, end, max_bytes, max_records),
@@ -232,14 +271,14 @@ fn scan_strict_rollout_segment(
     end: Option<HistoryPosition>,
     max_bytes: u64,
     max_records: usize,
-) -> io::Result<SegmentScan> {
-    let file = File::open(path)?;
-    let end_byte_offset = match end {
-        Some(end) => end.end_byte_offset,
-        None => file.metadata()?.len(),
+) -> Result<SegmentScan, SegmentScanError> {
+    let Some(opened) = open_rollout_segment_scanner(path, end, max_bytes)? else {
+        return Ok(source_byte_limit_exceeded_scan());
     };
-    let mut scanner =
-        ReverseJsonlScanner::new_at_with_byte_limit(file, end_byte_offset, max_bytes)?;
+    let OpenedSegmentScanner {
+        mut scanner,
+        source_bytes,
+    } = opened;
     let mut items_newest_first = Vec::new();
     let mut session_meta = None;
     let mut records_read = 0_usize;
@@ -261,7 +300,8 @@ fn scan_strict_rollout_segment(
                             .last_record_start_offset()
                             .map_or_else(|| "unknown".to_string(), |offset| offset.to_string())
                     ),
-                ));
+                )
+                .into());
             }
         };
         let reached_start = scanner.reached_start();
@@ -275,7 +315,8 @@ fn scan_strict_rollout_segment(
                         "session metadata is not the first record in {}",
                         path.display()
                     ),
-                ));
+                )
+                .into());
             }
             item => items_newest_first.push(item),
         }
@@ -285,7 +326,7 @@ fn scan_strict_rollout_segment(
         items_newest_first,
         session_meta,
         reached_start: scanner.reached_start(),
-        bytes_read: scanner.bytes_read(),
+        bytes_read: source_bytes.total(scanner.bytes_read()),
         records_read,
         source_issue: None,
     })
@@ -296,14 +337,14 @@ fn scan_recall_rollout_segment(
     end: Option<HistoryPosition>,
     max_bytes: u64,
     max_records: usize,
-) -> io::Result<SegmentScan> {
-    let file = File::open(path)?;
-    let end_byte_offset = match end {
-        Some(end) => end.end_byte_offset,
-        None => file.metadata()?.len(),
+) -> Result<SegmentScan, SegmentScanError> {
+    let Some(opened) = open_rollout_segment_scanner(path, end, max_bytes)? else {
+        return Ok(source_byte_limit_exceeded_scan());
     };
-    let mut scanner =
-        ReverseJsonlScanner::new_at_with_byte_limit(file, end_byte_offset, max_bytes)?;
+    let OpenedSegmentScanner {
+        mut scanner,
+        source_bytes,
+    } = opened;
     let mut items_newest_first = Vec::new();
     let mut session_meta = None;
     let mut records_read = 0_usize;
@@ -378,10 +419,55 @@ fn scan_recall_rollout_segment(
         items_newest_first,
         session_meta,
         reached_start: scanner.reached_start(),
-        bytes_read: scanner.bytes_read(),
+        bytes_read: source_bytes.total(scanner.bytes_read()),
         records_read,
         source_issue,
     })
+}
+
+fn open_rollout_segment_scanner(
+    path: &Path,
+    end: Option<HistoryPosition>,
+    max_source_bytes: u64,
+) -> Result<Option<OpenedSegmentScanner>, SegmentScanError> {
+    let (file, source_bytes) =
+        match codex_rollout::open_rollout_seekable_reader_with_source_byte_limit(
+            path,
+            max_source_bytes,
+        )? {
+            SourceByteLimitedSeekableReader::Direct(file) => (file, SegmentSourceBytes::Scanner),
+            SourceByteLimitedSeekableReader::Decoded {
+                file,
+                source_bytes_read,
+            } => (file, SegmentSourceBytes::Preloaded(source_bytes_read)),
+            SourceByteLimitedSeekableReader::LimitExceeded => return Ok(None),
+        };
+    let file_len = file.metadata()?.len();
+    let end_byte_offset = end.map_or(file_len, |end| end.end_byte_offset);
+    if end_byte_offset > file_len {
+        return Err(SegmentScanError::CutoffPastSource);
+    }
+    let scanner = match source_bytes {
+        SegmentSourceBytes::Scanner => {
+            ReverseJsonlScanner::new_at_with_byte_limit(file, end_byte_offset, max_source_bytes)?
+        }
+        SegmentSourceBytes::Preloaded(_) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+    };
+    Ok(Some(OpenedSegmentScanner {
+        scanner,
+        source_bytes,
+    }))
+}
+
+fn source_byte_limit_exceeded_scan() -> SegmentScan {
+    SegmentScan {
+        items_newest_first: Vec::new(),
+        session_meta: None,
+        reached_start: false,
+        bytes_read: 0,
+        records_read: 0,
+        source_issue: None,
+    }
 }
 
 struct RecallLineProjection {
@@ -503,12 +589,6 @@ fn recall_source_issue(
         event_type,
         message,
     }
-}
-
-fn is_compressed_rollout(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
 fn invalid_lineage(thread_id: ThreadId, detail: &str) -> ThreadStoreError {
