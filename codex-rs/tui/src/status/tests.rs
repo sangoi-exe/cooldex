@@ -1105,22 +1105,25 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
         /*collaboration_mode*/ None,
         /*reasoning_effort_override*/ None,
     );
-    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 92));
-    if cfg!(windows) {
-        for line in &mut rendered_lines {
-            *line = line.replace('\\', "/");
+    let formatted_used = codex_protocol::num_format::format_with_separators(8_000);
+    let formatted_limit = codex_protocol::num_format::format_with_separators(25_000);
+    let sanitize_rendered_lines = |mut rendered_lines: Vec<String>| {
+        if cfg!(windows) {
+            for line in &mut rendered_lines {
+                *line = line.replace('\\', "/");
+            }
         }
-    }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+        sanitize_directory(rendered_lines)
+            .join("\n")
+            .replace(&formatted_used, "8,000")
+            .replace(&formatted_limit, "25,000")
+    };
+    let rendered_lines = render_lines(&composite.display_lines(/*width*/ 92));
+    let sanitized = sanitize_rendered_lines(rendered_lines);
     assert_snapshot!(sanitized);
 
-    let mut rendered_lines = render_lines(&composite.display_lines(/*width*/ 46));
-    if cfg!(windows) {
-        for line in &mut rendered_lines {
-            *line = line.replace('\\', "/");
-        }
-    }
-    let sanitized = sanitize_directory(rendered_lines).join("\n");
+    let rendered_lines = render_lines(&composite.display_lines(/*width*/ 46));
+    let sanitized = sanitize_rendered_lines(rendered_lines);
     assert_snapshot!(
         "status_snapshot_wraps_enterprise_monthly_credit_details_in_narrow_terminal",
         sanitized
