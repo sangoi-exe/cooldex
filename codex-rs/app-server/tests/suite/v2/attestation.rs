@@ -115,14 +115,8 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
             ..Default::default()
         })
         .await?;
-    let turn_response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_request_id)),
-    )
-    .await??;
-    let _: TurnStartResponse = to_response(turn_response)?;
-
     let mut attestation_requests = 0;
+    let mut turn_response_seen = false;
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             match mcp.read_next_message().await? {
@@ -140,6 +134,12 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
                     )
                     .await?;
                 }
+                JSONRPCMessage::Response(response)
+                    if response.id == RequestId::Integer(turn_request_id) =>
+                {
+                    let _: TurnStartResponse = to_response(response)?;
+                    turn_response_seen = true;
+                }
                 JSONRPCMessage::Notification(notification)
                     if notification.method == "turn/completed" =>
                 {
@@ -151,6 +151,7 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
     })
     .await??;
     assert!(attestation_requests > 0);
+    assert!(turn_response_seen);
 
     assert!(
         websocket_server
