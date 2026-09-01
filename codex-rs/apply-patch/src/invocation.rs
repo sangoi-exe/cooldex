@@ -234,7 +234,7 @@ async fn try_verify_apply_patch_args(
         let path = hunk.resolve_path(&effective_cwd)?;
         if changes.contains_key(&path) {
             return Err(ParseError::InvalidPatchError(format!(
-                "multiple operations target {}",
+                "multiple operations target {}; use one operation per path or separate apply_patch calls",
                 path.inferred_native_path_string()
             ))
             .into());
@@ -579,6 +579,42 @@ mod tests {
             )
             .await,
             MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ImplicitInvocation)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_resolved_paths_explain_single_operation_contract() {
+        let session_dir = tempdir().unwrap();
+        fs::write(session_dir.path().join("duplicate.txt"), "before\n").unwrap();
+        let args = strs_to_strings(&[
+            "apply_patch",
+            r#"*** Begin Patch
+*** Update File: duplicate.txt
+@@
+-before
++first after
+*** Update File: ./duplicate.txt
+@@
+-before
++second after
+*** End Patch"#,
+        ]);
+
+        let result = maybe_parse_apply_patch_verified(
+            &args,
+            &PathUri::from_host_native_path(session_dir.path()).expect("absolute test path"),
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        let MaybeApplyPatchVerified::CorrectnessError(error) = result else {
+            panic!("expected duplicate-path correctness error, got {result:?}");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("use one operation per path or separate apply_patch calls")
         );
     }
 

@@ -508,7 +508,8 @@ async fn apply_patch_cli_rejects_duplicate_resolved_paths() -> Result<()> {
         "expected verification failure: {out}"
     );
     assert!(
-        out.contains("multiple operations target"),
+        out.contains("multiple operations target")
+            && out.contains("use one operation per path or separate apply_patch calls"),
         "expected duplicate-path diagnostics: {out}"
     );
     assert_eq!(harness.read_file_text("duplicate.txt").await?, "before\n");
