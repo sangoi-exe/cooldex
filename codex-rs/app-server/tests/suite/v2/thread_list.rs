@@ -40,10 +40,13 @@ use codex_git_utils::GitSha;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use codex_rollout::append_rollout_item_to_path;
@@ -52,6 +55,7 @@ use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_utils_absolute_path::test_support::PathExt;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::cmp::Reverse;
 use std::fs;
 use std::fs::FileTimes;
@@ -1374,12 +1378,37 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         let path = rollout_path(codex_home.path(), filename_ts, &thread_id);
         let mut session_meta = read_session_meta_line(&path).await?;
         let source = SessionSource::from(session_meta.meta.source.clone());
-        if version == Some(MultiAgentVersion::V2) {
+        let settings = if version == Some(MultiAgentVersion::V2) {
             session_meta.meta.base_instructions = Some(BaseInstructions::default());
-        }
+            Some(serde_json::from_value::<ThreadSettingsAppliedEvent>(json!({
+                "thread_id": thread_id.clone(),
+                "thread_settings": {
+                    "model": "mock-model",
+                    "model_provider_id": "mock_provider",
+                    "cwd": session_meta.meta.cwd.clone(),
+                    "approval_policy": "never",
+                    "approvals_reviewer": "user",
+                    "permission_profile": PermissionProfile::read_only(),
+                    "collaboration_mode": {
+                        "mode": "default",
+                        "settings": { "model": "mock-model" },
+                    },
+                    "shell_tool_enabled": true,
+                },
+            }))?)
+        } else {
+            None
+        };
         if let Some(version) = version {
             session_meta.meta.multi_agent_version = Some(version);
             append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(session_meta)).await?;
+        }
+        if let Some(settings) = settings {
+            append_rollout_item_to_path(
+                &path,
+                &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+            )
+            .await?;
         }
         if should_resume {
             let resume = (thread_id.clone(), source, capability);
