@@ -2813,6 +2813,7 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
                 ContentItemKind("generic.developer_instructions".to_string()),
                 ContentItemKind("generic.developer_policy".to_string()),
                 ContentItemKind("managed_config.developer_instructions".to_string()),
+                ContentItemKind("persistent_mode.instructions".to_string()),
             ]);
         }
     }
@@ -2835,44 +2836,6 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
         })
         .cloned()
         .expect("parent final answer should be recorded");
-    let mut expected_developer_message = ResponseItem::Message {
-        id: None,
-        role: "developer".to_string(),
-        content: vec![
-            ContentItem::InputText {
-                text: "Developer context before.\nChild developer instructions.\nDeveloper context after."
-                    .to_string(),
-            },
-            ContentItem::InputText {
-                text: "Preserved developer context.".to_string(),
-            },
-            ContentItem::InputText {
-                text: managed_fragment.to_string(),
-            },
-            ContentItem::InputText {
-                text: persistent_fragment.to_string(),
-            },
-        ],
-        phase: None,
-        internal_chat_message_metadata_passthrough: Some(
-            InternalChatMessageMetadataPassthrough {
-                content_item_kinds: Some(vec![
-                    ContentItemKind("generic.developer_instructions".to_string()),
-                    ContentItemKind("generic.developer_policy".to_string()),
-                    ContentItemKind("managed_config.developer_instructions".to_string()),
-                    ContentItemKind("persistent_mode.instructions".to_string()),
-                ]),
-                ..Default::default()
-            },
-        ),
-    };
-    expected_developer_message.set_turn_id_if_missing(&turn_context.sub_id);
-    expected_developer_message.set_create_time_if_missing(
-        history_items[1]
-            .executed_tool_call_metadata()
-            .and_then(|metadata| metadata.create_time.clone())
-            .expect("recorded developer message should have a creation timestamp"),
-    );
     let expected_history = [
         expected_parent_seed,
         expected_root_guidance,

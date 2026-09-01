@@ -858,7 +858,7 @@ async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
 }
 
 #[tokio::test]
-async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
+async fn multi_agent_v2_full_history_fork_inherits_effective_parent_service_tier() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         task_name: String,
@@ -917,10 +917,7 @@ async fn multi_agent_v2_full_history_fork_inherits_root_service_tier() {
         .config_snapshot()
         .await;
 
-    assert_eq!(
-        snapshot.service_tier,
-        Some(ServiceTier::Fast.request_value().to_string())
-    );
+    assert_eq!(snapshot.service_tier, None);
 }
 
 #[tokio::test]

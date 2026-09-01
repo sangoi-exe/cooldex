@@ -123,7 +123,12 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
         .expect("first turn should enter terminal transition")
         .expect("turn-stop observer should remain open");
 
-    submit_user_input(&codex, "second prompt").await;
+    let second_submit = tokio::spawn({
+        let codex = Arc::clone(&codex);
+        async move {
+            submit_user_input(&codex, "second prompt").await;
+        }
+    });
     assert!(
         tokio::time::timeout(
             Duration::from_millis(100),
@@ -138,6 +143,9 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
         .send(())
         .await
         .expect("turn-stop hook should still be waiting");
+    second_submit
+        .await
+        .expect("second submit task should finish after the transition");
     let mut lifecycle = Vec::new();
     while lifecycle.len() < 2 {
         let event = tokio::time::timeout(Duration::from_secs(2), codex.next_event())

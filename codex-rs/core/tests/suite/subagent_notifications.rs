@@ -1367,10 +1367,18 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 .count(),
         )
     });
+    // Full-history children retain the effective parent identity. Partial and
+    // no-history children rebuild from the configured child snapshot, which is
+    // intentionally absent in this fixture.
+    let expected_context_counts = match parent_context {
+        GrandchildParentContext::FullHistory | GrandchildParentContext::Compacted => [(1, 1); 3],
+        GrandchildParentContext::LastTurn | GrandchildParentContext::NoHistory => {
+            [(1, 1), (0, 1), (0, 1)]
+        }
+    };
     assert_eq!(
-        context_counts,
-        [(1, 1); 3],
-        "Initial context should appear once per agent: {parent_context:?}, {history_mode:?}"
+        context_counts, expected_context_counts,
+        "context ownership should match {parent_context:?} in {history_mode:?} mode"
     );
     assert!(!descendant_requests[1].body_contains_text(CHILD_TASK));
     Ok(())

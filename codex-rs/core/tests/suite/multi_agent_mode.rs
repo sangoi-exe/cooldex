@@ -351,6 +351,11 @@ async fn model_switch_refreshes_catalog_role_and_mode(
     for (index, request) in requests.iter().enumerate() {
         let input = request.input();
         let texts = developer_texts(&input);
+        let accumulated_mode_count = index + 1;
+        let (expected_no_spawn_count, expected_proactive_count) = match policy {
+            MultiAgentV2Policy::ExplicitRequestOnly => (accumulated_mode_count, 0),
+            MultiAgentV2Policy::Proactive => (0, accumulated_mode_count),
+        };
         assert_eq!(
             (
                 count_containing(&texts, expected_hints[0]),
@@ -358,7 +363,12 @@ async fn model_switch_refreshes_catalog_role_and_mode(
                 count_containing(&texts, NO_SPAWN_TEXT),
                 count_containing(&texts, PROACTIVE_TEXT),
             ),
-            (1, usize::from(index == 1), 1 + usize::from(index == 1), 0)
+            (
+                1,
+                usize::from(index == 1),
+                expected_no_spawn_count,
+                expected_proactive_count,
+            )
         );
     }
 
