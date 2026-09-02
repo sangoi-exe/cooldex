@@ -32,6 +32,8 @@
   supported topology; it does not attest current machine state.
 - Current upstream structure and behavior are the baseline. Add only approved fork-owned
   islands and the smallest native seams required to reach them.
+- `Merge-safety anchor:` markers are MANDATORY, not optional, on every touched workspace-local divergence file and every touched seam whose behavior, docs, tests, schema, serialization, cache, or operator surface must stay aligned with those customizations. Use the file's native comment syntax (`//`, `///`, `#`, `<!-- -->`, etc.); the required marker text is `Merge-safety anchor:`, not literal `//` everywhere. If a file cannot carry inline comments, add the nearest durable technical note that names the invariant being preserved. Missing merge-safety markers in touched customized or customization-adjacent seams are STOP-SHIP.
+- Existing `Merge anchor:` comments are legacy debt. Whenever you touch one of those files for customization-preserving work, normalize it to `Merge-safety anchor:` in the same change.
 - Keep `.github/**` and upstream API/wire behavior upstream-owned unless the current user
   explicitly changes that scope.
 - Resolve upstream conflicts manually from the canonical owner outward. Do not use
