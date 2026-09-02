@@ -3394,6 +3394,117 @@ async fn cli_override_model_instructions_file_sets_base_instructions() -> std::i
     Ok(())
 }
 
+// Merge-safety anchor: developer-instruction source precedence and selected-file
+// failures protect the operator's external instruction-canon workflow.
+#[tokio::test]
+async fn developer_instructions_file_overrides_inline_and_resolves_from_config()
+-> std::io::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"
+developer_instructions = "inline developer instructions"
+developer_instructions_file = "developer.md"
+"#,
+    )
+    .await?;
+    tokio::fs::write(
+        codex_home.join("developer.md"),
+        "\n  file developer instructions  \n",
+    )
+    .await?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home)
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("file developer instructions")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn programmatic_developer_instructions_override_skips_configured_file() -> std::io::Result<()>
+{
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"
+developer_instructions = "inline developer instructions"
+developer_instructions_file = "missing.md"
+"#,
+    )
+    .await?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home)
+        .harness_overrides(ConfigOverrides {
+            developer_instructions: Some("programmatic developer instructions".to_string()),
+            ..ConfigOverrides::default()
+        })
+        .build()
+        .await?;
+
+    assert_eq!(
+        config.developer_instructions.as_deref(),
+        Some("programmatic developer instructions")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_developer_instructions_file_fails_loud_without_inline_fallback()
+-> std::io::Result<()> {
+    for (case, contents, expected_kind) in [
+        ("missing", None, std::io::ErrorKind::NotFound),
+        (
+            "whitespace",
+            Some(b" \n\t ".as_slice()),
+            std::io::ErrorKind::InvalidData,
+        ),
+        (
+            "invalid-utf8",
+            Some(&[0xff, 0xfe][..]),
+            std::io::ErrorKind::InvalidData,
+        ),
+    ] {
+        let tmp = tempdir()?;
+        let codex_home = tmp.path().join("home");
+        tokio::fs::create_dir_all(&codex_home).await?;
+        tokio::fs::write(
+            codex_home.join(CONFIG_TOML_FILE),
+            format!(
+                "developer_instructions = \"inline fallback\"\n\
+                 developer_instructions_file = \"{case}.md\"\n"
+            ),
+        )
+        .await?;
+        if let Some(contents) = contents {
+            tokio::fs::write(codex_home.join(format!("{case}.md")), contents).await?;
+        }
+
+        let err = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home)
+            .build()
+            .await
+            .expect_err("configured developer instructions file should fail loud");
+
+        assert_eq!(err.kind(), expected_kind, "case: {case}");
+        assert!(
+            err.to_string().contains("developer instructions file"),
+            "case {case} returned unexpected error: {err}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn inline_instructions_set_base_instructions() -> std::io::Result<()> {
     let tmp = tempdir()?;

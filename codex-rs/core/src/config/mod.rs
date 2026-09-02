@@ -4135,7 +4135,21 @@ impl Config {
         let base_instructions_provenance = base_instructions
             .as_ref()
             .map(|_| BaseInstructionsProvenance::Custom);
-        let developer_instructions = developer_instructions.or(cfg.developer_instructions);
+        // Merge-safety anchor: configured developer instructions resolve in the
+        // order programmatic override, file, then inline content.
+        let file_developer_instructions = if developer_instructions.is_none() {
+            Self::try_read_non_empty_file(
+                fs,
+                cfg.developer_instructions_file.as_ref(),
+                "developer instructions file",
+            )
+            .await?
+        } else {
+            None
+        };
+        let developer_instructions = developer_instructions
+            .or(file_developer_instructions)
+            .or(cfg.developer_instructions);
         let include_permissions_instructions = cfg.include_permissions_instructions.unwrap_or(true);
         let include_apps_instructions = cfg.include_apps_instructions.unwrap_or(true);
         let include_collaboration_mode_instructions =

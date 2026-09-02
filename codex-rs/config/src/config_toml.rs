@@ -223,9 +223,15 @@ pub struct ConfigToml {
     /// System instructions.
     pub instructions: Option<String>,
 
+    // Merge-safety anchor: file-backed developer instructions remain a top-level
+    // source whose precedence is enforced by core loading and whose generated
+    // config-schema follower exposes the same canonical key.
     /// Developer instructions inserted as a `developer` role message.
     #[serde(default)]
     pub developer_instructions: Option<String>,
+
+    /// Optional path to a file containing developer instructions.
+    pub developer_instructions_file: Option<AbsolutePathBuf>,
 
     /// Whether to inject the `<permissions instructions>` developer block.
     pub include_permissions_instructions: Option<bool>,
