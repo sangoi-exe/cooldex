@@ -285,6 +285,8 @@ fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem
     ))
 }
 
+// Merge-safety anchor: local thread-store snapshot tests must preserve legacy
+// readability while following the complete V2 identity shape.
 fn settings_snapshot(
     cwd: &Path,
     model: &str,
@@ -293,6 +295,9 @@ fn settings_snapshot(
     ThreadSettingsSnapshot {
         model: model.to_string(),
         model_provider_id: "test-provider".to_string(),
+        model_context_window: None,
+        model_auto_compact_token_limit: None,
+        model_auto_compact_token_limit_scope: None,
         service_tier: None,
         approval_policy: AskForApproval::Never,
         approvals_reviewer: ApprovalsReviewer::User,

@@ -1836,6 +1836,8 @@ impl Session {
     pub(crate) async fn agent_identity_snapshot(&self) -> AgentIdentitySnapshot {
         let state = self.state.lock().await;
         let configuration = &state.session_configuration;
+        // Merge-safety anchor: live V2 identity capture must include the same
+        // effective role limits persisted for cold reload.
         AgentIdentitySnapshot::capture(
             configuration.session_source.get_agent_role(),
             configuration
@@ -1851,6 +1853,21 @@ impl Session {
                 .collaboration_mode
                 .model()
                 .to_string(),
+            Some(
+                configuration
+                    .original_config_do_not_use
+                    .model_context_window,
+            ),
+            Some(
+                configuration
+                    .original_config_do_not_use
+                    .model_auto_compact_token_limit,
+            ),
+            Some(
+                configuration
+                    .original_config_do_not_use
+                    .model_auto_compact_token_limit_scope,
+            ),
             configuration
                 .step_settings
                 .collaboration_mode

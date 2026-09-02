@@ -4,6 +4,7 @@ use crate::plugins::plugins_manager_for_config;
 use crate::skills_load_input_from_config;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_login::test_support::auth_manager_from_optional_auth;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -176,6 +177,86 @@ async fn apply_role_preserves_inherited_developer_instructions_when_role_file_om
     );
     assert_eq!(config.model.as_deref(), Some("role-model"));
     assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
+}
+
+// Merge-safety anchor: role-specific context and compaction limits must override
+// supplied values and inherit every omitted value from the parent config.
+#[tokio::test]
+async fn apply_role_overrides_model_context_and_compaction_limits() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path = write_role_config(
+        &home,
+        "bounded-context-role.toml",
+        r#"
+model_context_window = 131072
+model_auto_compact_token_limit = 98304
+model_auto_compact_token_limit_scope = "body_after_prefix"
+"#,
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    config.model_context_window = Some(262144);
+    config.model_auto_compact_token_limit = Some(196608);
+    config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    assert_eq!(
+        (
+            config.model_context_window,
+            config.model_auto_compact_token_limit,
+            config.model_auto_compact_token_limit_scope,
+        ),
+        (
+            Some(131072),
+            Some(98304),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+        )
+    );
+}
+
+#[tokio::test]
+async fn apply_role_inherits_unspecified_model_context_and_compaction_limits() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let role_path =
+        write_role_config(&home, "model-only-role.toml", "model = \"role-model\"").await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    config.model_context_window = Some(262144);
+    config.model_auto_compact_token_limit = Some(196608);
+    config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::BodyAfterPrefix;
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("custom role should apply");
+
+    assert_eq!(
+        (
+            config.model_context_window,
+            config.model_auto_compact_token_limit,
+            config.model_auto_compact_token_limit_scope,
+        ),
+        (
+            Some(262144),
+            Some(196608),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+        )
+    );
 }
 
 #[tokio::test]

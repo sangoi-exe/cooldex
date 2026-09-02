@@ -2266,9 +2266,18 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                 let thread_settings = EventMsg::ThreadSettingsApplied(
                     codex_protocol::protocol::ThreadSettingsAppliedEvent {
                         thread_id: Some(child_thread_id),
+                        // Merge-safety anchor: TUI resume fixtures must carry the
+                        // same persisted V2 identity limits as the runtime owner.
                         thread_settings: codex_protocol::protocol::ThreadSettingsSnapshot {
                             model: app.chat_widget.current_model().to_string(),
                             model_provider_id: app.config.model_provider_id.clone(),
+                            model_context_window: Some(app.config.model_context_window),
+                            model_auto_compact_token_limit: Some(
+                                app.config.model_auto_compact_token_limit,
+                            ),
+                            model_auto_compact_token_limit_scope: Some(
+                                app.config.model_auto_compact_token_limit_scope,
+                            ),
                             service_tier: app.config.service_tier.clone(),
                             approval_policy: app.config.permissions.approval_policy.value(),
                             approvals_reviewer: app.config.approvals_reviewer,

@@ -16,6 +16,7 @@ use codex_config::loader::resolve_relative_paths_in_config_toml;
 use codex_exec_server::read_sensitive_file_to_string;
 use codex_features::Feature;
 use codex_features::feature_for_key;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
@@ -33,10 +34,15 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
+// Merge-safety anchor: external agent roles may override the model context and
+// compaction limits without creating a parallel role-config owner.
 #[derive(Default, Serialize)]
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
     model: Option<String>,
+    model_context_window: Option<i64>,
+    model_auto_compact_token_limit: Option<i64>,
+    model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
     model_verbosity: Option<Verbosity>,
@@ -94,6 +100,9 @@ async fn apply_role_to_config_inner(
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
+        model_context_window: role_config.model_context_window,
+        model_auto_compact_token_limit: role_config.model_auto_compact_token_limit,
+        model_auto_compact_token_limit_scope: role_config.model_auto_compact_token_limit_scope,
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
         model_verbosity: role_config.model_verbosity,
@@ -219,6 +228,17 @@ mod role_overrides {
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
+        }
+        if let Some(model_context_window) = overrides.model_context_window {
+            next_config.model_context_window = Some(model_context_window);
+        }
+        if let Some(model_auto_compact_token_limit) = overrides.model_auto_compact_token_limit {
+            next_config.model_auto_compact_token_limit = Some(model_auto_compact_token_limit);
+        }
+        if let Some(model_auto_compact_token_limit_scope) =
+            overrides.model_auto_compact_token_limit_scope
+        {
+            next_config.model_auto_compact_token_limit_scope = model_auto_compact_token_limit_scope;
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());

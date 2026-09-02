@@ -21,6 +21,8 @@ fn cwd() -> AbsolutePathBuf {
         .expect("absolute current directory")
 }
 
+// Merge-safety anchor: app-server resume fixtures must follow the persisted V2
+// identity shape without fabricating values absent from legacy rollouts.
 fn settings_item(
     approval_policy: AskForApproval,
     approvals_reviewer: ApprovalsReviewer,
@@ -32,6 +34,9 @@ fn settings_item(
             thread_settings: ThreadSettingsSnapshot {
                 model: "gpt-5".to_string(),
                 model_provider_id: "openai".to_string(),
+                model_context_window: None,
+                model_auto_compact_token_limit: None,
+                model_auto_compact_token_limit_scope: None,
                 service_tier: None,
                 approval_policy,
                 approvals_reviewer,

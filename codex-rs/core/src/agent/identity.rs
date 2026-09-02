@@ -1,6 +1,7 @@
 use crate::config::Config;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -17,11 +18,16 @@ struct ModelProviderIdentity {
 }
 
 /// Effective model-facing identity that must move atomically with a V2 agent.
+// Merge-safety anchor: V2 agent identity must carry effective role-specific
+// context and compaction limits across eviction and cold reload.
 #[derive(Clone, PartialEq)]
 pub(crate) struct AgentIdentitySnapshot {
     agent_role: Option<String>,
     model_provider: ModelProviderIdentity,
     model: String,
+    model_context_window: Option<Option<i64>>,
+    model_auto_compact_token_limit: Option<Option<i64>>,
+    model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
     base_instructions: Arc<str>,
@@ -37,6 +43,9 @@ impl AgentIdentitySnapshot {
         model_provider_id: String,
         model_provider_info: ModelProviderInfo,
         model: String,
+        model_context_window: Option<Option<i64>>,
+        model_auto_compact_token_limit: Option<Option<i64>>,
+        model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
         model_reasoning_effort: Option<ReasoningEffort>,
         model_reasoning_summary: Option<ReasoningSummary>,
         base_instructions: String,
@@ -51,6 +60,9 @@ impl AgentIdentitySnapshot {
                 info: model_provider_info,
             },
             model,
+            model_context_window,
+            model_auto_compact_token_limit,
+            model_auto_compact_token_limit_scope,
             model_reasoning_effort,
             model_reasoning_summary,
             base_instructions: Arc::from(base_instructions),
@@ -77,6 +89,17 @@ impl AgentIdentitySnapshot {
         config.model_provider_id.clone_from(&self.model_provider.id);
         config.model_provider.clone_from(&self.model_provider.info);
         config.model = Some(self.model.clone());
+        if let Some(model_context_window) = self.model_context_window {
+            config.model_context_window = model_context_window;
+        }
+        if let Some(model_auto_compact_token_limit) = self.model_auto_compact_token_limit {
+            config.model_auto_compact_token_limit = model_auto_compact_token_limit;
+        }
+        if let Some(model_auto_compact_token_limit_scope) =
+            self.model_auto_compact_token_limit_scope
+        {
+            config.model_auto_compact_token_limit_scope = model_auto_compact_token_limit_scope;
+        }
         config
             .model_reasoning_effort
             .clone_from(&self.model_reasoning_effort);
@@ -109,6 +132,15 @@ impl fmt::Debug for AgentIdentitySnapshot {
             .field("model_provider_id", &self.model_provider.id)
             .field("model_provider_info", &"<redacted>")
             .field("model", &self.model)
+            .field("model_context_window", &self.model_context_window)
+            .field(
+                "model_auto_compact_token_limit",
+                &self.model_auto_compact_token_limit,
+            )
+            .field(
+                "model_auto_compact_token_limit_scope",
+                &self.model_auto_compact_token_limit_scope,
+            )
             .field("model_reasoning_effort", &self.model_reasoning_effort)
             .field("model_reasoning_summary", &self.model_reasoning_summary)
             .field("base_instructions", &"<redacted>")

@@ -269,6 +269,10 @@ async fn restore_v2_identity_snapshot(
             })?
     };
     let model = latest_thread_settings.model.clone();
+    let model_context_window = latest_thread_settings.model_context_window;
+    let model_auto_compact_token_limit = latest_thread_settings.model_auto_compact_token_limit;
+    let model_auto_compact_token_limit_scope =
+        latest_thread_settings.model_auto_compact_token_limit_scope;
     let reasoning_effort = latest_thread_settings.reasoning_effort.clone();
     let reasoning_summary = latest_thread_settings.reasoning_summary;
     let base_instructions = initial_history
@@ -292,11 +296,16 @@ async fn restore_v2_identity_snapshot(
         .map(|(session_source, _)| session_source)
         .unwrap_or_else(|| stored_thread.source.clone());
 
+    // Merge-safety anchor: V2 cold reload restores the persisted effective
+    // role limits and never rereads the external role TOML.
     Ok(Some(AgentIdentitySnapshot::capture(
         session_source.get_agent_role(),
         model_provider_id,
         model_provider,
         model,
+        model_context_window,
+        model_auto_compact_token_limit,
+        model_auto_compact_token_limit_scope,
         reasoning_effort,
         reasoning_summary,
         base_instructions,
