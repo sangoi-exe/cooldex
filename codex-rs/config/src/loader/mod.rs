@@ -51,6 +51,7 @@ use codex_utils_path_uri::PathUri;
 use dunce::canonicalize as normalize_path;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
@@ -87,6 +88,32 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "experimental_realtime_ws_base_url",
     "otel",
 ];
+
+/// Error returned when an explicitly selected Profile V2 config file is absent.
+#[derive(Debug)]
+pub struct SelectedProfileConfigFileNotFoundError {
+    profile: ProfileV2Name,
+    config_file: AbsolutePathBuf,
+}
+
+impl fmt::Display for SelectedProfileConfigFileNotFoundError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "selected profile `{}` requires config file {}, but the file does not exist",
+            self.profile,
+            self.config_file.as_path().display()
+        )
+    }
+}
+
+impl std::error::Error for SelectedProfileConfigFileNotFoundError {}
+
+#[derive(Debug, Clone)]
+pub(super) enum MissingConfigFileBehavior {
+    UseEmptyTable,
+    RequireSelectedProfile(ProfileV2Name),
+}
 
 async fn first_layer_config_error_from_entries(layers: &[ConfigLayerEntry]) -> Option<ConfigError> {
     typed_first_layer_config_error_from_entries::<ConfigToml>(layers, CONFIG_TOML_FILE).await
@@ -299,6 +326,7 @@ pub async fn load_config_layers_state(
         fs,
         &system_config_toml_file,
         strict_config,
+        MissingConfigFileBehavior::UseEmptyTable,
         |config_toml| {
             ConfigLayerEntry::new(
                 ConfigLayerSource::System {
@@ -531,6 +559,10 @@ async fn load_user_config_layer(
     ignore_user_config: bool,
     strict_config: bool,
 ) -> io::Result<ConfigLayerEntry> {
+    let missing_file_behavior = match profile {
+        Some(profile) => MissingConfigFileBehavior::RequireSelectedProfile(profile.clone()),
+        None => MissingConfigFileBehavior::UseEmptyTable,
+    };
     let profile = profile.map(ToString::to_string);
     if ignore_user_config {
         return Ok(ConfigLayerEntry::new(
@@ -542,15 +574,21 @@ async fn load_user_config_layer(
         ));
     }
 
-    load_config_toml_for_required_layer(fs, user_file, strict_config, |config_toml| {
-        ConfigLayerEntry::new(
-            ConfigLayerSource::User {
-                file: user_file.clone(),
-                profile: profile.clone(),
-            },
-            config_toml,
-        )
-    })
+    load_config_toml_for_required_layer(
+        fs,
+        user_file,
+        strict_config,
+        missing_file_behavior,
+        |config_toml| {
+            ConfigLayerEntry::new(
+                ConfigLayerSource::User {
+                    file: user_file.clone(),
+                    profile: profile.clone(),
+                },
+                config_toml,
+            )
+        },
+    )
     .await
 }
 
@@ -567,17 +605,24 @@ fn insert_layer_by_precedence(layers: &mut Vec<ConfigLayerEntry>, layer: ConfigL
 /// Attempts to load a config.toml file from `config_toml`.
 /// - If the file exists and is valid TOML, passes the parsed `toml::Value` to
 ///   `create_entry` and returns the resulting layer entry.
-/// - If the file does not exist, uses an empty `Table` with `create_entry` and
-///   returns the resulting layer entry.
+/// - If the file does not exist, applies the caller-selected missing-file
+///   behavior.
 /// - If there is an error reading the file or parsing the TOML, returns an
 ///   error.
 async fn load_config_toml_for_required_layer(
     fs: &dyn ExecutorFileSystem,
     toml_file: &AbsolutePathBuf,
     strict_config: bool,
+    missing_file_behavior: MissingConfigFileBehavior,
     create_entry: impl FnOnce(TomlValue) -> ConfigLayerEntry,
 ) -> io::Result<ConfigLayerEntry> {
-    let loaded = load_config_toml_for_required_layer_raw(fs, toml_file, strict_config).await?;
+    let loaded = load_config_toml_for_required_layer_raw(
+        fs,
+        toml_file,
+        strict_config,
+        missing_file_behavior,
+    )
+    .await?;
     let toml_value = resolve_relative_paths_in_config_toml(loaded.toml, loaded.base_dir.as_path())?;
 
     Ok(create_entry(toml_value))
@@ -593,6 +638,7 @@ async fn load_config_toml_for_required_layer_raw(
     fs: &dyn ExecutorFileSystem,
     toml_file: &AbsolutePathBuf,
     strict_config: bool,
+    missing_file_behavior: MissingConfigFileBehavior,
 ) -> io::Result<LoadedTomlFile> {
     let config_parent = toml_file.as_path().parent().ok_or_else(|| {
         io::Error::new(
@@ -627,7 +673,22 @@ async fn load_config_toml_for_required_layer_raw(
         }
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
-                Ok(TomlValue::Table(toml::map::Map::new()))
+                match missing_file_behavior {
+                    MissingConfigFileBehavior::UseEmptyTable => {
+                        Ok(TomlValue::Table(toml::map::Map::new()))
+                    }
+                    MissingConfigFileBehavior::RequireSelectedProfile(profile) => {
+                        // Merge-safety anchor: an explicit Profile V2 selection
+                        // fails loud instead of becoming an empty user overlay.
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            SelectedProfileConfigFileNotFoundError {
+                                profile,
+                                config_file: toml_file.clone(),
+                            },
+                        ))
+                    }
+                }
             } else {
                 Err(io::Error::new(
                     e.kind(),

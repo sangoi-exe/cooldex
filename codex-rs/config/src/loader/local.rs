@@ -1,4 +1,5 @@
 use super::CredentialBrokerProjectState;
+use super::MissingConfigFileBehavior;
 use super::apply_credential_broker_requirements;
 use super::credential_broker_trusted_config;
 use super::discover_project_layers;
@@ -117,11 +118,23 @@ pub(super) async fn load_local_config_layers_with_overrides(
     .await?;
 
     let system_file = system_config_toml_file_with_overrides(overrides)?;
-    let system =
-        load_config_toml_for_required_layer_raw(fs, &system_file, /*strict_config*/ false).await?;
+    // Merge-safety anchor: executor-local config reads keep ordinary absent
+    // system and base-user files optional; selected profiles are excluded here.
+    let system = load_config_toml_for_required_layer_raw(
+        fs,
+        &system_file,
+        /*strict_config*/ false,
+        MissingConfigFileBehavior::UseEmptyTable,
+    )
+    .await?;
     let user_file = codex_home.join(CONFIG_TOML_FILE);
-    let user =
-        load_config_toml_for_required_layer_raw(fs, &user_file, /*strict_config*/ false).await?;
+    let user = load_config_toml_for_required_layer_raw(
+        fs,
+        &user_file,
+        /*strict_config*/ false,
+        MissingConfigFileBehavior::UseEmptyTable,
+    )
+    .await?;
 
     let mut discovery_config = TomlValue::Table(toml::map::Map::new());
     merge_toml_values(&mut discovery_config, &system.toml);

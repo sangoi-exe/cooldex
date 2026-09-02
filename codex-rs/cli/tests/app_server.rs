@@ -32,6 +32,39 @@ foo = "bar"
     Ok(())
 }
 
+// Merge-safety anchor: both direct and instance-child app-server startup must
+// keep an absent explicitly selected Profile V2 terminal in non-strict mode.
+#[test]
+fn missing_profile_v2_fails_closed_for_non_strict_app_server() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args(["--profile", "missing", "app-server", "--listen", "off"])
+        .assert()
+        .failure()
+        .stderr(contains("selected profile `missing` requires config file"));
+
+    Ok(())
+}
+
+#[test]
+fn missing_profile_v2_fails_closed_for_non_strict_instance_child_app_server() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args([
+        "--profile",
+        "missing",
+        "app-server",
+        "--instance-child",
+        "--listen",
+        "off",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("selected profile `missing` requires config file"));
+
+    Ok(())
+}
+
 #[test]
 fn agents_accept_interactive_configuration_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;

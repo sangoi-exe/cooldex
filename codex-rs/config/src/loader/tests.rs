@@ -627,6 +627,117 @@ fn windows_local_managed_configuration_ignores_legacy_file_but_detects_requireme
     assert_eq!((legacy_only, with_system_requirements), (false, true));
 }
 
+// Merge-safety anchor: an explicit Profile V2 selection requires its own file,
+// while ordinary and intentionally ignored user config paths remain optional.
+#[tokio::test]
+async fn profile_v2_requires_selected_config_file() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").expect("write base user config");
+    let selected_config =
+        AbsolutePathBuf::resolve_path_against_base("missing.config.toml", tmp.path());
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.user_config_path = Some(selected_config.clone());
+    overrides.user_config_profile = Some("missing".parse().expect("profile-v2 name"));
+
+    let err = load_config_layers_state(
+        &TestFileSystem,
+        tmp.path(),
+        /*cwd*/ None,
+        &[],
+        overrides,
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect_err("an explicitly selected profile should require its config file");
+
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(
+        err.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                SelectedProfileConfigFileNotFoundError,
+            >,
+        )
+    );
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "selected profile `missing` requires config file {}, but the file does not exist",
+            selected_config.as_path().display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn profile_v2_accepts_existing_empty_selected_config_file() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").expect("write base user config");
+    let selected_config =
+        AbsolutePathBuf::resolve_path_against_base("empty.config.toml", tmp.path());
+    std::fs::write(selected_config.as_path(), "").expect("write selected user config");
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.user_config_path = Some(selected_config.clone());
+    overrides.user_config_profile = Some("empty".parse().expect("profile-v2 name"));
+
+    let stack = load_config_layers_state(
+        &TestFileSystem,
+        tmp.path(),
+        /*cwd*/ None,
+        &[],
+        overrides,
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("an existing empty selected profile file should remain valid");
+
+    assert_eq!(stack.get_user_config_file(), Some(&selected_config));
+}
+
+#[tokio::test]
+async fn missing_custom_user_config_path_without_profile_remains_optional() {
+    let tmp = tempdir().expect("tempdir");
+    let custom_config =
+        AbsolutePathBuf::resolve_path_against_base("custom.config.toml", tmp.path());
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.user_config_path = Some(custom_config.clone());
+
+    let stack = load_config_layers_state(
+        &TestFileSystem,
+        tmp.path(),
+        /*cwd*/ None,
+        &[],
+        overrides,
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("a custom user config path without an explicit profile remains optional");
+
+    assert_eq!(stack.get_user_config_file(), Some(&custom_config));
+}
+
+#[tokio::test]
+async fn ignored_user_config_does_not_require_selected_profile_file() {
+    let tmp = tempdir().expect("tempdir");
+    let selected_config =
+        AbsolutePathBuf::resolve_path_against_base("ignored.config.toml", tmp.path());
+    let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+    overrides.user_config_path = Some(selected_config.clone());
+    overrides.user_config_profile = Some("ignored".parse().expect("profile-v2 name"));
+    overrides.ignore_user_config = true;
+
+    let stack = load_config_layers_state(
+        &TestFileSystem,
+        tmp.path(),
+        /*cwd*/ None,
+        &[],
+        overrides,
+        &crate::NoopThreadConfigLoader,
+    )
+    .await
+    .expect("ignored user config should not require the selected profile file");
+
+    assert_eq!(stack.get_user_config_file(), Some(&selected_config));
+}
+
 #[tokio::test]
 async fn profile_v2_rejects_matching_legacy_profile_in_base_user_config() {
     let tmp = tempdir().expect("tempdir");

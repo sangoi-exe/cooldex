@@ -6,6 +6,7 @@ use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
+use codex_config::loader::SelectedProfileConfigFileNotFoundError;
 use codex_config::types::AppServerMode;
 use codex_core::config::Config;
 use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
@@ -82,12 +83,19 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
 
-fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
+// Merge-safety anchor: non-strict app-server startup may recover from ordinary
+// config errors, but an absent explicitly selected Profile V2 remains terminal.
+fn is_nonrecoverable_config_error(err: &std::io::Error) -> bool {
     err.get_ref().is_some_and(
         <dyn std::error::Error + Send + Sync + 'static>::is::<
             UnsupportedUntrustedApprovalPolicyError,
         >,
     )
+        || err.get_ref().is_some_and(
+            <dyn std::error::Error + Send + Sync + 'static>::is::<
+                SelectedProfileConfigFileNotFoundError,
+            >,
+        )
 }
 
 mod analytics_utils;
@@ -559,7 +567,7 @@ pub async fn run_main_with_transport_options(
                 config.http_client_factory(),
             );
         }
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
+        Err(err) if is_nonrecoverable_config_error(&err) => {
             return Err(err);
         }
         Err(err) => {
@@ -574,7 +582,7 @@ pub async fn run_main_with_transport_options(
         .await
     {
         Ok(config) => config,
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
+        Err(err) if is_nonrecoverable_config_error(&err) => {
             return Err(err);
         }
         Err(err) => {
