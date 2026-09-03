@@ -8,6 +8,7 @@ use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::SubAgentActivityItem;
 use codex_protocol::items::TurnItem;
@@ -3021,26 +3022,36 @@ async fn skills_toggle_skips_instructions_for_parent_and_spawned_child() -> Resu
     Ok(())
 }
 
+// Merge-safety anchor: non-full-history role TOMLs project sparse model limits
+// through AgentRoleOverrides into the spawned child's existing Config.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let child_snapshot = spawn_child_and_capture_snapshot(
+    let (test, spawned_id, _child_request_log) = setup_turn_one_with_custom_spawned_child(
         &server,
+        MULTI_AGENT_V1_NAMESPACE,
         json!({
             "message": CHILD_PROMPT,
             "agent_type": "custom",
             "model": REQUESTED_MODEL,
             "reasoning_effort": REQUESTED_REASONING_EFFORT,
         }),
+        /*child_response_delay*/ None,
+        /*wait_for_parent_notification*/ false,
+        INHERITED_REASONING_EFFORT,
         |builder| {
             builder.with_config(|config| {
                 let role_path = config.codex_home.join("custom-role.toml");
                 std::fs::write(
                     &role_path,
                     format!(
-                        "model = \"{ROLE_MODEL}\"\nmodel_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n",
+                        "model = \"{ROLE_MODEL}\"\n\
+                         model_reasoning_effort = \"{ROLE_REASONING_EFFORT}\"\n\
+                         model_context_window = 131072\n\
+                         model_auto_compact_token_limit = 98304\n\
+                         model_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
                     ),
                 )
                 .expect("write role config");
@@ -3052,13 +3063,37 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
                         nickname_candidates: None,
                     },
                 );
+                config.model_context_window = Some(262_144);
+                config.model_auto_compact_token_limit = Some(196_608);
+                config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
             })
         },
     )
     .await?;
 
-    assert_eq!(child_snapshot.model, ROLE_MODEL);
-    assert_eq!(child_snapshot.reasoning_effort, Some(ROLE_REASONING_EFFORT));
+    let child_thread = test
+        .thread_manager
+        .get_thread(ThreadId::from_string(&spawned_id)?)
+        .await?;
+    let child_config = child_thread.config().await;
+
+    assert_eq!(child_config.model.as_deref(), Some(ROLE_MODEL));
+    assert_eq!(
+        child_config.model_reasoning_effort,
+        Some(ROLE_REASONING_EFFORT)
+    );
+    assert_eq!(
+        (
+            child_config.model_context_window,
+            child_config.model_auto_compact_token_limit,
+            child_config.model_auto_compact_token_limit_scope,
+        ),
+        (
+            Some(131_072),
+            Some(98_304),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+        ),
+    );
 
     Ok(())
 }

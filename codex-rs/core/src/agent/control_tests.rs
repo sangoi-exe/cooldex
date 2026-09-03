@@ -32,7 +32,6 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -798,24 +797,6 @@ async fn ensure_v2_agent_loaded_recovers_settings_outside_bounded_model_context(
 }
 
 #[tokio::test]
-async fn root_resume_restores_v2_agent_role_limits_for_followup() {
-    check_v2_agent_reload(
-        V2ReloadRoute::Sender,
-        V2ReloadExpectation::FreshManagerFullIdentity,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn root_resume_canonicalizes_legacy_role_limits_for_repeated_followup() {
-    check_v2_agent_reload(
-        V2ReloadRoute::Sender,
-        V2ReloadExpectation::LegacyMissingRoleLimits,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn ensure_v2_agent_loaded_rejects_absent_persisted_settings_snapshot() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
@@ -851,8 +832,6 @@ enum V2ReloadRoute {
 #[derive(Clone, Copy)]
 enum V2ReloadExpectation {
     FullIdentity,
-    FreshManagerFullIdentity,
-    LegacyMissingRoleLimits,
     BoundedModelContext,
     MissingSettingsSnapshot,
     MissingShellState,
@@ -888,8 +867,8 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
-// Merge-safety anchor: V2 eviction and lazy reload must restore the captured
-// child identity instead of rereading mutable external role files.
+// Merge-safety anchor: V2 reload keeps the existing persisted thread-settings
+// requirement for agent restoration without expanding its schema.
 async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpectation) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -904,17 +883,8 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             .expect("root shell tool should be enabled");
     }
     config.model = Some("gpt-5.6-sol".to_string());
-    config.model_context_window = Some(262_144);
-    config.model_auto_compact_token_limit = Some(196_608);
-    config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
     let role_path = config.codex_home.join("worker.toml");
-    std::fs::write(
-        &role_path,
-        "model_context_window = 1000000\n\
-         model_auto_compact_token_limit = 98304\n\
-         model_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
-    )
-    .expect("write worker role config");
+    std::fs::write(&role_path, "model = \"role-file-model\"\n").expect("write worker role config");
     config.agent_roles.insert(
         "worker".to_string(),
         AgentRoleConfig {
@@ -964,9 +934,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     let parent_thread_id = parent_thread.session.thread_id;
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
-    crate::agent::role::apply_role_to_config(&mut child_config, Some("worker"))
-        .await
-        .expect("worker role should apply");
     child_config
         .features
         .disable(Feature::ShellTool)
@@ -989,35 +956,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
-    let child_turn = child_thread.session.new_default_turn().await;
-    assert_eq!(
-        (
-            child_turn.config.model_context_window,
-            child_turn.config.model_auto_compact_token_limit,
-            child_turn.config.model_auto_compact_token_limit_scope,
-        ),
-        (
-            Some(872_000),
-            Some(98_304),
-            AutoCompactTokenLimitScope::BodyAfterPrefix,
-        ),
-        "the spawned child must use the role-specific model limits",
-    );
     let expected_identity = child_thread.session.agent_identity_snapshot().await;
-    let expected_thread_settings = child_thread.session.thread_settings_snapshot().await;
-    assert_eq!(
-        (
-            expected_thread_settings.model_context_window,
-            expected_thread_settings.model_auto_compact_token_limit,
-            expected_thread_settings.model_auto_compact_token_limit_scope,
-        ),
-        (
-            Some(Some(872_000)),
-            Some(Some(98_304)),
-            Some(AutoCompactTokenLimitScope::BodyAfterPrefix),
-        ),
-        "the persisted snapshot must capture the catalog-capped role limits",
-    );
     child_thread
         .inject_response_items(vec![assistant_message(
             "child persisted",
@@ -1076,9 +1015,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     assert_eq!(stored_child.history_mode, ThreadHistoryMode::Paginated);
     if matches!(
         expectation,
-        V2ReloadExpectation::FreshManagerFullIdentity
-            | V2ReloadExpectation::LegacyMissingRoleLimits
-            | V2ReloadExpectation::MissingSettingsSnapshot
+        V2ReloadExpectation::MissingSettingsSnapshot
             | V2ReloadExpectation::MissingShellState
             | V2ReloadExpectation::CompressedAncestor
     ) {
@@ -1092,14 +1029,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             .flush_rollout()
             .await
             .expect("root rollout should flush");
-        if matches!(
-            expectation,
-            V2ReloadExpectation::FreshManagerFullIdentity
-                | V2ReloadExpectation::LegacyMissingRoleLimits
-        ) {
-            std::fs::remove_file(&role_path)
-                .expect("remove worker role before root-process resume");
-        }
         let mut root_rollout_path = root_thread
             .read_thread(
                 /*include_archived*/ true, /*include_history*/ false,
@@ -1116,54 +1045,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         assert_eq!(report.timed_out, Vec::<ThreadId>::new());
 
         match expectation {
-            V2ReloadExpectation::FreshManagerFullIdentity => {}
-            V2ReloadExpectation::LegacyMissingRoleLimits => {
-                let original_lines =
-                    std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
-                let mut updated_snapshots = 0;
-                let updated_lines = original_lines
-                    .lines()
-                    .map(|raw_line| {
-                        let mut value: serde_json::Value =
-                            serde_json::from_str(raw_line).expect("parse child rollout line");
-                        if value
-                            .pointer("/payload/type")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("thread_settings_applied")
-                        {
-                            let thread_settings = value
-                                .pointer_mut("/payload/thread_settings")
-                                .and_then(serde_json::Value::as_object_mut)
-                                .expect("thread settings payload");
-                            for field in [
-                                "model_context_window",
-                                "model_auto_compact_token_limit",
-                                "model_auto_compact_token_limit_scope",
-                            ] {
-                                assert!(
-                                    thread_settings.remove(field).is_some(),
-                                    "new snapshot should contain {field} before legacy conversion"
-                                );
-                            }
-                            assert!(
-                                thread_settings.contains_key("shell_tool_enabled"),
-                                "legacy role-limit conversion must retain shell state"
-                            );
-                            updated_snapshots += 1;
-                        }
-                        serde_json::to_string(&value).expect("serialize child rollout line")
-                    })
-                    .collect::<Vec<_>>();
-                std::fs::write(
-                    &child_rollout_path,
-                    format!("{}\n", updated_lines.join("\n")),
-                )
-                .expect("remove persisted role-limit fields");
-                assert!(
-                    updated_snapshots > 0,
-                    "child rollout should contain a persisted settings snapshot"
-                );
-            }
             V2ReloadExpectation::MissingSettingsSnapshot => {
                 let original_lines =
                     std::fs::read_to_string(&child_rollout_path).expect("read child rollout");
@@ -1293,16 +1174,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             }
         }
 
-        let mut resume_config = harness.config.clone();
-        if matches!(expectation, V2ReloadExpectation::FreshManagerFullIdentity) {
-            resume_config.model_context_window = Some(524_288);
-            resume_config.model_auto_compact_token_limit = Some(393_216);
-            resume_config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
-        } else if matches!(expectation, V2ReloadExpectation::LegacyMissingRoleLimits) {
-            resume_config.model_context_window = Some(1_000_000);
-            resume_config.model_auto_compact_token_limit = Some(393_216);
-            resume_config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
-        }
         let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
         let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
             CodexAuth::from_api_key("dummy"),
@@ -1316,7 +1187,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             .expect("load root rollout history");
         let resume_result = resumed_manager
             .resume_thread_with_history(
-                resume_config.clone(),
+                harness.config.clone(),
                 root_history,
                 auth_manager,
                 /*parent_trace*/ None,
@@ -1324,123 +1195,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             )
             .await;
         match expectation {
-            V2ReloadExpectation::FreshManagerFullIdentity => {
-                let resumed_root =
-                    resume_result.expect("root resume should restore child metadata");
-                let resumed_control = resumed_root.thread.session.services.agent_control.clone();
-                assert_thread_not_loaded(&resumed_manager, spawned_agent.thread_id).await;
-                resumed_control
-                    .ensure_v2_agent_loaded(
-                        resume_config,
-                        spawned_agent.thread_id,
-                        /*parent*/ None,
-                    )
-                    .await
-                    .expect("restored child should load without its role file");
-                let restored_child = resumed_manager
-                    .get_thread(spawned_agent.thread_id)
-                    .await
-                    .expect("restored child should be loaded");
-                assert_eq!(
-                    restored_child.session.agent_identity_snapshot().await,
-                    expected_identity
-                );
-                let restored_turn = restored_child.session.new_default_turn().await;
-                assert_eq!(
-                    (
-                        restored_turn.config.model_context_window,
-                        restored_turn.config.model_auto_compact_token_limit,
-                        restored_turn.config.model_auto_compact_token_limit_scope,
-                    ),
-                    (
-                        Some(872_000),
-                        Some(98_304),
-                        AutoCompactTokenLimitScope::BodyAfterPrefix,
-                    ),
-                    "root resume must restore the persisted role limits instead of the reload config",
-                );
-                let communication = InterAgentCommunication::new(
-                    AgentPath::root(),
-                    agent_path.clone(),
-                    Vec::new(),
-                    "follow-up after root resume".to_string(),
-                    /*trigger_turn*/ false,
-                );
-                resumed_control
-                    .send_inter_agent_communication(
-                        spawned_agent.thread_id,
-                        communication,
-                        AgentCommunicationContext::new(
-                            AgentCommunicationKind::Message,
-                            ThreadId::new(),
-                        ),
-                        Default::default(),
-                    )
-                    .await
-                    .expect("follow-up should reuse the restored child identity");
-                let followup_turn = restored_child.session.new_default_turn().await;
-                assert_eq!(
-                    (
-                        followup_turn.config.model_context_window,
-                        followup_turn.config.model_auto_compact_token_limit,
-                        followup_turn.config.model_auto_compact_token_limit_scope,
-                    ),
-                    (
-                        Some(872_000),
-                        Some(98_304),
-                        AutoCompactTokenLimitScope::BodyAfterPrefix,
-                    ),
-                );
-            }
-            V2ReloadExpectation::LegacyMissingRoleLimits => {
-                let resumed_root =
-                    resume_result.expect("root resume should restore legacy child metadata");
-                let resumed_control = resumed_root.thread.session.services.agent_control.clone();
-                assert_thread_not_loaded(&resumed_manager, spawned_agent.thread_id).await;
-                for access in 1..=2 {
-                    resumed_control
-                        .ensure_v2_agent_loaded(
-                            resume_config.clone(),
-                            spawned_agent.thread_id,
-                            /*parent*/ None,
-                        )
-                        .await
-                        .unwrap_or_else(|error| {
-                            panic!("legacy child access {access} should succeed: {error}")
-                        });
-                }
-                let restored_child = resumed_manager
-                    .get_thread(spawned_agent.thread_id)
-                    .await
-                    .expect("legacy child should be loaded");
-                let live_identity = restored_child.session.agent_identity_snapshot().await;
-                assert_eq!(
-                    resumed_control
-                        .ensure_agent_known(spawned_agent.thread_id)
-                        .expect("legacy child should remain registered")
-                        .identity_snapshot,
-                    Some(live_identity),
-                    "the first cold load must canonicalize the registry identity",
-                );
-                let restored_turn = restored_child.session.new_default_turn().await;
-                assert_eq!(
-                    (
-                        restored_turn.config.model_context_window,
-                        restored_turn.config.model_auto_compact_token_limit,
-                        restored_turn.config.model_auto_compact_token_limit_scope,
-                    ),
-                    (
-                        Some(872_000),
-                        Some(393_216),
-                        AutoCompactTokenLimitScope::Total,
-                    ),
-                    "legacy snapshots must inherit and capture the effective reload limits",
-                );
-                assert!(
-                    !restored_turn.config.features.enabled(Feature::ShellTool),
-                    "legacy role-limit fields must not erase persisted shell state"
-                );
-            }
             V2ReloadExpectation::MissingSettingsSnapshot => {
                 let error = match resume_result {
                     Ok(_) => panic!("root resume must reject a child without persisted settings"),
@@ -1944,9 +1698,6 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
                     thread_settings: ThreadSettingsSnapshot {
                         model: "parent-only-model".to_string(),
                         model_provider_id: "parent-only-provider".to_string(),
-                        model_context_window: None,
-                        model_auto_compact_token_limit: None,
-                        model_auto_compact_token_limit_scope: None,
                         service_tier: None,
                         approval_policy: AskForApproval::Never,
                         approvals_reviewer: ApprovalsReviewer::User,

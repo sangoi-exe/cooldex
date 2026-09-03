@@ -641,14 +641,9 @@ mod tests {
         let mut item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
             ThreadSettingsAppliedEvent {
                 thread_id: None,
-                // Merge-safety anchor: metadata-sync fixtures must follow the
-                // complete persisted V2 thread-settings identity shape.
                 thread_settings: ThreadSettingsSnapshot {
                     model: "gpt-5.2-codex".to_string(),
                     model_provider_id: "updated-provider".to_string(),
-                    model_context_window: None,
-                    model_auto_compact_token_limit: None,
-                    model_auto_compact_token_limit_scope: None,
                     service_tier: None,
                     approval_policy: AskForApproval::Never,
                     approvals_reviewer: ApprovalsReviewer::User,

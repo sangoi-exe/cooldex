@@ -277,20 +277,9 @@ impl SessionConfiguration {
         &self,
         environment_selections: &[TurnEnvironmentSelection],
     ) -> ThreadSettingsSnapshot {
-        // Merge-safety anchor: persisted V2 thread settings carry effective role
-        // limits so cold reload does not reinterpret the current role file.
         ThreadSettingsSnapshot {
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
-            model_context_window: Some(self.original_config_do_not_use.model_context_window),
-            model_auto_compact_token_limit: Some(
-                self.original_config_do_not_use
-                    .model_auto_compact_token_limit,
-            ),
-            model_auto_compact_token_limit_scope: Some(
-                self.original_config_do_not_use
-                    .model_auto_compact_token_limit_scope,
-            ),
             service_tier: self.step_settings.service_tier.clone(),
             approval_policy: self.step_settings.approval_policy.value(),
             approvals_reviewer: self.step_settings.approvals_reviewer,
@@ -675,16 +664,6 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     ) -> anyhow::Result<Arc<Self>> {
-        // Merge-safety anchor: session-owned config captures the catalog-capped
-        // context override while model switching retains the requested override.
-        if session_configuration
-            .model_info_overrides
-            .context_window
-            .is_some()
-        {
-            Arc::make_mut(&mut session_configuration.original_config_do_not_use)
-                .model_context_window = model_info.context_window;
-        }
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration

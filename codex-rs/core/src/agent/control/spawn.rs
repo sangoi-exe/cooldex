@@ -197,39 +197,15 @@ async fn load_agent_model_context(
     }
 }
 
-// Merge-safety anchor: typed content kinds distinguish configured developer
-// instructions from additive runtime-owned developer messages during reload.
+// Merge-safety anchor: V2 agent restoration reconstructs captured identity
+// from recorded thread settings and rollout history.
 fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
     for item in history {
         let RolloutItem::ResponseItem(response_item) = item else {
             continue;
         };
         match &response_item.item {
-            ResponseItem::Message {
-                role,
-                content,
-                internal_chat_message_metadata_passthrough,
-                ..
-            } if role == "developer" => {
-                if let Some(content_item_kinds) = internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|metadata| metadata.content_item_kinds.as_ref())
-                {
-                    if let Some(instructions) = content.iter().zip(content_item_kinds).find_map(
-                        |(content_item, content_kind)| {
-                            if content_kind.0 != "generic.developer_instructions" {
-                                return None;
-                            }
-                            let ContentItem::InputText { text } = content_item else {
-                                return None;
-                            };
-                            Some(text.clone())
-                        },
-                    ) {
-                        return Some(instructions);
-                    }
-                    continue;
-                }
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
                 if let Some(instructions) =
                     crate::event_mapping::first_non_contextual_dev_message_text(content)
                 {
@@ -295,10 +271,6 @@ async fn restore_v2_identity_snapshot(
             })?
     };
     let model = latest_thread_settings.model.clone();
-    let model_context_window = latest_thread_settings.model_context_window;
-    let model_auto_compact_token_limit = latest_thread_settings.model_auto_compact_token_limit;
-    let model_auto_compact_token_limit_scope =
-        latest_thread_settings.model_auto_compact_token_limit_scope;
     let reasoning_effort = latest_thread_settings.reasoning_effort.clone();
     let reasoning_summary = latest_thread_settings.reasoning_summary;
     let base_instructions = initial_history
@@ -322,16 +294,11 @@ async fn restore_v2_identity_snapshot(
         .map(|(session_source, _)| session_source)
         .unwrap_or_else(|| stored_thread.source.clone());
 
-    // Merge-safety anchor: V2 cold reload restores the persisted effective
-    // role limits and never rereads the external role TOML.
     Ok(Some(AgentIdentitySnapshot::capture(
         session_source.get_agent_role(),
         model_provider_id,
         model_provider,
         model,
-        model_context_window,
-        model_auto_compact_token_limit,
-        model_auto_compact_token_limit_scope,
         reasoning_effort,
         reasoning_summary,
         base_instructions,
@@ -345,21 +312,11 @@ async fn verify_loaded_v2_agent_identity(
     loaded_thread: &CodexThread,
     thread_id: ThreadId,
     identity_snapshot: &AgentIdentitySnapshot,
-    agent_registry: &AgentRegistry,
-    agent_metadata: &AgentMetadata,
 ) -> CodexResult<()> {
-    let live_identity = loaded_thread.session.agent_identity_snapshot().await;
-    let Some(canonical_identity) =
-        identity_snapshot.canonicalize_legacy_fields_from(&live_identity)
-    else {
+    if loaded_thread.session.agent_identity_snapshot().await != *identity_snapshot {
         return Err(CodexErr::InvalidRequest(format!(
             "agent {thread_id} is loaded with an identity that does not match its live identity snapshot; spawn a new agent before sending follow-up work"
         )));
-    };
-    if canonical_identity != *identity_snapshot {
-        let mut canonical_metadata = agent_metadata.clone();
-        canonical_metadata.identity_snapshot = Some(canonical_identity);
-        agent_registry.register_spawned_thread(canonical_metadata);
     }
     Ok(())
 }
@@ -604,7 +561,7 @@ impl AgentControl {
             .state
             .agent_metadata_for_thread(thread_id)
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
-        let identity_snapshot = match agent_metadata.identity_snapshot.clone() {
+        let identity_snapshot = match agent_metadata.identity_snapshot {
             Some(identity_snapshot) => identity_snapshot,
             None if agent_metadata
                 .agent_path
@@ -626,14 +583,7 @@ impl AgentControl {
         if owner_thread_id.is_none()
             && let Some(loaded_thread) = loaded_thread
         {
-            verify_loaded_v2_agent_identity(
-                &loaded_thread,
-                thread_id,
-                &identity_snapshot,
-                self.state.as_ref(),
-                &agent_metadata,
-            )
-            .await?;
+            verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot).await?;
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
         }
@@ -679,14 +629,7 @@ impl AgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                verify_loaded_v2_agent_identity(
-                    &thread,
-                    thread_id,
-                    &identity_snapshot,
-                    self.state.as_ref(),
-                    &agent_metadata,
-                )
-                .await?;
+                verify_loaded_v2_agent_identity(&thread, thread_id, &identity_snapshot).await?;
                 self.touch_loaded_v2_residency(&state, thread_id).await;
                 return Ok(());
             }
@@ -837,14 +780,6 @@ impl AgentControl {
             .await
         {
             Ok(reloaded_thread) => {
-                verify_loaded_v2_agent_identity(
-                    &reloaded_thread.thread,
-                    thread_id,
-                    &identity_snapshot,
-                    self.state.as_ref(),
-                    &agent_metadata,
-                )
-                .await?;
                 if let Some(parent_thread_id) = owner_thread_id {
                     self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
                 }
@@ -860,14 +795,8 @@ impl AgentControl {
                     }
                     self.state.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    verify_loaded_v2_agent_identity(
-                        &loaded_thread,
-                        thread_id,
-                        &identity_snapshot,
-                        self.state.as_ref(),
-                        &agent_metadata,
-                    )
-                    .await?;
+                    verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot)
+                        .await?;
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
                 }

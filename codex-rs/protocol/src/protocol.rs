@@ -22,7 +22,6 @@ use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
 use crate::capabilities::SelectedCapabilityRoot;
 use crate::config_types::ApprovalsReviewer;
-use crate::config_types::AutoCompactTokenLimitScope;
 use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
 use crate::config_types::MultiAgentMode;
@@ -2167,33 +2166,10 @@ pub struct ThreadSettingsAppliedEvent {
     pub thread_settings: ThreadSettingsSnapshot,
 }
 
-// Merge-safety anchor: this persisted snapshot owns effective V2 model limits;
-// omitted legacy fields remain distinguishable from explicitly unset values.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ThreadSettingsSnapshot {
     pub model: String,
     pub model_provider_id: String,
-    #[serde(
-        default,
-        deserialize_with = "serde_with::rust::double_option::deserialize",
-        serialize_with = "serde_with::rust::double_option::serialize",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[ts(optional)]
-    #[ts(type = "number | null")]
-    pub model_context_window: Option<Option<i64>>,
-    #[serde(
-        default,
-        deserialize_with = "serde_with::rust::double_option::deserialize",
-        serialize_with = "serde_with::rust::double_option::serialize",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[ts(optional)]
-    #[ts(type = "number | null")]
-    pub model_auto_compact_token_limit: Option<Option<i64>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     pub approval_policy: AskForApproval,
@@ -4420,14 +4396,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn thread_settings_snapshot_preserves_limits_and_accepts_legacy_missing_identity_fields()
-    -> Result<()> {
+    fn thread_settings_snapshot_accepts_legacy_missing_shell_tool_state() -> Result<()> {
         let snapshot = ThreadSettingsSnapshot {
             model: "gpt-5.4".to_string(),
             model_provider_id: "openai".to_string(),
-            model_context_window: Some(None),
-            model_auto_compact_token_limit: Some(Some(98304)),
-            model_auto_compact_token_limit_scope: Some(AutoCompactTokenLimitScope::BodyAfterPrefix),
             service_tier: None,
             approval_policy: AskForApproval::Never,
             approvals_reviewer: ApprovalsReviewer::User,
@@ -4449,40 +4421,16 @@ mod tests {
         };
 
         let mut legacy_value = serde_json::to_value(&snapshot)?;
-        assert_eq!(
-            serde_json::from_value::<ThreadSettingsSnapshot>(legacy_value.clone())?,
-            snapshot
-        );
         let Some(legacy_object) = legacy_value.as_object_mut() else {
             anyhow::bail!("thread settings snapshot must serialize as an object");
         };
-        assert_eq!(
-            legacy_object.remove("model_context_window"),
-            Some(json!(null))
-        );
-        assert_eq!(
-            legacy_object.remove("model_auto_compact_token_limit"),
-            Some(json!(98304))
-        );
-        assert_eq!(
-            legacy_object.remove("model_auto_compact_token_limit_scope"),
-            Some(json!("body_after_prefix"))
-        );
         assert_eq!(
             legacy_object.remove("shell_tool_enabled"),
             Some(json!(false))
         );
 
         let legacy_snapshot: ThreadSettingsSnapshot = serde_json::from_value(legacy_value)?;
-        assert_eq!(
-            (
-                legacy_snapshot.model_context_window,
-                legacy_snapshot.model_auto_compact_token_limit,
-                legacy_snapshot.model_auto_compact_token_limit_scope,
-                legacy_snapshot.shell_tool_enabled,
-            ),
-            (None, None, None, None)
-        );
+        assert_eq!(legacy_snapshot.shell_tool_enabled, None);
         Ok(())
     }
 
