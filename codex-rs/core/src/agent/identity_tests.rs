@@ -91,6 +91,27 @@ fn identity_equality_covers_every_field() {
     }
 }
 
+#[test]
+fn identity_canonicalization_fills_only_legacy_absent_model_limits() {
+    let live = snapshot();
+    let mut legacy = live.clone();
+    legacy.model_context_window = None;
+    legacy.model_auto_compact_token_limit = None;
+    legacy.model_auto_compact_token_limit_scope = None;
+
+    assert_eq!(
+        legacy.canonicalize_legacy_fields_from(&live),
+        Some(live.clone())
+    );
+
+    let mut explicitly_different = legacy;
+    explicitly_different.model_context_window = Some(Some(262144));
+    assert_eq!(
+        explicitly_different.canonicalize_legacy_fields_from(&live),
+        None
+    );
+}
+
 #[tokio::test]
 async fn identity_apply_restores_persisted_model_context_and_compaction_limits() {
     let mut config = crate::config::test_config().await;

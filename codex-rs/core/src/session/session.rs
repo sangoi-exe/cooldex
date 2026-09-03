@@ -675,6 +675,16 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
         windows_sandbox_proxy_settings_mode: codex_sandboxing::WindowsSandboxProxySettingsMode,
     ) -> anyhow::Result<Arc<Self>> {
+        // Merge-safety anchor: session-owned config captures the catalog-capped
+        // context override while model switching retains the requested override.
+        if session_configuration
+            .model_info_overrides
+            .context_window
+            .is_some()
+        {
+            Arc::make_mut(&mut session_configuration.original_config_do_not_use)
+                .model_context_window = model_info.context_window;
+        }
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration

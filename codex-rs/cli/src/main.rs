@@ -1878,10 +1878,9 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
         | Subcommand::Mcp(_)
+        // Merge-safety anchor: direct app-server startup must reach Profile V2 loading.
         | Subcommand::AppServer(AppServerCommand {
-            subcommand: None,
-            instance_child: true,
-            ..
+            subcommand: None, ..
         })
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
@@ -3258,6 +3257,12 @@ mod tests {
         assert_eq!(
             profile_v2_for_args(&["codex", "--profile", "work", "sandbox"])
                 .expect("sandbox supports config profile")
+                .as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            profile_v2_for_args(&["codex", "--profile", "work", "app-server"])
+                .expect("direct app-server supports config profile")
                 .as_deref(),
             Some("work")
         );

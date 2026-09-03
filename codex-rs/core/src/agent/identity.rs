@@ -122,6 +122,23 @@ impl AgentIdentitySnapshot {
         }
         Ok(())
     }
+
+    /// Replaces only fields absent from a legacy snapshot with the live values.
+    /// Explicitly persisted values must still match exactly.
+    pub(crate) fn canonicalize_legacy_fields_from(&self, live: &Self) -> Option<Self> {
+        let mut canonical = self.clone();
+        if canonical.model_context_window.is_none() {
+            canonical.model_context_window = live.model_context_window;
+        }
+        if canonical.model_auto_compact_token_limit.is_none() {
+            canonical.model_auto_compact_token_limit = live.model_auto_compact_token_limit;
+        }
+        if canonical.model_auto_compact_token_limit_scope.is_none() {
+            canonical.model_auto_compact_token_limit_scope =
+                live.model_auto_compact_token_limit_scope;
+        }
+        canonical.eq(live).then_some(canonical)
+    }
 }
 
 impl fmt::Debug for AgentIdentitySnapshot {

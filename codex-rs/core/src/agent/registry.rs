@@ -230,7 +230,9 @@ impl AgentRegistry {
             .collect()
     }
 
-    fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
+    // Merge-safety anchor: V2 cold reload reuses the canonical registration path
+    // when it replaces a legacy-form identity with its live canonical value.
+    pub(crate) fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
         let Some(thread_id) = agent_metadata.agent_id else {
             return;
         };
