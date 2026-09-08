@@ -220,7 +220,8 @@ impl Session {
         let recall = packet.recall().cloned();
         let compaction_window_id = &identity.compaction_window_id;
         let item_count = if let Some(recall) = recall {
-            let mut recall_item = Box::new(recall).into_boxed_response_item();
+            // Merge-safety anchor: replay recall as assistant output, not generic contextual input.
+            let mut recall_item = recall.into_response_item();
             recall_item.set_id(Some(ResponseItemId::with_suffix(
                 "msg",
                 format_args!("{compaction_window_id}-recall"),

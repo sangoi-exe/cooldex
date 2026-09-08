@@ -5,12 +5,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ReverseJsonlScanner;
+use codex_rollout::RolloutLine;
 use codex_rollout::ScanOutcome;
 use codex_rollout::SourceByteLimitedSeekableReader;
 use serde_json::Value;
@@ -266,6 +266,8 @@ fn scan_rollout_segment(
     }
 }
 
+// Merge-safety anchor: tail scans use rollout-owned canonical decoding while preserving reverse
+// source offsets, physical-byte bounds, ordinals, and reached-start semantics.
 fn scan_strict_rollout_segment(
     path: &Path,
     end: Option<HistoryPosition>,
@@ -284,7 +286,7 @@ fn scan_strict_rollout_segment(
     let mut records_read = 0_usize;
 
     while records_read < max_records {
-        let Some(outcome) = scanner.scan_next::<RolloutLine>()? else {
+        let Some(outcome) = scanner.scan_next_rollout_line()? else {
             break;
         };
         records_read += 1;
@@ -526,7 +528,7 @@ fn project_recall_rollout_line(
             event_type,
         });
     }
-    let line = serde_json::from_value(value).map_err(|error| {
+    let line = codex_rollout::decode_rollout_line(value).map_err(|error| {
         recall_source_issue(
             RecallRolloutSourceIssueKind::UnsupportedSchema,
             path,
@@ -553,7 +555,9 @@ fn is_recall_reconstruction_record(record_type: &str, event_type: Option<&str>) 
         | "compacted"
         | "post_compact_recovery_applied"
         | "turn_context"
-        | "world_state" => true,
+        | "token_usage_record"
+        | "world_state"
+        | "retained_context" => true,
         "event_msg" => matches!(
             event_type,
             Some(

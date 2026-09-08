@@ -581,6 +581,7 @@ fn map_steer_rejection(error: SteerInputError) -> CodexResult<NotSubmittedReason
     }
 }
 
+// Merge-safety anchor: keep schema preflight here while Session::steer_submitted_input remains the canonical TurnSlot steering owner.
 async fn active_turn_output_schema_mismatch(
     session: &Session,
     expected_turn_id: Option<&str>,

@@ -36,6 +36,9 @@ fn compaction(
     RolloutItem::Compacted(CompactedItem {
         message: "summary".to_string(),
         replacement_history,
+        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
+        guardian_history: None,
+        retained_context: None,
         mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: window_id.map(ToString::to_string),
@@ -46,6 +49,8 @@ fn compaction(
                 boundary_item_id: boundary_item_id.to_string(),
             }
         }),
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 

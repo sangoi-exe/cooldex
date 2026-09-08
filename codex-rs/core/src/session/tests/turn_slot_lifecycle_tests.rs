@@ -1,5 +1,8 @@
 use super::*;
 use crate::tasks::RegularTask;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
+use codex_protocol::turn_input::TurnInputMode;
+use codex_protocol::turn_input::TurnInputRequest;
 use pretty_assertions::assert_eq;
 
 struct BlockingTurnStop {
@@ -46,10 +49,6 @@ fn user_input(text: &str) -> Vec<UserInput> {
         text: text.to_string(),
         text_elements: Vec::new(),
     }]
-}
-
-fn user_input_request(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
-    codex_protocol::turn_input::TurnInputRequest::user_input(user_input(text))
 }
 
 async fn install_blocked_startup_prewarm(session: &Session) -> tokio::sync::oneshot::Sender<()> {
@@ -178,6 +177,8 @@ fn count_user_message_text(
         .count()
 }
 
+// Merge-safety anchor: lifecycle tests exercise direct TurnSlot admission so exact rejection
+// payloads and independently owned transitions stay covered without retired adapters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_handler_input_waits_for_completion_terminal_flush() {
     let (mut session, old_turn_context, rx) = make_session_and_context_with_rx().await;
@@ -212,14 +213,13 @@ async fn fresh_handler_input_waits_for_completion_terminal_flush() {
         let session = Arc::clone(&session);
         let fresh_turn_id = fresh_turn_id.clone();
         async move {
-            handlers::user_input_or_turn(
+            super::super::turn_input::handle(
                 &session,
+                TurnInputRequest::user_input(user_input(fresh_text)),
+                TurnInputMode::StartOrSteer,
                 fresh_turn_id,
-                user_input_request(fresh_text),
-                /*client_user_message_id*/ None,
-                /*parent_turn_id*/ None,
             )
-            .await;
+            .await
         }
     });
     let expected_old_input = user_input("expected old completion turn");
@@ -228,13 +228,18 @@ async fn fresh_handler_input_waits_for_completion_terminal_flush() {
         let old_turn_id = old_turn_context.sub_id.clone();
         let expected_old_input = expected_old_input.clone();
         async move {
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: expected_old_input,
+                client_id: None,
+            };
             session
-                .steer_input(
-                    expected_old_input,
+                .steer_submitted_input(
+                    &mut submitted_input,
                     /*additional_context*/ Default::default(),
                     Some(&old_turn_id),
-                    /*client_user_message_id*/ None,
+                    /*required_final_output_json_schema*/ None,
                     /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
                 )
                 .await
         }
@@ -259,7 +264,8 @@ async fn fresh_handler_input_waits_for_completion_terminal_flush() {
     timeout(Duration::from_secs(2), handler)
         .await
         .expect("fresh handler should finish")
-        .expect("fresh handler task should not panic");
+        .expect("fresh handler task should not panic")
+        .expect("fresh input should submit");
 
     let expected_old_error = timeout(Duration::from_secs(2), expected_old_steer)
         .await
@@ -350,16 +356,21 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
     let fresh_text = "fresh input during replacement transition";
     let handler = tokio::spawn({
         let session = Arc::clone(&session);
-        let fresh_request_id = fresh_request_id.clone();
         async move {
-            handlers::user_input_or_turn(
-                &session,
-                fresh_request_id,
-                user_input_request(fresh_text),
-                /*client_user_message_id*/ None,
-                /*parent_turn_id*/ None,
-            )
-            .await;
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: user_input(fresh_text),
+                client_id: None,
+            };
+            session
+                .steer_submitted_input(
+                    &mut submitted_input,
+                    /*additional_context*/ Default::default(),
+                    /*expected_turn_id*/ None,
+                    /*required_final_output_json_schema*/ None,
+                    /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
+                )
+                .await
         }
     });
     let expected_old_input = user_input("expected old replacement turn");
@@ -368,13 +379,18 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
         let old_turn_id = old_turn_context.sub_id.clone();
         let expected_old_input = expected_old_input.clone();
         async move {
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: expected_old_input,
+                client_id: None,
+            };
             session
-                .steer_input(
-                    expected_old_input,
+                .steer_submitted_input(
+                    &mut submitted_input,
                     /*additional_context*/ Default::default(),
                     Some(&old_turn_id),
-                    /*client_user_message_id*/ None,
+                    /*required_final_output_json_schema*/ None,
                     /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
                 )
                 .await
         }
@@ -392,7 +408,8 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
     timeout(Duration::from_secs(2), handler)
         .await
         .expect("fresh handler should finish")
-        .expect("fresh handler task should not panic");
+        .expect("fresh handler task should not panic")
+        .expect("fresh input should attach to the replacement");
 
     let expected_old_error = timeout(Duration::from_secs(2), expected_old_steer)
         .await
@@ -446,12 +463,6 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
 )]
 async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
     let (session, first_context, rx) = make_session_and_context_with_rx().await;
-    let second_context = session
-        .new_turn_with_default_settings("second-no-id-input".to_string(), Default::default())
-        .await;
-    let third_context = session
-        .new_turn_with_default_settings("third-no-id-input".to_string(), Default::default())
-        .await;
     let _startup_prewarm_release = install_blocked_startup_prewarm(session.as_ref()).await;
     let state_guard = session.state.lock().await;
 
@@ -461,25 +472,31 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
         let first_context = Arc::clone(&first_context);
         async move {
             session
-                .route_user_input(
+                .spawn_task(
                     first_context,
-                    user_input("first starting input"),
-                    /*additional_context*/ Default::default(),
-                    /*client_user_message_id*/ None,
-                    /*responsesapi_client_metadata*/ None,
+                    vec![TurnInput::UserInput {
+                        content: user_input("first starting input"),
+                        client_id: None,
+                    }],
+                    RegularTask::new(),
                 )
-                .await
+                .await;
         }
     });
     wait_for_starting_turn(session.as_ref(), &first_turn_id).await;
 
+    let mut stale_input = SubmittedTurnInput::UserInput {
+        content: user_input("stale expected id"),
+        client_id: None,
+    };
     let stale_error = session
-        .steer_input(
-            user_input("stale expected id"),
+        .steer_submitted_input(
+            &mut stale_input,
             /*additional_context*/ Default::default(),
             Some("stale-turn"),
-            /*client_user_message_id*/ None,
+            /*required_final_output_json_schema*/ None,
             /*responsesapi_client_metadata*/ None,
+            /*incoming_root_turn_id*/ None,
         )
         .await
         .expect_err("stale expected id should reject the published starter");
@@ -494,13 +511,18 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
     let second = tokio::spawn({
         let session = Arc::clone(&session);
         async move {
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: user_input("second waiting input"),
+                client_id: None,
+            };
             session
-                .route_user_input(
-                    second_context,
-                    user_input("second waiting input"),
+                .steer_submitted_input(
+                    &mut submitted_input,
                     /*additional_context*/ Default::default(),
-                    /*client_user_message_id*/ None,
+                    /*expected_turn_id*/ None,
+                    /*required_final_output_json_schema*/ None,
                     /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
                 )
                 .await
         }
@@ -508,13 +530,18 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
     let third = tokio::spawn({
         let session = Arc::clone(&session);
         async move {
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: user_input("third waiting input"),
+                client_id: None,
+            };
             session
-                .route_user_input(
-                    third_context,
-                    user_input("third waiting input"),
+                .steer_submitted_input(
+                    &mut submitted_input,
                     /*additional_context*/ Default::default(),
-                    /*client_user_message_id*/ None,
+                    /*expected_turn_id*/ None,
+                    /*required_final_output_json_schema*/ None,
                     /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
                 )
                 .await
         }
@@ -617,13 +644,18 @@ async fn cancelling_interrupt_caller_does_not_abandon_transition() {
         let turn_id = turn_context.sub_id.clone();
         let expected_old_input = expected_old_input.clone();
         async move {
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: expected_old_input,
+                client_id: None,
+            };
             session
-                .steer_input(
-                    expected_old_input,
+                .steer_submitted_input(
+                    &mut submitted_input,
                     /*additional_context*/ Default::default(),
                     Some(&turn_id),
-                    /*client_user_message_id*/ None,
+                    /*required_final_output_json_schema*/ None,
                     /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
                 )
                 .await
         }

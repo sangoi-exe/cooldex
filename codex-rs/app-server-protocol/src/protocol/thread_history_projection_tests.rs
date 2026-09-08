@@ -125,6 +125,7 @@ fn projects_completed_canonical_turn_items() {
         phase: None,
         memory_citation: None,
         delivery: None,
+        questions: None,
     });
 
     let user_changes = project(item_completed(thread_id, "turn-1", user_item.clone()));
@@ -188,6 +189,8 @@ fn projects_optional_completed_item_lifecycle_timestamps() {
 
 #[test]
 fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
+    // Merge-safety anchor: public-history projection excludes persistence/control
+    // records while the local recovery proof remains serializable in rollout data.
     let aborted = project(RolloutItem::EventMsg(EventMsg::TurnAborted(
         TurnAbortedEvent {
             turn_id: None,
@@ -200,12 +203,16 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
     let compacted = project(RolloutItem::Compacted(CompactedItem {
         message: String::new(),
         replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
         post_compact_recovery: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     }));
     let security_risk = project(RolloutItem::SecurityRiskScore(SecurityRiskScore {
         scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),

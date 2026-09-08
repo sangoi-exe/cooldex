@@ -9,7 +9,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_diagnostics::Gauge;
-use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
@@ -68,8 +67,6 @@ use codex_protocol::protocol::WarningEvent;
 use codex_thread_store::PersistContext;
 
 use codex_features::Feature;
-use codex_login::AuthManager;
-use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
@@ -118,6 +115,7 @@ pub(crate) enum RegularTaskContinuation {
     Sealed,
 }
 
+// Merge-safety anchor: preserve explicit mailbox parent attribution while other starts retain the first trusted root.
 pub(crate) enum MailboxParentProvenance {
     Ignore,
     Attribute,
@@ -218,35 +216,21 @@ fn bool_tag(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+// Merge-safety anchor: task runners retain only the Session handle; TurnContext remains the
+// sole owner of per-turn extension data so merge cleanup cannot restore a duplicate copy.
 /// Thin wrapper that exposes the parts of [`Session`] task runners need.
 #[derive(Clone)]
 pub(crate) struct SessionTaskContext {
     session: Arc<Session>,
-    turn_extension_data: Arc<ExtensionData>,
 }
 
 impl SessionTaskContext {
-    pub(crate) fn new(session: Arc<Session>, turn_extension_data: Arc<ExtensionData>) -> Self {
-        Self {
-            session,
-            turn_extension_data,
-        }
+    pub(crate) fn new(session: Arc<Session>) -> Self {
+        Self { session }
     }
 
     pub(crate) fn clone_session(&self) -> Arc<Session> {
         Arc::clone(&self.session)
-    }
-
-    pub(crate) fn turn_extension_data(&self) -> Arc<ExtensionData> {
-        Arc::clone(&self.turn_extension_data)
-    }
-
-    pub(crate) fn auth_manager(&self) -> Arc<AuthManager> {
-        Arc::clone(&self.session.services.auth_manager)
-    }
-
-    pub(crate) fn models_manager(&self) -> SharedModelsManager {
-        Arc::clone(&self.session.services.models_manager)
     }
 }
 
@@ -512,22 +496,6 @@ impl Session {
         }
     }
 
-    pub(crate) async fn start_claimed_regular_task(
-        self: &Arc<Self>,
-        claim: TurnStartClaim,
-        turn_context: Arc<TurnContext>,
-        input: Vec<TurnInput>,
-    ) -> CodexResult<()> {
-        self.start_claimed_regular_task_with_options(
-            claim,
-            turn_context,
-            input,
-            None,
-            MailboxParentProvenance::Ignore,
-        )
-        .await
-    }
-
     pub(crate) async fn start_claimed_regular_task_with_options(
         self: &Arc<Self>,
         claim: TurnStartClaim,
@@ -547,31 +515,6 @@ impl Session {
             mailbox_parent_provenance,
         )
         .await
-    }
-
-    pub(crate) async fn start_task<T: SessionTask>(
-        self: &Arc<Self>,
-        turn_context: Arc<TurnContext>,
-        input: Vec<TurnInput>,
-        task: T,
-        input_persisted: Option<
-            tokio::sync::oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>,
-        >,
-        mailbox_parent_provenance: MailboxParentProvenance,
-    ) {
-        let task: Arc<dyn AnySessionTask> = Arc::new(task);
-        if let Err(err) = self
-            .replace_or_start_task(
-                turn_context,
-                input,
-                task,
-                input_persisted,
-                mailbox_parent_provenance,
-            )
-            .await
-        {
-            warn!(%err, "failed to replace or start session task");
-        }
     }
 
     async fn start_claimed_task(
@@ -615,7 +558,6 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        // Reserved turn input already has its context; only newly arriving mail can change lineage.
         let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
         if let MailboxParentProvenance::Attribute = mailbox_parent_provenance {
             if let Some(id) = start_options.parent_turn_id.as_ref() {
@@ -640,15 +582,12 @@ impl Session {
                     .turn_metadata_state
                     .set_root_turn_id(id.clone());
             }
-        } else if pending_items.iter().any(|item| {
-            matches!(
-                item,
-                TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
-            )
-        }) && turn_context.turn_metadata_state.root_turn_id()
-            != start_options.root_turn_id
+        } else if turn_context.turn_metadata_state.root_turn_id().is_none()
+            && let Some(root_turn_id) = start_options.root_turn_id
         {
-            turn_context.turn_metadata_state.mark_root_turn_ambiguous();
+            turn_context
+                .turn_metadata_state
+                .set_root_turn_id(root_turn_id);
         }
         let turn_state = Arc::clone(&claim.turn_state);
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
@@ -656,17 +595,13 @@ impl Session {
             .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
             .await;
 
-        let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let agent_execution_guard = self.services.agent_control.execution_guard(
             turn_context.multi_agent_version,
             &turn_context.session_source,
         );
         let session = Arc::clone(self);
         let task_done_clone = Arc::clone(&task_done);
-        let session_ctx = Arc::new(SessionTaskContext::new(
-            Arc::clone(self),
-            Arc::clone(&turn_extension_data),
-        ));
+        let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
         let session_ctx_for_start = Arc::clone(&session_ctx);
         let ctx = Arc::clone(&turn_context);
         let task_for_run = Arc::clone(&task);

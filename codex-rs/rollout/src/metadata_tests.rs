@@ -292,12 +292,16 @@ fn builder_from_items_falls_back_to_filename() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "noop".to_string(),
         replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
         post_compact_recovery: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })];
 
     let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
@@ -316,6 +320,8 @@ fn builder_from_items_falls_back_to_filename() {
     assert_eq!(builder, expected);
 }
 
+// Merge-safety anchor: PostCompactRecoveryApplied remains canonical persisted history but does
+// not become model-context cutoff or SQLite thread metadata projection input.
 #[test]
 fn post_compact_recovery_current_projections_ignore_internal_metadata() {
     let dir = tempdir().expect("tempdir");

@@ -36,7 +36,8 @@ fn post_compact_recovery_keeps_history_out_of_developer_authority() {
     let boundary_rendered = context.render();
     let recall_context = context.recall().expect("separate recall context");
     let recall_rendered = recall_context.render();
-    let recall_item = Box::new(recall_context.clone()).into_boxed_response_item();
+    // Merge-safety anchor: recall preserves its assistant output shape and content-kind metadata.
+    let recall_item = recall_context.clone().into_response_item();
 
     assert_eq!(context.role(), "developer");
     assert_eq!(recall_context.role(), "assistant");

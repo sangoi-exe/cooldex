@@ -1,5 +1,6 @@
 # Merge-safety anchor: this declarative map is the source of truth for deterministic
-# cargo-validate package, surface, generator, self-test, receipt, and resource-profile selection.
+# cargo-validate package, surface, platform-accounted manifest, native-Windows
+# bootstrap, generator, self-test, receipt, and resource-profile selection.
 schema_version = 1
 
 [defaults]
@@ -10,6 +11,26 @@ history_sample_limit = 20
 
 [receipts]
 dir = ".sangoi/validation"
+
+# Native Windows uses installed C-drive tools only as read-only inputs. Every
+# run-created path is rooted below this literal F-drive cache namespace.
+# Version, URL, and digest pins are declarative here; the planner validates
+# coherent artifact paths from these values without mirroring the pins.
+[windows_runtime]
+cache_root = 'F:\.cache'
+workflow_namespace = "cw"
+minimum_free_disk_gib = 120
+minimum_available_memory_gib = 30
+target = "x86_64-pc-windows-msvc"
+rust_toolchain = "1.95.0-x86_64-pc-windows-msvc"
+nextest_version = "0.9.103"
+nextest_url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.103/cargo-nextest-0.9.103-x86_64-pc-windows-msvc.zip"
+nextest_sha256 = "f4764e4f58c297b917364922b998c70b521a2fda271b0a7d141654a9800817d6"
+v8_version = "150.4.0"
+v8_archive_url = "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz"
+v8_archive_sha256 = "732ec5da4243aa166799780c8519a5eea6f32f6e47657a323342794dc3c239d6"
+v8_binding_url = "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs"
+v8_binding_sha256 = "dabf78ba1faac127660db9862b1d0354175c71b8db2d4fcb5bacbd9c93576b16"
 
 [resource_profiles.check]
 reserve_free_pct = 0
@@ -159,6 +180,27 @@ cargo_jobs_mem_per_job_mib = 4096
 cargo_jobs_mem_reserve_mib = 16384
 cargo_jobs_low_disk_max = 3
 
+# Native Windows nextest execution is planned separately from WSL guard profiles.
+# The planner projects this contract into windows_runtime.resource_contract.
+[resource_profiles.windows_nextest]
+reserve_free_pct = 0
+reserve_free_gib = 5
+abort_free_pct = 0
+abort_free_gib = 5
+monitor = true
+test_threads = 8
+low_disk_test_threads_max = 8
+cargo_jobs_mode = "fixed"
+cargo_jobs_default = "min"
+cargo_jobs_min = 16
+cargo_jobs_max = 16
+cargo_jobs_hard_max = 16
+cargo_jobs_cpu_pct = 100
+cargo_jobs_cpu_reserve = 0
+cargo_jobs_mem_per_job_mib = 1
+cargo_jobs_mem_reserve_mib = 0
+cargo_jobs_low_disk_max = 16
+
 # Feature profiles are intentionally absent until a package needs one. Add entries
 # in this shape instead of letting agents invent --features by hand:
 #
@@ -214,6 +256,52 @@ argv = ["python3", "-m", "py_compile", "scripts/cargo-validate.py"]
 
 [commands.validate-tests]
 argv = ["python3", "scripts/test-cargo-validate.py"]
+
+[commands.validate-windows-tests]
+argv = ["python3", "scripts/test-cargo-validate-windows.py"]
+
+[commands.clear-windows-build-cache-tests]
+argv = ["python3", "scripts/test-clear-windows-build-cache.py"]
+
+# Merge-safety anchor: native aggregate V8 testing must select codex-v8-poc/sandbox
+# so its cfg matches the pinned sandbox-enabled V8 artifact.
+[commands.windows-nextest-workspace]
+argv = [
+  "cargo",
+  "nextest",
+  "run",
+  "--workspace",
+  "--features",
+  "codex-v8-poc/sandbox",
+  "--profile",
+  "local",
+  "--no-fail-fast",
+  "--no-tests",
+  "fail",
+  "--exclude",
+  "codex-bwrap",
+  "--exclude",
+  "codex-linux-sandbox",
+  "--exclude",
+  "codex-shell-escalation",
+  "--exclude",
+  "codex-windows-sandbox-service",
+  "-E",
+  'all() - (binary(windows_stable_ingress) | binary(conpty_search_path) | (package(codex-app-server) & test(/(?:^|::)(?:windows_sandbox_log_attachment_uses_current_log)(?:$|::)/)) | (package(codex-app-server-daemon) & test(/(?:^|::)(?:detached_launch_preflight_rejects_restrictive_job|failed_updater_handoff_preserves_predecessor_record|identity_queries_do_not_require_termination_access|inaccessible_reused_pid_is_stale_without_hiding_process_open_errors|powershell_installer_is_noninteractive_and_reports_script_failure|stale_creation_time_never_stops_reused_pid|updater_readiness_and_post_publication_failure_preserve_ownership)(?:$|::)/)) | (package(codex-app-server-transport) & test(/(?:^|::)(?:control_socket_pins_directory_until_shutdown)(?:$|::)/)) | (package(codex-arg0) & test(/(?:^|::)(?:windows_batch_alias_preserves_cross_volume_executable_paths|windows_batch_alias_preserves_unicode_executable_paths)(?:$|::)/)) | (package(codex-cli) & test(/(?:^|::)(?:codex_new_thread_url_encodes_windows_workspace_path|codex_new_thread_url_preserves_verbatim_workspace_path|display_workspace_path_leaves_regular_paths_unchanged|display_workspace_path_preserves_unc_prefix|display_workspace_path_removes_windows_extended_prefix|ignores_non_setup_sandbox_command_args|parses_managed_user_identity|parses_setup_from_sandbox_command_args|rejects_oversized_setup_failure_reports|reports_malformed_setup_failure_reports|reports_refresh_failure_after_setup_completed|requires_codex_home_for_managed_user|requires_explicit_user_identity|the_windows_system_volume_is_not_a_dev_drive|windows_update_command_resolution_ignores_relative_path_entries)(?:$|::)/)) | (package(codex-config) & test(/(?:^|::)(?:default_windows_managed_config_is_ignored_with_warning|windows_local_managed_configuration_ignores_legacy_file_but_detects_requirements|windows_system_config_toml_file_uses_expected_suffix|windows_system_requirements_toml_file_uses_expected_suffix)(?:$|::)/)) | (package(codex-core) & test(/(?:^|::)(?:commands_for_exec_policy_parses_powershell_shell_wrapper|create_env_inserts_pathext_on_windows_when_missing|create_env_preserves_existing_pathext_case_insensitively_on_windows|evaluates_powershell_inner_commands_against_allow_rules|evaluates_powershell_inner_commands_against_prompt_rules|initial_exec_yield_time_uses_windows_floor|inject_permission_profile_env_replaces_differently_cased_windows_key|read_only_windows_policy_without_sandbox_backend_still_requires_approval|read_only_windows_sandbox_runs_unmatched_commands_under_sandbox|resolve_root_git_project_for_trust_supports_windows_namespace_paths|test_core_inherit_respects_case_insensitive_names_on_windows|unmatched_dangerous_powershell_inner_commands_require_approval|unmatched_powershell_read_requires_approval_without_sandbox|windows_elevated_does_not_create_missing_workspace_metadata|windows_elevated_enforces_deny_read_and_protects_setup_marker|windows_elevated_unified_exec_enforces_managed_deny_reads|windows_restricted_token_rejects_exact_and_glob_deny_read_policy|windows_sandbox_proxy_listeners_preserve_effective_protocol_roles|windows_shell_identity_is_case_insensitive|windows_workspace_defaults_do_not_hide_explicit_metadata_carveouts|writable_windows_policy_without_sandbox_backend_still_requires_approval)(?:$|::)/)) | (package(codex-core-plugins) & test(/(?:^|::)(?:primary_runtime_cache_uses_user_profile_on_windows)(?:$|::)/)) | (package(codex-exec-server) & test(/(?:^|::)(?:completed_windows_image_read_does_not_wait_for_a_stuck_helper|connect_stdio_command_initializes_json_rpc_client_on_windows|duplicated_windows_file_handle_survives_bounded_helper_cleanup|exec_process_signal_terminates_on_windows|file_reads_reject_named_pipes|file_system_canonicalize_resolves_directory_junction|file_system_no_follow_operations_reject_named_pipes|file_system_operations_can_reject_junctions_in_any_path_component|file_system_remote_fs_helper_respects_windows_sandbox_write_policy|file_system_sandboxed_canonicalize_resolves_directory_junction|helper_env_preserves_windows_path_key_for_system_bwrap_discovery|managed_network_honors_windows_sandbox_level|native_open_rejects_named_pipes_before_connecting|remote_windows_sandbox_process_accepts_process_write|symlink_points_to_directory_handles_dangling_directory_symlinks)(?:$|::)/)) | (package(codex-hooks) & test(/(?:^|::)(?:cmd_shell_runs_quoted_hook_command_path)(?:$|::)/)) | (package(codex-http-client) & test(/(?:^|::)(?:proxy_bypass_matches_whitespace_separated_winhttp_entries)(?:$|::)/)) | (package(codex-mcp) & test(/(?:^|::)(?:agent_plugin_mcp_overlays_windows_environment_case_insensitively|agent_plugin_mcp_rejects_drive_relative_windows_command|agent_plugin_mcp_rejects_reserved_environment_aliases_case_insensitively)(?:$|::)/)) | (package(codex-network-proxy) & test(/(?:^|::)(?:brokered_credentials_match_environment_keys_case_insensitively_on_windows|parses_owner_table_and_matches_reversed_client_tuple|rejects_missing_or_ambiguous_registered_routes|rejects_multiple_matching_owner_rows|rejects_truncated_owner_table|reserve_windows_managed_listener_uses_ephemeral_port_when_preferred_ports_are_busy|reserve_windows_managed_listeners_falls_back_when_http_port_is_busy|reserve_windows_managed_listeners_preserves_http_when_socks_port_is_busy|resolves_loopback_connection_to_current_process|selects_exactly_one_registered_route|windows_managed_loopback_addr_clamps_non_loopback_inputs)(?:$|::)/)) | (package(codex-protocol) & test(/(?:^|::)(?:core_inherit_preserves_windows_startup_vars_case_insensitively|create_env_inserts_pathext_on_windows_when_missing|permission_paths_preserve_native_slash_unc_strings|workspace_write_ignores_slash_tmp_special_path_but_preserves_literal_path)(?:$|::)/)) | (package(codex-rmcp-client) & test(/(?:^|::)(?:local_stdio_shutdown_terminates_descendants_after_server_exit|test_windows_fails_without_extension|test_windows_succeeds_with_extension)(?:$|::)/)) | (package(codex-sandboxing) & test(/(?:^|::)(?:intersect_permission_profiles_preserves_deny_across_case_variant_grant|intersect_permission_profiles_rejects_symbolic_slash_tmp_grants|transform_for_direct_spawn_windows_materializes_inner_helper|transform_for_direct_spawn_windows_preserves_only_wrapper_setup_identity)(?:$|::)/)) | (package(codex-shell-command) & test(/(?:^|::)(?:parser_process_handles_multiple_requests|parser_process_rejects_named_blocks|parser_process_rejects_param_blocks|parser_process_rejects_stop_parsing_forms|parser_process_rejects_trap_blocks|parser_process_rejects_using_statements|parses_multiple_plain_powershell_commands|parses_plain_powershell_commands)(?:$|::)/)) | (package(codex-tui) & test(/(?:^|::)(?:altgr_ctrl_alt_char_inserts_literal|approvals_selection_popup_snapshot_windows_degraded_sandbox|daemon_connection_rejects_unprotected_socket_before_handshake|decodes_console_color_attribute_indices|decodes_console_color_intensity_indices|decodes_console_color_ref_byte_order|editor_directory_rejects_windows_temporary_directory_outside_tmpdir_policy_root|ignores_reverse_video_when_decoding_default_colors|pipe_server_cannot_impersonate_client|preserves_every_record_when_no_valid_color_response_arrives|preserves_fifo_order_when_later_console_records_are_buffered|preserves_focus_unicode_and_key_release_console_records|preserves_osc_looking_bracketed_paste_records|preserves_typeahead_records_and_modifier_state_around_color_responses|rejects_windows_altgr_prefixes_outside_vim|startup_does_not_prompt_for_windows_sandbox_when_not_requested|startup_draft_preserves_windows_altgr_text_input|startup_prompts_for_windows_sandbox_when_agent_requested|startup_windows_sandbox_prompt_blocks_disallowed_unelevated_fallback|windows_auto_mode_prompt_requests_enabling_sandbox_feature)(?:$|::)/)) | (package(codex-uds) & test(/(?:^|::)(?:implicit_peer_validation_rejects_elevated_listener|private_directory_acl_is_user_only_and_inherited_by_files|private_directory_rejects_junctions|private_directory_rejects_volume_roots|private_directory_supports_extended_length_paths|socket_validation_pins_private_directory_without_creating_missing_paths|socket_validation_rejects_broad_acl_without_repairing_it)(?:$|::)/)) | (package(codex-utils-absolute-path) & test(/(?:^|::)(?:canonicalize_preserving_symlinks_avoids_verbatim_prefixes|from_absolute_path_strips_windows_verbatim_prefix|home_directory_backslash_subpath_is_expanded_in_deserialization|windows_drive_relative_path_uses_path_prefix_and_base_tail|windows_root_relative_path_uses_base_prefix)(?:$|::)/)) | (package(codex-utils-path) & test(/(?:^|::)(?:matches_windows_verbatim_paths|windows_verbatim_paths_are_simplified)(?:$|::)/)) | (package(codex-utils-path-uri) & test(/(?:^|::)(?:file_uri_fallback_round_trips_non_unicode_windows_paths|file_uri_falls_back_for_windows_prefixes_without_a_uri_representation|file_uri_round_trips_windows_unc_paths|renders_native_non_unicode_windows_fallback_lossily)(?:$|::)/)) | (package(codex-utils-pty) & test(/(?:^|::)(?:conpty_ctrl_c_interrupts_powershell_foreground_child|conpty_delivers_input_to_foreground_children|contained_spawn_owns_immediate_descendant|driver_backed_interrupt_terminates_once|normal_exit_preserves_descendants_for_pipe_and_conpty|normalizes_terminal_input_without_changing_text_or_ctrl_c|process_fallback_interrupt_terminates_root|rejected_job_assignment_resumes_existing_job_member|terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty|windows_build_number_returns_value)(?:$|::)/)) | (package(codex-windows-sandbox) & test(/(?:^|::)(?:acl::tests|allow::tests|audit::tests|cap::tests|deny_read_acl::tests|desktop::tests|elevated::ipc_framed::tests|elevated::runner_client::tests|file_write::tests|helper_materialization::tests|identity::tests|logging::tests|no_reparse_dir::tests|path_normalization::tests|resolved_permissions::tests|sandbox_utils::tests|setup::tests|setup_error::tests|setup_launch::tests|spawn_prep::tests|stdio_bridge::tests|token::tests|unified_exec::backends::elevated::tests|unified_exec::tests|wfp::tests|winutil::tests|wrapper::tests|windows_impl::tests|win|setup_helper_embeds_as_invoker_manifest)(?:$|::)/)))',
+]
+profile = "windows_nextest"
+platform = "windows"
+executor = "powershell"
+classification = "platform-neutral-test"
+artifact_policy = "ephemeral-codex-exe"
+
+[commands.windows-only-excluded]
+argv = []
+classification = "windows-only-excluded"
+
+[commands.macos-not-applicable]
+argv = []
+classification = "macos-not-applicable"
 
 [commands.guard-tests]
 argv = ["just", "test-cargo-guard"]
@@ -418,6 +506,12 @@ flags = ["runtime"]
 generators = ["write-config-schema"]
 
 [[path_rules]]
+patterns = ["codex-rs/config-schema/**"]
+packages = ["codex-config-schema"]
+surfaces = ["config_schema"]
+generators = ["write-config-schema"]
+
+[[path_rules]]
 patterns = ["codex-rs/thread-manager-sample/**"]
 packages = ["codex-thread-manager-sample"]
 surfaces = ["cli"]
@@ -446,9 +540,11 @@ patterns = [
   "codex-rs/app-server-test-client/**",
   "codex-rs/apply-patch/**",
   "codex-rs/arg0/**",
+  "codex-rs/async-utils/**",
   "codex-rs/code-mode/**",
   "codex-rs/code-mode-host/**",
   "codex-rs/code-mode-protocol/**",
+  "codex-rs/code-mode-runtime/**",
   "codex-rs/codex-api/**",
   "codex-rs/codex-backend-openapi-models/**",
   "codex-rs/codex-client/**",
@@ -465,6 +561,8 @@ patterns = [
   "codex-rs/ext/connectors/**",
   "codex-rs/ext/extension-api/**",
   "codex-rs/ext/goal/**",
+  "codex-rs/ext/guardian-v2/**",
+  "codex-rs/ext/history-notes/**",
   "codex-rs/ext/image-generation/**",
   "codex-rs/ext/items/**",
   "codex-rs/ext/mcp/**",
@@ -475,6 +573,8 @@ patterns = [
   "codex-rs/external-agent-sessions/**",
   "codex-rs/feedback/**",
   "codex-rs/git-utils/**",
+  "codex-rs/guardian-context/**",
+  "codex-rs/history/**",
   "codex-rs/http-client/**",
   "codex-rs/install-context/**",
   "codex-rs/mcp-server/**",
@@ -483,24 +583,53 @@ patterns = [
   "codex-rs/models-manager/**",
   "codex-rs/network-proxy/**",
   "codex-rs/otel/**",
+  "codex-rs/otel-trace-websocket/**",
   "codex-rs/plugin/**",
   "codex-rs/prompts/**",
+  "codex-rs/realtime-webrtc/**",
   "codex-rs/response-debug-context/**",
   "codex-rs/rmcp-client/**",
   "codex-rs/rollout/**",
   "codex-rs/rollout-trace/**",
   "codex-rs/shell-command/**",
+  "codex-rs/skills/**",
   "codex-rs/state/**",
+  "codex-rs/terminal-detection/**",
   "codex-rs/thread-store/**",
+  "codex-rs/utils/audio/**",
+  "codex-rs/utils/cache/**",
   "codex-rs/utils/cli/**",
+  "codex-rs/utils/git-discovery/**",
   "codex-rs/utils/home-dir/**",
   "codex-rs/utils/output-truncation/**",
   "codex-rs/utils/path-uri/**",
   "codex-rs/utils/plugins/**",
   "codex-rs/websocket-client/**",
   "codex-rs/windows-sandbox-rs/**",
+  "codex-rs/windows-sandbox-service/**",
 ]
 surfaces = ["cli"]
+
+# Merge-safety anchor: full-mode WSL runtime and test preparation are explicit
+# for Linux/Unix package owners; non-full selected-package test-target
+# materialization remains unchanged.
+[[path_rules]]
+patterns = [
+  "codex-rs/uds/**",
+  "codex-rs/utils/path-utils/**",
+  "codex-rs/utils/pty/**",
+  "codex-rs/voice-host/**",
+  "codex-rs/worktree/**",
+]
+surfaces = ["cli"]
+flags = ["runtime"]
+wsl_runtime_packages = [
+  "codex-uds",
+  "codex-utils-path",
+  "codex-utils-pty",
+  "codex-voice-host",
+  "codex-worktree",
+]
 
 [[path_rules]]
 patterns = ["codex-rs/hooks/**"]
@@ -555,6 +684,11 @@ patterns = ["justfile"]
 commands = ["just-summary", "validate-plan-self"]
 
 [[path_rules]]
-patterns = ["scripts/cargo-validate.py", "scripts/cargo-validation.toml", "scripts/test-cargo-validate.py"]
+patterns = ["scripts/clear-windows-build-cache.ps1", "scripts/test-clear-windows-build-cache.py"]
 surfaces = ["validation_tooling"]
-commands = ["validate-py-compile", "validate-tests", "validate-plan-self"]
+commands = ["clear-windows-build-cache-tests"]
+
+[[path_rules]]
+patterns = ["scripts/cargo-validate.py", "scripts/cargo-validation.toml", "scripts/test-cargo-validate.py", "scripts/cargo-validate-windows.ps1", "scripts/test-cargo-validate-windows.py"]
+surfaces = ["validation_tooling"]
+commands = ["validate-py-compile", "validate-tests", "validate-windows-tests", "clear-windows-build-cache-tests", "validate-plan-self"]

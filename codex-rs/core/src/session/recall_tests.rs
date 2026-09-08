@@ -71,12 +71,17 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         message: message.to_string(),
         replacement_history: replacement_history
             .map(|items| items.into_iter().map(ResponseItemEnvelope::new).collect()),
+        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
+        guardian_history: None,
+        retained_context: None,
         window_number: Some(1),
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
         post_compact_recovery: None,
         mcp_resource_origins: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -96,12 +101,17 @@ fn compacted_window(
                 .map(ResponseItemEnvelope::new)
                 .collect(),
         ),
+        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
+        guardian_history: None,
+        retained_context: None,
         window_number: Some(window_number),
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: previous_window_id.map(ToString::to_string),
         window_id: Some(window_id.to_string()),
         post_compact_recovery: None,
         mcp_resource_origins: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 
@@ -115,12 +125,17 @@ fn legacy_compacted_window(
     RolloutItem::Compacted(CompactedItem {
         message: message.to_string(),
         replacement_history: None,
+        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
+        guardian_history: None,
+        retained_context: None,
         window_number: Some(window_number),
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: previous_window_id.map(ToString::to_string),
         window_id: Some(window_id.to_string()),
         post_compact_recovery: None,
         mcp_resource_origins: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 

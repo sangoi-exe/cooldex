@@ -213,6 +213,8 @@ fn model_transcripts_match(source_items: &[RolloutItem], history_items: &[Rollou
 }
 
 fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>> {
+    // Merge-safety anchor: External-source retained context is not safely importable and must
+    // fail closed, unlike destination persistence retained context.
     let mut model_items = Vec::new();
     let mut append_start_index = None;
     for (index, item) in items.iter().enumerate() {
@@ -220,6 +222,7 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
             RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RealtimeItem(_) => {}
             RolloutItem::ResponseItem(response_item) => {
                 model_items.push(SourceModelItem {
@@ -244,6 +247,7 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_) => return None,
             RolloutItem::EventMsg(_) => {}
@@ -253,13 +257,17 @@ fn source_model_items(items: &[RolloutItem]) -> Option<Vec<SourceModelItem<'_>>>
 }
 
 fn history_model_items(items: &[RolloutItem]) -> Option<Vec<&ResponseItem>> {
+    // Merge-safety anchor: Destination retained context is internal persistence state and must
+    // stay excluded from transcript comparison.
     let mut model_items = Vec::new();
     for item in items {
         match item {
             RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_) => {}
             RolloutItem::ResponseItem(response_item) => model_items.push(&response_item.item),
             RolloutItem::EventMsg(

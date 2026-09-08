@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -29,6 +28,8 @@ use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+
+// Merge-safety anchor: persisted rollout tests use codex_rollout's canonical JSONL decoder.
 
 const FIRST_USER: &str = "historical user request";
 const FIRST_REPLY: &str = "historical assistant response";
@@ -53,7 +54,7 @@ fn read_rollout_items(path: &Path) -> Vec<RolloutItem> {
     fs::read_to_string(path)
         .expect("read rollout")
         .lines()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse rollout line"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
         .map(|line| line.item)
         .collect()
 }

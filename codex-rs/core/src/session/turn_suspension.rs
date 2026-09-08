@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
+// Merge-safety anchor: suspension flushes durable history before retiring and cancelling active
+// root execution.
 pub(super) async fn suspend_turn_and_shutdown(
     session: &Arc<Session>,
     submission_id: String,
@@ -49,32 +51,33 @@ pub(super) async fn suspend_turn_and_shutdown(
     // The flush can yield while the active turn completes or changes. Recheck its
     // kind while acquiring the slot's terminal-transition ownership.
     let retired_turn = loop {
-        let mut active = session.active_turn.lock().await;
-        let Some(task) = active.running_task() else {
-            return Ok(SuspendTurnOutcome::NotActive);
-        };
-        if task.kind != TaskKind::Regular {
-            return Ok(SuspendTurnOutcome::UnsupportedTask);
-        }
-        if active.is_transitioning()
-            || active
-                .running_task()
-                .is_some_and(|task| task.steer_admission == crate::state::SteerAdmission::Starting)
-        {
-            let mut generation_rx = active.subscribe_generation();
-            drop(active);
-            if generation_rx.changed().await.is_err() {
+        let mut generation_rx = {
+            let mut active = session.active_turn.lock().await;
+            let Some(task) = active.running_task() else {
                 return Ok(SuspendTurnOutcome::NotActive);
+            };
+            if task.kind != TaskKind::Regular {
+                return Ok(SuspendTurnOutcome::UnsupportedTask);
             }
-            continue;
+            if active.is_transitioning()
+                || active.running_task().is_some_and(|task| {
+                    task.steer_admission == crate::state::SteerAdmission::Starting
+                })
+            {
+                active.subscribe_generation()
+            } else {
+                break active
+                    .begin_transition(TerminalTransitionKind::Interrupting, None)
+                    .map_err(|error| {
+                        CodexErr::Fatal(format!(
+                            "accepted root turn suspension could not begin terminal transition: {error}"
+                        ))
+                    })?;
+            }
+        };
+        if generation_rx.changed().await.is_err() {
+            return Ok(SuspendTurnOutcome::NotActive);
         }
-        break active
-            .begin_transition(TerminalTransitionKind::Interrupting, None)
-            .map_err(|error| {
-                CodexErr::Fatal(format!(
-                    "accepted root turn suspension could not begin terminal transition: {error}"
-                ))
-            })?;
     };
     let transition_generation = retired_turn.transition_generation;
     let turn_state = retired_turn.turn_state;

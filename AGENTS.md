@@ -148,6 +148,84 @@
   an explicit diagnostic reason, then use `--resume`, `--from-index`, or `--only-failed`
   for subsequent iterations.
 
+<!-- Merge-safety anchor: native-Windows bulk validation is planner-accounted and PowerShell-executed; full-mode WSL test preparation uses the config-owned explicit package mapper while Linux production builds remain on the guarded WSL path. -->
+### Native-Windows bulk test procedure
+
+- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...`
+  to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use
+  `--changed` for the current worktree and `--range <base>..<merge>` for a merge commit,
+  with `<base>` set to its first parent. An explicit `--windows-reuse-root
+  'F:\.cache\...existing-run-root...'` on either guarded action selects in-place native
+  reuse; no selector keeps cold preparation. `--mode full` is the bulk collector. Never run
+  Cargo or Nextest directly on native Windows, and never use the former Windows `just test`
+  route.
+- `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` are the only owners of
+  selection, platform classification, exclusions, the frozen manifest, and resource
+  contracts. The PowerShell executor runs only manifest-authorized Windows entries; it
+  must not infer or invent partitions.
+- Native Windows runs the bulk platform-neutral and Linux-relevant test surface.
+  Windows-only tests must be explicit exclusions and do not count as coverage.
+  Linux/Unix-only tests run only as targeted guarded WSL commands; macOS-only tests are
+  not applicable in this topology. WSL runs Linux checks and builds, plus those targeted
+  Linux/Unix-only tests.
+- In `--mode full`, WSL test-target check/link preparation follows only the explicit WSL
+  package mapping in `scripts/cargo-validation.toml`, which remains the list owner.
+  Normal per-package Linux checks, strict Clippy, and Linux product builds stay on WSL;
+  other modes retain their existing selection policy.
+- Build and product output are always Linux/WSL. An ephemeral `codex.exe` is permitted
+  only when a platform-neutral test requires it; it must never be installed, promoted,
+  published, or operated as the Windows Codex CLI product.
+- Cold preparation retains its 120-GiB free-disk and 30-GiB available-RAM requirements.
+  An explicit reuse root uses the 5-GiB warm disk floor derived only from
+  `[resource_profiles.windows_nextest].reserve_free_gib`; it does not add another
+  configurable value or guarantee that every incremental build will fit. Both cold and
+  reuse retain 30 GiB of available RAM and the 16-build-job/8-test-thread ceiling. Do not run Cargo or Nextest
+  concurrently in WSL and native Windows. A missing prerequisite, tool, manifest,
+  candidate identity, space or RAM requirement, or required evidence must fail loud.
+- Every Windows-created mutable path belongs below literal `F:\.cache`: cold preparation
+  creates its disposable candidate checkout, target directory, applicable `CARGO_HOME` and
+  `RUSTUP_HOME`, `TEMP`/`TMP`, V8/compiler/tool caches, helper staging, and logs/evidence
+  there. A selected reuse root retains its existing candidate, target, mutable tool homes,
+  and compatible pinned tools in place; each execution still creates fresh evidence and a
+  short, hyphen-free `TEMP`/`TMP` root below `F:\.cache`. C: may provide executables and
+  toolchains only as read-only inputs; it must not hold a build cache, target directory, or
+  temporary state.
+- `F:\codex-tools\bin\python3.exe` is a read-only native test-child input. The child
+  `PATH` keeps its directory first ahead of WindowsApps and also includes the selected
+  native Git `usr\bin` directory that provides `true.exe`; this never changes parent/global
+  `PATH` or installs tools. `FORCE_COLOR=0` applies only to the test child. Retain
+  `RUST_MIN_STACK=8388608`, and keep `PYTHONPYCACHEPREFIX` below that run's `TEMP`
+  directory in `F:\.cache`.
+- All Windows-side writes, candidate materialization, Cargo/Nextest execution, and cleanup
+  must use a checked-in PowerShell script invoked from WSL. Do not write directly to
+  `/mnt/f` or generate an ad hoc PowerShell script. Resolve PowerShell 7 as `pwsh.exe` or
+  `pwsh`; fail loud when neither is available.
+- Without `--windows-reuse-root`, candidate materialization must be fresh, pristine,
+  disposable, and match the frozen manifest and index identity without changing root refs,
+  index, or worktree. With an explicit selector, reuse the selected existing native working
+  set in place—candidate, target, `CARGO_HOME`/`RUSTUP_HOME`, and compatible pinned
+  tools—and synchronize only the changed tracked source needed to match the frozen index;
+  do not rewrite unchanged source. A selected root that cannot meet source, index, or tool
+  requirements must report the actual blocker: never move or delete its cache, auto-select
+  a latest root, or silently replace it with cold preparation. After synchronization,
+  tracked-source/index mismatch and ordinary untracked files still fail, while post-test
+  ignored outputs may remain; the root source-invariance check remains independent.
+  Receipts must bind the candidate, command, platform, executor, and terminal result.
+- For Windows space pressure, `scripts/clear-windows-build-cache.ps1` is the only cleanup
+  path. Its default is preflight; deletion requires `-Delete`, proof that no Windows or WSL
+  writer exists, literal `F:\.cache` as the target, preservation of that root, and JSON
+  stdout captured outside the target. Reuse must not trigger automatic cleanup. Deleted
+  content is unrecoverable; do not issue a manual partial cleanup command.
+- The first ordinary execution for a validation object uses the complete collector and
+  continues to collect failures. Retry reuse matches action, stage, plan, input, and
+  validation-tooling identities exactly. When changed input or tooling leaves no matching
+  prior evidence, `--only-failed` can execute zero commands and records partial coverage;
+  `--resume` refuses partial summaries. Use `--fresh` to start a new full validation and
+  emit fresh results; it does not require discarding reusable compiled artifacts. Cache
+  reuse is separate from validation-result reuse. Keep this procedure durable: do not add
+  branch or object IDs, session IDs, timestamps, receipt/run paths, execution hashes, or
+  machine-state claims.
+
 <!-- cooldex-wsl-release-procedure:begin -->
 ## WSL Release Procedure
 
@@ -523,6 +601,9 @@ Codex supports running connected app-server and exec-server on different operati
   `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
   `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust
   execution, validation policy, and impact-inventory owners.
+- `/home/lucas/work/codex/scripts/cargo-validate-windows.ps1` and
+  `/home/lucas/work/codex/scripts/clear-windows-build-cache.ps1` — native-Windows manifest
+  executor and exact `F:\.cache` cleanup owner.
 - `/home/lucas/work/codex/scripts/install/install.sh` and
   `/home/lucas/work/codex/scripts/build_codex_package.py` and
   `/home/lucas/work/codex/scripts/codex_package/` — release installer and package

@@ -80,7 +80,8 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
                 "assistant" => *phase == Some(MessagePhase::FinalAnswer),
                 _ => false,
             },
-            ResponseItem::FunctionCallOutput { call_id: None, .. } => true,
+            ResponseItem::FunctionCallOutput { call_id: None, .. }
+            | ResponseItem::ConfigurationUpdate { .. } => true,
             ResponseItem::AdditionalTools { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
@@ -103,11 +104,14 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         RolloutItem::RealtimeItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
+        // Child threads inherit model context, not the parent's cumulative usage state.
+        RolloutItem::TokenUsageRecord(_) => false,
         RolloutItem::Compacted(_)
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::EventMsg(_)
@@ -197,8 +201,9 @@ async fn load_agent_model_context(
     }
 }
 
-// Merge-safety anchor: V2 agent restoration reconstructs captured identity
-// from recorded thread settings and rollout history.
+// Merge-safety anchor: V2 reload restores captured identity from persisted thread
+// settings and rollout history, never a mutable role file; fork filtering keeps only
+// recovery proof owned by retained compaction history.
 fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
     for item in history {
         let RolloutItem::ResponseItem(response_item) = item else {
@@ -1098,8 +1103,11 @@ impl AgentControl {
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
             if filter_multi_agent_v2_usage_hints {
                 let parent_config = parent_thread.session.get_config().await;
-                let parent_usage_hints =
-                    resolve_usage_hints(&parent_config.multi_agent_v2, /*catalog*/ None);
+                let parent_usage_hints = resolve_usage_hints(
+                    &parent_config.multi_agent_v2,
+                    /*catalog*/ None,
+                    !parent_config.update_plan_enabled,
+                );
                 [parent_usage_hints.root, parent_usage_hints.subagent]
                     .into_iter()
                     .flatten()
@@ -1202,6 +1210,12 @@ impl AgentControl {
                     &mut replaced_parent_developer_instructions,
                 ),
                 RolloutItem::Compacted(compacted) => {
+                    // This checkpoint belongs to the inherited parent prefix.
+                    compacted.latest_token_usage_record = None;
+                    // Parent-local review evidence must not become the child's authorization.
+                    // Root user authorization is collected separately by the host.
+                    compacted.guardian_history = None;
+                    compacted.retained_context = None;
                     if let Some(replacement_history) = compacted.replacement_history.as_mut() {
                         replaced_parent_developer_instructions = false;
                         replacement_history.retain_mut(|response_item| {
@@ -1226,7 +1240,9 @@ impl AgentControl {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::PostCompactRecoveryApplied(_) => true,
-                RolloutItem::SecurityRiskScore(_) => false,
+                RolloutItem::RetainedContext(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::SecurityRiskScore(_) => false,
             }
         });
         if !preserve_reference_context_item {

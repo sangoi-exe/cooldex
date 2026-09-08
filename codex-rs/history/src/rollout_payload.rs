@@ -13,6 +13,7 @@ use super::ResponseItemEnvelope;
 use super::RolloutItem;
 use super::SecurityRiskScore;
 use super::SessionMetaLine;
+use super::TokenUsageRecord;
 use super::TurnContextItem;
 use super::WorldStateItem;
 use schemars::JsonSchema;
@@ -20,6 +21,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Persisted rollout item used by core history and rollout storage.
+// Merge-safety anchor: persisted recovery/retained/token wire records and compacted checkpoints
+// round-trip together; absent recovery omits, while token checkpoints remain nullable.
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(super) enum RolloutItemWire<'a> {
@@ -46,8 +49,14 @@ pub(super) enum RolloutItemWire<'a> {
     TurnContext {
         payload: Cow<'a, TurnContextItem>,
     },
+    TokenUsageRecord {
+        payload: Cow<'a, TokenUsageRecord>,
+    },
     WorldState {
         payload: Cow<'a, WorldStateItem>,
+    },
+    RetainedContext {
+        payload: Cow<'a, crate::RetainedContextEvent>,
     },
     SecurityRiskScore {
         payload: Cow<'a, SecurityRiskScore>,
@@ -89,7 +98,13 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
             RolloutItem::TurnContext(payload) => Self::TurnContext {
                 payload: Cow::Borrowed(payload),
             },
+            RolloutItem::TokenUsageRecord(payload) => Self::TokenUsageRecord {
+                payload: Cow::Borrowed(payload),
+            },
             RolloutItem::WorldState(payload) => Self::WorldState {
+                payload: Cow::Borrowed(payload),
+            },
+            RolloutItem::RetainedContext(payload) => Self::RetainedContext {
                 payload: Cow::Borrowed(payload),
             },
             RolloutItem::SecurityRiskScore(payload) => Self::SecurityRiskScore {
@@ -128,7 +143,13 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                 Self::PostCompactRecoveryApplied(payload.into_owned())
             }
             RolloutItemWire::TurnContext { payload } => Self::TurnContext(payload.into_owned()),
+            RolloutItemWire::TokenUsageRecord { payload } => {
+                Self::TokenUsageRecord(payload.into_owned())
+            }
             RolloutItemWire::WorldState { payload } => Self::WorldState(payload.into_owned()),
+            RolloutItemWire::RetainedContext { payload } => {
+                Self::RetainedContext(payload.into_owned())
+            }
             RolloutItemWire::SecurityRiskScore { payload } => {
                 Self::SecurityRiskScore(payload.into_owned())
             }
@@ -151,6 +172,10 @@ pub(super) struct CompactedItemWire<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replacement_history_metadata: Option<Vec<Cow<'a, CodexHarnessMetadata>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    guardian_history: Option<Cow<'a, crate::GuardianHistoryCheckpoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_context: Option<Cow<'a, crate::RetainedContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp_resource_origins: Option<Cow<'a, McpResourceOriginCheckpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_number: Option<u64>,
@@ -163,6 +188,10 @@ pub(super) struct CompactedItemWire<'a> {
     window_id: Option<WindowIdWire<'a>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_compact_recovery: Option<Cow<'a, PostCompactRecoveryMarker>>,
+    #[serde(default)]
+    compaction_response_id: Option<Cow<'a, str>>,
+    #[serde(default)]
+    latest_token_usage_record: Option<Cow<'a, TokenUsageRecord>>,
 }
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
@@ -190,6 +219,8 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                     .collect()
             }),
             replacement_history_metadata,
+            guardian_history: item.guardian_history.as_ref().map(Cow::Borrowed),
+            retained_context: item.retained_context.as_ref().map(Cow::Borrowed),
             mcp_resource_origins: item.mcp_resource_origins.as_ref().map(Cow::Borrowed),
             window_number: item.window_number,
             first_window_id: item.first_window_id.as_deref().map(Cow::Borrowed),
@@ -199,6 +230,8 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                 .as_deref()
                 .map(|window_id| WindowIdWire::Id(Cow::Borrowed(window_id))),
             post_compact_recovery: item.post_compact_recovery.as_ref().map(Cow::Borrowed),
+            compaction_response_id: item.compaction_response_id.as_deref().map(Cow::Borrowed),
+            latest_token_usage_record: item.latest_token_usage_record.as_ref().map(Cow::Borrowed),
         }
     }
 }
@@ -255,12 +288,16 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
         Ok(Self {
             message: item.message.into_owned(),
             replacement_history,
+            guardian_history: item.guardian_history.map(Cow::into_owned),
+            retained_context: item.retained_context.map(Cow::into_owned),
             mcp_resource_origins: item.mcp_resource_origins.map(Cow::into_owned),
             window_number,
             first_window_id: item.first_window_id.map(Cow::into_owned),
             previous_window_id: item.previous_window_id.map(Cow::into_owned),
             window_id,
             post_compact_recovery: item.post_compact_recovery.map(Cow::into_owned),
+            compaction_response_id: item.compaction_response_id.map(Cow::into_owned),
+            latest_token_usage_record: item.latest_token_usage_record.map(Cow::into_owned),
         })
     }
 }

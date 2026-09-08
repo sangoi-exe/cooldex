@@ -1,4 +1,5 @@
 // Aggregates all former standalone integration tests as modules.
+// Merge-safety anchor: retain fork recall coverage alongside upstream realtime-sideband coverage.
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 #[cfg(unix)]
 use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
@@ -72,7 +73,9 @@ mod external_auth;
 mod fork_thread;
 mod git_enrichment;
 mod guardian_authorization;
+mod guardian_history;
 mod guardian_mcp_elicitation;
+mod guardian_retained_context;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
 #[cfg(not(target_os = "windows"))]
@@ -126,6 +129,7 @@ mod prompt_debug_tests;
 mod quota_exceeded;
 mod realtime_conversation;
 mod realtime_initial_items;
+mod realtime_sideband_endpoint;
 mod recall;
 mod remote_env;
 mod remote_models;
@@ -136,6 +140,7 @@ mod request_permissions;
 mod request_permissions_tool;
 mod request_plugin_install;
 mod request_user_input;
+mod request_user_input_async;
 mod responses_api_proxy_headers;
 mod responses_lite;
 #[cfg(target_os = "linux")]
@@ -151,7 +156,6 @@ mod rollout_list_find;
 mod safety_buffering;
 mod safety_check_downgrade;
 mod search_tool;
-mod send_user_message_async;
 mod settings_commits;
 mod settings_constraints;
 mod shell_snapshot;
@@ -167,6 +171,7 @@ mod stream_no_completed;
 mod subagent_notifications;
 mod subagent_service_tier;
 mod token_budget;
+mod token_usage_rollout;
 mod tool_harness;
 mod tool_lifecycle;
 mod tool_parallelism;

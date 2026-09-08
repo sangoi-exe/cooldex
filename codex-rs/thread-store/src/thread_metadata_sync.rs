@@ -25,6 +25,8 @@ use crate::ThreadMetadataPatch;
 use crate::types::canonical_history_mode_from_rollout_items;
 
 const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
+// Merge-safety anchor: internal recovery, token, and retained-context rollout records remain
+// rollout-only control data and never become SQLite thread metadata.
 
 /// Live-thread helper that derives metadata updates from appended rollout items.
 ///
@@ -67,6 +69,7 @@ impl ThreadMetadataSync {
             created_at: Some(created_at),
             updated_at: Some(created_at),
             source: Some(params.source.clone()),
+            originator: (!params.originator.is_empty()).then(|| params.originator.clone()),
             thread_source: Some(params.thread_source.clone()),
             agent_nickname: Some(params.source.get_nickname()),
             agent_role: Some(params.source.get_agent_role()),
@@ -228,6 +231,9 @@ impl ThreadMetadataSync {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
                     update.source = Some(meta_line.meta.source.clone());
+                    if !meta_line.meta.originator.is_empty() {
+                        update.originator = Some(meta_line.meta.originator.clone());
+                    }
                     update.thread_source = Some(meta_line.meta.thread_source.clone());
                     update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
                     update.agent_role = Some(meta_line.meta.agent_role.clone());
@@ -306,6 +312,8 @@ impl ThreadMetadataSync {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::PostCompactRecoveryApplied(_)
                 | RolloutItem::RealtimeItem(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::WorldState(_) => {}
             }
@@ -380,6 +388,7 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.created_at.is_some()
         || update.advance_recency_at.is_some()
         || update.source.is_some()
+        || update.originator.is_some()
         || update.thread_source.is_some()
         || update.agent_nickname.is_some()
         || update.agent_role.is_some()
@@ -435,7 +444,7 @@ mod tests {
     use crate::ThreadPersistenceMetadata;
 
     #[tokio::test]
-    async fn create_without_project_omits_project_patch() {
+    async fn create_metadata_records_originator_without_project() {
         let thread_id = ThreadId::new();
         let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
             session_id: thread_id.into(),
@@ -463,7 +472,10 @@ mod tests {
         .await;
 
         let update = sync.take_pending_update().expect("pending metadata update");
-        assert_eq!(update.patch.project_id, None);
+        assert_eq!(
+            (update.patch.project_id, update.patch.originator.as_deref()),
+            (None, Some("test_originator")),
+        );
     }
 
     #[test]
@@ -487,6 +499,7 @@ mod tests {
             "2025-01-03T12:00:00+00:00"
         );
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
+        assert_eq!(update.patch.originator.as_deref(), Some("test_originator"));
         assert_eq!(update.patch.title.as_deref(), Some("hello metadata"));
         assert_eq!(
             update.patch.first_user_message.as_deref(),
@@ -583,12 +596,16 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         let first = sync
@@ -814,6 +831,7 @@ mod tests {
                 id: thread_id,
                 timestamp: "2025-01-03T12:00:00Z".to_string(),
                 source: SessionSource::Exec,
+                originator: "test_originator".to_string(),
                 ..Default::default()
             },
             git: None,

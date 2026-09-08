@@ -44,7 +44,8 @@ impl Session {
         Ok(())
     }
 
-    /// Injects hook context while classifying its actual receiving turn atomically.
+    /// Merge-safety anchor: retain TurnSlot-aware injection and delivery without source-turn ambiguity.
+    /// Injects hook context into the running turn atomically.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn provenance and turn state updates must remain atomic"
@@ -52,20 +53,14 @@ impl Session {
     pub(crate) async fn inject_hook_context_if_running(
         &self,
         input: Vec<ResponseItem>,
-        source_turn_id: Option<&str>,
     ) -> Result<(), Vec<ResponseItem>> {
         let slot = self.active_turn.lock().await;
-        let Some(task) = slot.running_task() else {
+        if slot.running_task().is_none() {
             return Err(input);
-        };
+        }
         let Some(turn_state) = slot.turn_state() else {
             return Err(input);
         };
-        if source_turn_id != Some(task.turn_context.sub_id.as_str()) {
-            task.turn_context
-                .turn_metadata_state
-                .mark_root_turn_ambiguous();
-        }
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 turn_state.as_ref(),
@@ -79,6 +74,8 @@ impl Session {
         Ok(())
     }
 
+    /// Merge-safety anchor: trusted client provenance stays attached through transition waits,
+    /// queued delivery, and history fallback.
     /// Preserves trusted client provenance while items wait for an active turn.
     #[expect(
         clippy::await_holding_invalid_type,
@@ -98,6 +95,10 @@ impl Session {
             if slot.is_transitioning() {
                 let mut generation_rx = slot.subscribe_generation();
                 drop(slot);
+                #[expect(
+                    clippy::expect_used,
+                    reason = "turn-slot generation sender remains live while the session is active"
+                )]
                 generation_rx
                     .changed()
                     .await
@@ -105,11 +106,6 @@ impl Session {
                 continue;
             }
             if let Some(turn_state) = slot.turn_state() {
-                if let Some(task) = slot.running_task() {
-                    task.turn_context
-                        .turn_metadata_state
-                        .mark_root_turn_ambiguous();
-                }
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                         turn_state.as_ref(),
@@ -341,3 +337,7 @@ impl Session {
         self.record_conversation_items(turn_context, &items).await;
     }
 }
+
+#[cfg(test)]
+#[path = "inject_tests.rs"]
+mod tests;

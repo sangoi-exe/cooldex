@@ -7,13 +7,16 @@ import argparse
 import contextlib
 import hashlib
 import json
+import ntpath
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
 from pathlib import Path
@@ -27,16 +30,84 @@ from codex_package.targets import TARGET_SPECS
 from codex_package.v8 import resolve_codex_v8_cargo_env
 
 # Merge-safety anchor: cargo-validate owns deterministic mechanical-prep and
-# validation planning, receipt placement, and resource-profile expansion; Cargo
-# build-like execution stays delegated to scripts/cargo-guard.sh.
+# platform-accounted validation manifests, native-Windows bootstrap projection,
+# receipt placement, and resource-profile expansion; WSL Cargo build-like
+# execution stays delegated to scripts/cargo-guard.sh.
 
 VALID_MODES = ("quick", "standard", "strict", "full")
+VALID_PLATFORMS = ("wsl", "windows")
+VALID_EXECUTORS = ("cargo-guard", "command", "powershell")
+VALID_CLASSIFICATIONS = (
+    "command",
+    "build-like",
+    "platform-neutral-test",
+    "wsl-unix-test",
+    "windows-only-excluded",
+    "macos-not-applicable",
+)
+EXCLUSION_CLASSIFICATIONS = ("windows-only-excluded", "macos-not-applicable")
+VALID_ARTIFACT_POLICIES = ("none", "ephemeral-codex-exe")
+WINDOWS_NEXTEST_PROFILE = "windows_nextest"
+WINDOWS_RUNTIME_SECTION = "windows_runtime"
+WINDOWS_RUNTIME_CONFIG_KEYS = frozenset(
+    {
+        "cache_root",
+        "workflow_namespace",
+        "minimum_free_disk_gib",
+        "minimum_available_memory_gib",
+        "target",
+        "rust_toolchain",
+        "nextest_version",
+        "nextest_url",
+        "nextest_sha256",
+        "v8_version",
+        "v8_archive_url",
+        "v8_archive_sha256",
+        "v8_binding_url",
+        "v8_binding_sha256",
+    }
+)
+WINDOWS_RUNTIME_CACHE_ROOT = r"F:\.cache"
+WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB = 120
+WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB = 30
+WINDOWS_RUNTIME_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_RUNTIME_URL_FIELDS = (
+    "nextest_url",
+    "v8_archive_url",
+    "v8_binding_url",
+)
+WINDOWS_RUNTIME_DIGEST_FIELDS = (
+    "nextest_sha256",
+    "v8_archive_sha256",
+    "v8_binding_sha256",
+)
+WINDOWS_RUNTIME_SOURCE_MATERIALIZATION_KEYS = frozenset(
+    {"posix_repo_root", "wsl_distro_name"}
+)
+WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS = frozenset(
+    {"resource_profile", "cargo_build_jobs", "nextest_test_threads"}
+)
+WINDOWS_RUNTIME_MANIFEST_KEYS = WINDOWS_RUNTIME_CONFIG_KEYS | frozenset(
+    {"resource_contract", "reuse_run_root", "source_materialization"}
+)
+WINDOWS_EXECUTOR_HELPER_PATH = Path("scripts/cargo-validate-windows.ps1")
+WINDOWS_HELPER_SUMMARY_SCHEMA = 1
+WINDOWS_HELPER_STATUS_EXIT_CODES = {
+    "success": 0,
+    "preflight-failed": 1,
+}
 PLAN_ACTIONS = {"plan", "prep-plan"}
 PREP_ACTIONS = {"prep", "prep-plan"}
 VALIDATION_ACTIONS = {"plan", "verify"}
 FIRST_PARTY_RUNTIME_SUPPORT_BINS_COMMAND = "first-party-runtime-support-bins"
 FIRST_PARTY_RUNTIME_EXPECTED_GROWTH_SOURCE = "forced:post-support-bins"
 CODEX_V8_HOST_TARGET = "host"
+# Merge-safety anchor: the selected code-mode V8 closure must receive the
+# checksum-verified host archive/binding pair through direct guarded Cargo
+# build-like rungs, without a mirror, fallback, or separate artifact owner.
+CODEX_V8_HOST_ARTIFACT_PACKAGES = frozenset(
+    {"codex-code-mode-host", "codex-code-mode-runtime"}
+)
 CODEX_V8_INHERITED_ENV_KEYS = (
     "RUSTY_V8_ARCHIVE",
     "RUSTY_V8_MIRROR",
@@ -70,6 +141,40 @@ COMMAND_LOG_READ_CHUNK_BYTES = 64 * 1024
 COMMAND_LOG_PIPE_DRAIN_GRACE_SECONDS = 0.5
 COMMAND_LOG_POLL_INTERVAL_SECONDS = 0.02
 FEATURE_CFG_RE = re.compile(r"\bcfg(?:_attr)?!?\s*\([\s\S]*?\bfeature\s*=")
+SAFE_WINDOWS_WORKFLOW_NAMESPACE_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)*\Z"
+)
+WINDOWS_RESERVED_NAMESPACE_NAMES = {
+    "aux",
+    "clock$",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "con",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9",
+    "nul",
+    "prn",
+}
+LOWERCASE_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+SEMVER_RE = re.compile(
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z"
+)
 DIFF_HUNK_RE = re.compile(
     r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@"
 )
@@ -130,6 +235,7 @@ VALIDATION_TOOLING_PATHS = (
     "scripts/cargo-validate.py",
     "scripts/cargo-guard.sh",
     "scripts/cargo-validation.toml",
+    "scripts/cargo-validate-windows.ps1",
     "scripts/codex_package/targets.py",
     "scripts/codex_package/v8.py",
     "justfile",
@@ -155,6 +261,10 @@ class CommandEntry:
     reason: str
     kind: str = "command"
     env: dict[str, str] = field(default_factory=dict)
+    platform: str | None = "wsl"
+    executor: str | None = "command"
+    classification: str = "command"
+    artifact_policy: str = "none"
     codex_v8_target: str | None = None
     resource_profile: str | None = None
     fingerprint: str | None = None
@@ -169,10 +279,13 @@ class CommandEntry:
             "reason": self.reason,
             "kind": self.kind,
             "env": dict(sorted(self.env.items())),
+            "platform": self.platform,
+            "executor": self.executor,
+            "classification": self.classification,
+            "resource_profile": self.resource_profile,
+            "artifact_policy": self.artifact_policy,
             "command_id": command_resume_id(self),
         }
-        if self.resource_profile is not None:
-            payload["resource_profile"] = self.resource_profile
         if self.codex_v8_target is not None:
             payload["codex_v8_target"] = self.codex_v8_target
         if self.fingerprint is not None:
@@ -229,6 +342,7 @@ class Selection:
     packages: dict[str, set[str]] = field(default_factory=dict)
     surfaces: dict[str, set[str]] = field(default_factory=dict)
     flags: set[str] = field(default_factory=set)
+    wsl_runtime_packages: set[str] = field(default_factory=set)
     generators: dict[str, set[str]] = field(default_factory=dict)
     prep_command_names: dict[str, set[str]] = field(default_factory=dict)
     prep_command_order: list[str] = field(default_factory=list)
@@ -277,9 +391,11 @@ class Plan:
     manual: list[ManualEntry]
     receipt_dir: Path | None
     telemetry_level: str
+    candidate_identity: dict[str, str | None]
+    windows_runtime: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "action": self.action,
             "stage": self.stage,
             "mode": self.mode,
@@ -292,7 +408,11 @@ class Plan:
             "manual": [entry.to_json() for entry in self.manual],
             "receipt_dir": str(self.receipt_dir) if self.receipt_dir else None,
             "telemetry_level": self.telemetry_level,
+            "candidate_identity": dict(self.candidate_identity),
         }
+        if self.windows_runtime is not None:
+            payload["windows_runtime"] = self.windows_runtime
+        return payload
 
 
 def repo_root_from_script() -> Path:
@@ -331,6 +451,425 @@ def load_config(config_path: Path) -> dict[str, Any]:
         return tomllib.loads(config_path.read_text())
     except tomllib.TOMLDecodeError as error:
         raise PlannerError(f"failed to parse {config_path}: {error}") from error
+
+
+def validate_windows_workflow_namespace(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not SAFE_WINDOWS_WORKFLOW_NAMESPACE_RE.fullmatch(
+        value
+    ):
+        raise PlannerError(
+            f"{context} must be a safe single relative namespace component"
+        )
+    if value in {".", ".."}:
+        raise PlannerError(
+            f"{context} must be a safe single relative namespace component"
+        )
+    if value.casefold() in WINDOWS_RESERVED_NAMESPACE_NAMES:
+        raise PlannerError(f"{context} must not be a reserved Windows path component")
+    return value
+
+
+def validate_wsl_distro_name(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PlannerError(f"{context} must be a non-empty string")
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        raise PlannerError(f"{context} contains an unsafe control character")
+    return value
+
+
+def current_wsl_distro_name(environ: Mapping[str, str] | None = None) -> str:
+    environment = os.environ if environ is None else environ
+    return validate_wsl_distro_name(
+        environment.get("WSL_DISTRO_NAME"),
+        "Windows manifest source_materialization.wsl_distro_name from WSL_DISTRO_NAME",
+    )
+
+
+def validate_windows_runtime_version(value: Any, context: str) -> str:
+    if not isinstance(value, str) or not SEMVER_RE.fullmatch(value):
+        raise PlannerError(f"{context} must be a semantic version")
+    return value
+
+
+def rust_toolchain_channel(repo_root: Path) -> str:
+    toolchain_path = repo_root / "codex-rs" / "rust-toolchain.toml"
+    try:
+        toolchain_config = tomllib.loads(toolchain_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise PlannerError(f"Windows runtime requires {toolchain_path}") from error
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise PlannerError(f"failed to read {toolchain_path}: {error}") from error
+
+    toolchain = toolchain_config.get("toolchain")
+    if not isinstance(toolchain, dict):
+        raise PlannerError(f"{toolchain_path} must define a [toolchain] table")
+    return validate_windows_runtime_version(
+        toolchain.get("channel"), f"{toolchain_path} [toolchain].channel"
+    )
+
+
+def windows_runtime_release_urls(
+    nextest_version: str, v8_version: str, target: str
+) -> dict[str, str]:
+    return {
+        "nextest_url": (
+            "https://github.com/nextest-rs/nextest/releases/download/"
+            f"cargo-nextest-{nextest_version}/"
+            f"cargo-nextest-{nextest_version}-{target}.zip"
+        ),
+        "v8_archive_url": (
+            "https://github.com/openai/codex/releases/download/"
+            f"rusty-v8-v{v8_version}/"
+            f"rusty_v8_ptrcomp_sandbox_release_{target}.lib.gz"
+        ),
+        "v8_binding_url": (
+            "https://github.com/openai/codex/releases/download/"
+            f"rusty-v8-v{v8_version}/"
+            f"src_binding_ptrcomp_sandbox_release_{target}.rs"
+        ),
+    }
+
+
+def locked_v8_version(repo_root: Path) -> str:
+    lock_path = repo_root / "codex-rs" / "Cargo.lock"
+    try:
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise PlannerError(f"Windows runtime requires {lock_path}") from error
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise PlannerError(f"failed to read {lock_path}: {error}") from error
+
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        raise PlannerError(f"{lock_path} must define package entries")
+    versions = [
+        package.get("version")
+        for package in packages
+        if isinstance(package, dict) and package.get("name") == "v8"
+    ]
+    if len(versions) != 1 or not isinstance(versions[0], str) or not versions[0]:
+        raise PlannerError(f"{lock_path} must define exactly one v8 package version")
+    return versions[0]
+
+
+def windows_nextest_profile_from_config(
+    config: dict[str, Any], context: str
+) -> dict[str, Any]:
+    profiles = config.get("resource_profiles")
+    if not isinstance(profiles, dict):
+        raise PlannerError(f"{context} requires [resource_profiles]")
+    profile = profiles.get(WINDOWS_NEXTEST_PROFILE)
+    if not isinstance(profile, dict):
+        raise PlannerError(
+            f"{context} requires [resource_profiles.{WINDOWS_NEXTEST_PROFILE}]"
+        )
+    return profile
+
+
+def windows_resource_contract_from_config(
+    config: dict[str, Any], context: str
+) -> dict[str, Any]:
+    profile = windows_nextest_profile_from_config(config, context)
+    if profile.get("cargo_jobs_mode") != "fixed":
+        raise PlannerError(
+            f"{context}.cargo_jobs_mode must be 'fixed' for the Windows resource contract"
+        )
+    if profile.get("cargo_jobs_default") != "min":
+        raise PlannerError(
+            f"{context}.cargo_jobs_default must be 'min' for the Windows resource contract"
+        )
+
+    job_keys = (
+        "cargo_jobs_min",
+        "cargo_jobs_max",
+        "cargo_jobs_hard_max",
+        "cargo_jobs_low_disk_max",
+    )
+    for key in job_keys:
+        validate_positive_int(profile.get(key), f"{context}.{key}")
+    cargo_build_jobs = int(profile["cargo_jobs_max"])
+    if any(profile[key] != cargo_build_jobs for key in job_keys):
+        raise PlannerError(
+            f"{context} must use one fixed cargo build-job value across its job limits"
+        )
+
+    thread_keys = ("test_threads", "low_disk_test_threads_max")
+    for key in thread_keys:
+        validate_positive_int(profile.get(key), f"{context}.{key}")
+    nextest_test_threads = int(profile["test_threads"])
+    if any(profile[key] != nextest_test_threads for key in thread_keys):
+        raise PlannerError(
+            f"{context} must use one fixed nextest thread value across its thread limits"
+        )
+
+    return {
+        "resource_profile": WINDOWS_NEXTEST_PROFILE,
+        "cargo_build_jobs": cargo_build_jobs,
+        "nextest_test_threads": nextest_test_threads,
+    }
+
+
+def windows_reuse_minimum_free_disk_gib_from_config(
+    config: dict[str, Any], context: str
+) -> int:
+    profile = windows_nextest_profile_from_config(config, context)
+    reserve_free_gib = profile.get("reserve_free_gib")
+    validate_positive_int(reserve_free_gib, f"{context}.reserve_free_gib")
+    return int(reserve_free_gib)
+
+
+def validate_windows_runtime_resource_contract(value: Any, context: str) -> None:
+    if not isinstance(value, dict):
+        raise PlannerError(f"{context} must be an object")
+    if set(value) != WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS:
+        raise PlannerError(
+            f"{context} must define exactly resource_profile, cargo_build_jobs, and nextest_test_threads"
+        )
+    if value["resource_profile"] != WINDOWS_NEXTEST_PROFILE:
+        raise PlannerError(
+            f"{context}.resource_profile must be {WINDOWS_NEXTEST_PROFILE!r}"
+        )
+    validate_positive_int(value["cargo_build_jobs"], f"{context}.cargo_build_jobs")
+    validate_positive_int(
+        value["nextest_test_threads"], f"{context}.nextest_test_threads"
+    )
+
+
+def validate_windows_reuse_run_root(value: Any, context: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise PlannerError(f"{context} must be a non-empty Windows path or null")
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        raise PlannerError(f"{context} contains an unsafe control character")
+
+    normalized = ntpath.normpath(value)
+    drive, tail = ntpath.splitdrive(normalized)
+    cache_root = ntpath.normpath(WINDOWS_RUNTIME_CACHE_ROOT)
+    normalized_cache_root = ntpath.normcase(cache_root)
+    if (
+        not ntpath.isabs(normalized)
+        or drive.casefold() != "f:"
+        or not tail.startswith("\\")
+    ):
+        raise PlannerError(
+            f"{context} must be an absolute Windows path below {WINDOWS_RUNTIME_CACHE_ROOT!r}"
+        )
+    if ntpath.normcase(normalized) == normalized_cache_root:
+        raise PlannerError(
+            f"{context} must name a workset below {WINDOWS_RUNTIME_CACHE_ROOT!r}, not the cache root"
+        )
+    try:
+        common_root = ntpath.commonpath((cache_root, normalized))
+    except ValueError:
+        common_root = ""
+    if ntpath.normcase(common_root) != normalized_cache_root:
+        raise PlannerError(
+            f"{context} must be an absolute Windows path below {WINDOWS_RUNTIME_CACHE_ROOT!r}"
+        )
+    return value
+
+
+def validate_windows_runtime_values(
+    runtime: dict[str, Any],
+    repo_root: Path,
+    context: str,
+    *,
+    minimum_free_disk_gib_floor: int = WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB,
+) -> None:
+    actual_keys = set(runtime)
+    if actual_keys != WINDOWS_RUNTIME_CONFIG_KEYS:
+        missing = sorted(WINDOWS_RUNTIME_CONFIG_KEYS - actual_keys)
+        unknown = sorted(actual_keys - WINDOWS_RUNTIME_CONFIG_KEYS)
+        detail = []
+        if missing:
+            detail.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unknown keys: {', '.join(unknown)}")
+        raise PlannerError(
+            f"{context} must define exactly the supported keys ({'; '.join(detail)})"
+        )
+
+    validate_windows_workflow_namespace(
+        runtime["workflow_namespace"], f"{context}.workflow_namespace"
+    )
+    if runtime["cache_root"] != WINDOWS_RUNTIME_CACHE_ROOT:
+        raise PlannerError(
+            f"{context}.cache_root must be {WINDOWS_RUNTIME_CACHE_ROOT!r}"
+        )
+    if runtime["target"] != WINDOWS_RUNTIME_TARGET:
+        raise PlannerError(f"{context}.target must be {WINDOWS_RUNTIME_TARGET!r}")
+    for field_name in WINDOWS_RUNTIME_DIGEST_FIELDS:
+        digest = runtime[field_name]
+        if not isinstance(digest, str) or not LOWERCASE_SHA256_RE.fullmatch(digest):
+            raise PlannerError(
+                f"{context}.{field_name} must be a lowercase 64-hex SHA-256 digest"
+            )
+    for field_name, floor in (
+        ("minimum_free_disk_gib", minimum_free_disk_gib_floor),
+        (
+            "minimum_available_memory_gib",
+            WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB,
+        ),
+    ):
+        value = runtime[field_name]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise PlannerError(f"{context}.{field_name} must be an integer")
+        if value < floor:
+            raise PlannerError(f"{context}.{field_name} must be at least {floor}")
+
+    nextest_version = validate_windows_runtime_version(
+        runtime["nextest_version"], f"{context}.nextest_version"
+    )
+    v8_version = validate_windows_runtime_version(
+        runtime["v8_version"], f"{context}.v8_version"
+    )
+    expected_toolchain = f"{rust_toolchain_channel(repo_root)}-{runtime['target']}"
+    if runtime["rust_toolchain"] != expected_toolchain:
+        raise PlannerError(
+            f"{context}.rust_toolchain must match {expected_toolchain!r}"
+        )
+    expected_urls = windows_runtime_release_urls(
+        nextest_version, v8_version, runtime["target"]
+    )
+    for field_name in WINDOWS_RUNTIME_URL_FIELDS:
+        if runtime[field_name] != expected_urls[field_name]:
+            raise PlannerError(
+                f"{context}.{field_name} must be the coherent HTTPS GitHub release URL"
+            )
+
+    lock_version = locked_v8_version(repo_root)
+    if v8_version != lock_version:
+        raise PlannerError(
+            f"{context}.v8_version {runtime['v8_version']!r} does not match "
+            f"codex-rs/Cargo.lock v8 version {lock_version!r}"
+        )
+
+
+def windows_runtime_from_config(
+    config: dict[str, Any], repo_root: Path, *, required: bool
+) -> dict[str, Any] | None:
+    runtime = config.get(WINDOWS_RUNTIME_SECTION)
+    if runtime is None:
+        if required:
+            raise PlannerError(
+                "cargo-validation.toml requires [windows_runtime] for Windows commands"
+            )
+        return None
+    if not isinstance(runtime, dict):
+        raise PlannerError("cargo-validation.toml [windows_runtime] must be a table")
+    static_runtime = dict(runtime)
+    validate_windows_runtime_values(
+        static_runtime, repo_root, "cargo-validation.toml [windows_runtime]"
+    )
+    return static_runtime
+
+
+def project_windows_runtime(
+    config: dict[str, Any],
+    repo_root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    reuse_run_root: str | None = None,
+) -> dict[str, Any]:
+    runtime = windows_runtime_from_config(config, repo_root, required=True)
+    if runtime is None:
+        raise AssertionError("required Windows runtime was not returned")
+    reuse_run_root = validate_windows_reuse_run_root(
+        reuse_run_root, "--windows-reuse-root"
+    )
+    resource_profile_context = (
+        f"cargo-validation.toml [resource_profiles.{WINDOWS_NEXTEST_PROFILE}]"
+    )
+    projected = dict(runtime)
+    projected["resource_contract"] = windows_resource_contract_from_config(
+        config, resource_profile_context
+    )
+    projected["reuse_run_root"] = reuse_run_root
+    if reuse_run_root is not None:
+        projected["minimum_free_disk_gib"] = (
+            windows_reuse_minimum_free_disk_gib_from_config(
+                config, resource_profile_context
+            )
+        )
+    projected["source_materialization"] = {
+        "posix_repo_root": str(repo_root.resolve()),
+        "wsl_distro_name": current_wsl_distro_name(environ),
+    }
+    return projected
+
+
+def validate_windows_runtime_manifest(
+    runtime: Any, repo_root: Path, context: str
+) -> None:
+    if not isinstance(runtime, dict):
+        raise PlannerError(f"{context} must be an object")
+    expected_keys = WINDOWS_RUNTIME_MANIFEST_KEYS
+    actual_keys = set(runtime)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unknown = sorted(actual_keys - expected_keys)
+        detail = []
+        if missing:
+            detail.append(f"missing keys: {', '.join(missing)}")
+        if unknown:
+            detail.append(f"unknown keys: {', '.join(unknown)}")
+        raise PlannerError(
+            f"{context} must define exactly the supported keys ({'; '.join(detail)})"
+        )
+
+    reuse_run_root = validate_windows_reuse_run_root(
+        runtime["reuse_run_root"], f"{context}.reuse_run_root"
+    )
+    static_runtime = {
+        field_name: runtime[field_name] for field_name in WINDOWS_RUNTIME_CONFIG_KEYS
+    }
+    validate_windows_runtime_values(
+        static_runtime,
+        repo_root,
+        context,
+        minimum_free_disk_gib_floor=(
+            1 if reuse_run_root is not None else WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB
+        ),
+    )
+    validate_windows_runtime_resource_contract(
+        runtime["resource_contract"], f"{context}.resource_contract"
+    )
+    source_materialization = runtime["source_materialization"]
+    if not isinstance(source_materialization, dict):
+        raise PlannerError(f"{context}.source_materialization must be an object")
+    if set(source_materialization) != WINDOWS_RUNTIME_SOURCE_MATERIALIZATION_KEYS:
+        raise PlannerError(
+            f"{context}.source_materialization must define exactly posix_repo_root and wsl_distro_name"
+        )
+    expected_repo_root = str(repo_root.resolve())
+    if source_materialization["posix_repo_root"] != expected_repo_root:
+        raise PlannerError(
+            f"{context}.source_materialization.posix_repo_root must be {expected_repo_root!r}"
+        )
+    validate_wsl_distro_name(
+        source_materialization["wsl_distro_name"],
+        f"{context}.source_materialization.wsl_distro_name",
+    )
+
+
+def validate_windows_plan_runtime(plan: Plan, repo_root: Path) -> None:
+    has_windows_command = any(
+        command.platform == "windows" for command in plan.commands
+    )
+    if not has_windows_command:
+        if plan.windows_runtime is not None:
+            raise PlannerError(
+                "non-Windows plans must not include a windows_runtime object"
+            )
+        return
+    if plan.windows_runtime is None:
+        raise PlannerError(
+            "Windows plans require a windows_runtime object before manifest emission or execution"
+        )
+    validate_windows_runtime_manifest(
+        plan.windows_runtime, repo_root, "plan.windows_runtime"
+    )
 
 
 def git_changed_files(repo_root: Path) -> list[str]:
@@ -819,7 +1358,13 @@ def profile_env(
 
 
 def command_fingerprint(
-    profile_name: str | None, job_contract_digest: str | None, argv: tuple[str, ...]
+    profile_name: str | None,
+    job_contract_digest: str | None,
+    argv: tuple[str, ...],
+    platform: str | None,
+    executor: str | None,
+    classification: str,
+    artifact_policy: str,
 ) -> str:
     payload = json.dumps(
         {
@@ -827,6 +1372,10 @@ def command_fingerprint(
             "resource_profile": profile_name,
             "job_contract_digest": job_contract_digest,
             "argv": list(argv),
+            "platform": platform,
+            "executor": executor,
+            "classification": classification,
+            "artifact_policy": artifact_policy,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -886,18 +1435,37 @@ def file_digest_record(repo_root: Path, file_path: str) -> dict[str, Any]:
     return record
 
 
-def git_head_digest(repo_root: Path) -> str:
-    process = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+def git_candidate_identity(repo_root: Path) -> dict[str, str | None]:
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--git-dir"],
         cwd=repo_root,
         check=False,
         text=True,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    if process.returncode != 0:
-        return "not-a-git-repo"
-    return process.stdout.strip()
+    if git_dir.returncode != 0:
+        return {"head": None, "merge_head": None, "index_tree": None}
+
+    # `git write-tree` is the canonical index-to-tree projection. It does not
+    # change refs, the index, or the worktree, which keeps the candidate bound
+    # to exactly the bytes a later native executor must consume.
+    head = run_capture(["git", "rev-parse", "HEAD"], repo_root).strip()
+    merge_head = (
+        subprocess.run(
+            ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            cwd=repo_root,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ).stdout.strip()
+        or None
+    )
+    index_tree = run_capture(["git", "write-tree"], repo_root).strip()
+    if not index_tree:
+        raise PlannerError("git write-tree returned an empty index tree identity")
+    return {"head": head, "merge_head": merge_head, "index_tree": index_tree}
 
 
 def validation_tooling_digest(repo_root: Path) -> str:
@@ -927,6 +1495,10 @@ def command_resume_id(command: CommandEntry) -> str:
             "argv": list(command.argv),
             "env": dict(sorted(resume_identity_env(command.env).items())),
             "kind": command.kind,
+            "platform": command.platform,
+            "executor": command.executor,
+            "classification": command.classification,
+            "artifact_policy": command.artifact_policy,
             "codex_v8_target": command.codex_v8_target,
             "resource_profile": command.resource_profile,
             "fingerprint": command.fingerprint,
@@ -942,37 +1514,40 @@ def command_resume_key(index: int, command: CommandEntry) -> str:
 
 
 def plan_resume_id(plan: Plan, tooling_digest: str) -> str:
-    return stable_digest(
-        {
-            "schema": 2,
-            "action": plan.action,
-            "stage": plan.stage,
-            "mode": plan.mode,
-            "changed_files": sorted(plan.files),
-            "selected_packages": sorted(plan.selected_packages),
-            "selected_surfaces": sorted(plan.selected_surfaces),
-            "flags": sorted(plan.flags),
-            "telemetry_level": plan.telemetry_level,
-            "validation_tooling_digest": tooling_digest,
-            "commands": [
-                {"index": index, "command_key": command_resume_key(index, command)}
-                for index, command in enumerate(plan.commands, start=1)
-            ],
-        }
-    )
+    payload: dict[str, Any] = {
+        "schema": 2,
+        "action": plan.action,
+        "stage": plan.stage,
+        "mode": plan.mode,
+        "changed_files": sorted(plan.files),
+        "selected_packages": sorted(plan.selected_packages),
+        "selected_surfaces": sorted(plan.selected_surfaces),
+        "flags": sorted(plan.flags),
+        "telemetry_level": plan.telemetry_level,
+        "candidate_identity": plan.candidate_identity,
+        "validation_tooling_digest": tooling_digest,
+        "commands": [
+            {"index": index, "command_key": command_resume_key(index, command)}
+            for index, command in enumerate(plan.commands, start=1)
+        ],
+    }
+    if plan.windows_runtime is not None:
+        payload["windows_runtime"] = plan.windows_runtime
+    return stable_digest(payload)
 
 
 def plan_input_digest(plan: Plan, repo_root: Path) -> str:
-    return stable_digest(
-        {
-            "schema": 1,
-            "head": git_head_digest(repo_root),
-            "changed_files": [
-                file_digest_record(repo_root, file_path)
-                for file_path in sorted(set(plan.files))
-            ],
-        }
-    )
+    payload: dict[str, Any] = {
+        "schema": 1,
+        "candidate_identity": plan.candidate_identity,
+        "changed_files": [
+            file_digest_record(repo_root, file_path)
+            for file_path in sorted(set(plan.files))
+        ],
+    }
+    if plan.windows_runtime is not None:
+        payload["windows_runtime"] = plan.windows_runtime
+    return stable_digest(payload)
 
 
 def default_history_sample_limit(config: dict[str, Any]) -> int:
@@ -1071,17 +1646,33 @@ def command_with_profile(
     history_entries: list[dict[str, Any]],
     *,
     use_growth_history: bool = True,
+    platform: str | None = "wsl",
+    executor: str | None = None,
+    classification: str | None = None,
+    artifact_policy: str = "none",
 ) -> CommandEntry:
     profile = profile_config(config, profile_name)
     job_contract_digest = profile_job_contract_digest(config, profile_name)
+    resolved_classification = classification or default_classification(argv)
+    resolved_executor = (
+        executor
+        if resolved_classification in EXCLUSION_CLASSIFICATIONS
+        else executor or default_executor(argv)
+    )
     fingerprint = (
-        command_fingerprint(profile_name, job_contract_digest, argv)
+        command_fingerprint(
+            profile_name,
+            job_contract_digest,
+            argv,
+            platform,
+            resolved_executor,
+            resolved_classification,
+            artifact_policy,
+        )
         if profile_name is not None
         else None
     )
-    is_direct_guard = (
-        len(argv) >= 3 and argv[0] == "./scripts/cargo-guard.sh" and argv[1] == "cargo"
-    )
+    is_direct_guard = guarded_cargo_argv(argv)
     fallback_growth = 0 if profile is not None and is_direct_guard else None
     command_history_entries = (
         history_entries if is_direct_guard and use_growth_history else []
@@ -1093,12 +1684,20 @@ def command_with_profile(
         fingerprint=fingerprint,
         fallback_expected_growth_gib=fallback_growth,
     )
-    env = profile_env(config, profile_name, expected_growth_override=effective_growth)
-    return CommandEntry(
+    env = (
+        profile_env(config, profile_name, expected_growth_override=effective_growth)
+        if platform == "wsl"
+        else {}
+    )
+    command = CommandEntry(
         argv,
         reason,
         kind,
         env,
+        platform=platform,
+        executor=resolved_executor,
+        classification=resolved_classification,
+        artifact_policy=artifact_policy,
         resource_profile=profile_name,
         fingerprint=fingerprint,
         job_contract_digest=job_contract_digest,
@@ -1106,6 +1705,8 @@ def command_with_profile(
         effective_expected_growth_gib=effective_growth,
         expected_growth_source=growth_source,
     )
+    validate_manifest_command(command, config, f"planned command {kind!r}")
+    return command
 
 
 def validate_positive_int(
@@ -1120,22 +1721,177 @@ def validate_positive_int(
         raise PlannerError(f"{context} must be positive")
 
 
-def raw_build_like_cargo(argv: list[str]) -> bool:
+def cargo_subcommand(argv: tuple[str, ...] | list[str]) -> str | None:
     if not argv or argv[0] != "cargo":
-        return False
+        return None
     for arg in argv[1:]:
         if arg.startswith("-") or arg.startswith("+"):
             continue
-        return arg in BUILD_LIKE_CARGO
-    return False
+        return arg
+    return None
 
 
-def validate_config(config: dict[str, Any], packages: list[PackageInfo]) -> None:
+def raw_build_like_cargo(argv: tuple[str, ...] | list[str]) -> bool:
+    return cargo_subcommand(argv) in BUILD_LIKE_CARGO
+
+
+def cargo_guard_argv(argv: tuple[str, ...] | list[str]) -> bool:
+    return bool(argv) and argv[0] == "./scripts/cargo-guard.sh"
+
+
+def guarded_cargo_argv(argv: tuple[str, ...] | list[str]) -> bool:
+    return cargo_guard_argv(argv) and len(argv) >= 2 and argv[1] == "cargo"
+
+
+def guarded_build_like_cargo(argv: tuple[str, ...] | list[str]) -> bool:
+    return guarded_cargo_argv(argv) and raw_build_like_cargo(list(argv[1:]))
+
+
+def default_executor(argv: tuple[str, ...] | list[str]) -> str:
+    if cargo_guard_argv(argv):
+        return "cargo-guard"
+    return "command"
+
+
+def default_classification(argv: tuple[str, ...] | list[str]) -> str:
+    if raw_build_like_cargo(argv) or guarded_build_like_cargo(argv):
+        return "build-like"
+    return "command"
+
+
+def command_manifest_metadata(
+    command_config: dict[str, Any], argv: tuple[str, ...] | list[str]
+) -> tuple[Any, Any, Any, Any]:
+    classification = command_config.get("classification", default_classification(argv))
+    excluded = classification in EXCLUSION_CLASSIFICATIONS
+    return (
+        command_config.get("platform", None if excluded else "wsl"),
+        command_config.get("executor", None if excluded else default_executor(argv)),
+        classification,
+        command_config.get("artifact_policy", "none"),
+    )
+
+
+def validate_manifest_command(
+    command: CommandEntry,
+    config: dict[str, Any],
+    context: str,
+) -> None:
+    if (
+        not isinstance(command.classification, str)
+        or command.classification not in VALID_CLASSIFICATIONS
+    ):
+        raise PlannerError(
+            f"{context} classification must be one of: {', '.join(VALID_CLASSIFICATIONS)}"
+        )
+
+    if not isinstance(command.reason, str) or not command.reason:
+        raise PlannerError(f"{context} reason must be a non-empty string")
+
+    if command.classification in EXCLUSION_CLASSIFICATIONS:
+        if command.argv:
+            raise PlannerError(f"{context} excluded entries must use an empty argv")
+        if command.platform is not None or command.executor is not None:
+            raise PlannerError(
+                f"{context} excluded entries must use null platform and executor"
+            )
+        if command.env:
+            raise PlannerError(f"{context} excluded entries must not define env")
+        if command.resource_profile is not None:
+            raise PlannerError(
+                f"{context} excluded entries must not select a resource profile"
+            )
+        if command.artifact_policy != "none":
+            raise PlannerError(
+                f"{context} excluded entries must use artifact_policy 'none'"
+            )
+        return
+
+    for field_name, value, allowed_values in (
+        ("platform", command.platform, VALID_PLATFORMS),
+        ("executor", command.executor, VALID_EXECUTORS),
+        ("artifact_policy", command.artifact_policy, VALID_ARTIFACT_POLICIES),
+    ):
+        if not isinstance(value, str) or value not in allowed_values:
+            raise PlannerError(
+                f"{context} {field_name} must be one of: {', '.join(allowed_values)}"
+            )
+
+    if command.resource_profile is not None:
+        if not isinstance(command.resource_profile, str):
+            raise PlannerError(f"{context} resource profile must be a string or null")
+        profile_config(config, command.resource_profile)
+
+    if command.platform == "windows" and command.executor != "powershell":
+        raise PlannerError(
+            f"{context} platform 'windows' requires executor 'powershell'"
+        )
+    if command.platform == "wsl" and command.executor == "powershell":
+        raise PlannerError(
+            f"{context} platform 'wsl' must not use executor 'powershell'"
+        )
+    if command.classification == "wsl-unix-test" and command.platform != "wsl":
+        raise PlannerError(f"{context} wsl-unix-test requires platform 'wsl'")
+
+    if not command.argv:
+        raise PlannerError(f"{context} executable entries must define a non-empty argv")
+
+    if command.executor == "cargo-guard":
+        if command.platform != "wsl" or not cargo_guard_argv(command.argv):
+            raise PlannerError(
+                f"{context} executor 'cargo-guard' requires a WSL cargo-guard argv"
+            )
+    elif cargo_guard_argv(command.argv):
+        raise PlannerError(
+            f"{context} cargo-guard argv requires executor 'cargo-guard'"
+        )
+
+    if raw_build_like_cargo(command.argv):
+        if command.platform != "windows" or command.executor != "powershell":
+            raise PlannerError(
+                f"{context} raw build-like cargo requires platform='windows' and executor='powershell'"
+            )
+        if command.resource_profile != WINDOWS_NEXTEST_PROFILE:
+            raise PlannerError(
+                f"{context} Windows raw build-like cargo requires resource profile {WINDOWS_NEXTEST_PROFILE!r}"
+            )
+
+    if command.artifact_policy == "ephemeral-codex-exe" and not (
+        command.platform == "windows"
+        and command.executor == "powershell"
+        and command.classification == "platform-neutral-test"
+        and cargo_subcommand(command.argv) in {"nextest", "test"}
+        and command.resource_profile == WINDOWS_NEXTEST_PROFILE
+    ):
+        raise PlannerError(
+            f"{context} artifact_policy 'ephemeral-codex-exe' requires a Windows PowerShell platform-neutral Cargo test"
+        )
+
+
+def validate_config(
+    config: dict[str, Any],
+    packages: list[PackageInfo],
+    repo_root: Path | None = None,
+) -> None:
     if config.get("schema_version") != 1:
         raise PlannerError("cargo-validation.toml schema_version must be 1")
 
     default_history_sample_limit(config)
     reject_stale_history_multiplier_defaults(config)
+
+    resolved_repo_root = (repo_root or repo_root_from_script()).resolve()
+    configured_commands = config.get("commands", {})
+    requires_windows_runtime = (
+        any(
+            isinstance(command, dict) and command.get("platform") == "windows"
+            for command in configured_commands.values()
+        )
+        if isinstance(configured_commands, dict)
+        else False
+    )
+    windows_runtime_from_config(
+        config, resolved_repo_root, required=requires_windows_runtime
+    )
 
     package_names = {package.name for package in packages}
     command_names = set(config.get("commands", {}))
@@ -1237,7 +1993,15 @@ def validate_config(config: dict[str, Any], packages: list[PackageInfo]) -> None
                     f"resource profile {profile_name}.cargo_jobs_low_disk_max must not exceed cargo_jobs_max"
                 )
 
+    if requires_windows_runtime:
+        windows_resource_contract_from_config(
+            config,
+            f"cargo-validation.toml [resource_profiles.{WINDOWS_NEXTEST_PROFILE}]",
+        )
+
     for command_name, command in config.get("commands", {}).items():
+        if not isinstance(command, dict):
+            raise PlannerError(f"validation command {command_name!r} must be a table")
         argv = command.get("argv")
         if not isinstance(argv, list) or not all(
             isinstance(item, str) for item in argv
@@ -1245,26 +2009,34 @@ def validate_config(config: dict[str, Any], packages: list[PackageInfo]) -> None
             raise PlannerError(
                 f"validation command {command_name!r} must define argv as a string array"
             )
-        if raw_build_like_cargo(argv):
-            raise PlannerError(
-                f"validation command {command_name!r} uses raw build-like cargo; route through cargo-guard or just"
-            )
         profile_name = command.get("profile")
-        if profile_name is not None and profile_name not in profile_names:
-            raise PlannerError(
-                f"validation command {command_name!r} references unknown resource profile {profile_name!r}"
-            )
+        if profile_name is not None:
+            if not isinstance(profile_name, str) or profile_name not in profile_names:
+                raise PlannerError(
+                    f"validation command {command_name!r} references unknown resource profile {profile_name!r}"
+                )
+        platform, executor, classification, artifact_policy = command_manifest_metadata(
+            command, argv
+        )
+        validate_manifest_command(
+            CommandEntry(
+                tuple(argv),
+                f"validation command {command_name!r}",
+                platform=platform,
+                executor=executor,
+                classification=classification,
+                artifact_policy=artifact_policy,
+                resource_profile=profile_name,
+            ),
+            config,
+            f"validation command {command_name!r}",
+        )
         codex_v8_target = command.get("codex_v8_target")
         if codex_v8_target is not None and codex_v8_target != CODEX_V8_HOST_TARGET:
             raise PlannerError(
                 f"validation command {command_name!r} codex_v8_target must be {CODEX_V8_HOST_TARGET!r}"
             )
-        if codex_v8_target is not None and not (
-            len(argv) >= 3
-            and argv[0] == "./scripts/cargo-guard.sh"
-            and argv[1] == "cargo"
-            and argv[2] in BUILD_LIKE_CARGO
-        ):
+        if codex_v8_target is not None and not guarded_build_like_cargo(argv):
             raise PlannerError(
                 f"validation command {command_name!r} codex_v8_target requires a direct guarded Cargo build-like command"
             )
@@ -1285,6 +2057,16 @@ def validate_config(config: dict[str, Any], packages: list[PackageInfo]) -> None
         for package in rule.get("packages", []):
             if package not in package_names:
                 raise PlannerError(f"path rule references unknown package {package!r}")
+        wsl_runtime_packages = rule.get("wsl_runtime_packages", [])
+        for package in wsl_runtime_packages:
+            if package not in package_names:
+                raise PlannerError(
+                    f"path rule references unknown WSL runtime package {package!r}"
+                )
+        if wsl_runtime_packages and "runtime" not in rule.get("flags", []):
+            raise PlannerError(
+                "path rule wsl_runtime_packages requires flags to include 'runtime'"
+            )
         for surface in rule.get("surfaces", []):
             if surface not in surface_names:
                 raise PlannerError(f"path rule references unknown surface {surface!r}")
@@ -1321,6 +2103,8 @@ def apply_path_rules(
             file_surface_matched = True
         for flag in rule.get("flags", []):
             selection.flags.add(flag)
+        for package in rule.get("wsl_runtime_packages", []):
+            selection.wsl_runtime_packages.add(package)
         for generator in rule.get("generators", []):
             selection.add_generator(generator, reason)
         for command_name in rule.get("prep_commands", []):
@@ -1437,6 +2221,9 @@ def command_from_config(
         raise PlannerError(
             f"validation command {command_name!r} must define argv as a string array"
         )
+    platform, executor, classification, artifact_policy = command_manifest_metadata(
+        command_config, argv
+    )
     return replace(
         command_with_profile(
             tuple(argv),
@@ -1445,6 +2232,10 @@ def command_from_config(
             config,
             command_config.get("profile"),
             history_entries,
+            platform=platform,
+            executor=executor,
+            classification=classification,
+            artifact_policy=artifact_policy,
         ),
         codex_v8_target=command_config.get("codex_v8_target"),
     )
@@ -1536,15 +2327,19 @@ def cargo_command(
     history_entries: list[dict[str, Any]],
     *,
     use_growth_history: bool = True,
+    codex_v8_target: str | None = None,
 ) -> CommandEntry:
-    return command_with_profile(
-        ("./scripts/cargo-guard.sh", "cargo", *args),
-        reason,
-        "cargo",
-        config,
-        profile,
-        history_entries,
-        use_growth_history=use_growth_history,
+    return replace(
+        command_with_profile(
+            ("./scripts/cargo-guard.sh", "cargo", *args),
+            reason,
+            "cargo",
+            config,
+            profile,
+            history_entries,
+            use_growth_history=use_growth_history,
+        ),
+        codex_v8_target=codex_v8_target,
     )
 
 
@@ -1579,6 +2374,11 @@ def add_command(
         if (
             existing.argv == command.argv
             and existing.env == command.env
+            and existing.platform == command.platform
+            and existing.executor == command.executor
+            and existing.classification == command.classification
+            and existing.resource_profile == command.resource_profile
+            and existing.artifact_policy == command.artifact_policy
             and existing.codex_v8_target == command.codex_v8_target
         ):
             return
@@ -1633,10 +2433,12 @@ def build_plan(
     receipt_dir: Path | None,
     telemetry_level: str,
     path_evidence: dict[str, PathSelectionEvidence] | None = None,
+    windows_reuse_root: str | None = None,
 ) -> Plan:
     history_entries = read_history_entries(
         receipt_dir / "history.jsonl" if receipt_dir else None
     )
+    candidate_identity = git_candidate_identity(repo_root)
     selection = Selection(files=files, path_evidence=path_evidence or {})
     for file_path in files:
         classify_file(file_path, repo_root, config, packages, selection)
@@ -1675,8 +2477,20 @@ def build_plan(
         {"runtime", "test_scope", "manifest_changed"} & selection.flags
     )
     need_runtime_tests = "runtime" in selection.flags
+    runtime_packages = set(selected_packages) if need_runtime_tests else set()
+    # Merge-safety anchor: in full mode, WSL runtime and test-target
+    # preparation must use the config-owned explicit WSL package selection,
+    # while normal checks and strict Clippy stay selected per package.
+    test_preparation_packages = set(selected_packages)
+    if mode == "full":
+        runtime_packages &= selection.wsl_runtime_packages
+        test_preparation_packages &= selection.wsl_runtime_packages
 
     if stage == "prep":
+        if windows_reuse_root is not None:
+            raise PlannerError(
+                "--windows-reuse-root requires a native Windows command; prep actions do not include native Windows commands"
+            )
         for generator, reasons in sorted(selection.generators.items()):
             add_command(
                 commands,
@@ -1713,6 +2527,7 @@ def build_plan(
             manual=manual,
             receipt_dir=receipt_dir,
             telemetry_level=telemetry_level,
+            candidate_identity=candidate_identity,
         )
 
     for command_name in selection.command_order:
@@ -1724,8 +2539,34 @@ def build_plan(
             ),
         )
 
+    # Merge-safety anchor: full-mode Windows aggregate and its platform
+    # exclusions must follow cheap structural checks and precede every WSL Cargo
+    # build/check/test/clippy rung, preserving native preflight capacity.
+    if mode == "full":
+        for command_name, reason in (
+            (
+                "windows-nextest-workspace",
+                "full mode requests the native Windows platform-neutral aggregate",
+            ),
+            (
+                "windows-only-excluded",
+                "full mode records Windows-only tests as excluded from the aggregate",
+            ),
+            (
+                "macos-not-applicable",
+                "full mode records macOS-only tests as not applicable",
+            ),
+        ):
+            add_command(
+                commands,
+                command_from_config(config, command_name, reason, history_entries),
+            )
+
     for package in selected_packages:
         package_info = package_infos[package]
+        codex_v8_target = (
+            CODEX_V8_HOST_TARGET if package in CODEX_V8_HOST_ARTIFACT_PACKAGES else None
+        )
         add_command(
             commands,
             cargo_command(
@@ -1734,12 +2575,14 @@ def build_plan(
                 config,
                 "check",
                 history_entries,
+                codex_v8_target=codex_v8_target,
             ),
         )
         if (
             mode_at_least(mode, "standard")
             and need_test_targets
             and package_info.has_test_targets
+            and package in test_preparation_packages
         ):
             add_command(
                 commands,
@@ -1749,6 +2592,7 @@ def build_plan(
                     config,
                     "check_tests",
                     history_entries,
+                    codex_v8_target=codex_v8_target,
                 ),
             )
             add_command(
@@ -1759,11 +2603,12 @@ def build_plan(
                     config,
                     "test_no_run",
                     history_entries,
+                    codex_v8_target=codex_v8_target,
                 ),
             )
         if (
             mode_at_least(mode, "standard")
-            and need_runtime_tests
+            and package in runtime_packages
             and (package_info.has_test_targets or package_info.has_doctests)
         ):
             if package in FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES:
@@ -1779,6 +2624,7 @@ def build_plan(
                         config,
                         "package_test",
                         history_entries,
+                        codex_v8_target=codex_v8_target,
                     )
                 )
                 if package in FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES
@@ -1788,20 +2634,37 @@ def build_plan(
                     config,
                     "package_test",
                     history_entries,
+                    codex_v8_target=codex_v8_target,
                 ),
             )
         if mode_at_least(mode, "strict"):
-            add_command(
-                commands,
-                command_with_profile(
-                    ("just", "clippy-strict", "-p", package),
-                    f"strict lint gate for {package}",
-                    "clippy-strict",
-                    config,
-                    "clippy",
-                    history_entries,
-                ),
-            )
+            if package in CODEX_V8_HOST_ARTIFACT_PACKAGES:
+                add_command(
+                    commands,
+                    replace(
+                        cargo_command(
+                            ["clippy", "-p", package, "--", "-D", "warnings"],
+                            f"strict lint gate for {package}",
+                            config,
+                            "clippy",
+                            history_entries,
+                            codex_v8_target=codex_v8_target,
+                        ),
+                        kind="clippy-strict",
+                    ),
+                )
+            else:
+                add_command(
+                    commands,
+                    command_with_profile(
+                        ("just", "clippy-strict", "-p", package),
+                        f"strict lint gate for {package}",
+                        "clippy-strict",
+                        config,
+                        "clippy",
+                        history_entries,
+                    ),
+                )
 
     surfaces = surface_by_name(config)
     for surface_name in selected_surfaces:
@@ -1854,17 +2717,16 @@ def build_plan(
             )
         )
 
-    if mode == "full":
-        add_command(
-            commands,
-            recipe_command(
-                "test",
-                "full mode requests workspace nextest fan-in",
-                config,
-                "workspace_nextest",
-                history_entries,
-            ),
+    has_windows_command = any(command.platform == "windows" for command in commands)
+    if windows_reuse_root is not None and not has_windows_command:
+        raise PlannerError(
+            "--windows-reuse-root requires a native Windows command in the selected validation plan"
         )
+    windows_runtime = (
+        project_windows_runtime(config, repo_root, reuse_run_root=windows_reuse_root)
+        if has_windows_command
+        else None
+    )
 
     return Plan(
         action=action,
@@ -1879,7 +2741,24 @@ def build_plan(
         manual=manual,
         receipt_dir=receipt_dir,
         telemetry_level=telemetry_level,
+        candidate_identity=candidate_identity,
+        windows_runtime=windows_runtime,
     )
+
+
+def command_display(command: CommandEntry) -> str:
+    if command.classification in EXCLUSION_CLASSIFICATIONS:
+        return f"(excluded: {command.classification})"
+    return " ".join(command.argv)
+
+
+def command_receipt_metadata(command: CommandEntry) -> dict[str, Any]:
+    return {
+        "platform": command.platform,
+        "executor": command.executor,
+        "classification": command.classification,
+        "artifact_policy": command.artifact_policy,
+    }
 
 
 def print_plan(plan: Plan, json_output: bool) -> None:
@@ -1909,8 +2788,12 @@ def print_plan(plan: Plan, json_output: bool) -> None:
     if not plan.commands:
         print("  (none)")
     for index, command in enumerate(plan.commands, start=1):
-        print(f"  {index}. {' '.join(command.argv)}")
+        print(f"  {index}. {command_display(command)}")
         print(f"     reason: {command.reason}")
+        print(f"     platform: {command.platform}")
+        print(f"     executor: {command.executor}")
+        print(f"     classification: {command.classification}")
+        print(f"     artifact-policy: {command.artifact_policy}")
         if command.env:
             env_text = " ".join(
                 f"{key}={value}" for key, value in sorted(command.env.items())
@@ -1926,6 +2809,7 @@ def print_plan(plan: Plan, json_output: bool) -> None:
 def write_plan_receipt(plan: Plan, repo_root: Path) -> None:
     if not plan.receipt_dir:
         return
+    validate_windows_plan_runtime(plan, repo_root)
     plan.receipt_dir.mkdir(parents=True, exist_ok=True)
     tooling_digest = validation_tooling_digest(repo_root)
     payload = plan.to_json()
@@ -2128,6 +3012,169 @@ def run_command_with_output_logs(
                 stdout_log_file=stdout_log_file,
                 stderr_log_file=stderr_log_file,
             )
+
+
+def current_windows_manifest_path(
+    plan: Plan,
+    *,
+    current_plan_id: str,
+    tooling_digest: str,
+) -> Path:
+    if plan.receipt_dir is None:
+        raise PlannerError(
+            "Windows PowerShell execution requires a receipt directory; --no-receipt is not supported"
+        )
+    manifest_path = plan.receipt_dir / "last-plan.json"
+    if not manifest_path.is_file():
+        raise PlannerError(
+            f"Windows PowerShell execution requires current last-plan.json: {manifest_path}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PlannerError(
+            f"Windows PowerShell execution cannot read current last-plan.json {manifest_path}: {error}"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise PlannerError(
+            f"Windows PowerShell execution requires a JSON object in {manifest_path}"
+        )
+    if manifest.get("plan_id") != current_plan_id:
+        raise PlannerError(
+            "Windows PowerShell execution requires current last-plan.json plan_id"
+        )
+    if manifest.get("validation_tooling_digest") != tooling_digest:
+        raise PlannerError(
+            "Windows PowerShell execution requires current last-plan.json validation tooling digest"
+        )
+    for field_name, expected in plan.to_json().items():
+        if manifest.get(field_name) != expected:
+            raise PlannerError(
+                f"Windows PowerShell execution requires current last-plan.json {field_name}"
+            )
+    return manifest_path.resolve()
+
+
+def wslpath_windows_path(path: Path, repo_root: Path) -> str:
+    try:
+        process = subprocess.run(
+            ["wslpath", "-w", str(path.resolve())],
+            cwd=repo_root,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise PlannerError(f"wslpath -w failed for {path}: {error}") from error
+    if process.returncode != 0:
+        detail = process.stderr.strip() or "no stderr"
+        raise PlannerError(
+            f"wslpath -w failed for {path} ({process.returncode}): {detail}"
+        )
+    windows_path = process.stdout.strip()
+    if not windows_path:
+        raise PlannerError(f"wslpath -w returned an empty path for {path}")
+    return windows_path
+
+
+def windows_executor_argv(repo_root: Path, manifest_path: Path) -> list[str]:
+    powershell = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if not powershell:
+        raise PlannerError(
+            "Windows PowerShell execution requires PowerShell 7 resolved by pwsh.exe or pwsh"
+        )
+    helper_path = (repo_root / WINDOWS_EXECUTOR_HELPER_PATH).resolve()
+    if not helper_path.is_file():
+        raise PlannerError(
+            f"Windows PowerShell execution helper does not exist: {helper_path}"
+        )
+    helper_windows_path = wslpath_windows_path(helper_path, repo_root)
+    manifest_windows_path = wslpath_windows_path(manifest_path, repo_root)
+    return [
+        powershell,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        helper_windows_path,
+        "-Manifest",
+        manifest_windows_path,
+    ]
+
+
+def read_windows_helper_summary(
+    stdout_log_path: Path, process_status: int
+) -> dict[str, Any]:
+    try:
+        lines = stdout_log_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise PlannerError(
+            f"invalid Windows helper summary: failed to read {stdout_log_path}: {error}"
+        ) from error
+    summary_line = next((line for line in reversed(lines) if line.strip()), None)
+    if summary_line is None:
+        raise PlannerError(
+            f"invalid Windows helper summary: {stdout_log_path} did not end with JSON"
+        )
+    try:
+        summary = json.loads(summary_line)
+    except json.JSONDecodeError as error:
+        raise PlannerError(
+            f"invalid Windows helper summary: {stdout_log_path}: {error}"
+        ) from error
+    if not isinstance(summary, dict):
+        raise PlannerError("invalid Windows helper summary: expected a JSON object")
+    expected_keys = {
+        "schema",
+        "status",
+        "exit_code",
+        "evidence_dir",
+        "result_path",
+    }
+    if set(summary) != expected_keys:
+        raise PlannerError(
+            "invalid Windows helper summary: expected only schema, status, exit_code, evidence_dir, and result_path"
+        )
+    if summary.get("schema") != WINDOWS_HELPER_SUMMARY_SCHEMA:
+        raise PlannerError(
+            f"invalid Windows helper summary: schema must be {WINDOWS_HELPER_SUMMARY_SCHEMA}"
+        )
+    status = summary.get("status")
+    if status not in {*WINDOWS_HELPER_STATUS_EXIT_CODES, "command-failed"}:
+        raise PlannerError("invalid Windows helper summary: unknown status")
+    exit_code = summary.get("exit_code")
+    if (
+        not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or exit_code < 0
+        or exit_code > 255
+    ):
+        raise PlannerError(
+            "invalid Windows helper summary: exit_code must be an integer from 0 through 255"
+        )
+    for field_name in ("evidence_dir", "result_path"):
+        value = summary.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise PlannerError(
+                f"invalid Windows helper summary: {field_name} must be a non-empty string"
+            )
+    if exit_code != process_status:
+        raise PlannerError(
+            "invalid Windows helper summary: exit_code does not match the PowerShell process"
+        )
+    if status == "command-failed":
+        if exit_code == 0:
+            raise PlannerError(
+                "invalid Windows helper summary: command-failed requires a non-zero exit_code"
+            )
+    elif WINDOWS_HELPER_STATUS_EXIT_CODES[status] != exit_code:
+        raise PlannerError(
+            f"invalid Windows helper summary: status {status!r} requires exit_code {WINDOWS_HELPER_STATUS_EXIT_CODES[status]}"
+        )
+    return summary
 
 
 def read_run_entries(run_path: Path | None) -> list[dict[str, Any]]:
@@ -2496,6 +3543,10 @@ def successful_run_entry(entry: dict[str, Any] | None) -> bool:
         return False
     if entry.get("output_log_error") is not None:
         return False
+    if entry.get("windows_executor_error") is not None:
+        return False
+    if entry.get("windows_helper_summary_error") is not None:
+        return False
     return True
 
 
@@ -2516,6 +3567,7 @@ def verify_plan(
     only_failed: bool = False,
     explain_skip: bool = False,
 ) -> int:
+    validate_windows_plan_runtime(plan, repo_root)
     if from_index is not None:
         if from_index < 1:
             raise PlannerError("--from-index must be >= 1")
@@ -2547,6 +3599,13 @@ def verify_plan(
             "pid": os.getpid(),
         }
     )
+    windows_manifest_path: Path | None = None
+    if any(command.platform == "windows" for command in plan.commands):
+        windows_manifest_path = current_windows_manifest_path(
+            plan,
+            current_plan_id=current_plan_id,
+            tooling_digest=tooling_digest,
+        )
 
     previous_entries: list[dict[str, Any]] = []
     run_path: Path | None = None
@@ -2619,6 +3678,42 @@ def verify_plan(
         current_command_key = command_resume_key(index, command)
         latest_entry = latest_entries.get(current_command_key)
 
+        if command.classification in EXCLUSION_CLASSIFICATIONS:
+            print(
+                f"[cargo-validate][excluded] {index}/{len(plan.commands)} "
+                f"{command_display(command)}"
+            )
+            entry = {
+                "coverage": "excluded",
+                "coverage_source": command.classification,
+                "partial_mode": current_partial_mode,
+                "index": index,
+                "command_id": current_command_id,
+                "command_key": current_command_key,
+                "action": plan.action,
+                "stage": plan.stage,
+                "plan_id": current_plan_id,
+                "input_digest": current_input_digest,
+                "validation_tooling_digest": tooling_digest,
+                "run_id": run_id,
+                "argv": list(command.argv),
+                "reason": command.reason,
+                "env": dict(sorted(command.env.items())),
+                "resource_profile": command.resource_profile,
+                "fingerprint": command.fingerprint,
+                "job_contract_digest": command.job_contract_digest,
+                "fallback_expected_growth_gib": command.fallback_expected_growth_gib,
+                "effective_expected_growth_gib": command.effective_expected_growth_gib,
+                "expected_growth_source": command.expected_growth_source,
+                "status": 0,
+            }
+            entry.update(command_receipt_metadata(command))
+            if command.codex_v8_target is not None:
+                entry["codex_v8_target"] = command.codex_v8_target
+            write_run_entry(plan.receipt_dir, entry)
+            records.append(entry)
+            continue
+
         skip_reason: str | None = None
         skip_status: int | None = None
         coverage_source: str | None = None
@@ -2655,7 +3750,10 @@ def verify_plan(
             )
 
         if skip_reason is not None:
-            message = f"[cargo-validate][skip] {index}/{len(plan.commands)} {' '.join(command.argv)}"
+            message = (
+                f"[cargo-validate][skip] {index}/{len(plan.commands)} "
+                f"{command_display(command)}"
+            )
             if explain_skip:
                 message += f" ({skip_reason})"
             print(message)
@@ -2686,6 +3784,7 @@ def verify_plan(
                 "expected_growth_source": command.expected_growth_source,
                 "status": skip_status,
             }
+            entry.update(command_receipt_metadata(command))
             if command.codex_v8_target is not None:
                 entry["codex_v8_target"] = command.codex_v8_target
             write_run_entry(plan.receipt_dir, entry)
@@ -2693,7 +3792,7 @@ def verify_plan(
             continue
 
         print(
-            f"[cargo-validate][run] {index}/{len(plan.commands)} {' '.join(command.argv)}"
+            f"[cargo-validate][run] {index}/{len(plan.commands)} {command_display(command)}"
         )
         started_at = time.time()
         command_env = os.environ.copy()
@@ -2738,9 +3837,61 @@ def verify_plan(
         stdout_log_path: Path | None = None
         stderr_log_path: Path | None = None
         output_log_error: str | None = None
+        windows_executor_error: str | None = None
+        windows_helper_summary: dict[str, Any] | None = None
+        windows_helper_summary_error: str | None = None
         command_status = 2
         if runtime_env_error is not None:
             print(f"[cargo-validate][error] {runtime_env_error}", file=sys.stderr)
+        elif command.platform == "windows":
+            if windows_manifest_path is None:
+                raise PlannerError(
+                    f"Windows command {index} is missing its current manifest path"
+                )
+            try:
+                executor_argv = windows_executor_argv(repo_root, windows_manifest_path)
+            except PlannerError as error:
+                windows_executor_error = str(error)
+                print(f"[cargo-validate][error] {error}", file=sys.stderr)
+            else:
+                if plan.receipt_dir is None:
+                    raise PlannerError(
+                        f"Windows command {index} reached execution without a receipt directory"
+                    )
+                stdout_log_path, stderr_log_path = command_log_paths(
+                    plan.receipt_dir,
+                    run_id=run_id,
+                    index=index,
+                    command_id=current_command_id,
+                )
+                try:
+                    command_status = run_command_with_output_logs(
+                        executor_argv,
+                        cwd=repo_root,
+                        env=command_env,
+                        stdout_log_path=stdout_log_path,
+                        stderr_log_path=stderr_log_path,
+                    )
+                except CommandOutputError as error:
+                    command_status = error.return_code
+                    output_log_error = str(error)
+                except OSError as error:
+                    windows_executor_error = (
+                        f"Windows PowerShell execution failed to launch: {error}"
+                    )
+                    print(
+                        f"[cargo-validate][error] {windows_executor_error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    try:
+                        windows_helper_summary = read_windows_helper_summary(
+                            stdout_log_path, command_status
+                        )
+                    except PlannerError as error:
+                        windows_helper_summary_error = str(error)
+                        command_status = 2
+                        print(f"[cargo-validate][error] {error}", file=sys.stderr)
         elif plan.receipt_dir:
             stdout_log_path, stderr_log_path = command_log_paths(
                 plan.receipt_dir,
@@ -2772,8 +3923,18 @@ def verify_plan(
             "resource_profile": command.resource_profile,
             "fingerprint": command.fingerprint,
             "job_contract_digest": command.job_contract_digest,
-            "coverage": "setup_failed" if runtime_env_error else "executed",
-            "coverage_source": "runtime-env-setup" if runtime_env_error else "executed",
+            "coverage": (
+                "setup_failed"
+                if runtime_env_error is not None or windows_executor_error is not None
+                else "executed"
+            ),
+            "coverage_source": (
+                "runtime-env-setup"
+                if runtime_env_error is not None
+                else "windows-executor-setup"
+                if windows_executor_error is not None
+                else "executed"
+            ),
             "partial_mode": current_partial_mode,
             "command_id": current_command_id,
             "command_key": current_command_key,
@@ -2790,6 +3951,7 @@ def verify_plan(
             "started_at": started_at,
             "duration_seconds": round(finished_at - started_at, 3),
         }
+        entry.update(command_receipt_metadata(command))
         if command.codex_v8_target is not None:
             entry["codex_v8_target"] = command.codex_v8_target
         if resolved_env:
@@ -2798,6 +3960,15 @@ def verify_plan(
             entry["cleared_env"] = list(cleared_env)
         if runtime_env_error is not None:
             entry["runtime_env_error"] = runtime_env_error
+        if windows_executor_error is not None:
+            entry["windows_executor_error"] = windows_executor_error
+        if windows_helper_summary is not None:
+            entry["windows_helper_status"] = windows_helper_summary["status"]
+            entry["windows_helper_exit_code"] = windows_helper_summary["exit_code"]
+            entry["windows_evidence_dir"] = windows_helper_summary["evidence_dir"]
+            entry["windows_result_path"] = windows_helper_summary["result_path"]
+        if windows_helper_summary_error is not None:
+            entry["windows_helper_summary_error"] = windows_helper_summary_error
         if (
             plan.receipt_dir
             and stdout_log_path is not None
@@ -2853,6 +4024,16 @@ def verify_plan(
                 stopped_after_failure = True
                 break
             continue
+        if windows_executor_error is not None:
+            exit_status = 2
+            if not keep_going:
+                print(
+                    f"[cargo-validate][error] stopping after failed command {index}",
+                    file=sys.stderr,
+                )
+                stopped_after_failure = True
+                break
+            continue
         if output_log_error is not None:
             exit_status = 2
             print(
@@ -2862,6 +4043,16 @@ def verify_plan(
             stopped_after_failure = True
             break
         if metrics_error is not None:
+            exit_status = 2
+            if not keep_going:
+                print(
+                    f"[cargo-validate][error] stopping after failed command {index}",
+                    file=sys.stderr,
+                )
+                stopped_after_failure = True
+                break
+            continue
+        if windows_helper_summary_error is not None:
             exit_status = 2
             if not keep_going:
                 print(
@@ -2909,11 +4100,13 @@ def verify_plan(
     if stopped_after_failure:
         for index in range(len(records) + 1, len(plan.commands) + 1):
             command = plan.commands[index - 1]
+            excluded = command.classification in EXCLUSION_CLASSIFICATIONS
             entry = {
-                "coverage": "skipped",
-                "coverage_source": "not-run-after-failure",
+                "coverage": "excluded" if excluded else "skipped",
+                "coverage_source": (
+                    command.classification if excluded else "not-run-after-failure"
+                ),
                 "partial_mode": current_partial_mode,
-                "skip_reason": "not run after earlier failure",
                 "index": index,
                 "command_id": command_resume_id(command),
                 "command_key": command_resume_key(index, command),
@@ -2932,8 +4125,11 @@ def verify_plan(
                 "fallback_expected_growth_gib": command.fallback_expected_growth_gib,
                 "effective_expected_growth_gib": command.effective_expected_growth_gib,
                 "expected_growth_source": command.expected_growth_source,
-                "status": None,
+                "status": 0 if excluded else None,
             }
+            if not excluded:
+                entry["skip_reason"] = "not run after earlier failure"
+            entry.update(command_receipt_metadata(command))
             if command.codex_v8_target is not None:
                 entry["codex_v8_target"] = command.codex_v8_target
             write_run_entry(plan.receipt_dir, entry)
@@ -2968,6 +4164,9 @@ def verify_plan(
         "skipped_count": sum(
             1 for entry in records if entry.get("coverage") == "skipped"
         ),
+        "excluded_count": sum(
+            1 for entry in records if entry.get("coverage") == "excluded"
+        ),
         "partial_mode": current_partial_mode,
         "status": exit_status,
         "failed_commands": [
@@ -2980,6 +4179,8 @@ def verify_plan(
             if entry.get("status") not in (0, None)
             or entry.get("guard_metrics_error") is not None
             or entry.get("output_log_error") is not None
+            or entry.get("windows_executor_error") is not None
+            or entry.get("windows_helper_summary_error") is not None
         ],
         "runtime_env_failures": [
             {
@@ -3052,6 +4253,10 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
         help="add an explicit validation surface",
     )
     parser.add_argument("--mode", choices=VALID_MODES, default=default_mode)
+    parser.add_argument(
+        "--windows-reuse-root",
+        help=r"reuse an explicit native Windows workset below F:\.cache",
+    )
     parser.add_argument(
         "--telemetry-level",
         choices=TELEMETRY_LEVELS,
@@ -3170,7 +4375,7 @@ def main(argv: list[str]) -> int:
             raise PlannerError("no changed files or --surface selectors supplied")
 
         packages = load_metadata(repo_root, args.metadata_json)
-        validate_config(config, packages)
+        validate_config(config, packages, repo_root)
 
         receipt_dir = None
         if not args.no_receipt:
@@ -3194,6 +4399,7 @@ def main(argv: list[str]) -> int:
             receipt_dir=receipt_dir,
             telemetry_level=args.telemetry_level,
             path_evidence=path_evidence,
+            windows_reuse_root=args.windows_reuse_root,
         )
         write_plan_receipt(plan, repo_root)
         print_plan(plan, args.json)

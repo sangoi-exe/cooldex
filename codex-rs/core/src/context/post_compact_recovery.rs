@@ -118,7 +118,9 @@ impl PostCompactRecallContext {
         }]
     }
 
-    fn into_response_item(self) -> ResponseItem {
+    // Merge-safety anchor: recall remains assistant `OutputText` with its content-kind metadata;
+    // generic contextual conversion emits input text.
+    pub(crate) fn into_response_item(self) -> ResponseItem {
         let role = self.role().to_string();
         let content = self.output_content();
         let content_kind = self.content_kind();
@@ -134,10 +136,6 @@ impl PostCompactRecallContext {
                 },
             ),
         }
-    }
-
-    pub(crate) fn into_boxed_response_item(self: Box<Self>) -> ResponseItem {
-        (*self).into_response_item()
     }
 }
 

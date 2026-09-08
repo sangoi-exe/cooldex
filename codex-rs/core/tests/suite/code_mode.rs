@@ -38,6 +38,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -107,6 +108,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use test_case::test_case;
+use test_case::test_matrix;
 use tokio::sync::oneshot;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -849,15 +851,10 @@ async fn code_mode_only_restricts_prompt_tools() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Result<()> {
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-    skip_if_no_network!(Ok(()));
-
-    for omit_tools_from in [
+// Merge-safety anchor: Each generated Cartesian scenario keeps a fresh fixture, so timeout and
+// failure attribution stays per scenario; this changes test structure only, not Code Mode runtime behavior.
+#[test_matrix(
+    [
         &["code_mode"][..],
         &["deferred"][..],
         &["direct"][..],
@@ -866,199 +863,197 @@ async fn code_mode_excludes_mcp_servers_using_their_configured_identity() -> Res
         &["deferred", "direct"][..],
         &["code_mode", "deferred", "direct"][..],
         &[][..],
-    ] {
-        for (code_mode_only, supports_search_tool, non_prefixed_mcp_tool_names) in [
-            (false, false, false),
-            (false, false, true),
-            (false, true, false),
-            (false, true, true),
-            (true, false, false),
-            (true, false, true),
-            (true, true, false),
-            (true, true, true),
-        ] {
-            let server = responses::start_mock_server().await;
-            let response = responses::mount_sse_once(
-                &server,
-                sse(vec![
-                    ev_response_created("resp-1"),
-                    ev_assistant_message("msg-1", "done"),
-                    ev_completed("resp-1"),
-                ]),
-            )
-            .await;
-            let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
-            let environment_id = remote_aware_environment_id();
-            let mut builder = test_codex()
-                .with_model_info_override("gpt-5.4", move |model| {
-                    model.supports_search_tool = supports_search_tool;
-                })
-                .with_config(move |config| {
-                    config
-                        .features
-                        .enable(if code_mode_only {
-                            Feature::CodeModeOnly
-                        } else {
-                            Feature::CodeMode
-                        })
-                        .expect("test config should allow Code Mode");
-                    if non_prefixed_mcp_tool_names {
-                        config
-                            .features
-                            .enable(Feature::NonPrefixedMcpToolNames)
-                            .expect("test config should allow unprefixed MCP tools");
-                    }
+    ],
+    [false, true],
+    [false, true],
+    [false, true]
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_excludes_mcp_servers_using_their_configured_identity(
+    omit_tools_from: &'static [&'static str],
+    code_mode_only: bool,
+    supports_search_tool: bool,
+    non_prefixed_mcp_tool_names: bool,
+) -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
 
-                    let mut servers = config.mcp_servers.get().clone();
-                    servers.insert(
-                        "rmcp".to_string(),
-                        serde_json::from_value(serde_json::json!({
-                            "command": rmcp_test_server_bin,
-                            "environment_id": environment_id,
-                            "cwd": config.cwd,
-                            "omit_tools_from": omit_tools_from,
-                        }))
-                        .expect("test MCP server config should be valid"),
-                    );
-                    config
-                        .mcp_servers
-                        .set(servers)
-                        .expect("test config should allow MCP servers");
-                });
-            let base_test = builder.build_with_auto_env(&server).await?;
-            let namespace = if non_prefixed_mcp_tool_names {
-                "rmcp"
-            } else {
-                "mcp__rmcp"
-            };
-            let new_thread = base_test
-                .thread_manager
-                .start_thread(StartThreadOptions {
-                    dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
-                        name: namespace.to_string(),
-                        description: "An unrelated dynamic tool sharing the MCP namespace."
-                            .to_string(),
-                        tools: vec![DynamicToolNamespaceTool::Function(
-                            DynamicToolFunctionSpec {
-                                name: "unrelated".to_string(),
-                                description: "A dynamic tool that must remain in Code Mode."
-                                    .to_string(),
-                                input_schema: serde_json::json!({
-                                    "type": "object",
-                                    "properties": {},
-                                    "additionalProperties": false,
-                                }),
-                                defer_loading: false,
-                            },
-                        )],
-                    })],
-                    ..StartThreadOptions::new(base_test.config.clone())
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let environment_id = remote_aware_environment_id();
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", move |model| {
+            model.supports_search_tool = supports_search_tool;
+        })
+        .with_config(move |config| {
+            config
+                .features
+                .enable(if code_mode_only {
+                    Feature::CodeModeOnly
+                } else {
+                    Feature::CodeMode
                 })
-                .await?;
-            let mut test = base_test;
-            test.codex = new_thread.thread;
-            test.session_configured = new_thread.session_configured;
-            wait_for_mcp_server(&test.codex, "rmcp").await?;
-            test.submit_turn("inspect the directly callable MCP tool")
-                .await?;
+                .expect("test config should allow Code Mode");
+            if non_prefixed_mcp_tool_names {
+                config
+                    .features
+                    .enable(Feature::NonPrefixedMcpToolNames)
+                    .expect("test config should allow unprefixed MCP tools");
+            }
 
-            let body = response.single_request().body_json();
-            let omit_code_mode = omit_tools_from.contains(&"code_mode");
-            let omit_deferred = omit_tools_from.contains(&"deferred");
-            let omit_direct = omit_tools_from.contains(&"direct");
-            let available_directly = !omit_direct
-                && (!supports_search_tool || omit_deferred || code_mode_only && omit_code_mode);
-            let visible_directly = available_directly && (!code_mode_only || omit_code_mode);
-            let echo_tool = namespace_child_tool(&body, namespace, "echo");
-            assert_eq!(
-                echo_tool.is_some(),
-                visible_directly,
-                "MCP omissions must determine initial prompt exposure; \
-             omit_tools_from={omit_tools_from:?}, code_mode_only={code_mode_only}, \
-             supports_search_tool={supports_search_tool}, namespace={namespace}, tools={:?}",
-                tool_names(&body)
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "rmcp".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "command": rmcp_test_server_bin,
+                    "environment_id": environment_id,
+                    "cwd": config.cwd,
+                    "omit_tools_from": omit_tools_from,
+                }))
+                .expect("test MCP server config should be valid"),
             );
-            if let Some(echo_tool) = echo_tool {
-                assert_eq!(
-                    echo_tool["description"]
-                        .as_str()
-                        .is_some_and(|description| description.contains("exec tool declaration:")),
-                    !omit_code_mode,
-                    "the MCP tool description must agree with Code Mode availability; \
-                 omit_tools_from={omit_tools_from:?}, code_mode_only={code_mode_only}, \
-                 namespace={namespace}"
-                );
-            }
-
-            let exec_description = body["tools"]
-                .as_array()
-                .expect("request should contain tools")
-                .iter()
-                .find_map(|tool| {
-                    (tool["name"].as_str() == Some("exec"))
-                        .then(|| tool["description"].as_str())
-                        .flatten()
-                })
-                .expect("Code Mode exec should remain available");
-            let nested_tool_name = format!("{namespace}__echo");
-            if code_mode_only {
-                assert_eq!(
-                    exec_description.contains(&nested_tool_name),
-                    !omit_code_mode && (!supports_search_tool || omit_deferred),
-                    "the Code Mode declaration must agree with MCP tool exposure; \
-                 omit_tools_from={omit_tools_from:?}, \
-                 supports_search_tool={supports_search_tool}, \
-                 nested_tool_name={nested_tool_name}"
-                );
-            }
-            let unrelated_nested_tool_name = format!("{namespace}__unrelated");
-            if code_mode_only {
-                assert!(
-                    exec_description.contains(&unrelated_nested_tool_name),
-                    "MCP omissions must not exclude unrelated tools sharing its namespace; \
-                 omit_tools_from={omit_tools_from:?}, \
-                 supports_search_tool={supports_search_tool}, \
-                 nested_tool_name={unrelated_nested_tool_name}"
-                );
-            } else {
-                let unrelated_tool = namespace_child_tool(&body, namespace, "unrelated")
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "MCP omissions must not hide an unrelated same-namespace tool; \
-                         omit_tools_from={omit_tools_from:?}, \
-                         supports_search_tool={supports_search_tool}, namespace={namespace}, \
-                         tools={:?}",
-                            tool_names(&body)
-                        )
-                    });
-                assert!(
-                    unrelated_tool["description"]
-                        .as_str()
-                        .is_some_and(|description| {
-                            description.contains(&unrelated_nested_tool_name)
-                                && description.contains("exec tool declaration:")
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test config should allow MCP servers");
+        });
+    let base_test = builder.build_with_auto_env(&server).await?;
+    let namespace = if non_prefixed_mcp_tool_names {
+        "rmcp"
+    } else {
+        "mcp__rmcp"
+    };
+    let new_thread = base_test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+                name: namespace.to_string(),
+                description: "An unrelated dynamic tool sharing the MCP namespace.".to_string(),
+                tools: vec![DynamicToolNamespaceTool::Function(
+                    DynamicToolFunctionSpec {
+                        name: "unrelated".to_string(),
+                        description: "A dynamic tool that must remain in Code Mode.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false,
                         }),
-                    "an unrelated same-namespace tool must remain available inside Code Mode; \
+                        defer_loading: false,
+                    },
+                )],
+            })],
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
+        .await?;
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+    wait_for_mcp_server(&test.codex, "rmcp").await?;
+    test.submit_turn("inspect the directly callable MCP tool")
+        .await?;
+
+    let body = response.single_request().body_json();
+    let omit_code_mode = omit_tools_from.contains(&"code_mode");
+    let omit_deferred = omit_tools_from.contains(&"deferred");
+    let omit_direct = omit_tools_from.contains(&"direct");
+    let available_directly = !omit_direct
+        && (!supports_search_tool || omit_deferred || code_mode_only && omit_code_mode);
+    let visible_directly = available_directly && (!code_mode_only || omit_code_mode);
+    let echo_tool = namespace_child_tool(&body, namespace, "echo");
+    assert_eq!(
+        echo_tool.is_some(),
+        visible_directly,
+        "MCP omissions must determine initial prompt exposure; \
+     omit_tools_from={omit_tools_from:?}, code_mode_only={code_mode_only}, \
+     supports_search_tool={supports_search_tool}, namespace={namespace}, tools={:?}",
+        tool_names(&body)
+    );
+    if let Some(echo_tool) = echo_tool {
+        assert_eq!(
+            echo_tool["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("exec tool declaration:")),
+            !omit_code_mode,
+            "the MCP tool description must agree with Code Mode availability; \
+         omit_tools_from={omit_tools_from:?}, code_mode_only={code_mode_only}, \
+         namespace={namespace}"
+        );
+    }
+
+    let exec_description = body["tools"]
+        .as_array()
+        .expect("request should contain tools")
+        .iter()
+        .find_map(|tool| {
+            (tool["name"].as_str() == Some("exec"))
+                .then(|| tool["description"].as_str())
+                .flatten()
+        })
+        .expect("Code Mode exec should remain available");
+    let nested_tool_name = format!("{namespace}__echo");
+    if code_mode_only {
+        assert_eq!(
+            exec_description.contains(&nested_tool_name),
+            !omit_code_mode && (!supports_search_tool || omit_deferred),
+            "the Code Mode declaration must agree with MCP tool exposure; \
+         omit_tools_from={omit_tools_from:?}, \
+         supports_search_tool={supports_search_tool}, \
+         nested_tool_name={nested_tool_name}"
+        );
+    }
+    let unrelated_nested_tool_name = format!("{namespace}__unrelated");
+    if code_mode_only {
+        assert!(
+            exec_description.contains(&unrelated_nested_tool_name),
+            "MCP omissions must not exclude unrelated tools sharing its namespace; \
+         omit_tools_from={omit_tools_from:?}, \
+         supports_search_tool={supports_search_tool}, \
+         nested_tool_name={unrelated_nested_tool_name}"
+        );
+    } else {
+        let unrelated_tool =
+            namespace_child_tool(&body, namespace, "unrelated").unwrap_or_else(|| {
+                panic!(
+                    "MCP omissions must not hide an unrelated same-namespace tool; \
                  omit_tools_from={omit_tools_from:?}, \
-                 supports_search_tool={supports_search_tool}, \
-                 nested_tool_name={unrelated_nested_tool_name}"
-                );
-            }
-        }
+                 supports_search_tool={supports_search_tool}, namespace={namespace}, \
+                 tools={:?}",
+                    tool_names(&body)
+                )
+            });
+        assert!(
+            unrelated_tool["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains(&unrelated_nested_tool_name)
+                        && description.contains("exec tool declaration:")
+                }),
+            "an unrelated same-namespace tool must remain available inside Code Mode; \
+         omit_tools_from={omit_tools_from:?}, \
+         supports_search_tool={supports_search_tool}, \
+         nested_tool_name={unrelated_nested_tool_name}"
+        );
     }
 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> Result<()> {
-    skip_if_wine_exec!(
-        Ok(()),
-        "requires a Windows test_stdio_server in the Wine-exec environment"
-    );
-    skip_if_no_network!(Ok(()));
-
-    for omit_tools_from in [
+// Merge-safety anchor: Each generated Cartesian scenario keeps a fresh fixture, so timeout and
+// failure attribution stays per scenario; this changes test structure only, not Code Mode runtime behavior.
+#[test_matrix(
+    [
         &["code_mode"][..],
         &["deferred"][..],
         &["direct"][..],
@@ -1067,139 +1062,144 @@ async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure() -> 
         &["deferred", "direct"][..],
         &["code_mode", "deferred", "direct"][..],
         &[][..],
-    ] {
-        for (supports_search_tool, non_prefixed_mcp_tool_names, direct_only_namespace) in [
-            (false, false, false),
-            (false, false, true),
-            (false, true, false),
-            (false, true, true),
-            (true, false, false),
-            (true, false, true),
-            (true, true, false),
-            (true, true, true),
-        ] {
-            let namespace = if non_prefixed_mcp_tool_names {
-                "rmcp"
-            } else {
-                "mcp__rmcp"
-            };
-            let visible_directly = !omit_tools_from.contains(&"direct")
-                && (!supports_search_tool
-                    || omit_tools_from.contains(&"deferred")
-                    || direct_only_namespace);
-            let server = responses::start_mock_server().await;
-            let response = responses::mount_sse_once(
-                &server,
-                sse(vec![
-                    ev_response_created("resp-1"),
-                    if visible_directly {
-                        responses::ev_function_call_with_namespace(
-                            "call-1",
-                            namespace,
-                            "echo",
-                            r#"{"message":"ping"}"#,
-                        )
-                    } else {
-                        ev_assistant_message("msg-1", "done")
-                    },
-                    ev_completed("resp-1"),
-                ]),
-            )
-            .await;
-            let follow_up_response = if visible_directly {
-                Some(
-                    responses::mount_sse_once(
-                        &server,
-                        sse(vec![
-                            ev_assistant_message("msg-1", "done"),
-                            ev_completed("resp-2"),
-                        ]),
-                    )
-                    .await,
+    ],
+    [false, true],
+    [false, true],
+    [false, true]
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_code_mode_exclusion_does_not_change_direct_mode_tool_exposure(
+    omit_tools_from: &'static [&'static str],
+    supports_search_tool: bool,
+    non_prefixed_mcp_tool_names: bool,
+    direct_only_namespace: bool,
+) -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let namespace = if non_prefixed_mcp_tool_names {
+        "rmcp"
+    } else {
+        "mcp__rmcp"
+    };
+    let visible_directly = !omit_tools_from.contains(&"direct")
+        && (!supports_search_tool
+            || omit_tools_from.contains(&"deferred")
+            || direct_only_namespace);
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            if visible_directly {
+                responses::ev_function_call_with_namespace(
+                    "call-1",
+                    namespace,
+                    "echo",
+                    r#"{"message":"ping"}"#,
                 )
             } else {
-                None
-            };
-            let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
-            let environment_id = remote_aware_environment_id();
-            let mut builder = test_codex()
-                .with_model_info_override("gpt-5.4", move |model| {
-                    model.supports_search_tool = supports_search_tool;
-                })
-                .with_config(move |config| {
-                    if non_prefixed_mcp_tool_names {
-                        config
-                            .features
-                            .enable(Feature::NonPrefixedMcpToolNames)
-                            .expect("test config should allow unprefixed MCP tools");
-                    }
-                    if direct_only_namespace {
-                        config.code_mode.direct_only_tool_namespaces = vec![
-                            if non_prefixed_mcp_tool_names {
-                                "rmcp"
-                            } else {
-                                "mcp__rmcp"
-                            }
-                            .to_string(),
-                        ];
-                    }
-
-                    let mut servers = config.mcp_servers.get().clone();
-                    servers.insert(
-                        "rmcp".to_string(),
-                        serde_json::from_value(serde_json::json!({
-                            "command": rmcp_test_server_bin,
-                            "environment_id": environment_id,
-                            "cwd": config.cwd,
-                            "omit_tools_from": omit_tools_from,
-                        }))
-                        .expect("test MCP server config should be valid"),
-                    );
-                    config
-                        .mcp_servers
-                        .set(servers)
-                        .expect("test config should allow MCP servers");
-                });
-            let test = builder.build_with_auto_env(&server).await?;
-            wait_for_mcp_server(&test.codex, "rmcp").await?;
-            test.submit_turn("inspect ordinary direct-mode MCP tool exposure")
-                .await?;
-
-            let body = response.single_request().body_json();
-            assert_eq!(
-                namespace_child_tool(&body, namespace, "echo").is_some(),
-                visible_directly,
-                "MCP omissions must determine direct-mode tool exposure; \
-             omit_tools_from={omit_tools_from:?}, \
-             supports_search_tool={supports_search_tool}, \
-             direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
-                tool_names(&body)
-            );
-            assert_eq!(
-                tool_names(&body).iter().any(|name| name == "tool_search"),
-                supports_search_tool,
-                "MCP omissions must not disable tool search for other tools; \
-             omit_tools_from={omit_tools_from:?}, \
-             supports_search_tool={supports_search_tool}, \
-             direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
-                tool_names(&body)
-            );
-            if let Some(follow_up_response) = follow_up_response {
-                let output = follow_up_response
-                    .single_request()
-                    .function_call_output("call-1");
-                assert!(
-                    output["output"]
-                        .as_str()
-                        .is_some_and(|output| output.contains("ECHOING: ping")),
-                    "the advertised MCP tool must remain callable; \
-                     omit_tools_from={omit_tools_from:?}, \
-                     supports_search_tool={supports_search_tool}, \
-                     direct_only_namespace={direct_only_namespace}, \
-                     namespace={namespace}, output={output:?}"
-                );
+                ev_assistant_message("msg-1", "done")
+            },
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up_response = if visible_directly {
+        Some(
+            responses::mount_sse_once(
+                &server,
+                sse(vec![
+                    ev_assistant_message("msg-1", "done"),
+                    ev_completed("resp-2"),
+                ]),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let rmcp_test_server_bin = remote_aware_stdio_server_bin()?;
+    let environment_id = remote_aware_environment_id();
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", move |model| {
+            model.supports_search_tool = supports_search_tool;
+        })
+        .with_config(move |config| {
+            if non_prefixed_mcp_tool_names {
+                config
+                    .features
+                    .enable(Feature::NonPrefixedMcpToolNames)
+                    .expect("test config should allow unprefixed MCP tools");
             }
-        }
+            if direct_only_namespace {
+                config.code_mode.direct_only_tool_namespaces = vec![
+                    if non_prefixed_mcp_tool_names {
+                        "rmcp"
+                    } else {
+                        "mcp__rmcp"
+                    }
+                    .to_string(),
+                ];
+            }
+
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "rmcp".to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "command": rmcp_test_server_bin,
+                    "environment_id": environment_id,
+                    "cwd": config.cwd,
+                    "omit_tools_from": omit_tools_from,
+                }))
+                .expect("test MCP server config should be valid"),
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test config should allow MCP servers");
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    wait_for_mcp_server(&test.codex, "rmcp").await?;
+    test.submit_turn("inspect ordinary direct-mode MCP tool exposure")
+        .await?;
+
+    let body = response.single_request().body_json();
+    assert_eq!(
+        namespace_child_tool(&body, namespace, "echo").is_some(),
+        visible_directly,
+        "MCP omissions must determine direct-mode tool exposure; \
+     omit_tools_from={omit_tools_from:?}, \
+     supports_search_tool={supports_search_tool}, \
+     direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
+        tool_names(&body)
+    );
+    assert_eq!(
+        tool_names(&body).iter().any(|name| name == "tool_search"),
+        supports_search_tool,
+        "MCP omissions must not disable tool search for other tools; \
+     omit_tools_from={omit_tools_from:?}, \
+     supports_search_tool={supports_search_tool}, \
+     direct_only_namespace={direct_only_namespace}, namespace={namespace}, tools={:?}",
+        tool_names(&body)
+    );
+    if let Some(follow_up_response) = follow_up_response {
+        let output = follow_up_response
+            .single_request()
+            .function_call_output("call-1");
+        assert!(
+            output["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("ECHOING: ping")),
+            "the advertised MCP tool must remain callable; \
+             omit_tools_from={omit_tools_from:?}, \
+             supports_search_tool={supports_search_tool}, \
+             direct_only_namespace={direct_only_namespace}, \
+             namespace={namespace}, output={output:?}"
+        );
     }
 
     Ok(())
@@ -1596,6 +1596,31 @@ text(output.output);
         "nested tool calls must not be recorded while executed-tool-call metadata is disabled",
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_does_not_expose_update_plan_by_default() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let (_test, second_mock) = run_code_mode_turn(
+        &server,
+        "inspect the available tools",
+        r#"
+text(JSON.stringify({
+  callable: typeof tools.update_plan === "function",
+  listed: ALL_TOOLS.some(({ name }) => name === "update_plan"),
+}));
+"#,
+    )
+    .await?;
+
+    let (output, _) = custom_tool_output_body_and_success(&second_mock.single_request(), "call-1");
+    assert_eq!(
+        serde_json::from_str::<Value>(&output)?,
+        serde_json::json!({ "callable": false, "listed": false })
+    );
     Ok(())
 }
 
@@ -3830,6 +3855,89 @@ text("after");
     );
     assert_eq!(text_item(&items, /*index*/ 1), "before");
     assert_eq!(output, "before");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_omits_short_audio_and_preserves_other_output() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let [short_audio_url, valid_audio_url] = [120_u32, 600].map(|frames| {
+        let sample_rate = 24_000_u32;
+        let data_size = frames * 2;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.resize(44 + data_size as usize, /*value*/ 0);
+        format!("data:audio/wav;base64,{}", BASE64_STANDARD.encode(wav))
+    });
+    let code = format!(
+        r#"
+text("before");
+audio({short_audio_url:?});
+text("between");
+audio({valid_audio_url:?});
+text("after");
+"#,
+    );
+
+    let server = responses::start_mock_server().await;
+    let mut builder = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.input_modalities.push(InputModality::Audio);
+        })
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call("call-1", "exec", &code),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("use exec to return short and valid audio with text")
+        .await?;
+
+    let req = second_mock.single_request();
+    let items = custom_tool_output_items(&req, "call-1");
+    let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
+    assert_ne!(success, Some(false));
+    assert_eq!(
+        &items[1..],
+        &[
+            serde_json::json!({ "type": "input_text", "text": "before" }),
+            serde_json::json!({
+                "type": "input_text",
+                "text": "Audio output omitted because the clip is shorter than 25 ms; use a longer clip."
+            }),
+            serde_json::json!({ "type": "input_text", "text": "between" }),
+            serde_json::json!({ "type": "input_audio", "audio_url": valid_audio_url }),
+            serde_json::json!({ "type": "input_text", "text": "after" }),
+        ]
+    );
 
     Ok(())
 }

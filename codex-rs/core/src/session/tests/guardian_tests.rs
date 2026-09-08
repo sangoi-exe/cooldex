@@ -89,6 +89,8 @@ where
     }
 }
 
+// Merge-safety anchor: guardian authority tests install tasks through the current Session owner
+// so published task and TurnSlot state remain coupled.
 async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<TurnContext> {
     let (current_turn, _) = session
         .new_turn_with_sub_id(
@@ -107,15 +109,13 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
         .await
         .expect("next turn should accept different approval authority");
     session
-        .start_task(
+        .spawn_task(
             current_turn,
             Vec::new(),
             super::NeverEndingTask {
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
-            None,
-            crate::tasks::MailboxParentProvenance::Ignore,
         )
         .await;
 
@@ -629,10 +629,13 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
         .set(AskForApproval::Never)
         .expect("test setup should allow updating approval policy");
     let mut config = (*turn_context_raw.config).clone();
+    // Keep Never outside Full Access without requiring an OS sandbox for this routing test.
     config
         .permissions
-        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
-        .expect("test setup should allow disabling the permission profile");
+        .set_permission_profile(codex_protocol::models::PermissionProfile::External {
+            network: NetworkSandboxPolicy::Restricted,
+        })
+        .expect("test setup should allow external sandbox permissions");
     let TurnEnvironmentState::Ready(environment) =
         &mut turn_context_raw.environments.environments[0]
     else {
@@ -657,15 +660,13 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
     session
-        .start_task(
+        .spawn_task(
             Arc::clone(&turn_context),
             Vec::new(),
             super::NeverEndingTask {
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
-            None,
-            crate::tasks::MailboxParentProvenance::Ignore,
         )
         .await;
     let originating_turn_state = {
@@ -746,15 +747,13 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
     )
     .await;
     session
-        .start_task(
+        .spawn_task(
             Arc::clone(&turn),
             Vec::new(),
             super::NeverEndingTask {
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
-            None,
-            crate::tasks::MailboxParentProvenance::Ignore,
         )
         .await;
     // Inject later-step authority directly while live policy changes remain gated.
@@ -1293,6 +1292,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         auth_manager,
         models_manager,
+        git_root_discovery: Arc::default(),
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         skills_service,
         plugins_manager,

@@ -48,7 +48,6 @@ use codex_protocol::protocol::SessionSource as CoreSessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_rollout::RolloutItem;
-use codex_rollout::RolloutLine;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::read_session_meta_line;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
@@ -57,6 +56,7 @@ use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
@@ -106,6 +106,7 @@ async fn list_threads_with_sort(
     mcp.request(|request_id| ClientRequest::ThreadList {
         request_id,
         params: codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor,
             limit,
             sort_key,
@@ -145,6 +146,7 @@ async fn list_threads_for_relation(
     mcp.request(|request_id| ClientRequest::ThreadList {
         request_id,
         params: codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor,
             limit: Some(limit),
             sort_key: None,
@@ -221,7 +223,7 @@ fn set_rollout_cwd(path: &Path, cwd: &Path) -> Result<()> {
     let first_line = lines
         .first_mut()
         .ok_or_else(|| anyhow::anyhow!("rollout at {} is empty", path.display()))?;
-    let mut rollout_line: RolloutLine = serde_json::from_str(first_line)?;
+    let mut rollout_line = codex_rollout::parse_rollout_line(first_line)?;
     let RolloutItem::SessionMeta(mut session_meta_line) = rollout_line.item else {
         return Err(anyhow::anyhow!(
             "rollout at {} does not start with session metadata",
@@ -550,6 +552,7 @@ async fn thread_list_respects_cwd_filters() -> Result<()> {
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -663,6 +666,7 @@ sqlite = true
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -950,6 +954,7 @@ sqlite = true
 
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -986,6 +991,7 @@ sqlite = true
 
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -1015,6 +1021,7 @@ sqlite = true
 
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -1200,6 +1207,7 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
     let mut mcp = init_mcp(codex_home.path()).await?;
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -1226,6 +1234,7 @@ async fn thread_list_relation_filters_reject_invalid_requests() -> Result<()> {
     let thread_id = ThreadId::new().to_string();
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,
@@ -1302,6 +1311,8 @@ async fn thread_list_empty_source_kinds_defaults_to_interactive_only() -> Result
     Ok(())
 }
 
+// Merge-safety anchor: V2 list fixtures preserve persisted settings for unloaded threads and
+// live overrides for resumed threads.
 #[tokio::test]
 async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -1325,6 +1336,7 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
     append_rollout_item_to_path(&parent_rollout_path, &RolloutItem::SessionMeta(parent_meta))
         .await?;
     // Legacy children resume before the root restores the V2 registry from persisted spawn edges.
+    let mut expected_settings = HashMap::from([(cli_id.clone(), (None, None))]);
     let mut expected = vec![(cli_id.clone(), None, false)];
     let mut threads_to_resume = vec![(cli_id.clone(), SessionSource::Cli, Some(true))];
 
@@ -1380,25 +1392,34 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         let source = SessionSource::from(session_meta.meta.source.clone());
         let settings = if version == Some(MultiAgentVersion::V2) {
             session_meta.meta.base_instructions = Some(BaseInstructions::default());
-            Some(serde_json::from_value::<ThreadSettingsAppliedEvent>(json!({
-                "thread_id": thread_id.clone(),
-                "thread_settings": {
-                    "model": "mock-model",
-                    "model_provider_id": "mock_provider",
-                    "cwd": session_meta.meta.cwd.clone(),
-                    "approval_policy": "never",
-                    "approvals_reviewer": "user",
-                    "permission_profile": PermissionProfile::read_only(),
-                    "collaboration_mode": {
-                        "mode": "default",
-                        "settings": { "model": "mock-model" },
+            Some(serde_json::from_value::<ThreadSettingsAppliedEvent>(
+                json!({
+                    "thread_id": thread_id.clone(),
+                    "thread_settings": {
+                        "model": "mock-model",
+                        "model_provider_id": "mock_provider",
+                        "cwd": session_meta.meta.cwd.clone(),
+                        "approval_policy": "never",
+                        "approvals_reviewer": "user",
+                        "permission_profile": PermissionProfile::read_only(),
+                        "collaboration_mode": {
+                            "mode": "default",
+                            "settings": { "model": "mock-model" },
+                        },
+                        "shell_tool_enabled": true,
                     },
-                    "shell_tool_enabled": true,
-                },
-            }))?)
+                }),
+            )?)
         } else {
             None
         };
+        expected_settings.insert(
+            thread_id.clone(),
+            settings
+                .as_ref()
+                .map(|settings| (Some(settings.thread_settings.model.clone()), None))
+                .unwrap_or((None, None)),
+        );
         if let Some(version) = version {
             session_meta.meta.multi_agent_version = Some(version);
             append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(session_meta)).await?;
@@ -1423,18 +1444,26 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
 
     let mut mcp = init_mcp(codex_home.path()).await?;
     for (thread_id, source, capability) in threads_to_resume {
+        let (model, effort) = if thread_id == cli_id {
+            ("gpt-5.2", "high")
+        } else {
+            ("gpt-5.4", "low")
+        };
         let request_id = mcp
             .send_thread_resume_request(ThreadResumeParams {
                 thread_id: thread_id.clone(),
+                model: Some(model.to_string()),
+                config: Some([("model_reasoning_effort".to_string(), json!(effort))].into()),
                 ..Default::default()
             })
             .await?;
         let ThreadResumeResponse { thread, .. } =
             timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
         assert_eq!(
-            (thread.id, thread.source, thread.can_accept_direct_input),
-            (thread_id, source, capability)
+            (&thread.id, &thread.source, thread.can_accept_direct_input),
+            (&thread_id, &source, capability)
         );
+        expected_settings.insert(thread_id, (thread.model, thread.reasoning_effort));
     }
 
     let response = list_threads(
@@ -1449,6 +1478,18 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         /*archived*/ None,
     )
     .await?;
+    for thread in &response.data {
+        let expected_settings_for_thread = expected_settings
+            .get(&thread.id)
+            .expect("thread list response contains only expected fixture threads");
+        assert_eq!(
+            (thread.model.as_deref(), thread.reasoning_effort.clone()),
+            (
+                expected_settings_for_thread.0.as_deref(),
+                expected_settings_for_thread.1.clone(),
+            )
+        );
+    }
     expected.reverse();
     assert_eq!(
         response
@@ -1521,6 +1562,7 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: codex_app_server_protocol::ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -2342,6 +2384,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     } = {
         let request_id = mcp
             .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(1),
                 sort_key: Some(ThreadSortKey::UpdatedAt),
@@ -2383,6 +2426,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     } = {
         let request_id = mcp
             .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+                originators: None,
                 cursor: Some(backwards_cursor),
                 limit: Some(10),
                 sort_key: Some(ThreadSortKey::UpdatedAt),
@@ -2612,6 +2656,138 @@ async fn thread_list_archived_filter() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_list_rejects_originator_filter_but_accepts_empty_allowlist() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_minimal_config(codex_home.path())?;
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let request_id = mcp
+        .send_thread_list_request(serde_json::from_value(json!({
+            "originators": ["future_client"]
+        }))?)
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(
+        (error.error.code, error.error.message),
+        (
+            -32602,
+            "originator filtering is not supported by the local app-server".to_string()
+        ),
+    );
+    for params in [
+        json!({}),
+        json!({"originators": null}),
+        json!({"originators": []}),
+    ] {
+        let response: ThreadListResponse = mcp
+            .request(|request_id| ClientRequest::ThreadList {
+                request_id,
+                params: serde_json::from_value(params).expect("valid list params"),
+            })
+            .await?;
+        assert_eq!(response.data, Vec::new());
+    }
+    Ok(())
+}
+
+#[test_case::test_case("codex_work_desktop")]
+#[tokio::test]
+async fn thread_originator_is_preserved_in_list_read_and_resume(originator: &str) -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_runtime_config(codex_home.path(), &server.uri())?;
+    let mut mcp = init_mcp(codex_home.path()).await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            service_name: Some(originator.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(thread.originator.as_deref(), Some(originator));
+    let started: codex_app_server_protocol::ThreadStartedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("thread/started"),
+    )
+    .await??;
+    assert_eq!(started.thread, thread);
+    let thread_id = thread.id;
+
+    // The first turn exercises live metadata persistence, not rollout-file backfill.
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![UserInput::Text {
+                    text: "Persist this thread".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+    let completed: codex_app_server_protocol::TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed.turn.status,
+        codex_app_server_protocol::TurnStatus::Completed
+    );
+
+    for restart in [false, true] {
+        if restart {
+            assert!(
+                timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully())
+                    .await??
+                    .success()
+            );
+            mcp = init_mcp(codex_home.path()).await?;
+        }
+        let response: ThreadListResponse = mcp
+            .request(|request_id| ClientRequest::ThreadList {
+                request_id,
+                params: serde_json::from_value(json!({"useStateDbOnly": true}))
+                    .expect("valid list params"),
+            })
+            .await?;
+        assert_eq!(
+            response
+                .data
+                .into_iter()
+                .map(|thread| (thread.id, thread.originator))
+                .collect::<Vec<_>>(),
+            vec![(thread_id.clone(), Some(originator.to_string()))],
+        );
+        let read: ThreadReadResponse = mcp
+            .request(|request_id| ClientRequest::ThreadRead {
+                request_id,
+                params: ThreadReadParams {
+                    thread_id: thread_id.clone(),
+                    include_turns: false,
+                },
+            })
+            .await?;
+        assert_eq!(read.thread.originator.as_deref(), Some(originator));
+    }
+    let resumed: ThreadResumeResponse = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resumed.thread.originator.as_deref(), Some(originator));
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_list_invalid_cursor_returns_error() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_minimal_config(codex_home.path())?;
@@ -2620,6 +2796,7 @@ async fn thread_list_invalid_cursor_returns_error() -> Result<()> {
 
     let request_id = mcp
         .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            originators: None,
             cursor: Some("not-a-cursor".to_string()),
             limit: Some(2),
             sort_key: None,

@@ -395,6 +395,8 @@ mod tests {
         );
     }
 
+    // Merge-safety anchor: local in-memory compaction fixtures keep optional checkpoint fields
+    // aligned with persisted semantics.
     #[tokio::test]
     async fn bounded_rollout_tail_reports_limits_and_order() {
         let store = InMemoryThreadStore::default();
@@ -406,22 +408,30 @@ mod tests {
         let first = RolloutItem::Compacted(CompactedItem {
             message: "first".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
         let second = RolloutItem::Compacted(CompactedItem {
             message: "second".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
         store
             .append_items(AppendThreadItemsParams {
@@ -481,12 +491,16 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "durable despite metadata failure".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         live_thread
@@ -532,12 +546,16 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "must not become visible".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         live_thread
@@ -570,12 +588,16 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "flush must fail before metadata projection".to_string(),
             replacement_history: Some(Vec::new()),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
             post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         live_thread
@@ -1357,6 +1379,7 @@ fn stored_thread_from_state(
         });
 
     Ok(StoredThread {
+        originator: (!created.originator.is_empty()).then(|| created.originator.clone()),
         thread_id,
         extra_config: created.extra_config.clone(),
         rollout_path: metadata

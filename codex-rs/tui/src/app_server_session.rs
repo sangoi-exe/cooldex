@@ -8,6 +8,10 @@ mod history;
 mod models;
 mod rollout_history;
 
+#[cfg(test)]
+#[path = "app_server_session/collaboration_catalog_tests.rs"]
+mod collaboration_catalog_tests;
+
 pub(crate) use history::HISTORY_ITEM_PAGE_LIMIT;
 pub(crate) use history::HISTORY_ITEM_SCAN_LIMIT;
 pub(crate) use history::HistoryHydrationScope;
@@ -20,6 +24,7 @@ use crate::bottom_pane::FeedbackAudience;
 use crate::dynamic_tools_mcp::DynamicToolMcpServer;
 use crate::dynamic_tools_mcp::ThreadToolTransport;
 use crate::legacy_core::config::Config;
+use crate::local_settings::LocalSettings;
 use crate::service_tier_resolution;
 use crate::session_state::MessageHistoryMetadata;
 use crate::session_state::ThreadSessionState;
@@ -179,7 +184,8 @@ pub(crate) enum ThreadHistorySupport {
 }
 
 fn bootstrap_request_error(context: &'static str, err: TypedRequestError) -> color_eyre::Report {
-    color_eyre::eyre::eyre!("{context}: {err}")
+    let message = format!("{context}: {err}");
+    color_eyre::Report::new(err).wrap_err(message)
 }
 
 pub(crate) fn is_history_pagination_unsupported(source: &JSONRPCErrorError) -> bool {
@@ -291,10 +297,13 @@ pub(crate) struct AppServerBootstrap {
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) available_models: Vec<ModelPreset>,
+    pub(crate) collaboration_modes: Vec<codex_protocol::config_types::CollaborationModeMask>,
 }
 
 pub(crate) struct AppServerSession {
     client: AppServerClient,
+    // Merge-safety anchor: an instance-owned child remains supervised by this session so shutdown
+    // closes its client before the owned process and picker callers can reuse its endpoint.
     #[cfg(target_os = "linux")]
     instance_supervisor: Option<AppServerInstance>,
     next_request_id: i64,
@@ -382,6 +391,15 @@ pub(crate) enum TurnPermissionsOverride {
 pub(crate) struct UnsupportedLegacyPermissionProfile;
 
 impl AppServerSession {
+    /// Platform of the app-server process, not necessarily its executor.
+    pub(crate) fn app_server_platform_family(&self) -> Option<&str> {
+        self.client.platform_family()
+    }
+
+    pub(crate) fn app_server_platform_os(&self) -> Option<&str> {
+        self.client.platform_os()
+    }
+
     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
         Self {
             client,
@@ -470,6 +488,8 @@ impl AppServerSession {
         }
     }
 
+    // Merge-safety anchor: InstanceChild sessions retain their supervisor while preserving the
+    // upstream dynamic-tool transport builder for reconnectable remote sessions.
     #[cfg(target_os = "linux")]
     pub(crate) fn new_instance_child(
         client: AppServerClient,
@@ -478,6 +498,13 @@ impl AppServerSession {
         let mut session = Self::new(client, ThreadParamsMode::Embedded);
         session.instance_supervisor = Some(supervisor);
         session
+    }
+
+    pub(crate) fn with_thread_tool_transport(mut self, transport: ThreadToolTransport) -> Self {
+        if let ThreadToolTransport::Mcp(server) = transport {
+            self.dynamic_tool_mcp = Some(server);
+        }
+        self
     }
 
     pub(crate) fn with_remote_cwd_override(mut self, remote_cwd_override: Option<PathBuf>) -> Self {
@@ -520,6 +547,11 @@ impl AppServerSession {
         {
             None
         }
+    }
+
+    /// Carry capabilities that may exist only in memory when the optional cache is unwritable.
+    pub(crate) fn inherit_task_tool_capabilities(&mut self, previous: &Self) {
+        self.task_tool_threads.extend(&previous.task_tool_threads);
     }
 
     pub(crate) fn task_tools_available(&self, thread_id: ThreadId) -> bool {
@@ -579,7 +611,7 @@ impl AppServerSession {
         // requirements together so an uncached model fetch can overlap both config requests.
         let model_request_id = self.next_request_id();
         let requirements_request_id = self.next_request_id();
-        let (models, requirements) = tokio::try_join!(
+        let (models, requirements, collaboration_modes) = tokio::try_join!(
             async {
                 self.client
                     .request_typed::<ModelListResponse>(ClientRequest::ModelList {
@@ -611,6 +643,7 @@ impl AppServerSession {
                         )
                     })
             },
+            async { Ok(crate::collaboration_modes::list(self.request_handle()).await) },
         )?;
         self.managed_new_thread_defaults = requirements
             .requirements
@@ -688,6 +721,7 @@ impl AppServerSession {
             feedback_audience,
             has_chatgpt_account,
             available_models,
+            collaboration_modes,
         })
     }
 
@@ -825,10 +859,12 @@ impl AppServerSession {
 
     pub(crate) async fn fork_thread(
         &mut self,
+        local_settings: &LocalSettings,
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at(
+            local_settings,
             config,
             thread_id,
             /*last_turn_id*/ None,
@@ -840,6 +876,7 @@ impl AppServerSession {
 
     pub(crate) async fn fork_thread_at(
         &mut self,
+        local_settings: &LocalSettings,
         config: Config,
         thread_id: ThreadId,
         last_turn_id: Option<String>,
@@ -847,6 +884,7 @@ impl AppServerSession {
         goal_continuation: ForkGoalContinuation,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at_with_presentation(
+            local_settings,
             config,
             thread_id,
             last_turn_id,
@@ -859,10 +897,12 @@ impl AppServerSession {
 
     pub(crate) async fn fork_side_thread(
         &mut self,
+        local_settings: &LocalSettings,
         config: Config,
         thread_id: ThreadId,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at_with_presentation(
+            local_settings,
             config,
             thread_id,
             /*last_turn_id*/ None,
@@ -873,8 +913,13 @@ impl AppServerSession {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keep local preferences separate while the legacy Config parameter is still required"
+    )]
     async fn fork_thread_at_with_presentation(
         &mut self,
+        local_settings: &LocalSettings,
         config: Config,
         thread_id: ThreadId,
         last_turn_id: Option<String>,
@@ -948,6 +993,7 @@ impl AppServerSession {
                     /*turn_cursor*/ None,
                     /*item_cursor*/ None,
                     Some(&config),
+                    Some(local_settings),
                     HistoryHydrationScope::Initial,
                 )
                 .await
@@ -976,9 +1022,11 @@ impl AppServerSession {
         let Some(model) = config.model.as_deref().or(self.default_model.as_deref()) else {
             return config.clone();
         };
+        let local_settings = LocalSettings::from(config);
         let mut session_config = config.clone();
         match service_tier_resolution::service_tier_update_for_core(
             config,
+            &local_settings.notices,
             model,
             &self.available_models,
         ) {
@@ -1092,6 +1140,7 @@ impl AppServerSession {
             /*turn_cursor*/ None,
             /*item_cursor*/ None,
             /*config*/ None,
+            /*local_settings*/ None,
             HistoryHydrationScope::Initial,
         )
         .await?;
@@ -1226,6 +1275,7 @@ impl AppServerSession {
     pub(crate) async fn turn_start(
         &mut self,
         thread_id: ThreadId,
+        client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -1249,7 +1299,7 @@ impl AppServerSession {
                 params: TurnStartParams {
                     thread_id: thread_id.to_string(),
                     turn_trigger: None,
-                    client_user_message_id: None,
+                    client_user_message_id: Some(client_user_message_id),
                     input: items,
                     tool_output: None,
                     responsesapi_client_metadata: None,
@@ -1307,6 +1357,7 @@ impl AppServerSession {
         &mut self,
         thread_id: ThreadId,
         turn_id: String,
+        client_user_message_id: String,
         items: Vec<UserInput>,
     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
         let request_id = self.next_request_id();
@@ -1315,7 +1366,7 @@ impl AppServerSession {
                 request_id,
                 params: TurnSteerParams {
                     thread_id: thread_id.to_string(),
-                    client_user_message_id: None,
+                    client_user_message_id: Some(client_user_message_id),
                     input: items,
                     responsesapi_client_metadata: None,
                     additional_context: None,
@@ -1838,8 +1889,9 @@ fn config_request_overrides_from_config(
 }
 
 fn service_tier_override_from_config(config: &Config) -> Option<Option<String>> {
+    let local_settings = LocalSettings::from(config);
     config.service_tier.clone().map(Some).or_else(|| {
-        (config.notices.fast_default_opt_out == Some(true))
+        (local_settings.notices.fast_default_opt_out == Some(true))
             .then(|| Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()))
     })
 }
@@ -1860,7 +1912,7 @@ fn sandbox_mode_from_permission_profile(
                     .network_sandbox_policy()
                     .is_enabled()
                     .then_some(codex_app_server_protocol::SandboxMode::DangerFullAccess)
-            } else if file_system_policy.can_write_path_with_cwd(cwd, cwd) {
+            } else if file_system_policy.can_write_local_path_with_cwd(cwd, cwd) {
                 Some(codex_app_server_protocol::SandboxMode::WorkspaceWrite)
             } else {
                 Some(codex_app_server_protocol::SandboxMode::ReadOnly)
@@ -2310,8 +2362,11 @@ async fn thread_session_state_from_thread_response(
         .map(ThreadId::from_string)
         .transpose()
         .map_err(|err| format!("forked_from_id is invalid: {err}"))?;
-    let history_config =
-        codex_message_history::HistoryConfig::new(config.codex_home.clone(), &config.history);
+    let local_settings = LocalSettings::from(config);
+    let history_config = codex_message_history::HistoryConfig::new(
+        local_settings.codex_home,
+        &local_settings.history,
+    );
     let (log_id, entry_count) = codex_message_history::history_metadata(&history_config).await;
     Ok(ThreadSessionState {
         thread_id,
@@ -2456,6 +2511,7 @@ mod tests {
         RateLimitSnapshot {
             limit_id: Some(limit_id.to_string()),
             limit_name: None,
+            normal_model_slug: None,
             primary: Some(codex_app_server_protocol::RateLimitWindow {
                 used_percent: 0,
                 window_duration_mins: Some(10_080),
@@ -2539,6 +2595,9 @@ mod tests {
     #[test]
     fn app_server_rate_limit_snapshots_deduplicates_top_level_limit_from_map() {
         let response = GetAccountRateLimitsResponse {
+            ordinary_usage_allowed: None,
+            account_id: None,
+            rate_limit_upsell: None,
             rate_limits: rate_limit_snapshot("codex"),
             rate_limits_by_limit_id: Some(HashMap::from([
                 ("codex".to_string(), rate_limit_snapshot("codex")),
@@ -3340,7 +3399,12 @@ mod tests {
         app_server.available_models = vec![preset];
 
         let resumed = app_server
-            .resume_thread(config, thread_id, ResumeModelSettings::RestoreFromThread)
+            .resume_thread(
+                &LocalSettings::from(&config),
+                config,
+                thread_id,
+                ResumeModelSettings::RestoreFromThread,
+            )
             .await?;
 
         assert_eq!(resumed.session.service_tier, None);
@@ -3367,6 +3431,7 @@ mod tests {
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
         app_server
             .resume_thread(
+                &LocalSettings::from(&config),
                 config.clone(),
                 source_thread_id,
                 ResumeModelSettings::RestoreFromThread,
@@ -3379,10 +3444,18 @@ mod tests {
         let mut ephemeral_config = config;
         ephemeral_config.ephemeral = true;
         let normal_ephemeral_fork = app_server
-            .fork_thread(ephemeral_config.clone(), source_thread_id)
+            .fork_thread(
+                &LocalSettings::from(&ephemeral_config),
+                ephemeral_config.clone(),
+                source_thread_id,
+            )
             .await?;
         let side_fork = app_server
-            .fork_side_thread(ephemeral_config, source_thread_id)
+            .fork_side_thread(
+                &LocalSettings::from(&ephemeral_config),
+                ephemeral_config,
+                source_thread_id,
+            )
             .await?;
 
         assert_eq!(
@@ -3416,7 +3489,11 @@ mod tests {
         ephemeral_config.ephemeral = true;
 
         let fork = app_server
-            .fork_thread(ephemeral_config, source_thread_id)
+            .fork_thread(
+                &LocalSettings::from(&ephemeral_config),
+                ephemeral_config,
+                source_thread_id,
+            )
             .await?;
 
         assert_eq!(fork.session.forked_from_id, Some(source_thread_id));
@@ -3486,6 +3563,7 @@ mod tests {
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
         let resumed = app_server
             .resume_thread(
+                &LocalSettings::from(&config),
                 config.clone(),
                 source_thread_id,
                 ResumeModelSettings::RestoreFromThread,
@@ -3499,7 +3577,11 @@ mod tests {
         side_config.ephemeral = true;
         let next_request_id = app_server.next_request_id;
         let side = app_server
-            .fork_side_thread(side_config, source_thread_id)
+            .fork_side_thread(
+                &LocalSettings::from(&side_config),
+                side_config,
+                source_thread_id,
+            )
             .await?;
 
         assert_eq!(app_server.next_request_id, next_request_id + 1);
@@ -3590,8 +3672,12 @@ mod tests {
         )?;
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
 
-        let regular = app_server.fork_thread(config.clone(), thread_id).await?;
-        let side = app_server.fork_side_thread(config, thread_id).await?;
+        let regular = app_server
+            .fork_thread(&LocalSettings::from(&config), config.clone(), thread_id)
+            .await?;
+        let side = app_server
+            .fork_side_thread(&LocalSettings::from(&config), config, thread_id)
+            .await?;
 
         assert_eq!(regular.turns.len(), 1);
         assert!(matches!(
@@ -3691,6 +3777,8 @@ mod tests {
         let read_only_profile = PermissionProfile::read_only();
         let response = ThreadResumeResponse {
             thread: codex_app_server_protocol::Thread {
+                originator: None,
+                environments: None,
                 id: thread_id.to_string(),
                 extra: None,
                 session_id: ThreadId::new().to_string(),
@@ -3703,6 +3791,8 @@ mod tests {
                 project_id: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
+                model: None,
+                reasoning_effort: None,
                 created_at: 1,
                 updated_at: 2,
                 recency_at: Some(2),
@@ -3735,6 +3825,7 @@ mod tests {
                             phase: None,
                             memory_citation: None,
                             delivery: None,
+                            questions: None,
                         },
                     ],
                     status: TurnStatus::Completed,

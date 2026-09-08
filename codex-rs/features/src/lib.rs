@@ -18,7 +18,10 @@ mod feature_configs;
 mod legacy;
 pub use feature_configs::CodeModeConfigToml;
 pub use feature_configs::CodeModeHostConfigToml;
+// Merge-safety anchor: merge the local Computer Use/multi-agent feature surface with
+// upstream context management so the persisted recovery/retained/token history contract remains intact.
 pub use feature_configs::ComputerUseConfigToml;
+pub use feature_configs::ContextManagementConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
@@ -173,9 +176,10 @@ pub enum Feature {
     MemoryTool,
     /// Enable importing project-scoped memory from external agents.
     ExternalAgentMemoryImport,
-    /// Compress cold local thread-store rollout files.
+    /// Compress cold local thread-store rollout files, including shared histories.
+    /// Requires every reader of the Codex home to support compressed shared histories.
     LocalThreadStoreCompression,
-    /// Allow rollout compression on homes used exclusively by compressed-lineage-aware readers.
+    /// Removed compatibility flag; local_thread_store_compression controls all rollout files.
     LocalThreadStoreSharedCompression,
     /// Migrate legacy local rollout files to paginated history in the background.
     BackgroundPaginatedRolloutMigration,
@@ -205,6 +209,8 @@ pub enum Feature {
     EnableMcpApps,
     /// Enable MCP protocol version 2026-07-28 support.
     Mcp20260728,
+    /// Let RMCP coordinate OAuth refresh through the configured credential store.
+    McpOAuthRefreshCoordination,
     /// Removed compatibility flag for the legacy Apps MCP path override.
     AppsMcpPathOverride,
     /// Removed compatibility flag retained as a no-op now that tool_search is always enabled.
@@ -297,6 +303,9 @@ pub enum Feature {
     SendAsyncMessage,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
+    /// Select thread-owned context for both Guardian reviewers.
+    /// Read once from the thread's fixed feature set when Guardian evidence is initialized.
+    GuardianThreadContext,
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
     GuardianReuseParentCompaction,
     /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
@@ -311,6 +320,8 @@ pub enum Feature {
     Goals,
     /// Add current context-window metadata to model-visible context.
     TokenBudget,
+    /// Enables experimental context management.
+    ContextManagement,
     /// Track and report a shared token budget across a session's agent threads.
     RolloutBudget,
     /// Add current-time reminders to model-visible context.
@@ -329,7 +340,7 @@ pub enum Feature {
     FastMode,
     /// Enable explicitly requested model changes for later step captures.
     StepModelSwitching,
-    /// Enable experimental realtime voice conversation mode in the TUI.
+    /// Removed compatibility flag. Realtime sessions no longer require a per-thread opt-in.
     RealtimeConversation,
     /// Prevent idle system sleep while a turn is actively running.
     PreventIdleSleep,
@@ -363,6 +374,8 @@ pub enum Feature {
     WindowsSandbox,
     /// Use the elevated Windows sandbox pipeline (setup + runner).
     WindowsSandboxElevated,
+    /// Attempt elevated Windows sandbox provisioning through the installed service.
+    WindowsSandboxService,
     /// Legacy remote models flag kept for backward compatibility.
     RemoteModels,
     /// Removed legacy git commit attribution guidance flag.
@@ -762,6 +775,8 @@ pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<FeatureToml<TokenBudgetConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<FeatureToml<ContextManagementConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_budget: Option<FeatureToml<RolloutBudgetConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_time_reminder: Option<FeatureToml<CurrentTimeReminderConfigToml>>,
@@ -810,6 +825,13 @@ impl FeaturesToml {
         }
         if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::TokenBudget.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self
+            .context_management
+            .as_ref()
+            .and_then(FeatureToml::enabled)
+        {
+            entries.insert(Feature::ContextManagement.key().to_string(), enabled);
         }
         if let Some(enabled) = self.rollout_budget.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::RolloutBudget.key().to_string(), enabled);
@@ -1088,7 +1110,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::LocalThreadStoreSharedCompression,
         key: "local_thread_store_shared_compression",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1176,6 +1198,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::WindowsSandboxService,
+        key: "windows_sandbox_service",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::RemoteModels,
         key: "remote_models",
         stage: Stage::Removed,
@@ -1254,6 +1282,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Mcp20260728,
         key: "mcp_2026_07_28",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::McpOAuthRefreshCoordination,
+        key: "mcp_oauth_refresh_coordination",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1498,6 +1532,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::GuardianThreadContext,
+        key: "guardian_thread_context",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianReuseParentCompaction,
         key: "guardian_reuse_parent_compaction",
         stage: Stage::UnderDevelopment,
@@ -1536,6 +1576,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::TokenBudget,
         key: "token_budget",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ContextManagement,
+        key: "context_management",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
@@ -1602,7 +1648,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::RealtimeConversation,
         key: "realtime_conversation",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {

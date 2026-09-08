@@ -237,7 +237,9 @@ fn classified_identity(item: &ResponseItem) -> ClassifiedToolItem {
                 ClassifiedToolItem::UnsupportedOutput,
                 ClassifiedToolItem::Output,
             ),
+        // Merge-safety anchor: configuration controls remain singleton non-tool boundaries.
         ResponseItem::AdditionalTools { .. }
+        | ResponseItem::ConfigurationUpdate { .. }
         | ResponseItem::Message { .. }
         | ResponseItem::AgentMessage { .. }
         | ResponseItem::Reasoning { .. }

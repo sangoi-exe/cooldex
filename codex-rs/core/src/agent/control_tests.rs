@@ -14,6 +14,8 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
+use crate::session::multi_agents::resolve_usage_hints;
+use crate::session::step_context::StepContext;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use assert_matches::assert_matches;
@@ -24,7 +26,6 @@ use codex_history::CompactedItem;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
@@ -61,10 +62,13 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::WorldStateItem;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -286,7 +290,9 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::TurnContext(_) => None,
         })
         .expect("session metadata should be persisted")
@@ -433,7 +439,7 @@ async fn persisted_rollout_items(thread: &CodexThread) -> Vec<RolloutItem> {
     .expect("test thread rollout should be readable")
     .lines()
     .map(|line| {
-        serde_json::from_str::<RolloutLine>(line)
+        codex_rollout::parse_rollout_line(line)
             .expect("test thread rollout line should parse")
             .item
     })
@@ -867,8 +873,8 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
-// Merge-safety anchor: V2 reload keeps the existing persisted thread-settings
-// requirement for agent restoration without expanding its schema.
+// Merge-safety anchor: V2 reload and fork tests retain the local persisted identity
+// and post-compaction recovery-proof invariants as rollout fields evolve upstream.
 async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpectation) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -992,12 +998,16 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                 RolloutItem::Compacted(CompactedItem {
                     message: "bounded child context".to_string(),
                     replacement_history: Some(Vec::new()),
+                    guardian_history: None,
+                    retained_context: None,
                     mcp_resource_origins: None,
                     window_number: Some(1),
                     first_window_id: None,
                     previous_window_id: None,
                     window_id: None,
                     post_compact_recovery: None,
+                    compaction_response_id: None,
+                    latest_token_usage_record: None,
                 }),
             ])
             .await;
@@ -1755,7 +1765,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
     let lines = std::fs::read_to_string(&rollout_path)
         .expect("read child rollout")
         .lines()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse rollout line"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
         .collect::<Vec<_>>();
     let RolloutItem::SessionMeta(meta_line) = &lines[0].item else {
         panic!("child rollout should start with session metadata");
@@ -1849,6 +1859,8 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
                 }
                 .into(),
             ]),
+            guardian_history: None,
+            retained_context: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some(compaction_window_id.clone()),
@@ -1857,6 +1869,8 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
             }),
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         })])
         .await;
     parent_thread
@@ -1911,7 +1925,7 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     )
     .expect("read child rollout")
     .lines()
-    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .map(|line| codex_rollout::parse_rollout_line(line).expect("parse child rollout line"))
     .collect::<Vec<_>>();
     assert!(
         !child_rollout.iter().any(|line| matches!(
@@ -1957,6 +1971,8 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
             }
             .into(),
         ]),
+        guardian_history: None,
+        retained_context: None,
         mcp_resource_origins: None,
         window_number: Some(2),
         first_window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000".to_string()),
@@ -1965,6 +1981,8 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
         post_compact_recovery: Some(PostCompactRecoveryMarker {
             boundary_item_id: owned_boundary_id.to_string(),
         }),
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     });
     let owned_application =
         RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
@@ -2020,6 +2038,8 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
             RolloutItem::Compacted(CompactedItem {
                 message: "summary".to_string(),
                 replacement_history: Some(vec![boundary.into()]),
+                guardian_history: None,
+                retained_context: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: Some(compaction_window_id.clone()),
@@ -2028,6 +2048,8 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: boundary_item_id.to_string(),
                 }),
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
@@ -2070,7 +2092,7 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
     )
     .expect("read child rollout")
     .lines()
-    .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout line"))
+    .map(|line| codex_rollout::parse_rollout_line(line).expect("parse child rollout line"))
     .collect::<Vec<_>>();
     let pending = child_rollout
         .iter()
@@ -2161,6 +2183,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                     OMITTED_BOUNDARY,
                     "omitted prefix context",
                 )),
+                guardian_history: None,
+                retained_context: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
@@ -2169,6 +2193,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: OMITTED_BOUNDARY.to_string(),
                 }),
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             rollout_response_item(ResponseItem::Message {
                 id: None,
@@ -2206,6 +2232,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                     RETAINED_BOUNDARY,
                     "retained compressed context",
                 )),
+                guardian_history: None,
+                retained_context: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
@@ -2214,6 +2242,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: RETAINED_BOUNDARY.to_string(),
                 }),
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: RETAINED_PROOF_TURN.to_string(),
@@ -2242,6 +2272,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                     SIBLING_BOUNDARY,
                     "retained sibling context",
                 )),
+                guardian_history: None,
+                retained_context: None,
                 mcp_resource_origins: None,
                 window_number: Some(2),
                 first_window_id: Some(SOURCE_FIRST_ALIAS.to_string()),
@@ -2250,6 +2282,8 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: SIBLING_BOUNDARY.to_string(),
                 }),
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             rollout_response_item(spawn_agent_call("spawn-call-l07")),
         ])
@@ -2469,6 +2503,127 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
 }
 
 #[tokio::test]
+async fn spawn_agent_fork_drops_inherited_token_usage_state() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
+    let parent_usage = TokenUsage {
+        total_tokens: 120,
+        ..TokenUsage::default()
+    };
+    let parent_record = TokenUsageRecord {
+        thread_id: parent_thread_id,
+        turn_id: "parent-turn".to_string(),
+        session_id: parent_thread.session.session_id(),
+        root_turn_id: "parent-turn".to_string(),
+        response_id: "parent-response".to_string(),
+        usage: parent_usage.clone(),
+        turn_token_usage: parent_usage.clone(),
+        thread_token_usage: parent_usage,
+    };
+    let parent_spawn_call_id = "spawn-call-token-usage".to_string();
+    parent_thread
+        .session
+        .persist_rollout_items(&[
+            RolloutItem::Compacted(CompactedItem {
+                message: String::new(),
+                replacement_history: Some(vec![user_message("compacted parent context").into()]),
+                retained_context: None,
+                guardian_history: None,
+                mcp_resource_origins: None,
+                window_number: None,
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+                post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: Some(parent_record.clone()),
+            }),
+            RolloutItem::TokenUsageRecord(parent_record),
+            rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
+        ])
+        .await;
+
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+
+    let child_usage = TokenUsage {
+        total_tokens: 80,
+        ..TokenUsage::default()
+    };
+    let turn_context = child_thread.session.new_default_turn().await;
+    child_thread
+        .session
+        .record_observed_response_completed(
+            turn_context.as_ref(),
+            "child-response",
+            Some(&child_usage),
+            /*usage_metadata*/ None,
+        )
+        .await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush");
+    let rollout_path = child_thread
+        .rollout_path()
+        .expect("child rollout should exist");
+    let lines = std::fs::read_to_string(&rollout_path)
+        .expect("read child rollout")
+        .lines()
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
+        .collect::<Vec<_>>();
+    assert!(
+        !lines.iter().any(|line| {
+            matches!(
+                &line.item,
+                RolloutItem::TokenUsageRecord(record) if record.thread_id == parent_thread_id
+            )
+        }),
+        "child rollout should not inherit parent token usage records"
+    );
+    assert!(
+        lines.iter().all(|line| {
+            !matches!(
+                &line.item,
+                RolloutItem::Compacted(compacted)
+                    if compacted.latest_token_usage_record.is_some()
+            )
+        }),
+        "child rollout should not inherit parent token usage checkpoints"
+    );
+    let child_record = lines.iter().rev().find_map(|line| match &line.item {
+        RolloutItem::TokenUsageRecord(record) => Some(record),
+        _ => None,
+    });
+    assert_eq!(
+        child_record,
+        Some(&TokenUsageRecord {
+            thread_id: child_thread_id,
+            turn_id: turn_context.sub_id.clone(),
+            session_id: child_thread.session.session_id(),
+            root_turn_id: turn_context.sub_id.clone(),
+            response_id: "child-response".to_string(),
+            usage: child_usage.clone(),
+            turn_token_usage: child_usage.clone(),
+            thread_token_usage: child_usage,
+        })
+    );
+}
+
+#[tokio::test]
 async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_provable_turns() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
@@ -2490,12 +2645,16 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                     }
                     .into(),
                 ]),
+                retained_context: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
                 post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             rollout_response_item(ResponseItem::Message {
                 id: None,
@@ -2964,6 +3123,16 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         Some("Child root guidance.".to_string());
     child_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Child subagent guidance.".to_string());
+    let child_usage_hints = resolve_usage_hints(
+        &child_config.multi_agent_v2,
+        /*catalog*/ None,
+        !child_config.update_plan_enabled && child_config.model_catalog.is_none(),
+    );
+    let expected_child_subagent_hint = child_usage_hints
+        .subagent
+        .as_ref()
+        .expect("configured child subagent hint should resolve")
+        .render();
     let new_thread = harness
         .manager
         .start_thread(StartThreadOptions::new(parent_config))
@@ -2972,6 +3141,12 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
     let parent_thread_id = new_thread.thread_id;
     let parent_thread = new_thread.thread;
     let turn_context = parent_thread.session.new_default_turn().await;
+    let parent_step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let parent_world_state = parent_thread
+        .session
+        .build_world_state_for_step(parent_step_context.as_ref())
+        .await
+        .expect("parent world state should build");
     let parent_spawn_call_id = "spawn-call-compacted-usage-hints".to_string();
     let parent_task = InterAgentCommunication::new(
         AgentPath::root(),
@@ -3023,6 +3198,12 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
             internal_chat_message_metadata_passthrough: None,
         },
     ];
+    let answer_event: codex_history::RetainedContextEvent = serde_json::from_value(serde_json::json!({
+        "type": "verified_answer", "turn_id": "parent-answer-turn", "call_id": "parent-answer-call",
+        "questions": [{"question": "Parent-local action?", "answer": "Parent only."}]
+    })).expect("verified answer fixture");
+    let mut retained_context = codex_history::RetainedContext::default();
+    retained_context.record(&answer_event);
     parent_thread
         .session
         .persist_rollout_items(&[
@@ -3031,14 +3212,24 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                retained_context: Some(retained_context),
+                guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
+                    user_message("Parent-local approval must not be inherited."),
+                ])),
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
                 post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
+            RolloutItem::WorldState(WorldStateItem::full(
+                parent_world_state.snapshot().into_object(),
+            )),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
+            RolloutItem::RetainedContext(answer_event),
             rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
         .await;
@@ -3067,12 +3258,7 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
             SpawnAgentOptions {
                 fork_parent_spawn_call_id: Some(parent_spawn_call_id),
                 fork_mode: Some(SpawnAgentForkMode::FullHistory),
-                multi_agent_v2_usage_hints: Some(ResolvedMultiAgentV2UsageHints {
-                    root: None,
-                    subagent: Some(MultiAgentRoleInstructions::catalog(
-                        "Catalog child subagent guidance.",
-                    )),
-                }),
+                multi_agent_v2_usage_hints: Some(child_usage_hints),
                 ..Default::default()
             },
         )
@@ -3085,7 +3271,19 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         .get_thread(child_thread_id)
         .await
         .expect("child thread should be registered");
+    wait_for_recorded_user_message(child_thread.as_ref(), "child task").await;
     let history = child_thread.session.clone_history().await;
+    assert!(
+        !history_contains_text(
+            history.conversation_history_snapshot().review_items(),
+            "Parent-local approval must not be inherited.",
+        ),
+        "a subagent must not inherit its parent review checkpoint",
+    );
+    assert_eq!(
+        history.retained_context(),
+        &codex_history::RetainedContext::default()
+    );
     assert!(
         history_contains_text(history.raw_items(), "compacted parent summary"),
         "forked child history should retain compacted non-hint content"
@@ -3094,9 +3292,13 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         !history_contains_text(history.raw_items(), "Catalog parent root guidance."),
         "forked child history should strip the resolved parent hint from compacted replacement history"
     );
-    assert!(
-        history_contains_text(history.raw_items(), "Catalog child subagent guidance."),
-        "full-history forked child should add the resolved child hint after compacted-history sanitization"
+    let child_subagent_hint_count = history
+        .raw_items()
+        .filter(|item| history_contains_text(std::iter::once(*item), &expected_child_subagent_hint))
+        .count();
+    assert_eq!(
+        child_subagent_hint_count, 1,
+        "full-history forked child should retain one resolved child hint after first-turn context generation"
     );
     assert!(
         !history
@@ -3133,11 +3335,6 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         ),
         "forked child history should preserve unrelated compacted developer fragments"
     );
-    assert!(
-        !history_contains_text(history.raw_items(), "Child subagent guidance."),
-        "full-history child should not append a fresh child subagent hint"
-    );
-
     let _ = harness
         .control
         .shutdown_live_agent(child_thread_id)
@@ -3218,12 +3415,16 @@ async fn spawn_agent_full_fork_does_not_append_child_instructions_after_compacti
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
                 ),
+                retained_context: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
                 post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
@@ -3369,12 +3570,16 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
             RolloutItem::Compacted(CompactedItem {
                 message: "legacy compacted summary".to_string(),
                 replacement_history: None,
+                retained_context: None,
+                guardian_history: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
                 post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
             }),
         ];
         if let Some(instructions) = parent_developer_instructions {

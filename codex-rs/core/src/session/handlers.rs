@@ -24,9 +24,7 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
-use crate::user_message_admission::UserMessageAdmission;
 use codex_history::RolloutItem;
-use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -41,15 +39,10 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
-use codex_protocol::turn_input::TurnInput as ProtocolTurnInput;
-use codex_protocol::turn_input::TurnInputMode;
-use codex_protocol::turn_input::TurnInputRequest;
-use codex_protocol::turn_input::TurnInputSubmission;
 use codex_thread_store::PersistContext;
 
 use crate::context_manager::is_user_turn_boundary;
@@ -63,6 +56,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+// Merge-safety anchor: user-turn admission stays in turn_input; handlers must not recreate
+// adapters around retired routing semantics.
 pub async fn interrupt(sess: &Arc<Session>) {
     sess.interrupt_task().await;
 }
@@ -83,71 +78,6 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
     .await;
 }
 
-pub async fn user_input_or_turn(
-    sess: &Arc<Session>,
-    sub_id: String,
-    mut request: TurnInputRequest,
-    client_user_message_id: Option<String>,
-    parent_turn_id: Option<String>,
-) {
-    if let ProtocolTurnInput::UserInput { client_id, .. } = &mut request.input
-        && client_id.is_none()
-    {
-        *client_id = client_user_message_id;
-    }
-    if request.start.parent_turn_id.is_none() {
-        request.start.parent_turn_id = parent_turn_id;
-    }
-    let admission = match turn_input::handle(
-        sess,
-        request,
-        TurnInputMode::StartOrSteer,
-        sub_id.clone(),
-    )
-    .await
-    {
-        Ok(TurnInputSubmission::Started { turn_id }) => {
-            Ok(UserMessageAdmission::Started { turn_id })
-        }
-        Ok(TurnInputSubmission::Steered { turn_id }) => {
-            Ok(UserMessageAdmission::Steered { turn_id })
-        }
-        Ok(TurnInputSubmission::NotSubmitted { reason }) => {
-            sess.send_event_raw(Event {
-                id: sub_id.clone(),
-                msg: EventMsg::Error(ErrorEvent {
-                    misalignment: None,
-                    message: format!("failed to submit turn input: {reason:?}"),
-                    codex_error_info: Some(CodexErrorInfo::BadRequest),
-                }),
-            })
-            .await;
-            Err(CodexErr::InvalidRequest(format!(
-                "failed to admit user message: {reason:?}"
-            )))
-        }
-        Err(error) => {
-            sess.send_event_raw(Event {
-                id: sub_id.clone(),
-                msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
-            })
-            .await;
-            Err(CodexErr::InvalidRequest(format!(
-                "failed to admit user message: {error:?}"
-            )))
-        }
-    };
-    sess.pending_user_message_admissions
-        .complete(&sub_id, admission);
-}
-
-pub async fn update_thread_settings(
-    sess: &Arc<Session>,
-    sub_id: String,
-    thread_settings: ThreadSettingsOverrides,
-) {
-    thread_settings::update(sess, sub_id, thread_settings).await;
-}
 /// Queues an inter-agent message, then lets the shared pending-work scheduler
 /// decide whether an idle session should start a regular turn.
 pub async fn inter_agent_communication(
@@ -443,16 +373,10 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .collect::<Vec<_>>();
     sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
-    if sess
-        .services
+    sess.services
         .thread_extension_data
-        .remove::<NodeReplReviewEvidence>()
-        .is_some()
-    {
-        sess.guardian_review_session
-            .invalidate_for_node_repl_evidence()
-            .await;
-    }
+        .remove::<NodeReplReviewEvidence>();
+    sess.guardian_review_session.invalidate().await;
     sess.services
         .agent_control
         .rollout_budget()
@@ -513,6 +437,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
+// Merge-safety anchor: preserve the fork's retired-turn distinction while upstream shutdown also stops shell prewarming.
 pub(super) enum ActiveTurnShutdown {
     Abort,
     AlreadyRetired,
@@ -528,6 +453,11 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>, active_turn: A
             sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
         }
         ActiveTurnShutdown::AlreadyRetired => {}
+    }
+    let shell_snapshot_prewarm = sess.state.lock().await.shell_snapshot_prewarm.take();
+    if let Some(shell_snapshot_prewarm) = shell_snapshot_prewarm {
+        shell_snapshot_prewarm.abort();
+        let _ = shell_snapshot_prewarm.await;
     }
     sess.hooks().shutdown().await;
     sess.async_hook_results.close();

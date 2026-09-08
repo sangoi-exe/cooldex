@@ -4,7 +4,6 @@ use codex_core::TurnInputRequest;
 use codex_core::TurnInputSubmission;
 use codex_core::UserMessageAdmission;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -26,6 +25,8 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+// Merge-safety anchor: persisted user-message assertions use codex_rollout's canonical JSONL decoder.
+
 fn persisted_user_input_request(text: &str, client_id: &str) -> TurnInputRequest {
     TurnInputRequest::new(TurnInput::UserInput {
         content: vec![UserInput::Text {
@@ -41,7 +42,7 @@ async fn persisted_user_message_texts(codex: &codex_core::CodexThread) -> Result
     let rollout = tokio::fs::read_to_string(rollout_path).await?;
     let mut texts = rollout
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter_map(|line| match line.item {

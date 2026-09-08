@@ -1,5 +1,6 @@
 use super::*;
 use crate::tasks::SessionTaskContext;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use pretty_assertions::assert_eq;
 
 struct BlockingTurnStartedTask {
@@ -67,10 +68,6 @@ fn user_input(text: &str) -> Vec<UserInput> {
     }]
 }
 
-fn user_input_request(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
-    codex_protocol::turn_input::TurnInputRequest::user_input(user_input(text))
-}
-
 async fn recv_turn_started(rx: &async_channel::Receiver<Event>, expected_turn_id: &str) -> Event {
     timeout(Duration::from_secs(2), async {
         loop {
@@ -113,6 +110,8 @@ async fn recv_turn_aborted(
     .expect("expected TurnAborted")
 }
 
+// Merge-safety anchor: generation waiters remain blocked until the successor emits TurnStarted
+// and then steer into that published successor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_waiters_release_only_after_successor_turn_started() {
     let (session, old_turn_context, rx) = make_session_and_context_with_rx().await;
@@ -166,14 +165,20 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
     let fresh_handler = tokio::spawn({
         let session = Arc::clone(&session);
         async move {
-            handlers::user_input_or_turn(
-                &session,
-                "fresh-waiter".to_string(),
-                user_input_request(fresh_text),
-                /*client_user_message_id*/ None,
-                /*parent_turn_id*/ None,
-            )
-            .await;
+            let mut submitted_input = SubmittedTurnInput::UserInput {
+                content: user_input(fresh_text),
+                client_id: None,
+            };
+            session
+                .steer_submitted_input(
+                    &mut submitted_input,
+                    /*additional_context*/ Default::default(),
+                    /*expected_turn_id*/ None,
+                    /*required_final_output_json_schema*/ None,
+                    /*responsesapi_client_metadata*/ None,
+                    /*incoming_root_turn_id*/ None,
+                )
+                .await
         }
     });
     tokio::task::yield_now().await;
@@ -209,7 +214,8 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
     timeout(Duration::from_secs(2), fresh_handler)
         .await
         .expect("fresh waiter should finish after TurnStarted")
-        .expect("fresh waiter task should not panic");
+        .expect("fresh waiter task should not panic")
+        .expect("fresh waiter should steer into the successor");
     timeout(Duration::from_secs(2), replacement)
         .await
         .expect("replacement should finish startup")

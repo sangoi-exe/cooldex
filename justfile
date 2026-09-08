@@ -109,7 +109,9 @@ test *args:
 
 [windows]
 test *args:
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @($args | Select-Object -Skip 1)
+    # Merge-safety anchor: native Windows test execution stays owned by the WSL
+    # cargo-guard planner route; do not recreate a raw-Cargo bypass here.
+    throw "Windows test execution is owned by WSL. From the repository root run: ./scripts/cargo-guard.sh verify --changed --mode full"
 
 validate *args:
     ../scripts/cargo-guard.sh verify --changed --mode standard {args}
@@ -251,7 +253,7 @@ mcp-server-run *args:
 
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
-    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-core --bin codex-write-config-schema
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-config-schema --bin codex-write-config-schema
 
 # Regenerate vendored app-server protocol schema artifacts.
 write-app-server-schema *args:

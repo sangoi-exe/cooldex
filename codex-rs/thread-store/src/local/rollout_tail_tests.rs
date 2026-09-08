@@ -3,12 +3,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -33,6 +33,8 @@ fn message(text: &str) -> RolloutItem {
     )
 }
 
+// Merge-safety anchor: tail fixtures decode persisted lines through codex_rollout so readback
+// follows the same envelope semantics as bounded reverse scans.
 fn append_line(path: &std::path::Path, ordinal: u64, item: RolloutItem) {
     let mut file = OpenOptions::new()
         .append(true)
@@ -122,7 +124,7 @@ async fn loads_legacy_fork_with_copied_source_session_metadata() {
         .expect("read parent rollout")
         .lines()
         .next()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse parent metadata"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse parent metadata"))
         .map(|line| line.item)
         .expect("parent metadata line");
 
@@ -139,7 +141,7 @@ async fn loads_legacy_fork_with_copied_source_session_metadata() {
         .expect("read child rollout")
         .lines()
         .skip(1)
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse child rollout item"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse child rollout item"))
         .map(|line| line.item)
         .collect::<Vec<_>>();
     append_line(child_path.as_path(), 1, parent_meta);
@@ -491,8 +493,7 @@ async fn recall_projection_ignores_redacted_historical_token_count_record() {
     .expect("write rollout");
     append_value(
         path.as_path(),
-        // Redacted from the historical token-count record that reproduced the
-        // strict flattened RolloutLine deserialization failure in the operator rollout.
+        // A deliberately malformed, recall-irrelevant token-count record.
         serde_json::json!({
             "timestamp": "2025-01-03T13:00:01Z",
             "type": "event_msg",
@@ -521,7 +522,7 @@ async fn recall_projection_ignores_redacted_historical_token_count_record() {
                     "limit_id": "redacted",
                     "limit_name": null,
                     "primary": {
-                        "used_percent": 97.5,
+                        "used_percent": "redacted",
                         "window_minutes": 300,
                         "resets_at": 1
                     },
@@ -707,7 +708,7 @@ async fn rejects_rollout_whose_physical_first_record_is_not_session_metadata() {
 fn set_history_base(path: &std::path::Path, history_base: HistoryPosition) {
     let contents = fs::read_to_string(path).expect("read child rollout");
     let (head, tail) = contents.split_once('\n').expect("session metadata line");
-    let mut line: RolloutLine = serde_json::from_str(head).expect("parse session metadata line");
+    let mut line = codex_rollout::parse_rollout_line(head).expect("parse session metadata line");
     let RolloutItem::SessionMeta(session_meta) = &mut line.item else {
         panic!("expected session metadata head");
     };

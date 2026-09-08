@@ -100,6 +100,7 @@ async fn projects_list_by_recency_and_preserve_metadata_timestamps() -> Result<(
                 .request(|request_id| ClientRequest::ThreadList {
                     request_id,
                     params: ThreadListParams {
+                        originators: None,
                         cursor: None,
                         limit: Some(10),
                         sort_key: None,
@@ -324,6 +325,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -369,6 +371,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -417,6 +420,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -610,6 +614,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -701,6 +706,7 @@ async fn deleted_project_is_dropped_before_first_durable_thread_persistence() ->
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -892,6 +898,7 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     for project_id in [String::new(), Uuid::now_v7().to_string()] {
         let request_id = server
             .send_thread_list_request(ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -978,6 +985,7 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     assert_eq!(error.error.code, -32601);
     let list_id = unsupported_projects
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(10),
             sort_key: None,

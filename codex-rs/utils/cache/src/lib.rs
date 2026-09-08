@@ -1,14 +1,17 @@
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use lru::LruCache;
 use sha1::Digest;
 use sha1::Sha1;
-use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
 
-/// A minimal LRU cache protected by a Tokio mutex.
+/// Merge-safety anchor: cache synchronization is origin-local `std::sync::Mutex`; Tokio gates
+/// runtime presence only.
+///
+/// A minimal LRU cache protected by a standard mutex.
 /// Calls outside a Tokio runtime are no-ops.
 pub struct BlockingLruCache<K, V> {
     inner: Mutex<LruCache<K, V>>,
@@ -124,7 +127,7 @@ where
     K: Eq + Hash,
 {
     tokio::runtime::Handle::try_current().ok()?;
-    Some(tokio::task::block_in_place(|| m.blocking_lock()))
+    Some(m.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// Computes the SHA-1 digest of `bytes`.
@@ -167,6 +170,42 @@ mod tests {
         assert!(cache.get(&"b").is_none());
         assert_eq!(cache.get(&"a"), Some(1));
         assert_eq!(cache.get(&"c"), Some(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reuses_value_for_same_key() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        let mut factory_calls = 0;
+
+        assert_eq!(
+            cache.get_or_insert_with("first", || {
+                factory_calls += 1;
+                1
+            }),
+            1
+        );
+        assert_eq!(
+            cache.get_or_insert_with("first", || {
+                factory_calls += 1;
+                2
+            }),
+            1
+        );
+
+        assert_eq!(factory_calls, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovers_from_poisoned_mutex() {
+        let cache = BlockingLruCache::new(NonZeroUsize::new(2).expect("capacity"));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().expect("initial lock");
+            panic!("poison cache mutex");
+        }));
+        assert!(result.is_err());
+
+        assert_eq!(cache.get_or_insert_with("first", || 1), 1);
+        assert_eq!(cache.get(&"first"), Some(1));
     }
 
     #[test]

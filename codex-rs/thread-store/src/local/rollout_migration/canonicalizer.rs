@@ -8,6 +8,8 @@
 //! The goal is to preserve the model-visible conversation, not to preserve every legacy record
 //! byte-for-byte. Filesystem publishing and SQLite projection intentionally live outside this
 //! module.
+// Merge-safety anchor: legacy canonicalization preserves persisted internal recovery, token, and
+// retained-context records even though those records are not model-visible conversation items.
 
 use chrono::DateTime;
 use codex_protocol::ThreadId;
@@ -293,7 +295,9 @@ impl LegacyRolloutCanonicalizer {
             item @ (RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RealtimeItem(_)
+            | RolloutItem::RetainedContext(_)
             | RolloutItem::SecurityRiskScore(_)
             | RolloutItem::WorldState(_)) => {
                 self.write_item(writer, &timestamp, item).await?;

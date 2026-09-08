@@ -4,6 +4,9 @@ use std::io::Seek;
 use std::io::SeekFrom;
 
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use crate::RolloutLine;
 
 const READ_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -163,6 +166,19 @@ where
                 self.record_reversed.push(byte);
             }
         }
+    }
+
+    // Merge-safety anchor: bounded physical-byte scanning, offsets, and reached-start status
+    // remain independent of the canonical decoder for persisted rollout lines.
+    /// Scans the next rollout record through the canonical persisted JSON decoder.
+    pub fn scan_next_rollout_line(&mut self) -> io::Result<Option<ScanOutcome<RolloutLine>>> {
+        Ok(self.scan_next::<Value>()?.map(|outcome| match outcome {
+            ScanOutcome::Parsed(value) => match crate::decode_rollout_line(value) {
+                Ok(line) => ScanOutcome::Parsed(line),
+                Err(error) => ScanOutcome::Rejected(error),
+            },
+            ScanOutcome::Rejected(error) => ScanOutcome::Rejected(error),
+        }))
     }
 
     fn read_previous_byte(&mut self) -> io::Result<Option<u8>> {
