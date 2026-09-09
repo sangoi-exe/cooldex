@@ -712,7 +712,11 @@ pub(crate) async fn record_pending_input(
     persist_context: PersistContext,
 ) {
     match pending_input {
-        TurnInput::UserInput { content, client_id } => {
+        TurnInput::UserInput {
+            content,
+            client_id,
+            acceptance_order,
+        } => {
             let awaiting_admission = client_id.as_deref().is_some_and(|client_id| {
                 sess.pending_user_message_admissions
                     .contains_client_id(client_id)
@@ -727,6 +731,7 @@ pub(crate) async fn record_pending_input(
                     turn_context.as_ref(),
                     content.as_slice(),
                     client_id.clone(),
+                    acceptance_order,
                     persist_context,
                 )
                 .await;
@@ -768,6 +773,7 @@ pub(crate) async fn record_pending_input(
                 turn_context.as_ref(),
                 content.as_slice(),
                 client_id,
+                acceptance_order,
                 persist_context,
             )
             .await;

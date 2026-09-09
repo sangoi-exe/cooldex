@@ -11,9 +11,14 @@
   particular plan path or status, branch or Git object, review state, live
   alias/symlink/binary identity, temporary path, validation receipt or hash, or
   last-reviewed timestamp.
-- `/home/lucas/.codex/config.toml` remains the owner of Codex-global lifecycle,
-  Scope, Gate, evidence, taxonomy, role, and instruction-corpus contracts. Use
-  narrow pointers instead of copying those rule bodies into this workspace.
+- `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and
+  `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` own
+  shared lead and child behavior. The exact session-selected profile config owns
+  its profile and route registry (for an Orch session,
+  `/home/lucas/.codex/orch.config.toml`); registered
+  `/home/lucas/.codex/agents/*.toml` files own role-specific behavior and verdict
+  semantics. Use narrow pointers instead of copying those rule bodies into this
+  workspace.
 
 ## Local Baseline
 
@@ -39,6 +44,13 @@
 - Resolve upstream conflicts manually from the canonical owner outward. Do not use
   whole-side conflict selection or preserve obsolete local paths through aliases,
   wrappers, dual reads, or fallback adapters.
+- For an admitted upstream sync, the root identifies the common base, local state,
+  and selected upstream; distinguishes upstream-only changes from fork divergences
+  and affected seams; reconciles changed contracts; updates directly affected
+  schemas, fixtures, and validation mapping; then validates bounded batches and
+  the integrated candidate. Every batch continues through errors to terminal
+  completion before failure investigation or correction. Do not freeze particular refs in durable
+  guidance or redesign unrelated upstream code.
 - When the current thread explicitly attaches a plan, verify its root branch and Git
   object, separate `.sangoi` branch and Git object, upstream instruction blob, and review
   anchors before mutation. Do not infer plan attachment from workspace files, completed
@@ -61,15 +73,10 @@
   `CODEX_COMPUTER_USE_TEMP_ROOT`.
 - Missing `mcp_bin` and `sky_bin` leaves the source/development Computer Use MCP
   runtime unavailable. Do not invent a fallback runtime pair.
-- The current live Computer Use worktree starts Xvfb display reservation at
-  `FIRST_DISPLAY = 90` and scans a high display range instead of relying on the
-  previous/default display allocation path. That high-range start is a proven
-  current code fact.
-- Workspace-local rationale: current-thread historical evidence records the
-  current user reporting another local Xvfb consumer in `~/work/chatgpt-web.js`
-  on `X0`, and separately reporting that using higher display IDs fixed the WSL
-  collision here. This file does not claim a stronger historical root cause
-  than that operator-reported fact pattern.
+- `codex-rs/ext/computer-use/AGENTS.md` is the Computer Use extension owner. Its
+  live worktree reserves Xvfb starting at `FIRST_DISPLAY = 90` and scans a high
+  display range rather than relying on the default allocation path; retain that
+  high-range invariant unless current evidence changes it.
 
 ## Upstream Defect Policy
 
@@ -98,6 +105,12 @@
 
 ## Product Architecture
 
+<!-- Merge-safety anchor: full-history V2 usage-hint identity persists a typed birth binding;
+do not reconstruct it from mutable configuration, hashes, thread settings, events, or rendered context. -->
+- `SessionMeta.agent_usage_hint_binding` is the canonical birth binding for durable
+  MultiAgentV2 usage-hint identity. `AgentIdentitySnapshot` and runtime `Config` carry
+  it; the runtime field is not a `ConfigToml` key. The PRD owns state, inheritance, and
+  legacy-restoration limits.
 - `.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` owns planned
   requirements, architecture boundaries, and shipped-status interpretation.
 
@@ -126,13 +139,13 @@
 - `scripts/cargo-validation.toml` owns resource profiles, job caps, one-thread runtime-test
   limits, and receipt placement under `.sangoi/validation/`. Missing guard, policy,
   profile, or receipt ownership fails closed.
-- For every Rust code change, run
-  `scripts/cooldex/rust-blast-radius-guard.py` from the workspace root against each
-  changed symbol or owning file/line before editing when possible and again after each
-  changed Rust file. Preserve the complete uncapped report outside model context and
-  consume a compact owner/follower-slice summary plus unresolved hits. Treat the report
-  as an impact inventory, not behavioral proof, and manually account for followers it
-  misses.
+- For each coherent semantic batch and changed contract, establish impact coverage
+  for canonical owners and direct followers. Use direct owner/follower evidence,
+  compiler/test results, and targeted searches when those decide the surface; use
+  `scripts/cooldex/rust-blast-radius-guard.py` for unresolved Rust-impact
+  questions. When used, preserve its complete uncapped report outside model
+  context, consume an owner/follower summary plus unresolved hits, and manually
+  account for followers it misses. A silent report is not completeness proof.
 - Before completion-class Code Review, materialize the actual review object and complete
   every targeted, finite-closure, and repository-input-provenance validation needed to
   establish that object. Earlier advisory review is non-final.
@@ -141,20 +154,25 @@
   completion-class review before those artifacts exist.
 - Expensive cumulative suites may remain post-review only when they do not define the
   reviewed object. Apply
-  `/home/lucas/.codex/config.toml#evidence-efficient-execution` when remediation or
+  `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md#evidence-efficient-execution` when remediation or
   proof-only corrections may reuse unchanged evidence.
-- The first ordinary validation of a review object must run the complete collector before
-  ordinary failures are fixed. `verify` keeps going by default; use `--fail-fast` only for
-  an explicit diagnostic reason, then use `--resume`, `--from-index`, or `--only-failed`
-  for subsequent iterations.
+- This root-wide sequencing rule applies to every admitted batch—not only guarded
+  validation—including diagnostic, prep, initial, retry, focused, and full runs:
+  it must continue through errors and reach terminal completion before failure
+  investigation or correction. Failure collection and waiting are allowed; existing
+  resource and safety boundaries remain in force. This sequencing rule does not
+  change validator implementation or CLI availability.
 
 <!-- Merge-safety anchor: native-Windows bulk validation is planner-accounted and PowerShell-executed; full-mode WSL test preparation uses the config-owned explicit package mapper while Linux production builds remain on the guarded WSL path. -->
 ### Native-Windows bulk test procedure
 
 - The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...`
   to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use
-  `--changed` for the current worktree and `--range <base>..<merge>` for a merge commit,
-  with `<base>` set to its first parent. An explicit `--windows-reuse-root
+  `--changed` to select paths from the current worktree and `--range <base>..<merge>` for
+  a merge commit, with `<base>` set to its first parent. `--changed` does not materialize
+  arbitrary unstaged or untracked worktree bytes: the native executor consumes the index
+  candidate, which requires worktree/index equality and no ordinary untracked source. The
+  root owns exact task staging; Workers do not stage. An explicit `--windows-reuse-root
   'F:\.cache\...existing-run-root...'` on either guarded action selects in-place native
   reuse; no selector keeps cold preparation. `--mode full` is the bulk collector. Never run
   Cargo or Nextest directly on native Windows, and never use the former Windows `just test`
@@ -168,6 +186,20 @@
   Linux/Unix-only tests run only as targeted guarded WSL commands; macOS-only tests are
   not applicable in this topology. WSL runs Linux checks and builds, plus those targeted
   Linux/Unix-only tests.
+<!-- Merge-safety anchor: only the native aggregate uses direct dev/test opt1 overrides;
+it retains limited symbols, debug assertions, and overflow checks while WSL codegen stays
+unchanged. -->
+- `commands.windows-nextest-workspace` in `scripts/cargo-validation.toml` applies direct
+  Cargo `--config` overrides to both `dev` and `test`: `opt-level=1`,
+  `debug="limited"`, `debug-assertions=true`, and `overflow-checks=true`. These settings
+  apply only to the native aggregate; WSL commands retain their existing codegen settings.
+  The default uses the existing profiles and does not add diagnostic verbosity.
+<!-- Merge-safety anchor: codex-voice-host source and workspace membership stay intact,
+but the planner must exclude only its validation and visibly retain its unvalidated limit. -->
+- `codex-voice-host` remains in the workspace and its source is not removed, but the
+  planner excludes it from every package-derived WSL validation rung and the native full
+  workspace aggregate. Each applicable plan must warn that it remains unvalidated; this
+  is not a claim that voice functionality works.
 - In `--mode full`, WSL test-target check/link preparation follows only the explicit WSL
   package mapping in `scripts/cargo-validation.toml`, which remains the list owner.
   Normal per-package Linux checks, strict Clippy, and Linux product builds stay on WSL;
@@ -182,6 +214,13 @@
   reuse retain 30 GiB of available RAM and the 16-build-job/8-test-thread ceiling. Do not run Cargo or Nextest
   concurrently in WSL and native Windows. A missing prerequisite, tool, manifest,
   candidate identity, space or RAM requirement, or required evidence must fail loud.
+- `--yolo` is an explicit per-plan native-Windows-only RAM/disk-floor override for
+  `./scripts/cargo-guard.sh plan ... --yolo` or `verify ... --yolo` when the selected
+  validation plan contains a native Windows command. It is invalid for prep and direct
+  guarded WSL Cargo, records the actual/required values and any bypass in native
+  preflight evidence, and does not weaken writer, mutex, bootstrap, candidate, or input
+  checks. It can cause paging, out-of-memory, disk-full, or incomplete outputs; it never
+  triggers automatic cleanup.
 - Every Windows-created mutable path belongs below literal `F:\.cache`: cold preparation
   creates its disposable candidate checkout, target directory, applicable `CARGO_HOME` and
   `RUSTUP_HOME`, `TEMP`/`TMP`, V8/compiler/tool caches, helper staging, and logs/evidence
@@ -196,10 +235,14 @@
   `PATH` or installs tools. `FORCE_COLOR=0` applies only to the test child. Retain
   `RUST_MIN_STACK=8388608`, and keep `PYTHONPYCACHEPREFIX` below that run's `TEMP`
   directory in `F:\.cache`.
-- All Windows-side writes, candidate materialization, Cargo/Nextest execution, and cleanup
-  must use a checked-in PowerShell script invoked from WSL. Do not write directly to
-  `/mnt/f` or generate an ad hoc PowerShell script. Resolve PowerShell 7 as `pwsh.exe` or
-  `pwsh`; fail loud when neither is available.
+- The supported WSL access path mounts Windows volumes read-only. Native `pwsh.exe` or
+  `pwsh` is the technical mechanism for Windows-side writes, not a user prohibition or
+  extra permission checkpoint. Maintained Cargo/Nextest execution, candidate
+  materialization, and cache cleanup remain owned by checked-in
+  `scripts/cargo-validate-windows.ps1` and `scripts/clear-windows-build-cache.ps1`;
+  a bounded diagnostic need not be checked in. Do not write directly to `/mnt/f`.
+  Installation, destructive actions, and privileged work retain their separate
+  authorization boundaries. Fail loud when neither PowerShell 7 command is available.
 - Without `--windows-reuse-root`, candidate materialization must be fresh, pristine,
   disposable, and match the frozen manifest and index identity without changing root refs,
   index, or worktree. With an explicit selector, reuse the selected existing native working
@@ -216,15 +259,17 @@
   writer exists, literal `F:\.cache` as the target, preservation of that root, and JSON
   stdout captured outside the target. Reuse must not trigger automatic cleanup. Deleted
   content is unrecoverable; do not issue a manual partial cleanup command.
-- The first ordinary execution for a validation object uses the complete collector and
-  continues to collect failures. Retry reuse matches action, stage, plan, input, and
+- The root-wide sequencing rule applies to every admitted native batch—including
+  diagnostic, prep, initial, retry, focused, and full runs: it continues through
+  errors to terminal completion before failure investigation or correction. Retry
+  reuse matches action, stage, plan, input, and
   validation-tooling identities exactly. When changed input or tooling leaves no matching
   prior evidence, `--only-failed` can execute zero commands and records partial coverage;
   `--resume` refuses partial summaries. Use `--fresh` to start a new full validation and
-  emit fresh results; it does not require discarding reusable compiled artifacts. Cache
-  reuse is separate from validation-result reuse. Keep this procedure durable: do not add
-  branch or object IDs, session IDs, timestamps, receipt/run paths, execution hashes, or
-  machine-state claims.
+  emit fresh results; it does not require discarding reusable compiled artifacts.
+  Compiled-cache reuse is separate from validation-result reuse. Keep this procedure
+  durable: do not add branch or object IDs, session IDs, timestamps, receipt/run paths,
+  execution hashes, or machine-state claims.
 
 <!-- cooldex-wsl-release-procedure:begin -->
 ## WSL Release Procedure
@@ -254,7 +299,7 @@
   properties, package metadata, and staged executable version.
 - Final Code Review covers the actual source commit plus staged asset hashes and local
   validation results.
-- Apply `/home/lucas/.codex/config.toml#evidence-efficient-execution` to proof-only
+- Apply `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md#evidence-efficient-execution` to proof-only
   corrections. When source and staged-asset hashes are unchanged, rerun the corrected
   mechanical proof against the same object; do not rebuild or reopen semantic review
   unless an accepted claim was explicitly invalidated.
@@ -264,7 +309,7 @@
   Rust-free WSL user environment and require the released version.
 <!-- cooldex-wsl-release-procedure:end -->
 
-<!-- upstream-agents-core:begin blob=faa57cc0db48123e1011f1eb47692cd3bbbcfc3a source=upstream/main -->
+<!-- upstream-agents-core:begin blob=fd0b9ed9e781bdb29bb11a8f62b777ad773fec81 source=upstream/main -->
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
@@ -530,7 +575,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 
 - `app-server-protocol/src/protocol/common.rs`
 - `app-server-protocol/src/protocol/v2.rs`
-- `app-server/README.md`
 
 ### Core Rules
 
@@ -564,7 +608,6 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 
 ### Development Workflow
 
-- Update app-server docs/examples when API behavior changes (at minimum `app-server/README.md`).
 - Regenerate schema fixtures when API shapes change:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
@@ -593,10 +636,23 @@ Codex supports running connected app-server and exec-server on different operati
 
 - `/home/lucas/work/codex/AGENTS.md` — durable workspace policy, exact upstream core,
   and stable root owner map.
+- `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and
+  `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` — shared
+  lead and child behavior owners.
+- Session-selected profile config — profile route registry and profile-specific
+  child-workflow owner; for an Orch session,
+  `/home/lucas/.codex/orch.config.toml`.
+- `/home/lucas/.codex/agents/` — registered specialist role behavior and verdict
+  owners.
 - `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` —
   product requirements, architecture boundaries, and shipped-status interpretation.
 - `/home/lucas/work/codex/.sangoi/reference/areas/cooldex-fork-feature-inventory.md` —
   detailed current fork-feature inventory, operator-support layout, and evidence limits.
+- `/home/lucas/work/codex/codex-rs/protocol/src/protocol.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/config/mod.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/agent/identity.rs`, and
+  `/home/lucas/work/codex/codex-rs/core/src/session/multi_agents.rs` — MultiAgentV2
+  usage-hint binding, full-history identity, and contextual-rendering owners.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`,
   `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
   `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust

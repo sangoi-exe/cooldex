@@ -12,7 +12,7 @@
 - `scripts/test-cargo-guard.sh` and `scripts/test-cargo-validate.py` - local regression coverage for the guard and planner.
 - `scripts/cargo-validate-windows.ps1` and `scripts/test-cargo-validate-windows.py` - native-Windows manifest executor and its deterministic PowerShell/fake-tool coverage.
 - `scripts/clear-windows-build-cache.ps1` and `scripts/test-clear-windows-build-cache.py` - exact `F:\.cache` cleanup seam and regression coverage.
-- `scripts/cooldex/rust-blast-radius-guard.py` - Rust reachability/impact-map helper required by root policy.
+- `scripts/cooldex/rust-blast-radius-guard.py` - Rust reachability/impact-map helper for unresolved impact questions.
 - `scripts/cooldex/test-rust-blast-radius-guard-items.py` - Python regression coverage for blast-radius item resolution and report-summary behavior.
 - `scripts/codex_package/` - Python package/release layout helpers and tests.
 - `scripts/install/install.sh` and `scripts/install/test_install_sh.py` - standalone GitHub Release resolution, checksum-verified installation, and regression coverage.
@@ -28,14 +28,36 @@
   resource contract. The executor fixes native test-child `RUST_MIN_STACK` at `8388608`
   (8 MiB). `cargo-guard.sh` owns WSL dispatch; the PowerShell helpers own native Windows
   execution, writes, and cleanup, not a second partitioning policy.
+<!-- Merge-safety anchor: native aggregate dev/test opt1 configuration remains literal
+command arguments with limited symbols, debug assertions, and overflow checks; WSL
+codegen remains unchanged. -->
+- `commands.windows-nextest-workspace` owns the exact native `--config` pairs for
+  `profile.dev` and `profile.test`: `opt-level=1`, `debug="limited"`,
+  `debug-assertions=true`, and `overflow-checks=true`. The settings are direct TOML argv
+  entries for the existing profiles. The default adds no diagnostic verbosity and leaves
+  WSL codegen unchanged.
+<!-- Merge-safety anchor: voice source remains workspace-owned, while only
+codex-voice-host validation is deliberately excluded through the TOML selection policy
+and planner warnings retain the unvalidated limitation. -->
+- `defaults.validation_excluded_packages` in `cargo-validation.toml` excludes only
+  `codex-voice-host` from package-derived WSL validation rungs and the full native
+  workspace aggregate. Retain its explicit path classification and plan warning; do not
+  treat this validation exclusion as source removal or product proof.
 - `cargo-validate.py` owns parsing and frozen-manifest projection of explicit
-  `--windows-reuse-root`; `cargo-validate-windows.ps1` owns selected-root compatibility and
-  source checks, in-place synchronization, fresh run paths, and the native test-child
-  environment. Root `AGENTS.md` owns the operator-facing cold/reuse and
-  validation-result-reuse rules.
+  `--windows-reuse-root` and native-Windows-only `--yolo`; `cargo-validate-windows.ps1`
+  owns selected-root compatibility and source checks, in-place synchronization, fresh run
+  paths, the native test-child environment, and the recorded resource-floor bypass. Root
+  `AGENTS.md` owns the operator-facing cold/reuse, override, and validation-result-reuse
+  rules.
 - Native Windows Cargo/Nextest is valid only through the WSL guard, frozen manifest, and
   checked-in PowerShell executor. Direct Windows Cargo/Nextest and the former Windows
   `just test` route are invalid.
+- The supported WSL access path mounts Windows volumes read-only. Native `pwsh.exe` or
+  `pwsh` is the technical mechanism for Windows-side writes, not a user prohibition or
+  extra permission checkpoint. The checked-in executor and cleanup scripts retain
+  ownership of maintained native Cargo/Nextest, candidate materialization, and destructive
+  cleanup; a bounded diagnostic need not be checked in. Installation, destructive actions,
+  and privileged work retain their separate authorization boundaries.
 - Windows-created mutable candidate, target, Cargo/Rustup, temporary, cache, staging, log,
   and evidence state must remain below literal `F:\.cache`; C: toolchains are read-only
   inputs, and WSL must not write directly to `/mnt/f`.
@@ -71,7 +93,9 @@ junctions as leaf entries and never traverses or deletes through their targets. 
 - In `--mode full`, `cargo-validate.py` gates WSL test-target preparation through the
   `wsl_runtime_packages` path-rule mapping in `cargo-validation.toml`; update that mapper
   and `test-cargo-validate.py` together. Other modes retain their current selection policy.
-- Root `AGENTS.md` `Native-Windows bulk test procedure` owns the exact-match retry and fresh-collection requirements.
+- Root `AGENTS.md` `Guarded Rust Validation` and `Native-Windows bulk test procedure`
+  own all-batch terminal collection before failure investigation/correction plus the
+  exact-match retry and fresh-collection requirements.
 <!-- Merge-safety anchor: keep selector provenance and this local validation map aligned so committed package deletions remain plannable without weakening unknown-path failures. -->
 - `cargo-validate.py` owns changed-surface selectors: `--changed`, `--commit`,
   `--range`, `--file`, and `--surface`. `--range` follows
@@ -82,6 +106,11 @@ junctions as leaf entries and never traverses or deletes through their targets. 
   and fail loud on malformed status records. A historical deletion cannot
   override a revision re-add, a current path, or an explicit `--file` selector.
   `--json` is machine-readable output, not a selector-input schema.
+- `--changed` selects paths from cached, unstaged, and ordinary untracked worktree
+  changes; it does not turn arbitrary worktree bytes into a native candidate.
+  `cargo-validate-windows.ps1` consumes the index candidate and requires
+  worktree/index equality with no ordinary untracked source. The root owns exact
+  task staging; Workers do not stage.
 - `cargo-guard.sh` preserves successful `-p/--package` caches and cleans only the failed package with `cargo clean -p <package>` after package-targeted failures or disk emergencies; broad clean stays limited to clean-required pressure without package targets.
 - When changing validation command selection, resource profiles, receipt semantics, cleanup behavior, or target-cache behavior, update the matching script tests and root Atlas/validation notes if validation truth changes.
 - `cargo-validate.py` and `cargo-validation.toml` should fail loud on unknown durable surfaces instead of silently skipping them.

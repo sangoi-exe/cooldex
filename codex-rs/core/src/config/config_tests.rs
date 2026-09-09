@@ -664,6 +664,7 @@ disable_in_process_fallback = true
     Ok(())
 }
 
+// Merge-safety anchor: Computer Use config retains its runtime paths, temp root, and timeouts.
 #[tokio::test]
 async fn load_config_resolves_computer_use_config() -> std::io::Result<()> {
     let codex_home = tempdir()?;
@@ -1308,10 +1309,12 @@ fn config_toml_deserializes_model_availability_nux() {
         Tui {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
+            whimsy: true,
             show_tooltips: true,
             auto_recap: true,
             disable_paste_burst: None,
             vim_mode_default: false,
+            question_esc_back: true,
             raw_output_mode: false,
             app_server_mode: AppServerMode::Upstream,
             alternate_screen: AltScreenMode::default(),
@@ -4387,10 +4390,12 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
         Tui {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
+            whimsy: true,
             show_tooltips: true,
             auto_recap: true,
             disable_paste_burst: None,
             vim_mode_default: false,
+            question_esc_back: true,
             raw_output_mode: false,
             app_server_mode: AppServerMode::Upstream,
             alternate_screen: AltScreenMode::Auto,

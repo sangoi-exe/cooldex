@@ -206,6 +206,7 @@ async fn projects_list_by_recency_and_preserve_metadata_timestamps() -> Result<(
 async fn projects_persist_and_assign_threads() -> Result<()> {
     let responses = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
+    // Merge-safety anchor: project tests disable the local Computer Use runtime so temporary homes remain self-contained.
     MockResponsesConfig::new(&responses.uri())
         .disable_feature(Feature::ComputerUse)
         .enable_feature(Feature::Sqlite)
@@ -353,6 +354,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(String::new()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -399,6 +401,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(created.project.id.clone()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -447,6 +450,7 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
             params: ThreadMetadataUpdateParams {
                 thread_id: started.thread.id.clone(),
                 project_id: Some(created.project.id.clone()),
+                daybreak_enabled: None,
                 git_info: None,
             },
         })
@@ -938,6 +942,7 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
             thread_id: started.thread.id.clone(),
             project_id: Some(Uuid::now_v7().to_string()),
+            daybreak_enabled: None,
             git_info: Some(ThreadMetadataGitInfoUpdateParams {
                 sha: Some(Some("abc123".to_string())),
                 branch: None,

@@ -40,6 +40,7 @@ fn assistant_output_text(text: &str) -> ResponseItem {
     }
 }
 
+// Merge-safety anchor: log-db keeps ordinary traces but filters post-sampling token estimates.
 #[test]
 fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
     let feedback = codex_feedback::CodexFeedback::new();
@@ -98,5 +99,26 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
     assert_eq!(
         last_agent_message.as_deref(),
         Some("plan contributed assistant text")
+    );
+}
+
+#[test]
+fn realtime_user_verification_notice_excludes_request_payload() {
+    let event = EventMsg::ElicitationRequest(codex_protocol::approvals::ElicitationRequestEvent {
+        turn_id: None,
+        server_name: "private-server-name".to_string(),
+        id: codex_protocol::mcp::RequestId::String("private-request-id".to_string()),
+        request: codex_protocol::approvals::ElicitationRequest::UserVerification {
+            title: "private-title".to_string(),
+            description: "private-description".to_string(),
+            challenge: "private-challenge".to_string(),
+        },
+    });
+    assert_eq!(
+        realtime_text_for_event(&event),
+        Some((
+            "<user_verification_notice>User verification is required. Please respond in the app.</user_verification_notice>".to_string(),
+            None,
+        )),
     );
 }

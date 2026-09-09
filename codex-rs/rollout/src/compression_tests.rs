@@ -697,6 +697,9 @@ fn write_rollout(path: &std::path::Path, thread_id: ThreadId, message: &str) -> 
             history_base: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
+            // Merge-safety anchor: compression fixtures preserve metadata absence rather than
+            // supplying a fresh-thread Resolve binding.
+            agent_usage_hint_binding: None,
             context_window: None,
         },
         git: None,

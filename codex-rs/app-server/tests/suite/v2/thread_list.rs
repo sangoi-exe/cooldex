@@ -41,6 +41,7 @@ use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -1311,8 +1312,8 @@ async fn thread_list_empty_source_kinds_defaults_to_interactive_only() -> Result
     Ok(())
 }
 
-// Merge-safety anchor: V2 list fixtures preserve persisted settings for unloaded threads and
-// live overrides for resumed threads.
+// Merge-safety anchor: V2 list fixtures keep the durable hint binding in their first SessionMeta
+// record and persist settings separately, while loaded threads retain live overrides.
 #[tokio::test]
 async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
@@ -1388,10 +1389,22 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
             parent_thread_id,
         )?;
         let path = rollout_path(codex_home.path(), filename_ts, &thread_id);
-        let mut session_meta = read_session_meta_line(&path).await?;
+        let content = fs::read_to_string(&path)?;
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let first_line = lines
+            .first_mut()
+            .ok_or_else(|| anyhow::anyhow!("rollout at {} is empty", path.display()))?;
+        let mut rollout_line = codex_rollout::parse_rollout_line(first_line)?;
+        let RolloutItem::SessionMeta(mut session_meta) = rollout_line.item else {
+            return Err(anyhow::anyhow!(
+                "rollout at {} does not start with session metadata",
+                path.display()
+            ));
+        };
         let source = SessionSource::from(session_meta.meta.source.clone());
         let settings = if version == Some(MultiAgentVersion::V2) {
             session_meta.meta.base_instructions = Some(BaseInstructions::default());
+            session_meta.meta.agent_usage_hint_binding = Some(AgentUsageHintBinding::Resolve);
             Some(serde_json::from_value::<ThreadSettingsAppliedEvent>(
                 json!({
                     "thread_id": thread_id.clone(),
@@ -1422,7 +1435,9 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         );
         if let Some(version) = version {
             session_meta.meta.multi_agent_version = Some(version);
-            append_rollout_item_to_path(&path, &RolloutItem::SessionMeta(session_meta)).await?;
+            rollout_line.item = RolloutItem::SessionMeta(session_meta);
+            *first_line = serde_json::to_string(&rollout_line)?;
+            fs::write(&path, lines.join("\n") + "\n")?;
         }
         if let Some(settings) = settings {
             append_rollout_item_to_path(

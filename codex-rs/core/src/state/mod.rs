@@ -15,6 +15,9 @@ pub(crate) use post_compact_recovery::PostCompactRecoveryIdentity;
 pub(crate) use post_compact_recovery::PostCompactRecoveryRuntimeState;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
+// Merge-safety anchor: explicit TurnSlot and post-compaction recovery remain canonical state
+// owners; do not restore the legacy ActiveTurn export.
+pub(crate) use turn::AcceptedUserInputResponse;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;

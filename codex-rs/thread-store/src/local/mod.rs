@@ -27,6 +27,9 @@ mod update_thread_metadata;
 mod writer_lock;
 
 #[cfg(test)]
+#[path = "daybreak_metadata_tests.rs"]
+mod daybreak_metadata_tests;
+#[cfg(test)]
 #[path = "pending_thread_metadata_tests.rs"]
 mod pending_thread_metadata_tests;
 #[cfg(test)]
@@ -1985,6 +1988,9 @@ mod tests {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: new fixture threads use an explicit Resolve binding just as
+            // ordinary runtime creation does.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
             subagent_history_start_ordinal: None,

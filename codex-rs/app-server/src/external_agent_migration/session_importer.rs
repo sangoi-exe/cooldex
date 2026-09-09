@@ -483,6 +483,9 @@ impl ExternalAgentSessionImporter {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: Some(MultiAgentVersion::V1),
+            // Merge-safety anchor: imported external conversations create ordinary V1 threads,
+            // not full-history V2 identities with an inherited usage hint.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
             subagent_history_start_ordinal: None,

@@ -208,6 +208,7 @@ impl ResponsesRequest {
         self.body_json().to_string().contains(&json_fragment)
     }
 
+    // Merge-safety anchor: history-drop assertions exclude post-compact recall.
     /// Returns true if any message text outside a post-compact recall block
     /// contains the provided substring.
     pub fn body_contains_message_text_outside_recall(&self, text: &str) -> bool {
@@ -1091,7 +1092,7 @@ where
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/(responses|guardian)$"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }

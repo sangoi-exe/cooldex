@@ -273,6 +273,8 @@ fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
         dynamic_tools: Vec::new(),
         selected_capability_roots: Vec::new(),
         multi_agent_version: None,
+        // Merge-safety anchor: new fixture threads retain the explicit Resolve creation contract.
+        agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
         history_mode: ThreadHistoryMode::Legacy,
         history_base: None,
         subagent_history_start_ordinal: None,

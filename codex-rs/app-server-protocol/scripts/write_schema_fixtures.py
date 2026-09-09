@@ -37,8 +37,10 @@ def main() -> None:
     if args.prettier:
         env["CODEX_APP_SERVER_SCHEMA_PRETTIER"] = str(args.prettier)
 
+    # Merge-safety anchor: generation invokes the current ignored-test owner through the guard.
     subprocess.run(
         [
+            str(workspace_root.parent / "scripts" / "cargo-guard.sh"),
             "cargo",
             "test",
             "-p",

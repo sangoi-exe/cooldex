@@ -348,6 +348,9 @@ fn write_rollout_with_user_message(
                     history_base: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
+                    // Merge-safety anchor: state-DB fixture metadata represents source absence,
+                    // not a newly resolved runtime binding.
+                    agent_usage_hint_binding: None,
                     context_window: None,
                 },
                 git: None,

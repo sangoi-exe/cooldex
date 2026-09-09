@@ -5,16 +5,21 @@ use crate::codex_thread::CodexThread;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
+use crate::context::GuardianContextMode;
 use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::PersistentModeState;
+use crate::session::multi_agents::full_history_usage_hint_binding;
 use crate::session::multi_agents::resolve_usage_hints;
+use crate::session::multi_agents::usage_hint_text;
 use crate::tools::handlers::multi_agents_common::build_agent_resume_config;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::intersect_effective_permission_profiles;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashSet;
@@ -29,6 +34,7 @@ struct SpawnAgentThreadInheritance {
 enum V2AgentMetadataRestoreError {
     MissingThreadSettingsSnapshot { thread_id: ThreadId },
     MissingShellToolState { thread_id: ThreadId },
+    MissingAgentUsageHintBinding { thread_id: ThreadId },
     Other(CodexErr),
 }
 
@@ -151,7 +157,11 @@ pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
     });
 }
 
-fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[String]) -> bool {
+fn retain_forked_developer_message(
+    item: &mut ResponseItem,
+    usage_hint_texts: &[String],
+    context_mode: GuardianContextMode,
+) -> bool {
     if !matches!(item, ResponseItem::Message { role, .. } if role == "developer") {
         return true;
     }
@@ -160,11 +170,20 @@ fn retain_forked_developer_message(item: &mut ResponseItem, usage_hint_texts: &[
         return false;
     };
     content.retain(|content_item| {
+        if context_mode == GuardianContextMode::ThreadOwned
+            && content_item.kind().0 == "guardian.approved_action"
+        {
+            return false;
+        }
         let ContentItem::InputText { text } = content_item.content() else {
             return true;
         };
 
         !(MultiAgentRoleInstructions::matches_text(text)
+            || (context_mode == GuardianContextMode::ThreadOwned
+                && text.starts_with(
+                    crate::guardian::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX,
+                ))
             || MultiAgentModeInstructions::matches_text(text)
             || CurrentTimeReminder::matches_text(text)
             || usage_hint_texts
@@ -202,19 +221,35 @@ async fn load_agent_model_context(
 }
 
 // Merge-safety anchor: V2 reload restores captured identity from persisted thread
-// settings and rollout history, never a mutable role file; fork filtering keeps only
-// recovery proof owned by retained compaction history.
+// settings and rollout history, never a mutable role file. Typed usage-hint content must not
+// be reclassified as developer instructions while resolving the persisted identity.
 fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
     for item in history {
         let RolloutItem::ResponseItem(response_item) = item else {
             continue;
         };
         match &response_item.item {
-            ResponseItem::Message { role, content, .. } if role == "developer" => {
-                if let Some(instructions) =
-                    crate::event_mapping::first_non_contextual_dev_message_text(content)
-                {
-                    return Some(instructions.to_string());
+            ResponseItem::Message {
+                role,
+                content,
+                internal_chat_message_metadata_passthrough,
+                ..
+            } if role == "developer" => {
+                let content_item_kinds = internal_chat_message_metadata_passthrough
+                    .as_ref()
+                    .and_then(|metadata| metadata.content_item_kinds.as_deref());
+                for (index, content_item) in content.iter().enumerate() {
+                    let is_usage_hint = content_item_kinds
+                        .and_then(|kinds| kinds.get(index))
+                        .is_some_and(|kind| kind.0.as_str() == "multi_agent.usage_hint");
+                    if !is_usage_hint
+                        && let Some(instructions) =
+                            crate::event_mapping::first_non_contextual_dev_message_text(
+                                std::slice::from_ref(content_item),
+                            )
+                    {
+                        return Some(instructions.to_string());
+                    }
                 }
             }
             ResponseItem::Message { role, content, .. }
@@ -227,6 +262,12 @@ fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<Str
         }
     }
     None
+}
+
+fn missing_v2_agent_usage_hint_binding_error(thread_id: ThreadId) -> CodexErr {
+    CodexErr::InvalidRequest(format!(
+        "agent {thread_id} is missing a canonical agent_usage_hint_binding required to restore its identity snapshot"
+    ))
 }
 
 async fn restore_v2_identity_snapshot(
@@ -254,6 +295,12 @@ async fn restore_v2_identity_snapshot(
     if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
         return Ok(None);
     }
+    let agent_usage_hint_binding = initial_history
+        .get_resumed_agent_usage_hint_binding()
+        .flatten()
+        .ok_or(V2AgentMetadataRestoreError::MissingAgentUsageHintBinding {
+            thread_id: stored_thread.thread_id,
+        })?;
     let latest_thread_settings = state
         .load_latest_thread_settings_snapshot(LoadThreadHistoryParams {
             thread_id: stored_thread.thread_id,
@@ -310,6 +357,7 @@ async fn restore_v2_identity_snapshot(
         first_persisted_developer_instructions(&history),
         service_tier,
         Some(shell_tool_enabled),
+        agent_usage_hint_binding,
     )))
 }
 
@@ -441,6 +489,9 @@ impl AgentControl {
                     return Err(CodexErr::InvalidRequest(format!(
                         "agent {thread_id} is missing a persisted shell_tool_enabled value required to restore its identity snapshot"
                     )));
+                }
+                Err(V2AgentMetadataRestoreError::MissingAgentUsageHintBinding { thread_id }) => {
+                    return Err(missing_v2_agent_usage_hint_binding_error(thread_id));
                 }
                 Err(V2AgentMetadataRestoreError::Other(err)) => {
                     warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
@@ -812,11 +863,20 @@ impl AgentControl {
 
     async fn spawn_agent_internal(
         &self,
-        config: Config,
+        mut config: Config,
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
+        let is_full_history_fork = matches!(
+            options.fork_mode.as_ref(),
+            Some(SpawnAgentForkMode::FullHistory)
+        );
+        if !is_full_history_fork {
+            // Fresh and bounded children must resolve their own V2 hint. Only a full-history
+            // capture may carry an inherited binding into a new child session.
+            config.agent_usage_hint_binding = AgentUsageHintBinding::Resolve;
+        }
         let state = self.upgrade()?;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -1023,7 +1083,7 @@ impl AgentControl {
     async fn spawn_forked_thread(
         &self,
         state: &Arc<ThreadManagerState>,
-        config: Config,
+        mut config: Config,
         session_source: SessionSource,
         options: &SpawnAgentOptions,
         inheritance: SpawnAgentThreadInheritance,
@@ -1054,20 +1114,27 @@ impl AgentControl {
 
         let parent_thread_id = *parent_thread_id;
         let parent_thread = state.get_thread(parent_thread_id).await?;
-        let parent_developer_instructions = if multi_agent_version == MultiAgentVersion::V2 {
-            match parent_thread
-                .session
-                .new_default_turn()
-                .await
-                .developer_instructions
-                .clone()
+        let parent_turn = if multi_agent_version == MultiAgentVersion::V2 {
+            let parent_turn = parent_thread.session.new_default_turn().await;
+            if matches!(fork_mode, SpawnAgentForkMode::FullHistory)
+                && matches!(
+                    &config.agent_usage_hint_binding,
+                    AgentUsageHintBinding::Resolve
+                )
             {
-                Some(instructions) if !instructions.is_empty() => Some(instructions),
-                Some(_) | None => None,
+                // Direct AgentControl callers do not have the public handler's captured identity.
+                // Freeze their parent turn only when no explicit inherited binding was supplied.
+                config.agent_usage_hint_binding = full_history_usage_hint_binding(&parent_turn);
             }
+            Some(parent_turn)
         } else {
             None
         };
+        let parent_developer_instructions = parent_turn.as_ref().and_then(|turn| {
+            turn.developer_instructions
+                .clone()
+                .filter(|instructions| !instructions.is_empty())
+        });
         let parent_history_mode = parent_thread.config_snapshot().await.history_mode;
         // `record_conversation_items` only queues persistence writes asynchronously.
         // Flush before snapshotting store history for a fork.
@@ -1112,6 +1179,12 @@ impl AgentControl {
                     .into_iter()
                     .flatten()
                     .map(|instructions| instructions.render())
+                    .chain(
+                        parent_turn
+                            .as_deref()
+                            .and_then(|turn| usage_hint_text(turn, &turn.session_source))
+                            .map(|instructions| instructions.render()),
+                    )
                     .collect()
             } else {
                 Vec::new()
@@ -1131,18 +1204,32 @@ impl AgentControl {
                 break;
             }
         }
-        let mut replaced_parent_developer_instructions = false;
-        // Non-full V2 forks scrub inherited hints and remove the parent's developer-instruction
-        // fragment before the child rebuilds its own context. Full-history forks retain the
-        // complete parent context instead. Compaction stores response items separately, so apply
-        // the same policy to top-level messages and compacted replacement histories.
-        let retain_forked_item = |response_item: &mut ResponseItem, replaced: &mut bool| {
+        let context_mode = GuardianContextMode::from_features(&config.features);
+        // Merge-safety anchor: Full-history V2 forks retain the parent's effective instruction
+        // and identity context without appending a child developer or usage-hint layer. Truncated
+        // forks rebuild after sanitization; Guardian-only authorization remains parent-owned.
+        // Compaction stores response items separately, so sanitize both top-level messages and
+        // compacted replacement histories with the same owner.
+        let retain_forked_item = |envelope: &mut ResponseItemEnvelope| {
+            if context_mode == GuardianContextMode::ThreadOwned
+                && multi_agent_version == MultiAgentVersion::V2
+                && matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user")
+            {
+                // Persist the scope of every inherited user message, including the suffix
+                // after a checkpoint. Resume must not recapture it as local authorization.
+                envelope
+                    .metadata
+                    .get_or_insert_default()
+                    .inherited_user_message = true;
+            }
+            let response_item = &mut envelope.item;
             if matches!(response_item, ResponseItem::AgentMessage { .. }) {
                 return false;
             }
             if !retain_forked_developer_message(
                 response_item,
                 &multi_agent_v2_usage_hint_texts_to_filter,
+                context_mode,
             ) {
                 return false;
             }
@@ -1176,7 +1263,6 @@ impl AgentControl {
                         return true;
                     }
 
-                    *replaced = true;
                     *text = text.replace(parent_developer_instructions, "");
                     !text.is_empty()
                 });
@@ -1205,30 +1291,27 @@ impl AgentControl {
             }
 
             match item {
-                RolloutItem::ResponseItem(response_item) => retain_forked_item(
-                    &mut response_item.item,
-                    &mut replaced_parent_developer_instructions,
-                ),
+                RolloutItem::ResponseItem(response_item) => retain_forked_item(response_item),
                 RolloutItem::Compacted(compacted) => {
                     // This checkpoint belongs to the inherited parent prefix.
                     compacted.latest_token_usage_record = None;
                     // Parent-local review evidence must not become the child's authorization.
                     // Root user authorization is collected separately by the host.
                     compacted.guardian_history = None;
-                    compacted.retained_context = None;
+                    // Only V2 fetches root authorization live. Its local scope starts known-empty;
+                    // V1 must remain incomplete when inherited authorization has been stripped.
+                    compacted.retained_context = (context_mode == GuardianContextMode::ThreadOwned
+                        && multi_agent_version == MultiAgentVersion::V2)
+                        .then(codex_history::RetainedContext::default);
                     if let Some(replacement_history) = compacted.replacement_history.as_mut() {
-                        replaced_parent_developer_instructions = false;
-                        replacement_history.retain_mut(|response_item| {
-                            retain_forked_item(
-                                &mut response_item.item,
-                                &mut replaced_parent_developer_instructions,
-                            )
-                        });
+                        replacement_history.retain_mut(&retain_forked_item);
                     }
                     true
                 }
                 RolloutItem::WorldState(world_state) => {
-                    if multi_agent_version == MultiAgentVersion::V2 {
+                    if multi_agent_version == MultiAgentVersion::V2
+                        && !matches!(fork_mode, SpawnAgentForkMode::FullHistory)
+                    {
                         world_state.state.remove("multi_agent_usage_hint");
                     }
                     true
@@ -1247,18 +1330,6 @@ impl AgentControl {
         });
         if !preserve_reference_context_item {
             drop_unowned_recovery_applications(&mut forked_rollout_items);
-        }
-        if preserve_reference_context_item
-            && multi_agent_version == MultiAgentVersion::V2
-            && let Some(subagent_usage_hint) = options
-                .multi_agent_v2_usage_hints
-                .as_ref()
-                .and_then(|hints| hints.subagent.clone())
-        {
-            let subagent_usage_hint_message = ContextualUserFragment::into(subagent_usage_hint);
-            forked_rollout_items.push(RolloutItem::ResponseItem(
-                subagent_usage_hint_message.into(),
-            ));
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);

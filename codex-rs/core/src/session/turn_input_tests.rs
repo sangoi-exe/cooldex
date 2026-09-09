@@ -168,6 +168,7 @@ async fn steering_does_not_wait_for_realtime_history() {
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
+// Merge-safety anchor: the refreshed MCP runtime receives server elicitation authority changes.
 #[tokio::test]
 async fn accepted_input_applies_thread_settings() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
@@ -871,6 +872,7 @@ async fn steer_only_enforces_expected_turn_id() {
         .spawn_task(
             Arc::clone(&turn_context),
             vec![TurnInput::UserInput {
+                acceptance_order: None,
                 content: vec![UserInput::Text {
                     text: "hello".to_string(),
                     text_elements: Vec::new(),
@@ -960,6 +962,7 @@ async fn rejects_non_regular_turns() {
             .spawn_task(
                 Arc::clone(&turn_context),
                 vec![TurnInput::UserInput {
+                    acceptance_order: None,
                     content: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),

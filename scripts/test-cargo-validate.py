@@ -50,7 +50,9 @@ class CargoValidateTests(unittest.TestCase):
             "codex-app-server-protocol": "app-server-protocol",
             "codex-app-server-transport": "app-server-transport",
             "codex-async-utils": "async-utils",
+            "codex-attachment-store": "attachment-store",
             "codex-backend-client": "backend-client",
+            "codex-build-info": "build-info",
             "codex-chatgpt": "chatgpt",
             "codex-cli": "cli",
             "codex-cloud-config": "cloud-config",
@@ -82,6 +84,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-mcp": "codex-mcp",
             "codex-model-provider": "model-provider",
             "codex-models-manager": "models-manager",
+            "codex-mxc-sandbox": "mxc-sandbox",
             "codex-otel-trace-websocket": "otel-trace-websocket",
             "codex-protocol": "protocol",
             "codex-realtime-webrtc": "realtime-webrtc",
@@ -95,9 +98,11 @@ class CargoValidateTests(unittest.TestCase):
             "codex-tui": "tui",
             "codex-unmapped-fixture": "unmapped-fixture",
             "codex-uds": "uds",
+            "codex-user-verification": "user-verification",
             "codex-utils-audio": "utils/audio",
             "codex-utils-cache": "utils/cache",
             "codex-utils-git-discovery": "utils/git-discovery",
+            "codex-utils-image": "utils/image",
             "codex-utils-path": "utils/path-utils",
             "codex-utils-process": "utils/process",
             "codex-utils-pty": "utils/pty",
@@ -1680,6 +1685,8 @@ class CargoValidateTests(unittest.TestCase):
 
     def test_known_cli_fallback_roots_have_explicit_strict_rule(self) -> None:
         cases = (
+            ("codex-attachment-store", "codex-rs/attachment-store/Cargo.toml"),
+            ("codex-build-info", "codex-rs/build-info/Cargo.toml"),
             ("codex-code-mode-protocol", "codex-rs/code-mode-protocol/Cargo.toml"),
             (
                 "codex-exec-server-protocol",
@@ -1688,6 +1695,9 @@ class CargoValidateTests(unittest.TestCase):
             ("codex-feedback", "codex-rs/feedback/Cargo.toml"),
             ("codex-install-context", "codex-rs/install-context/Cargo.toml"),
             ("codex-models-manager", "codex-rs/models-manager/src/manager.rs"),
+            ("codex-mxc-sandbox", "codex-rs/mxc-sandbox/Cargo.toml"),
+            ("codex-user-verification", "codex-rs/user-verification/Cargo.toml"),
+            ("codex-utils-image", "codex-rs/utils/image/Cargo.toml"),
             ("codex-websocket-client", "codex-rs/websocket-client/Cargo.toml"),
             ("codex-async-utils", "codex-rs/async-utils/Cargo.toml"),
             ("codex-code-mode-runtime", "codex-rs/code-mode-runtime/Cargo.toml"),
@@ -1720,7 +1730,6 @@ class CargoValidateTests(unittest.TestCase):
             ("codex-uds", "codex-rs/uds/Cargo.toml"),
             ("codex-utils-path", "codex-rs/utils/path-utils/Cargo.toml"),
             ("codex-utils-pty", "codex-rs/utils/pty/Cargo.toml"),
-            ("codex-voice-host", "codex-rs/voice-host/Cargo.toml"),
             ("codex-worktree", "codex-rs/worktree/Cargo.toml"),
         )
 
@@ -1758,6 +1767,130 @@ class CargoValidateTests(unittest.TestCase):
                 else:
                     self.assertIn(["just", "clippy-strict", "-p", package], commands)
                 self.assertIn(["just", "strict-codex-bin"], commands)
+
+    def test_voice_host_validation_is_explicitly_excluded_in_all_modes(self) -> None:
+        exclusion_line = 'validation_excluded_packages = ["codex-voice-host"]\n'
+        native_exclusion = '  "--exclude",\n  "codex-voice-host",\n'
+        runtime_packages = (
+            "wsl_runtime_packages = [\n"
+            '  "codex-uds",\n'
+            '  "codex-utils-path",\n'
+            '  "codex-utils-pty",\n'
+            '  "codex-worktree",\n'
+            "]\n"
+        )
+        runtime_packages_before_exclusion = (
+            "wsl_runtime_packages = [\n"
+            '  "codex-uds",\n'
+            '  "codex-utils-path",\n'
+            '  "codex-utils-pty",\n'
+            '  "codex-voice-host",\n'
+            '  "codex-worktree",\n'
+            "]\n"
+        )
+        production_config_text = PRODUCTION_CONFIG.read_text(encoding="utf-8")
+        self.assertIn(exclusion_line, production_config_text)
+        self.assertIn(native_exclusion, production_config_text)
+        self.assertIn(runtime_packages, production_config_text)
+        baseline_config = (
+            self.repo_root / "cargo-validation-without-voice-exclusion.toml"
+        )
+        baseline_config.write_text(
+            production_config_text.replace(exclusion_line, "", 1)
+            .replace(native_exclusion, "", 1)
+            .replace(runtime_packages, runtime_packages_before_exclusion, 1),
+            encoding="utf-8",
+        )
+        warning = "codex-voice-host validation is excluded and remains unvalidated"
+        cases = {
+            "voice-only": ("codex-rs/voice-host/Cargo.toml",),
+            "voice-and-uds": (
+                "codex-rs/voice-host/Cargo.toml",
+                "codex-rs/uds/Cargo.toml",
+            ),
+        }
+
+        for case, files in cases.items():
+            for mode in ("quick", "standard", "strict", "full"):
+                with self.subTest(case=case, mode=mode):
+                    selector_args = [
+                        argument
+                        for file_path in files
+                        for argument in ("--file", file_path)
+                    ]
+                    plan = self.plan_json(*selector_args, "--mode", mode)
+                    baseline_process = self.run_planner(
+                        "plan",
+                        "--json",
+                        "--no-receipt",
+                        "--repo-root",
+                        str(self.repo_root),
+                        "--metadata-json",
+                        str(self.metadata_path),
+                        "--config",
+                        str(baseline_config),
+                        *selector_args,
+                        "--mode",
+                        mode,
+                    )
+                    baseline = json.loads(baseline_process.stdout)
+
+                    self.assertEqual(
+                        baseline["selected_packages"], plan["selected_packages"]
+                    )
+                    expected_warning = (
+                        warning
+                        + ", including in the full native Windows workspace aggregate"
+                        if mode == "full"
+                        else warning
+                    )
+                    self.assertEqual([expected_warning], plan["warnings"])
+                    self.assertEqual([], baseline["warnings"])
+
+                    wsl_voice_commands = [
+                        command["argv"]
+                        for command in plan["commands"]
+                        if command["platform"] == "wsl"
+                        and "codex-voice-host" in command["argv"]
+                    ]
+                    self.assertEqual([], wsl_voice_commands)
+
+                    expected_commands = [
+                        command["argv"]
+                        for command in baseline["commands"]
+                        if "codex-voice-host" not in command["argv"]
+                    ]
+                    actual_commands = []
+                    for command in plan["commands"]:
+                        argv = list(command["argv"])
+                        if command["kind"] == "windows-nextest-workspace":
+                            pairs = list(zip(argv, argv[1:]))
+                            self.assertEqual(
+                                1,
+                                pairs.count(("--exclude", "codex-voice-host")),
+                            )
+                            exclusion_index = pairs.index(
+                                ("--exclude", "codex-voice-host")
+                            )
+                            del argv[exclusion_index : exclusion_index + 2]
+                        actual_commands.append(argv)
+                    self.assertEqual(expected_commands, actual_commands)
+
+        rendered = self.run_planner(
+            "plan",
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
+            "--file",
+            "codex-rs/voice-host/Cargo.toml",
+            "--mode",
+            "full",
+        )
+        self.assertIn("warnings:\n  - " + warning, rendered.stdout)
 
     def test_cache_crate_paths_have_explicit_strict_rule(self) -> None:
         for file_path in (
@@ -2689,6 +2822,177 @@ class CargoValidateTests(unittest.TestCase):
                     process.stderr,
                 )
 
+    def test_yolo_requires_a_native_windows_validation_plan(self) -> None:
+        for action in ("prep-plan", "prep"):
+            with self.subTest(action=action):
+                process = self.run_planner(
+                    action,
+                    "--json",
+                    "--no-receipt",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--metadata-json",
+                    str(self.metadata_path),
+                    "--config",
+                    str(PRODUCTION_CONFIG),
+                    "--file",
+                    "scripts/cargo-validate.py",
+                    "--mode",
+                    "full",
+                    "--yolo",
+                    check=False,
+                )
+                self.assertEqual(2, process.returncode)
+                self.assertIn(
+                    "--yolo requires a native Windows command", process.stderr
+                )
+                self.assertIn("prep actions", process.stderr)
+
+        process = self.run_planner(
+            "plan",
+            "--json",
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
+            "--file",
+            "scripts/cargo-validate.py",
+            "--mode",
+            "standard",
+            "--yolo",
+            check=False,
+        )
+        self.assertEqual(2, process.returncode)
+        self.assertIn(
+            "--yolo requires a native Windows command in the selected validation plan",
+            process.stderr,
+        )
+
+    def test_yolo_serializes_in_flags_and_binds_plan_identity(self) -> None:
+        planner = load_planner_module()
+        normal = self.windows_verification_plan(
+            planner, [self.windows_aggregate_command(planner)], None
+        )
+        yolo = replace(
+            normal,
+            flags=["yolo"],
+            warnings=["--yolo fixture warning"],
+        )
+        self.assertNotEqual(
+            planner.plan_resume_id(normal, "tooling"),
+            planner.plan_resume_id(yolo, "tooling"),
+        )
+        self.assertEqual(
+            planner.plan_input_digest(normal, self.repo_root),
+            planner.plan_input_digest(yolo, self.repo_root),
+        )
+
+        rendered = self.plan_json(
+            "--file", "scripts/cargo-validate.py", "--mode", "full", "--yolo"
+        )
+        self.assertIn("yolo", rendered["flags"])
+        self.assertTrue(
+            any(
+                "--yolo bypasses only native Windows RAM and disk" in warning
+                for warning in rendered["warnings"]
+            )
+        )
+
+    def test_normal_runs_do_not_reuse_yolo_results(self) -> None:
+        planner = load_planner_module()
+        success_summary = json.dumps(
+            {
+                "schema": 1,
+                "status": "success",
+                "exit_code": 0,
+                "evidence_dir": r"F:\\.cache\\e",
+                "result_path": r"F:\\.cache\\e\\result.json",
+            },
+            separators=(",", ":"),
+        )
+        failed_summary = json.dumps(
+            {
+                "schema": 1,
+                "status": "command-failed",
+                "exit_code": 7,
+                "evidence_dir": r"F:\\.cache\\e",
+                "result_path": r"F:\\.cache\\e\\result.json",
+            },
+            separators=(",", ":"),
+        )
+        receipt_dir = self.repo_root / "yolo-resume-receipts"
+        normal = self.windows_verification_plan(
+            planner, [self.windows_aggregate_command(planner)], receipt_dir
+        )
+        yolo = replace(normal, flags=["yolo"])
+        (
+            pwsh_path,
+            tool_dir,
+            pwsh_argv_path,
+            _wslpath_argv_path,
+            _cargo_marker_path,
+        ) = self.write_windows_executor_tools(summary_line=success_summary)
+        self.write_windows_manifest_fixture(planner, yolo)
+        with (
+            mock.patch.object(
+                planner.shutil,
+                "which",
+                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+            ),
+            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+        ):
+            self.assertEqual(
+                0, planner.verify_plan(yolo, self.repo_root, keep_going=False)
+            )
+            self.write_windows_manifest_fixture(planner, normal)
+            self.assertEqual(
+                0,
+                planner.verify_plan(
+                    normal, self.repo_root, keep_going=False, resume=True
+                ),
+            )
+        normal_resume_entry = json.loads(
+            (receipt_dir / "last-run.jsonl").read_text().splitlines()[0]
+        )
+        self.assertEqual("executed", normal_resume_entry["coverage"])
+        self.assertTrue(pwsh_argv_path.is_file())
+
+        only_failed_receipt_dir = self.repo_root / "yolo-only-failed-receipts"
+        normal_only_failed = replace(normal, receipt_dir=only_failed_receipt_dir)
+        yolo_failure = replace(normal_only_failed, flags=["yolo"])
+        self.write_windows_manifest_fixture(planner, yolo_failure)
+        self.write_windows_executor_tools(summary_line=failed_summary, exit_code=7)
+        with (
+            mock.patch.object(
+                planner.shutil,
+                "which",
+                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+            ),
+            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+        ):
+            self.assertEqual(
+                7, planner.verify_plan(yolo_failure, self.repo_root, keep_going=False)
+            )
+            self.write_windows_manifest_fixture(planner, normal_only_failed)
+            pwsh_argv_path.unlink(missing_ok=True)
+            self.assertEqual(
+                0,
+                planner.verify_plan(
+                    normal_only_failed,
+                    self.repo_root,
+                    keep_going=False,
+                    only_failed=True,
+                ),
+            )
+        normal_only_failed_entry = json.loads(
+            (only_failed_receipt_dir / "last-run.jsonl").read_text().splitlines()[0]
+        )
+        self.assertEqual("skipped", normal_only_failed_entry["coverage"])
+        self.assertFalse(pwsh_argv_path.exists())
+
     def test_windows_reuse_root_requires_an_explicit_native_workset_path(self) -> None:
         planner = load_planner_module()
         production_config = planner.load_config(PRODUCTION_CONFIG)
@@ -3135,12 +3439,31 @@ class CargoValidateTests(unittest.TestCase):
         argv = command["argv"]
         self.assertIsInstance(argv, list)
         self.assertTrue(all(isinstance(argument, str) for argument in argv))
+        # Merge-safety anchor: Windows aggregate defaults retain direct dev/test opt1
+        # configuration plus limited symbols, debug assertions, and overflow checks; WSL
+        # codegen does not use these arguments.
         self.assertEqual(
             [
                 "cargo",
                 "nextest",
                 "run",
                 "--workspace",
+                "--config",
+                "profile.dev.opt-level=1",
+                "--config",
+                'profile.dev.debug="limited"',
+                "--config",
+                "profile.dev.debug-assertions=true",
+                "--config",
+                "profile.dev.overflow-checks=true",
+                "--config",
+                "profile.test.opt-level=1",
+                "--config",
+                'profile.test.debug="limited"',
+                "--config",
+                "profile.test.debug-assertions=true",
+                "--config",
+                "profile.test.overflow-checks=true",
                 "--features",
                 "codex-v8-poc/sandbox",
                 "--profile",
@@ -3149,8 +3472,9 @@ class CargoValidateTests(unittest.TestCase):
                 "--no-tests",
                 "fail",
             ],
-            argv[:11],
+            argv[:27],
         )
+        self.assertNotIn("--cargo-verbose", argv)
         argument_pairs = tuple(zip(argv, argv[1:]))
         for excluded_package in (
             "codex-bwrap",

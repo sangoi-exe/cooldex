@@ -42,6 +42,7 @@ impl FeatureConfig for CodeModeConfigToml {
     }
 }
 
+// Merge-safety anchor: typed feature config preserves Computer Use local-runtime settings and V2 policy/child-instruction selection.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComputerUseConfigToml {
@@ -173,6 +174,10 @@ pub struct GuardianV2ConfigToml {
     /// Route Guardian review and classification through the unmetered Codex endpoints.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_guardian: Option<bool>,
+    /// Use thread-owned context for sync and async Guardian. Defaults to false.
+    /// Independent of the Guardian v2 `enabled` toggle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_context: Option<bool>,
     /// Persist reviewed actions and risk scores to rollout files for debugging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persist_scores: Option<bool>,

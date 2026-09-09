@@ -595,6 +595,9 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: new materialization fixtures use explicit Resolve, matching
+            // canonical fresh-thread persistence.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: ThreadHistoryMode::Legacy,
             history_base: None,
             subagent_history_start_ordinal: None,
@@ -2582,6 +2585,7 @@ async fn create_paginated_subagent_thread(
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: ThreadHistoryMode::Paginated,
             history_base,
             subagent_history_start_ordinal,

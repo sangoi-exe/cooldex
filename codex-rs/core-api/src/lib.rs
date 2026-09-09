@@ -68,6 +68,7 @@ pub use codex_core::config::ThreadStoreConfig;
 pub use codex_core::config::find_codex_home;
 pub use codex_core::init_state_db;
 pub use codex_core::local_agent_graph_store_from_state_db;
+pub use codex_core::passthrough_image_store;
 pub use codex_core::resolve_installation_id;
 pub use codex_core::thread_store_from_config;
 pub use codex_exec_server::EnvironmentManager;
@@ -124,6 +125,10 @@ pub use codex_protocol::error::Result as CodexResult;
 pub use codex_protocol::models::PermissionProfile;
 pub use codex_protocol::models::PermissionProfileSnapshot;
 pub use codex_protocol::openai_models::ModelPreset;
+// Merge-safety anchor: the embedding facade exposes Config's typed usage-hint binding
+// without requiring clients to add another Codex workspace dependency.
+pub use codex_protocol::protocol::AgentUsageHintBinding;
+pub use codex_protocol::protocol::AgentUsageHintInstructions;
 pub use codex_protocol::protocol::AskForApproval;
 pub use codex_protocol::protocol::EnvironmentConfigState;
 pub use codex_protocol::protocol::EventMsg;

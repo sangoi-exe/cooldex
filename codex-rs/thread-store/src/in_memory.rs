@@ -70,6 +70,7 @@ mod tests {
     use crate::ThreadSortKey;
     use codex_history::CompactedItem;
     use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::AgentUsageHintBinding;
     use codex_protocol::protocol::SessionSource;
 
     #[tokio::test]
@@ -146,6 +147,7 @@ mod tests {
                     dynamic_tools: Vec::new(),
                     selected_capability_roots: Vec::new(),
                     multi_agent_version: None,
+                    agent_usage_hint_binding: AgentUsageHintBinding::Resolve,
                     history_mode: ThreadHistoryMode::Legacy,
                     history_base: None,
                     subagent_history_start_ordinal: None,
@@ -660,6 +662,7 @@ mod tests {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: AgentUsageHintBinding::Resolve,
             history_mode,
             history_base: None,
             subagent_history_start_ordinal: None,
@@ -800,6 +803,9 @@ impl InMemoryThreadStore {
             history_base: params.history_base,
             subagent_history_start_ordinal: params.subagent_history_start_ordinal,
             multi_agent_version: params.multi_agent_version,
+            // Merge-safety anchor: the in-memory canonical metadata mirrors the persisted local
+            // recorder's explicit fresh-thread hint binding.
+            agent_usage_hint_binding: Some(params.agent_usage_hint_binding.clone()),
             context_window: Some(SessionContextWindow::new(params.initial_window_id.clone())),
             ..SessionMeta::default()
         };
@@ -1424,6 +1430,7 @@ fn stored_thread_from_state(
         section_position: state.section_positions.get(&thread_id).copied(),
         section_entered_at: state.section_entered_at.get(&thread_id).copied(),
         project_id: None,
+        daybreak_enabled: metadata.and_then(|metadata| metadata.daybreak_enabled),
         cwd: metadata
             .and_then(|metadata| metadata.cwd.clone())
             .unwrap_or_default(),

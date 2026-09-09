@@ -71,6 +71,9 @@ async fn timeline_pages_mix_items_and_resolve_the_opening_realtime_session() -> 
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: this newly created timeline fixture carries explicit Resolve,
+            // matching ordinary runtime persistence.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: ThreadHistoryMode::Paginated,
             history_base: None,
             subagent_history_start_ordinal: None,

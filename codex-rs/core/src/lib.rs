@@ -16,6 +16,8 @@ mod realtime_prompt;
 mod responses_metadata;
 mod responses_retry;
 pub(crate) mod session;
+// Merge-safety anchor: UserMessageAdmission and tool_batch remain wired into
+// codex-core so the established admission and batched-tool paths remain linked.
 mod user_message_admission;
 pub use codex_protocol::turn_input::NotSubmittedReason;
 pub use codex_protocol::turn_input::RecoverTurnRequest;
@@ -71,6 +73,7 @@ mod exec_policy;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;
+pub mod guardian_review;
 mod hook_mcp_executor;
 mod hook_runtime;
 mod image_preparation;
@@ -128,6 +131,7 @@ pub use thread_manager::ThreadManager;
 pub use thread_manager::ThreadShutdownReport;
 pub use thread_manager::build_models_manager;
 pub use thread_manager::local_agent_graph_store_from_state_db;
+pub use thread_manager::passthrough_image_store;
 pub use thread_manager::thread_store_from_config;
 pub use tools::handlers::WaitForEnvironmentToolConfig;
 pub use web_search::web_search_action_detail;
@@ -215,3 +219,6 @@ pub use installation_id::resolve_installation_id;
 pub mod compact;
 mod memory_usage;
 pub mod otel_init;
+
+// Captured environment bindings can be passed back to ThreadManager by internal reviewers.
+pub use environment_selection::TurnEnvironmentSnapshot;

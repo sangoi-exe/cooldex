@@ -29,7 +29,9 @@ pub use codex_history::CompactedItem;
 pub use codex_history::InitialHistory;
 pub use codex_history::ResponseItemEnvelope;
 pub use codex_history::ResumedHistory;
+pub use codex_history::RetainedContextEntry;
 pub use codex_history::RetainedContextEvent;
+pub use codex_history::RetainedInputSource;
 pub use codex_history::RolloutItem;
 pub use codex_history::RolloutLine;
 pub(crate) use codex_protocol::protocol;
@@ -95,6 +97,7 @@ pub use compression::existing_rollout_path;
 pub use compression::open_rollout_line_reader;
 pub use compression::plain_rollout_path;
 pub use compression::spawn_rollout_compression_worker;
+// Merge-safety anchor: partial-history recovery retains source-byte-limited rollout reader exports.
 pub use seekable_reader::SourceByteLimitedSeekableReader;
 pub use seekable_reader::open_rollout_seekable_reader;
 pub use seekable_reader::open_rollout_seekable_reader_with_source_byte_limit;

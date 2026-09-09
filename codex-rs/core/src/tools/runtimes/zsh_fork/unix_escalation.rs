@@ -85,7 +85,7 @@ fn approval_sandbox_permissions(
 
 pub(crate) async fn prepare_unified_exec_zsh_fork(
     req: &crate::tools::runtimes::unified_exec::UnifiedExecRequest,
-    _attempt: &SandboxAttempt<'_>,
+    attempt: &SandboxAttempt<'_>,
     ctx: &ToolCtx,
     exec_request: ExecRequest,
     shell_zsh_path: &std::path::Path,
@@ -129,6 +129,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         .to_abs_path()
         .map_err(|err| ToolError::Rejected(err.to_string()))?;
     let command_executor = CoreShellCommandExecutor {
+        sandbox_manager: attempt.manager.clone(),
         command: exec_request.command.clone(),
         cwd,
         permission_profile: exec_request.permission_profile.clone(),
@@ -143,6 +144,8 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
         use_legacy_landlock: req.turn_environment.config().use_legacy_landlock,
     };
+    // Merge-safety anchor: escalation and approval sandbox permissions preserve
+    // reads denied by the active file-system sandbox policy.
     let file_system_sandbox_policy = exec_request.permission_profile.file_system_sandbox_policy();
     let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
         req.sandbox_permissions,
@@ -575,6 +578,7 @@ fn commands_for_intercepted_exec_policy(
 // TODO(anp): Capture these Windows and Landlock settings from
 // TurnEnvironment::sandbox_context when preparing this executor, preserving its snapshot.
 struct CoreShellCommandExecutor {
+    sandbox_manager: SandboxManager,
     command: Vec<String>,
     cwd: AbsolutePathBuf,
     permission_profile: PermissionProfile,
@@ -767,7 +771,7 @@ impl CoreShellCommandExecutor {
         let (program, args) = command
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("prepared command must not be empty"))?;
-        let sandbox_manager = SandboxManager::new();
+        let sandbox_manager = &self.sandbox_manager;
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Auto,

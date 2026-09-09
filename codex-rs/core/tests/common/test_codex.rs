@@ -678,6 +678,7 @@ impl TestCodexBuilder {
         let state_db = codex_core::init_state_db(&config).await;
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
+        // Merge-safety anchor: the test provider receives the global AGENTS.md inclusion mode.
         let user_instructions_provider =
             self.user_instructions_provider.clone().unwrap_or_else(|| {
                 Arc::new(CodexHomeUserInstructionsProvider::new(
@@ -705,6 +706,7 @@ impl TestCodexBuilder {
             Arc::clone(&self.extensions),
             user_instructions_provider,
             /*analytics_events_client*/ None,
+            codex_core::passthrough_image_store(),
             Arc::clone(&thread_store),
             codex_core::local_agent_graph_store_from_state_db(state_db.as_ref()),
             installation_id,

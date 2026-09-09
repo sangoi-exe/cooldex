@@ -1,10 +1,15 @@
 use super::*;
+use crate::context::MultiAgentRoleInstructions;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentUsageHintBinding;
+use codex_protocol::protocol::AgentUsageHintInstructions;
+use pretty_assertions::assert_eq;
 use pretty_assertions::assert_ne;
 
 const BASE_SECRET: &str = "base-instruction-secret";
 const DEVELOPER_SECRET: &str = "developer-instruction-secret";
+const HINT_SECRET: &str = "usage-hint-secret";
 
 fn snapshot() -> AgentIdentitySnapshot {
     AgentIdentitySnapshot::capture(
@@ -21,6 +26,12 @@ fn snapshot() -> AgentIdentitySnapshot {
         Some(DEVELOPER_SECRET.to_string()),
         Some("priority".to_string()),
         Some(false),
+        AgentUsageHintBinding::Inherited {
+            instructions: Some(AgentUsageHintInstructions {
+                text: HINT_SECRET.to_string(),
+                marked: true,
+            }),
+        },
     )
 }
 
@@ -58,6 +69,8 @@ fn identity_equality_covers_every_field() {
     different_tier.service_tier = None;
     let mut different_shell_tool = expected.clone();
     different_shell_tool.shell_tool_enabled = Some(true);
+    let mut different_usage_hint_binding = expected.clone();
+    different_usage_hint_binding.agent_usage_hint_binding = AgentUsageHintBinding::Resolve;
 
     for actual in [
         different_role,
@@ -70,6 +83,7 @@ fn identity_equality_covers_every_field() {
         different_developer,
         different_tier,
         different_shell_tool,
+        different_usage_hint_binding,
     ] {
         assert_ne!(actual, expected);
     }
@@ -89,6 +103,15 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
         .expect("identity should apply");
 
     assert!(!config.features.enabled(Feature::ShellTool));
+    assert_eq!(
+        config.agent_usage_hint_binding,
+        AgentUsageHintBinding::Inherited {
+            instructions: Some(AgentUsageHintInstructions {
+                text: HINT_SECRET.to_string(),
+                marked: true,
+            }),
+        }
+    );
 }
 
 #[tokio::test]
@@ -115,6 +138,44 @@ fn identity_debug_redacts_instruction_and_provider_details() {
 
     assert!(!debug.contains(BASE_SECRET));
     assert!(!debug.contains(DEVELOPER_SECRET));
+    assert!(!debug.contains(HINT_SECRET));
     assert!(!debug.contains("OpenAI"));
     assert!(debug.contains("<redacted>"));
+}
+
+// Merge-safety anchor: full-history identity tests retain the raw hint text/marker distinction
+// and inherited absence without treating either state as ordinary mutable resolution.
+#[test]
+fn full_history_capture_preserves_typed_hint_or_inherited_absence() {
+    let marked =
+        snapshot().for_full_history(Some(MultiAgentRoleInstructions::catalog(HINT_SECRET)));
+    assert_eq!(
+        marked.agent_usage_hint_binding,
+        AgentUsageHintBinding::Inherited {
+            instructions: Some(AgentUsageHintInstructions {
+                text: HINT_SECRET.to_string(),
+                marked: true,
+            }),
+        }
+    );
+
+    let absent = snapshot().for_full_history(None);
+    assert_eq!(
+        absent.agent_usage_hint_binding,
+        AgentUsageHintBinding::Inherited { instructions: None }
+    );
+}
+
+#[test]
+fn usage_hint_instruction_conversion_preserves_raw_text_and_markers() {
+    for instructions in [
+        MultiAgentRoleInstructions::unmarked("unmarked hint"),
+        MultiAgentRoleInstructions::catalog("marked hint"),
+    ] {
+        let persisted = instructions.clone().into_agent_usage_hint_instructions();
+        let restored =
+            MultiAgentRoleInstructions::from_agent_usage_hint_instructions(persisted.clone());
+
+        assert_eq!(restored.into_agent_usage_hint_instructions(), persisted);
+    }
 }

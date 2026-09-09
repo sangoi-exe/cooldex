@@ -223,7 +223,6 @@ GUARDED_JUST_RECIPES = {
     "clippy",
     "clippy-fix",
     "clippy-strict",
-    "mcp-server-run",
     "smoke-codex-bin",
     "strict-codex-bin",
     "test",
@@ -1894,6 +1893,21 @@ def validate_config(
     )
 
     package_names = {package.name for package in packages}
+    excluded_validation_packages = config.get("defaults", {}).get(
+        "validation_excluded_packages", []
+    )
+    if not isinstance(excluded_validation_packages, list) or not all(
+        isinstance(package, str) for package in excluded_validation_packages
+    ):
+        raise PlannerError(
+            "defaults.validation_excluded_packages must be a string array"
+        )
+    for package in excluded_validation_packages:
+        if package not in package_names:
+            raise PlannerError(
+                "defaults.validation_excluded_packages references unknown package "
+                f"{package!r}"
+            )
     command_names = set(config.get("commands", {}))
     surface_names = {surface.get("name") for surface in config.get("surfaces", [])}
     profile_names = set(config.get("resource_profiles", {}))
@@ -2434,6 +2448,7 @@ def build_plan(
     telemetry_level: str,
     path_evidence: dict[str, PathSelectionEvidence] | None = None,
     windows_reuse_root: str | None = None,
+    yolo: bool = False,
 ) -> Plan:
     history_entries = read_history_entries(
         receipt_dir / "history.jsonl" if receipt_dir else None
@@ -2456,6 +2471,21 @@ def build_plan(
     commands: list[CommandEntry] = []
     manual: list[ManualEntry] = []
     selected_packages = sorted(selection.packages)
+    selected_package_names = set(selected_packages)
+    validation_excluded_packages = set(
+        config.get("defaults", {}).get("validation_excluded_packages", [])
+    )
+    validation_packages = sorted(selected_package_names - validation_excluded_packages)
+    active_validation_exclusions = (
+        validation_excluded_packages
+        if stage == "validation" and mode == "full"
+        else validation_excluded_packages & selected_package_names
+    )
+    for package in sorted(active_validation_exclusions):
+        warning = f"{package} validation is excluded and remains unvalidated"
+        if mode == "full":
+            warning += ", including in the full native Windows workspace aggregate"
+        selection.warnings.append(warning)
     selected_surfaces = sorted(selection.surfaces)
     package_infos = {package.name: package for package in packages}
 
@@ -2477,11 +2507,11 @@ def build_plan(
         {"runtime", "test_scope", "manifest_changed"} & selection.flags
     )
     need_runtime_tests = "runtime" in selection.flags
-    runtime_packages = set(selected_packages) if need_runtime_tests else set()
+    runtime_packages = set(validation_packages) if need_runtime_tests else set()
     # Merge-safety anchor: in full mode, WSL runtime and test-target
     # preparation must use the config-owned explicit WSL package selection,
-    # while normal checks and strict Clippy stay selected per package.
-    test_preparation_packages = set(selected_packages)
+    # while normal checks and strict Clippy stay selected per validation package.
+    test_preparation_packages = set(validation_packages)
     if mode == "full":
         runtime_packages &= selection.wsl_runtime_packages
         test_preparation_packages &= selection.wsl_runtime_packages
@@ -2490,6 +2520,10 @@ def build_plan(
         if windows_reuse_root is not None:
             raise PlannerError(
                 "--windows-reuse-root requires a native Windows command; prep actions do not include native Windows commands"
+            )
+        if yolo:
+            raise PlannerError(
+                "--yolo requires a native Windows command; prep actions do not include native Windows commands"
             )
         for generator, reasons in sorted(selection.generators.items()):
             add_command(
@@ -2562,7 +2596,7 @@ def build_plan(
                 command_from_config(config, command_name, reason, history_entries),
             )
 
-    for package in selected_packages:
+    for package in validation_packages:
         package_info = package_infos[package]
         codex_v8_target = (
             CODEX_V8_HOST_TARGET if package in CODEX_V8_HOST_ARTIFACT_PACKAGES else None
@@ -2721,6 +2755,15 @@ def build_plan(
     if windows_reuse_root is not None and not has_windows_command:
         raise PlannerError(
             "--windows-reuse-root requires a native Windows command in the selected validation plan"
+        )
+    if yolo and not has_windows_command:
+        raise PlannerError(
+            "--yolo requires a native Windows command in the selected validation plan"
+        )
+    if yolo:
+        selection.flags.add("yolo")
+        selection.warnings.append(
+            "--yolo bypasses only native Windows RAM and disk preflight floors; low resources can cause paging, out-of-memory, disk-full, or incomplete outputs, and do not trigger automatic cleanup"
         )
     windows_runtime = (
         project_windows_runtime(config, repo_root, reuse_run_root=windows_reuse_root)
@@ -4258,6 +4301,11 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
         help=r"reuse an explicit native Windows workset below F:\.cache",
     )
     parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="bypass only native Windows RAM and disk preflight floors for a validation plan with native Windows commands",
+    )
+    parser.add_argument(
         "--telemetry-level",
         choices=TELEMETRY_LEVELS,
         default=DEFAULT_TELEMETRY_LEVEL,
@@ -4400,6 +4448,7 @@ def main(argv: list[str]) -> int:
             telemetry_level=args.telemetry_level,
             path_evidence=path_evidence,
             windows_reuse_root=args.windows_reuse_root,
+            yolo=args.yolo,
         )
         write_plan_receipt(plan, repo_root)
         print_plan(plan, args.json)

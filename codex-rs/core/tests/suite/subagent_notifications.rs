@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
@@ -88,7 +89,8 @@ const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
 const FULL_HISTORY_MULTI_AGENT_MODE_HINT: &str = "Delegate independent work to another agent.";
-const FULL_HISTORY_SHARED_USAGE_HINT: &str = "Shared delegation guidance.";
+const FULL_HISTORY_ROOT_USAGE_HINT: &str = "Root-only delegation guidance.";
+const FULL_HISTORY_SUBAGENT_USAGE_HINT: &str = "Child-only delegation guidance.";
 const FULL_HISTORY_PROACTIVE_POLICY: &str = "Proactive multi-agent delegation is active.";
 const FULL_HISTORY_EXPLICIT_POLICY: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask";
 
@@ -1319,6 +1321,9 @@ async fn grandchild_full_fork_preserves_context_baseline(
         (&child_log, "/root/child"),
         (&grandchild_log, "/root/child/grandchild"),
     ] {
+        // Merge-safety anchor: distinguish the two bounded descendant waits without
+        // changing their retry timing or request/status predicates; emit bounded evidence
+        // only when a completion wait fails.
         let request = timeout(Duration::from_secs(/*secs*/ 10), async {
             loop {
                 let request = mock.requests().into_iter().find(|request| {
@@ -1334,19 +1339,104 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "timed out waiting for matching request from {agent_name} \
+                 (parent_context={parent_context:?}, history_mode={history_mode:?})"
+            )
+        })?;
         let thread_id = ThreadId::from_string(
             request.body_json()["client_metadata"]["thread_id"]
                 .as_str()
                 .expect("descendant thread id"),
         )?;
         let thread = test.thread_manager.get_thread(thread_id).await?;
-        timeout(Duration::from_secs(/*secs*/ 10), async {
+        if let Err(error) = timeout(Duration::from_secs(/*secs*/ 10), async {
             while !matches!(thread.agent_status().await, AgentStatus::Completed(_)) {
                 sleep(Duration::from_millis(/*millis*/ 10)).await;
             }
         })
-        .await?;
+        .await
+        {
+            let observed_status = thread.agent_status().await;
+            let request_sequence = match server.received_requests().await {
+                Some(requests) => {
+                    let max_requests = 16;
+                    let total = requests.len();
+                    let omitted = total.saturating_sub(max_requests);
+                    let summaries = requests
+                        .iter()
+                        .take(max_requests)
+                        .enumerate()
+                        .map(|(sequence_index, request)| {
+                            let body = decoded_body(request)
+                                .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+                            let agent_name = body
+                                .as_ref()
+                                .and_then(|body| {
+                                    body["client_metadata"]["x-codex-turn-metadata"]
+                                        .as_str()
+                                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                                })
+                                .and_then(|metadata| {
+                                    metadata["agent_name"].as_str().map(str::to_owned)
+                                })
+                                .unwrap_or_else(|| "<unavailable>".to_string());
+                            let (thread_id, markers) = if let Some(body) = body {
+                                let body_text = body.to_string();
+                                (
+                                    body["client_metadata"]["thread_id"]
+                                        .as_str()
+                                        .unwrap_or("<unavailable>")
+                                        .to_string(),
+                                    format!(
+                                        "[ROOT_PROMPT={}, CHILD_TASK={}, GRANDCHILD_TASK={}, \
+                                         ROOT_CALL={}, CHILD_CALL={}, COMPACT_PROMPT={}, \
+                                         COMPACT_SUMMARY={}, PRELUDE_CALL={}]",
+                                        body_text.contains(ROOT_PROMPT),
+                                        body_text.contains(CHILD_TASK),
+                                        body_text.contains(GRANDCHILD_TASK),
+                                        body_text.contains(ROOT_CALL),
+                                        body_text.contains(CHILD_CALL),
+                                        body_text.contains(COMPACT_PROMPT),
+                                        body_text.contains(COMPACT_SUMMARY),
+                                        body_text.contains(PRELUDE_CALL),
+                                    ),
+                                )
+                            } else {
+                                (
+                                    "<unavailable>".to_string(),
+                                    "<unavailable: body decode/json>".to_string(),
+                                )
+                            };
+                            format!(
+                                "sequence_index={sequence_index} method={} path={} thread_id={} \
+                                 agent_name={} markers={markers}",
+                                request.method,
+                                request.url.path(),
+                                thread_id,
+                                agent_name,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    format!(
+                        "request_sequence(total={total}, omitted={omitted}, sampled=[{}])",
+                        summaries.join("; ")
+                    )
+                }
+                None => "request_sequence=<unavailable: mock server request recording disabled>"
+                    .to_string(),
+            };
+            return Err(error).with_context(|| {
+                format!(
+                    "timed out waiting for {agent_name} (thread_id={thread_id}) to reach Completed \
+                     (observed_status_after_timeout={observed_status:?}, \
+                     parent_context={parent_context:?}, history_mode={history_mode:?}, \
+                     {request_sequence})"
+                )
+            });
+        }
         descendant_requests.push(request);
     }
     let context_counts = [
@@ -1385,6 +1475,8 @@ async fn grandchild_full_fork_preserves_context_baseline(
     Ok(())
 }
 
+// Merge-safety anchor: full-history V2 request fixtures keep parent and child usage hints
+// deliberately unequal so a fresh child re-resolution cannot masquerade as inherited identity.
 #[derive(Clone, Copy)]
 enum FullHistoryV2ModelSelection {
     InheritedIdentity,
@@ -1497,9 +1589,9 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
             FullHistoryV2ModelSelection::MultiAgentModePolicyInheritance
         ) {
             config.multi_agent_v2.root_agent_usage_hint_text =
-                Some(FULL_HISTORY_SHARED_USAGE_HINT.to_string());
+                Some(FULL_HISTORY_ROOT_USAGE_HINT.to_string());
             config.multi_agent_v2.subagent_usage_hint_text =
-                Some(FULL_HISTORY_SHARED_USAGE_HINT.to_string());
+                Some(FULL_HISTORY_SUBAGENT_USAGE_HINT.to_string());
         }
         config.model = Some(INHERITED_MODEL.to_string());
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
@@ -1598,10 +1690,14 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
                     .count(),
                 child_developer_messages
                     .iter()
-                    .filter(|message| message.contains(FULL_HISTORY_SHARED_USAGE_HINT))
+                    .filter(|message| message.contains(FULL_HISTORY_ROOT_USAGE_HINT))
+                    .count(),
+                child_developer_messages
+                    .iter()
+                    .filter(|message| message.contains(FULL_HISTORY_SUBAGENT_USAGE_HINT))
                     .count(),
             ),
-            (1, 1, 0, 2)
+            (1, 1, 0, 1, 0)
         );
     }
     if matches!(selection, FullHistoryV2ModelSelection::CurrentTimeReminders) {

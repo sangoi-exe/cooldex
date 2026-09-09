@@ -62,6 +62,7 @@ use crate::state_db;
 use crate::state_db::StateDbHandle;
 use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::GitInfo as ProtocolGitInfo;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -112,6 +113,7 @@ pub enum RolloutRecorderParams {
         dynamic_tools: Vec<DynamicToolSpec>,
         selected_capability_roots: Vec<SelectedCapabilityRoot>,
         multi_agent_version: Option<MultiAgentVersion>,
+        agent_usage_hint_binding: Option<AgentUsageHintBinding>,
         history_mode: ThreadHistoryMode,
         history_base: Option<HistoryPosition>,
         subagent_history_start_ordinal: Option<u64>,
@@ -209,6 +211,7 @@ impl RolloutRecorderParams {
             dynamic_tools,
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: Some(AgentUsageHintBinding::Resolve),
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,
@@ -261,6 +264,23 @@ impl RolloutRecorderParams {
         } = &mut self
         {
             *version = multi_agent_version;
+        }
+        self
+    }
+
+    /// Override the durable hint binding for source-preserving rewrites.
+    // Merge-safety anchor: new recorder parameters default to explicit Resolve, but callers that
+    // rewrite an existing SessionMeta must retain its Option without inferring a replacement.
+    pub fn with_agent_usage_hint_binding(
+        mut self,
+        agent_usage_hint_binding: Option<AgentUsageHintBinding>,
+    ) -> Self {
+        if let Self::Create {
+            agent_usage_hint_binding: binding,
+            ..
+        } = &mut self
+        {
+            *binding = agent_usage_hint_binding;
         }
         self
     }
@@ -853,6 +873,7 @@ impl RolloutRecorder {
                 dynamic_tools,
                 selected_capability_roots,
                 multi_agent_version,
+                agent_usage_hint_binding,
                 history_mode,
                 history_base,
                 subagent_history_start_ordinal,
@@ -900,6 +921,7 @@ impl RolloutRecorder {
                     history_base,
                     subagent_history_start_ordinal,
                     multi_agent_version,
+                    agent_usage_hint_binding,
                     context_window: initial_window_id.map(SessionContextWindow::new),
                 };
 
@@ -1289,6 +1311,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         preview,
         section,
         project_id,
+        daybreak_enabled,
         cwd,
         git_branch,
         git_sha,
@@ -1319,6 +1342,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
     }
     item.section = section;
     item.project_id = project_id;
+    item.daybreak_enabled = daybreak_enabled;
     item.model = model;
     item.reasoning_effort = reasoning_effort;
     if item.cwd.is_none() {
@@ -2036,6 +2060,7 @@ fn thread_item_from_state_metadata(
         preview: item.preview,
         section: item.section,
         project_id: item.project_id,
+        daybreak_enabled: item.daybreak_enabled,
         cwd: Some(item.cwd),
         git_branch: item.git_branch,
         git_sha: item.git_sha,

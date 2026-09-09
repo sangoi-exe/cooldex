@@ -438,6 +438,7 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
             .await
             .0,
         vec![TurnInput::UserInput {
+            acceptance_order: None,
             content: user_input(fresh_text),
             client_id: None,
         }]
@@ -475,6 +476,7 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
                 .spawn_task(
                     first_context,
                     vec![TurnInput::UserInput {
+                        acceptance_order: None,
                         content: user_input("first starting input"),
                         client_id: None,
                     }],
@@ -584,10 +586,12 @@ async fn cancelling_starting_caller_keeps_internal_owner_and_one_successor() {
         .0;
     assert_eq!(pending.len(), 2);
     assert!(pending.contains(&TurnInput::UserInput {
+        acceptance_order: None,
         content: user_input("second waiting input"),
         client_id: None,
     }));
     assert!(pending.contains(&TurnInput::UserInput {
+        acceptance_order: None,
         content: user_input("third waiting input"),
         client_id: None,
     }));

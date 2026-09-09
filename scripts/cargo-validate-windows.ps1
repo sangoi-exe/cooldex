@@ -1050,7 +1050,8 @@ function Invoke-ExecutionPreflight {
         [pscustomobject]$Runtime,
         [pscustomobject]$Paths,
         [pscustomobject]$TestFixture,
-        [string]$Stage
+        [string]$Stage,
+        [bool]$Yolo
     )
 
     $check = [ordered]@{
@@ -1061,6 +1062,9 @@ function Invoke-ExecutionPreflight {
         required_free_disk_bytes = $null
         available_memory_bytes = $null
         required_available_memory_bytes = $null
+        yolo = $Yolo
+        bypassed_free_disk_floor = $false
+        bypassed_available_memory_floor = $false
         native_processes = $null
         wsl_processes = $null
         error = $null
@@ -1077,10 +1081,18 @@ function Invoke-ExecutionPreflight {
         $check.available_memory_bytes = $availableMemory
         $check.required_available_memory_bytes = $requiredMemory
         if ($freeDisk -lt $requiredDisk) {
-            Fail-Manifest "F: free bytes $freeDisk are below the required $requiredDisk"
+            if ($Yolo) {
+                $check.bypassed_free_disk_floor = $true
+            } else {
+                Fail-Manifest "F: free bytes $freeDisk are below the required $requiredDisk"
+            }
         }
         if ($availableMemory -lt $requiredMemory) {
-            Fail-Manifest "available Windows physical memory $availableMemory is below the required $requiredMemory"
+            if ($Yolo) {
+                $check.bypassed_available_memory_floor = $true
+            } else {
+                Fail-Manifest "available Windows physical memory $availableMemory is below the required $requiredMemory"
+            }
         }
         $check.native_processes = Get-NativeWriterSummary $TestFixture
         $check.wsl_processes = Get-WslWriterSummary $Runtime $Paths $TestFixture
@@ -3016,7 +3028,8 @@ function Invoke-ApprovedCommand {
         [pscustomobject]$Runtime,
         [pscustomobject]$Materialization,
         [pscustomobject]$TestFixture,
-        [pscustomobject]$Bootstrap
+        [pscustomobject]$Bootstrap,
+        [bool]$Yolo
     )
 
     $isFixture = $null -ne $Approved.fixture
@@ -3121,7 +3134,7 @@ function Invoke-ApprovedCommand {
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    $commandPreflight = Invoke-ExecutionPreflight $Runtime $Paths $TestFixture "before-approved-command-$($Approved.index)"
+    $commandPreflight = Invoke-ExecutionPreflight $Runtime $Paths $TestFixture "before-approved-command-$($Approved.index)" $Yolo
     try {
         if (-not $process.Start()) {
             Fail-Manifest "direct cargo process did not start"
@@ -3180,6 +3193,7 @@ try {
     # workflow-namespace validator, before New-RunPaths can create any F: state.
     Assert-ManifestRoot $manifestData
     $runtime = Get-WindowsRuntime $manifestData
+    $yolo = (Assert-StringArray $manifestData["flags"] "manifest.flags") -contains "yolo"
     $script:Runtime = $runtime
     $script:CacheRoot = $runtime.cache_root
     $script:RunPaths = New-RunPaths $runtime.workflow_namespace $runtime.reuse_run_root
@@ -3189,6 +3203,7 @@ try {
         cache_root = $script:CacheRoot
         paths = $script:RunPaths
         resource_contract = $runtime.resource_contract
+        yolo = $yolo
         windows_runtime = [ordered]@{
             cache_root = $runtime.cache_root
             workflow_namespace = $runtime.workflow_namespace
@@ -3285,7 +3300,7 @@ try {
     $materialization = $null
     if ($approved.Count -ne 0) {
         $script:Preflight.native_mutex = Enter-NativeExecutionMutex $testFixture
-        $null = Invoke-ExecutionPreflight $runtime $script:RunPaths $testFixture "before-materialization-or-command"
+        $null = Invoke-ExecutionPreflight $runtime $script:RunPaths $testFixture "before-materialization-or-command" $yolo
         Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
         if ($candidate.is_bound) {
             $script:Preflight.candidate_materialization = [ordered]@{
@@ -3335,7 +3350,7 @@ try {
             $bootstrap = $null
         }
         foreach ($command in $approved) {
-            $result = Invoke-ApprovedCommand $command $script:RunPaths $runtime $materialization $testFixture $bootstrap
+            $result = Invoke-ApprovedCommand $command $script:RunPaths $runtime $materialization $testFixture $bootstrap $yolo
             $script:CommandResults.Add($result)
             if ($null -ne $materialization) {
                 $candidateAfterCommand = Assert-CandidateIntegrity $script:NativeGit.path $script:GitEnvironment $script:RunPaths $candidate $materialization.source_symlink_state "candidate-after-command-$($command.index)" -AllowIgnoredUntracked

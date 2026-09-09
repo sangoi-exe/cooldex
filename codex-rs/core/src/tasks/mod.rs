@@ -589,6 +589,11 @@ impl Session {
                 .turn_metadata_state
                 .set_root_turn_id(root_turn_id);
         }
+        if turn_context.turn_metadata_state.root_turn_id().is_none() {
+            turn_context
+                .turn_metadata_state
+                .set_root_turn_id(turn_context.sub_id.clone());
+        }
         let turn_state = Arc::clone(&claim.turn_state);
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue

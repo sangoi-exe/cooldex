@@ -276,6 +276,9 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
         history_base: None,
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
+        // Merge-safety anchor: this unrelated fixture metadata intentionally leaves the durable
+        // binding absent; it must not infer Resolve during construction.
+        agent_usage_hint_binding: None,
         context_window: None,
     };
     let payload = serde_json::to_value(SessionMetaLine {
@@ -369,6 +372,7 @@ pub fn create_fake_rollout_with_text_elements(
         history_base: None,
         subagent_history_start_ordinal: None,
         multi_agent_version: None,
+        agent_usage_hint_binding: None,
         context_window: None,
     };
     let payload = serde_json::to_value(SessionMetaLine {

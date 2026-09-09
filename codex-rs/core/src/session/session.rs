@@ -7,6 +7,7 @@ use super::step_settings::StepSettingsUpdate;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
+use crate::context::GuardianContextMode;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::hook_mcp_executor::CoreHookMcpExecutor;
@@ -55,6 +56,7 @@ pub(crate) struct Session {
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     pub(super) features: ManagedFeatures,
+    pub(crate) guardian_context_mode: GuardianContextMode,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
@@ -73,7 +75,6 @@ pub(crate) struct Session {
     pub(crate) pending_user_message_admissions:
         crate::user_message_admission::PendingUserMessageAdmissions,
     pub(crate) input_queue: InputQueue,
-    pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
     pub(super) fork_persistence: ForkPersistence,
@@ -1118,14 +1119,18 @@ impl Session {
         thread_extension_init.insert(codex_extension_api::ThreadOriginator(
             session_configuration.originator.clone(),
         ));
+        // Publish the already resolved model before extensions make startup decisions.
+        // Turn construction refreshes this attachment when the selected model changes.
+        thread_extension_init.insert(model_info);
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
             thread_id.to_string(),
             thread_extension_init,
         );
-        // Select the answer path once, before extensions or tool handlers observe the thread.
-        thread_extension_data.insert(crate::context::GuardianReviewEvidence::from_features(
-            &config.features,
+        // Resolve once for live history, replay, and all reviewer consumers.
+        let guardian_context_mode = GuardianContextMode::from_features(&config.features);
+        thread_extension_data.insert(crate::context::GuardianReviewEvidence::new(
+            guardian_context_mode,
         ));
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
@@ -1154,6 +1159,9 @@ impl Session {
                             dynamic_tools: session_configuration.dynamic_tools.clone(),
                             selected_capability_roots: selected_capability_roots.clone(),
                             multi_agent_version: initial_multi_agent_version,
+                            // Merge-safety anchor: session creation freezes the already-selected
+                            // runtime binding into durable metadata without resolving/rendering it.
+                            agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
                             history_mode: session_configuration.history_mode,
                             history_base: match &fork_persistence {
                                 ForkPersistence::Copied => None,
@@ -1411,17 +1419,25 @@ impl Session {
                 slug: Some(session_model),
             };
             config.features.emit_metrics(&session_telemetry);
+            let is_worktree = session_configuration.cwd().canonicalize().ok().and_then(|cwd| {
+                codex_git_utils::repository_identity(&cwd).and_then(|_| {
+                    get_git_repo_root(&cwd).map(|root| root.join(".git").is_file())
+                })
+            });
+            let is_worktree_tag = match is_worktree {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "unknown",
+            };
+            let is_git_tag = if get_git_repo_root(session_configuration.cwd()).is_some() {
+                "true"
+            } else {
+                "false"
+            };
             session_telemetry.counter(
                 THREAD_STARTED_METRIC,
                 /*inc*/ 1,
-                &[(
-                    "is_git",
-                    if get_git_repo_root(session_configuration.cwd()).is_some() {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )],
+                &[("is_git", is_git_tag), ("is_worktree", is_worktree_tag)],
             );
 
             let mcp_server_names =
@@ -1547,6 +1563,10 @@ impl Session {
             let mut state = SessionState::new_with_auto_compact_window_ids(
                 session_configuration.clone(),
                 initial_auto_compact_window_ids,
+                ContextManager::with_guardian_context_mode(
+                    guardian_context_mode,
+                    &session_configuration.session_source,
+                ),
             );
             state.base_instructions_provenance = base_instructions_provenance.clone();
             let managed_network_requirements_configured = config
@@ -1786,6 +1806,7 @@ impl Session {
                 thread_settings_persistence: Semaphore::new(/*permits*/ 1),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
+                guardian_context_mode,
                 windows_sandbox_proxy_settings_mode,
                 multi_agent_version,
                 mcp_refresh: McpRefresh::new(),
@@ -1802,7 +1823,6 @@ impl Session {
                 async_hook_results,
                 pending_user_message_admissions: Default::default(),
                 input_queue: InputQueue::new(),
-                guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
                 git_enrichment_policy,
                 fork_persistence,

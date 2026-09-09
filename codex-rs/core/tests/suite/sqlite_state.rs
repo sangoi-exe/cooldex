@@ -437,6 +437,9 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     history_base: None,
                     subagent_history_start_ordinal: None,
                     multi_agent_version: None,
+                    // Merge-safety anchor: synthetic historical metadata remains absent rather
+                    // than being rewritten to Resolve by a fixture.
+                    agent_usage_hint_binding: None,
                     context_window: None,
                 },
                 git: None,

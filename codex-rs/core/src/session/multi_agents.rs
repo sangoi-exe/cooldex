@@ -6,6 +6,7 @@ use codex_features::MultiAgentV2Policy;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::openai_models::MultiAgentModeMessages;
 use codex_protocol::openai_models::MultiAgentRoleMessages;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -66,12 +67,20 @@ pub(crate) struct ResolvedMultiAgentV2UsageHints {
     pub(crate) subagent: Option<MultiAgentRoleInstructions>,
 }
 
-pub(super) fn usage_hint_text(
+pub(crate) fn usage_hint_text(
     turn_context: &TurnContext,
     session_source: &SessionSource,
 ) -> Option<MultiAgentRoleInstructions> {
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
+    }
+
+    if let AgentUsageHintBinding::Inherited { instructions } =
+        &turn_context.config.agent_usage_hint_binding
+    {
+        return instructions
+            .clone()
+            .map(MultiAgentRoleInstructions::from_agent_usage_hint_instructions);
     }
 
     let catalog = turn_context
@@ -94,6 +103,15 @@ pub(super) fn usage_hint_text(
         | SessionSource::Custom(_)
         | SessionSource::Unknown => snapshot.root,
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
+    }
+}
+
+// Merge-safety anchor: full-history capture freezes the typed effective hint at the parent turn;
+// later child turns must use this binding rather than resolve current config or model catalog data.
+pub(crate) fn full_history_usage_hint_binding(turn_context: &TurnContext) -> AgentUsageHintBinding {
+    AgentUsageHintBinding::Inherited {
+        instructions: usage_hint_text(turn_context, &turn_context.session_source)
+            .map(MultiAgentRoleInstructions::into_agent_usage_hint_instructions),
     }
 }
 

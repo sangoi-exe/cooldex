@@ -3342,6 +3342,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3363,6 +3364,7 @@ mod tests {
                 .expect("guardian action"),
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 plugin_id: Some("sample@openai-curated".into()),
@@ -3434,6 +3436,7 @@ mod tests {
                 ..Default::default()
             }),
             EventMsg::GuardianAssessment(GuardianAssessmentEvent {
+                review_reason: None,
                 id: "review-guardian-execve".into(),
                 target_item_id: Some("guardian-execve".into()),
                 plugin_id: Some("sample@openai-curated".into()),

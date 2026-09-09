@@ -58,6 +58,9 @@ fn write_rollout_with_source_and_provider(
                 history_base: None,
                 subagent_history_start_ordinal: None,
                 multi_agent_version: None,
+                // Merge-safety anchor: index fixtures keep unrelated metadata binding-free;
+                // no Resolve inference belongs in the synthetic source record.
+                agent_usage_hint_binding: None,
                 context_window: None,
             },
             git: None,

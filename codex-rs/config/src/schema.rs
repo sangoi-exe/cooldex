@@ -68,6 +68,7 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
             );
             continue;
         }
+        // Merge-safety anchor: Computer Use retains typed feature schema generation; core/config.schema.json follows this source.
         if feature.id == codex_features::Feature::ComputerUse {
             validation.properties.insert(
                 feature.key.to_string(),
@@ -84,6 +85,10 @@ pub fn features_schema(schema_gen: &mut SchemaGenerator) -> Schema {
                     codex_features::NonPrefixedMcpToolNamesConfigToml,
                 >>(),
             );
+            continue;
+        }
+        if feature.id == codex_features::Feature::GuardianThreadContext {
+            // This setting is already part of the guardianv2 feature table.
             continue;
         }
         if feature.id == codex_features::Feature::GuardianV2 {

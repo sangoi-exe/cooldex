@@ -227,6 +227,7 @@ async fn replacement_waiters_release_only_after_successor_turn_started() {
             .await
             .0,
         vec![TurnInput::UserInput {
+            acceptance_order: None,
             content: user_input(fresh_text),
             client_id: None,
         }]

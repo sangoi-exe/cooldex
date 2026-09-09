@@ -49,6 +49,7 @@ Usage:
   ./scripts/cargo-guard.sh prep --changed --mode standard
   ./scripts/cargo-guard.sh verify --changed --mode standard
   ./scripts/cargo-guard.sh verify --range BASE..HEAD --mode strict
+  ./scripts/cargo-guard.sh verify --changed --mode full --yolo
   ./scripts/cargo-guard.sh <cargo-subcommand> [args...]
   ./scripts/cargo-guard.sh cargo <cargo-subcommand> [args...]
 
@@ -67,6 +68,8 @@ Planner selectors:
   - --file <path>: explicit changed file
   - --surface <name>: explicit validation surface
   - --json: print machine-readable JSON plan output
+  - --yolo: for native Windows validation plans only, bypass RAM and disk preflight floors;
+    this risks paging, out-of-memory, disk-full, or incomplete outputs and never triggers cleanup
 
 Runs Cargo with deterministic guardrails for build-like commands:
   - runs from ./codex-rs by default

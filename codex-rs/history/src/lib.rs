@@ -13,6 +13,7 @@ use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -62,6 +63,14 @@ pub struct CodexHarnessMetadata {
     /// Producer compatibility for an opaque compaction item, never the currently selected model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_hash: Option<String>,
+
+    /// Thread acceptance order, independent of when queued user input reaches model history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_input_order: Option<u64>,
+
+    /// Copied parent context stays model-visible but must not become child-local authorization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherited_user_message: bool,
 }
 
 impl ResponseItemEnvelope {
@@ -161,10 +170,16 @@ impl JsonSchema for RolloutItem {
 }
 
 mod guardian_history;
+mod reconciled_retained_context;
 mod retained_context;
 
+pub use reconciled_retained_context::ReconciledRetainedContext;
 pub use retained_context::RetainedContext;
+pub use retained_context::RetainedContextEntry;
 pub use retained_context::RetainedContextEvent;
+pub use retained_context::RetainedContextOrder;
+pub use retained_context::RetainedInputSource;
+pub use retained_context::RetainedUserMessage;
 pub use retained_context::VerifiedAnswer;
 pub use retained_context::VerifiedQuestionAnswer;
 mod rollout_payload;
@@ -417,6 +432,22 @@ impl InitialHistory {
     pub fn get_resumed_parent_thread_id(&self) -> Option<ThreadId> {
         self.get_resumed_session_meta()
             .and_then(|meta| meta.parent_thread_id)
+    }
+
+    // Merge-safety anchor: a resumed V2 child reads its birth binding only from its first
+    // canonical SessionMeta; inherited parent metadata must not supply a fallback value.
+    pub fn get_resumed_agent_usage_hint_binding(&self) -> Option<Option<AgentUsageHintBinding>> {
+        match self {
+            Self::New | Self::Cleared | Self::Forked(_) => None,
+            Self::Resumed(resumed) => match resumed.history.first() {
+                Some(RolloutItem::SessionMeta(meta_line))
+                    if meta_line.meta.id == resumed.conversation_id =>
+                {
+                    Some(meta_line.meta.agent_usage_hint_binding.clone())
+                }
+                _ => None,
+            },
+        }
     }
 
     fn get_session_meta(&self) -> Option<&SessionMeta> {

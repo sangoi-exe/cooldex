@@ -1,5 +1,6 @@
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::protocol::AgentUsageHintInstructions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultiAgentRoleInstructions {
@@ -19,6 +20,21 @@ impl MultiAgentRoleInstructions {
         Self {
             text: text.into(),
             marked: true,
+        }
+    }
+
+    // Merge-safety anchor: durable full-history hint identity crosses the protocol boundary as
+    // raw text plus marker state; it must never recover either property by parsing rendered text.
+    pub(crate) fn from_agent_usage_hint_instructions(
+        AgentUsageHintInstructions { text, marked }: AgentUsageHintInstructions,
+    ) -> Self {
+        Self { text, marked }
+    }
+
+    pub(crate) fn into_agent_usage_hint_instructions(self) -> AgentUsageHintInstructions {
+        AgentUsageHintInstructions {
+            text: self.text,
+            marked: self.marked,
         }
     }
 }

@@ -40,6 +40,9 @@ pub(super) async fn create_thread(
         .with_session_id(params.session_id)
         .with_selected_capability_roots(params.selected_capability_roots)
         .with_multi_agent_version(params.multi_agent_version)
+        // Merge-safety anchor: fresh thread creation writes an explicit binding, while rewriters
+        // retain any source metadata absence through the recorder's optional builder field.
+        .with_agent_usage_hint_binding(Some(params.agent_usage_hint_binding))
         .with_history_mode(params.history_mode)
         .with_history_base(params.history_base)
         .with_forked_from_ordinal_exclusive(

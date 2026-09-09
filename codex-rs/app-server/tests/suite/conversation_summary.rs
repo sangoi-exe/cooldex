@@ -134,6 +134,9 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: pathless fixture creation follows the fresh-thread contract
+            // and must persist an explicit Resolve binding.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,

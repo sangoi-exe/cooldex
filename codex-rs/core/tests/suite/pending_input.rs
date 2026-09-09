@@ -86,12 +86,14 @@ async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyho
             responses::user_message_item("automatic response item"),
         )))
         .await?;
-    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+    let StartIfIdleSubmission::Started { turn_id } = submission else {
+        panic!("automatic input should start a turn");
+    };
     wait_for_turn_complete(test.codex.as_ref()).await;
 
     let request = response.single_request();
     let request_body = request.body_json();
-    responses::assert_root_turn(&request_body, /*expected*/ None)?;
+    responses::assert_root_turn(&request_body, Some(&turn_id))?;
     responses::assert_parent_turn(&request_body, /*expected*/ None)?;
     let user_messages = request.message_input_texts("user");
     assert!(
@@ -155,6 +157,7 @@ async fn standalone_tool_output_starts_instruction_turn() -> anyhow::Result<()> 
     Ok(())
 }
 
+// Merge-safety anchor: idle TurnSlot admission carries submitted input into the first model request.
 async fn assert_idle_user_input_reaches_the_first_model_request(
     mode: ModeKind,
 ) -> anyhow::Result<()> {

@@ -344,11 +344,13 @@ enabled = false
                 ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     good_config.codex_home.clone(),
+                    // Merge-safety anchor: refresh-created threads honor include_global_agents_md when resolving home instructions.
                     codex_home::GlobalInstructionsMode::from_include_global_agents_md(
                         good_config.include_global_agents_md,
                     ),
                 )),
                 /*analytics_events_client*/ None,
+                codex_core::passthrough_image_store(),
                 Arc::clone(&thread_store),
                 codex_core::local_agent_graph_store_from_state_db(Some(&state_db)),
                 "11111111-1111-4111-8111-111111111111".to_string(),

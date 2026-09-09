@@ -23,6 +23,8 @@ pub enum TurnInput {
     UserInput {
         content: Vec<UserInput>,
         client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acceptance_order: Option<u64>,
     },
     FunctionCallOutput(ResponseItem),
     // Preserve the existing serialized format while carrying injection API metadata
@@ -278,6 +280,8 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
+    // Merge-safety anchor: keep active-turn metadata in the TurnSlot owner so late mailbox
+    // delivery cannot bypass rooted turn provenance.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -486,6 +490,7 @@ mod tests {
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 &turn_state,
                 vec![TurnInput::UserInput {
+                    acceptance_order: None,
                     content: vec![UserInput::Text {
                         text: "steer".to_string(),
                         text_elements: Vec::new(),
@@ -518,6 +523,7 @@ mod tests {
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                 &turn_state,
                 vec![TurnInput::UserInput {
+                    acceptance_order: None,
                     content: vec![UserInput::Text {
                         text: "already pending".to_string(),
                         text_elements: Vec::new(),

@@ -19,6 +19,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::parse_command::ParsedCommand;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use dirs::home_dir;
 use http::StatusCode;
 use pretty_assertions::assert_eq;
@@ -34,6 +35,51 @@ use codex_protocol::mcp::Tool;
 use rmcp::model::ContentBlock;
 
 const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+#[test]
+fn connected_server_version_notice_snapshot() {
+    let target = crate::AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::from_absolute_path(
+                std::env::temp_dir().join("codex.sock"),
+            )
+            .expect("absolute socket path"),
+        },
+    };
+    let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
+        &target,
+        /*server_home*/ None,
+        "0.153.0",
+        Some("0.152.1"),
+        /*last_shown*/ None,
+    )
+    .expect("older remote service should have a notice");
+    let cell = new_server_version_warning(notice);
+    insta::assert_snapshot!(render_lines(&cell.display_lines(/*width*/ 100)).join("\n"));
+}
+
+#[test]
+fn local_daemon_version_notice_snapshot() {
+    let target = crate::AppServerTarget::LocalDaemon {
+        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
+            socket_path: AbsolutePathBuf::from_absolute_path(
+                std::env::temp_dir().join("codex.sock"),
+            )
+            .expect("absolute socket path"),
+        },
+    };
+    let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
+        &target,
+        /*server_home*/ None,
+        "0.153.0",
+        Some("0.152.1"),
+        /*last_shown*/ None,
+    )
+    .expect("older local service should have a notice");
+    let cell = new_server_version_warning(notice);
+    insta::assert_snapshot!(render_lines(&cell.display_lines(/*width*/ 100)).join("\n"));
+}
+
 async fn test_config() -> Config {
     let codex_home = std::env::temp_dir();
     ConfigBuilder::default()
@@ -598,7 +644,7 @@ fn unified_exec_interaction_cell_renders_wait() {
 }
 
 #[test]
-fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics() {
+fn final_message_separator_preserves_runtime_metrics_for_short_turns() {
     let summary = RuntimeMetricsSummary {
         tool_calls: RuntimeMetricTotals {
             count: 3,
@@ -633,7 +679,7 @@ fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics
     let rendered = render_lines(&cell.display_lines(/*width*/ 600));
 
     assert_eq!(rendered.len(), 1);
-    assert!(!rendered[0].contains("Worked for"));
+    assert!(rendered[0].starts_with("  Local tools:"));
     assert!(rendered[0].contains("Local tools: 3 calls (2.5s)"));
     assert!(rendered[0].contains("Inference: 2 calls (1.2s)"));
     assert!(rendered[0].contains("WebSocket: 1 events send (700ms)"));
@@ -769,14 +815,21 @@ fn ps_output_multiline_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_snapshot() {
-    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Apply);
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
 }
 
 #[test]
-fn cyber_policy_error_event_individual_snapshot() {
-    let cell = new_cyber_policy_error_event(Some(PlanType::Pro));
+fn cyber_policy_error_event_astra_snapshot() {
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Astra);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn cyber_policy_error_event_limited_snapshot() {
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Limited);
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -790,7 +843,7 @@ fn safety_access_block_event_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_narrow_snapshot() {
-    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
+    let cell = new_cyber_policy_error_event(crate::daybreak::Notice::Apply);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
 }

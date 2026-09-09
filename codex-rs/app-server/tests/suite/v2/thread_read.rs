@@ -525,6 +525,9 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: these test-created threads model fresh persistence and retain
+            // the explicit Resolve binding rather than legacy metadata absence.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
             history_base: None,
             subagent_history_start_ordinal: None,
@@ -1584,6 +1587,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: codex_protocol::protocol::ThreadHistoryMode::Paginated,
             history_base: None,
             subagent_history_start_ordinal: None,
@@ -2310,6 +2314,7 @@ async fn seed_pathless_store_thread(
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,

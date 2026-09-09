@@ -3034,6 +3034,27 @@ pub struct HistoryPosition {
     pub end_byte_offset: u64,
 }
 
+/// Durable instructions used by a multi-agent usage-hint binding.
+// Merge-safety anchor: durable hint bindings preserve the raw text plus marker state rather than
+// a rendered fragment, so full-history children can retain their original hint identity.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct AgentUsageHintInstructions {
+    pub text: String,
+    pub marked: bool,
+}
+
+/// Durable source for resolving a multi-agent usage hint.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum AgentUsageHintBinding {
+    #[default]
+    Resolve,
+    Inherited {
+        instructions: Option<AgentUsageHintInstructions>,
+    },
+}
+
 /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
 ///
 /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
@@ -3099,6 +3120,8 @@ pub struct SessionMeta {
     pub subagent_history_start_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<MultiAgentVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_usage_hint_binding: Option<AgentUsageHintBinding>,
     /// Initial context-window identity for consumers that tail rollout JSONL before compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<SessionContextWindow>,
@@ -3131,6 +3154,7 @@ impl Default for SessionMeta {
             history_base: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
+            agent_usage_hint_binding: None,
             context_window: None,
         }
     }
@@ -4593,6 +4617,47 @@ mod tests {
                 },
             )])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn session_meta_round_trips_agent_usage_hint_binding_states() -> Result<()> {
+        let bindings = vec![
+            Some(AgentUsageHintBinding::Resolve),
+            Some(AgentUsageHintBinding::Inherited { instructions: None }),
+            Some(AgentUsageHintBinding::Inherited {
+                instructions: Some(AgentUsageHintInstructions {
+                    text: "inherited instructions".to_string(),
+                    marked: false,
+                }),
+            }),
+            Some(AgentUsageHintBinding::Inherited {
+                instructions: Some(AgentUsageHintInstructions {
+                    text: "inherited instructions".to_string(),
+                    marked: true,
+                }),
+            }),
+        ];
+
+        let serialized = bindings
+            .iter()
+            .map(|binding| {
+                serde_json::to_value(SessionMeta {
+                    agent_usage_hint_binding: binding.clone(),
+                    ..SessionMeta::default()
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (index, value) in serialized.iter().enumerate() {
+            for earlier in &serialized[..index] {
+                assert_ne!(value, earlier);
+            }
+        }
+
+        for (binding, value) in bindings.into_iter().zip(serialized) {
+            let round_tripped: SessionMeta = serde_json::from_value(value)?;
+            assert_eq!(round_tripped.agent_usage_hint_binding, binding);
+        }
         Ok(())
     }
 

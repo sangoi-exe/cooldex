@@ -108,6 +108,8 @@ async fn handle_spawn_agent(
     apply_spawn_agent_service_tier(&session, &mut config, /*requested_service_tier*/ None).await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
+    // Merge-safety anchor: spawn supplies no multi_agent_v2_usage_hints
+    // override, so the copied child identity remains authoritative.
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
         config,
         input_items,
@@ -125,7 +127,6 @@ async fn handle_spawn_agent(
             parent_turn_id: Some(turn.sub_id.clone()),
             root_turn_id: turn.turn_metadata_state.root_turn_id(),
             environments: Some(step_context.environments.to_selections()),
-            multi_agent_v2_usage_hints: None,
             cyber_access_program: turn.cyber_access_program,
         },
     ))

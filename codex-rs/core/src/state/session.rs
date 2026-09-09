@@ -47,6 +47,8 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
+    // Merge-safety anchor: post_compact_recovery and prepared auto-compaction
+    // windows remain session-scoped so recovery installs only a matching window.
     pub(crate) post_compact_recovery: PostCompactRecoveryRuntimeState,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
@@ -66,14 +68,15 @@ impl SessionState {
         Self::new_with_auto_compact_window_ids(
             session_configuration,
             AutoCompactWindowIds::new_initial(),
+            ContextManager::new(),
         )
     }
 
     pub(crate) fn new_with_auto_compact_window_ids(
         session_configuration: SessionConfiguration,
         auto_compact_window_ids: AutoCompactWindowIds,
+        history: ContextManager,
     ) -> Self {
-        let history = ContextManager::new();
         Self {
             session_configuration,
             base_instructions_provenance: None,

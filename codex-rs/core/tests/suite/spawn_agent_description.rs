@@ -90,7 +90,9 @@ fn test_model_info(
         input_modalities: default_input_modalities(),
         used_fallback_model_metadata: false,
         supports_search_tool: false,
+        supports_experimental_context: false,
         use_responses_lite: false,
+        guardian: None,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: None,
@@ -331,6 +333,7 @@ async fn configured_agent_roles_control_spawn_agent_type(
     Ok(())
 }
 
+// Merge-safety anchor: V2 spawn-agent guidance mirrors full-history fork identity rules.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_spawn_agent_guidance_schema_and_runtime_identity_contract_match() -> Result<()> {
     let server = start_mock_server().await;

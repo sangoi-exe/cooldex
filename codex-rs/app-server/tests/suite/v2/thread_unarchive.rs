@@ -258,6 +258,9 @@ async fn thread_unarchive_preserves_pathless_store_metadata() -> Result<()> {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: this fresh pathless fixture must retain explicit Resolve;
+            // only source-preserving rewrites may carry metadata absence.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,

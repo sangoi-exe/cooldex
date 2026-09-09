@@ -3,11 +3,36 @@ use crate::bottom_pane::goal_status_indicator_line;
 use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::rate_limits::NUDGE_MODEL_SLUG;
 use crate::chatwidget::rate_limits::get_limits_duration;
+use crate::chatwidget::realtime::tests::activate_voice_for_thread;
 use codex_app_server_protocol::SpendControlLimitSnapshot;
 use codex_app_server_protocol::ThreadUsage;
 use pretty_assertions::assert_eq;
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serial_test::serial;
+
+#[tokio::test]
+async fn voice_live_transcript_renders_beside_the_streamed_cell() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.animations = false;
+    activate_voice_for_thread(&mut chat, ThreadId::new());
+    chat.transcript.active_cell = Some(Box::new(history_cell::StreamingAgentTailCell::new(
+        vec![Line::from("Agent answer arriving").into()],
+        /*is_first_line*/ true,
+    )));
+    chat.on_realtime_transcript_delta("user".into(), "pick a number".into());
+
+    let width = 60;
+    let height = chat.desired_height(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("render live voice transcript");
+    let rendered = normalized_backend_snapshot(terminal.backend());
+    assert!(rendered.contains("Agent answer arriving"), "{rendered}");
+    assert!(rendered.contains("pick a number"), "{rendered}");
+    assert_chatwidget_snapshot!("voice_live_transcript_and_stream", rendered);
+}
 
 fn enable_test_ambient_pet(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
@@ -91,7 +116,10 @@ async fn resumed_session_hides_unknown_token_usage_until_an_update_arrives() {
 
 #[tokio::test]
 async fn app_server_cyber_policy_error_renders_dedicated_notice() {
-    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(Some("gpt-5.6-sol")).await;
+    chat.cyber_policy_notice
+        .set(crate::daybreak::Notice::Apply)
+        .unwrap();
 
     handle_error(
         &mut chat,
@@ -102,27 +130,10 @@ async fn app_server_cyber_policy_error_renders_dedicated_notice() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
-    assert!(rendered.contains("This content can't be shown"));
-    assert!(rendered.contains("extra caution with cybersecurity requests"));
-    assert!(rendered.contains("openai.com/form/enterprise-trusted-access-for-cyber"));
+    assert!(rendered.contains("This content can’t be shown"));
+    assert!(rendered.contains("We take extra care with some cybersecurity requests"));
+    assert!(rendered.contains("Apply for Daybreak"));
     assert!(!rendered.contains("server fallback message"));
-}
-
-#[tokio::test]
-async fn app_server_cyber_policy_error_uses_individual_link_for_personal_plan() {
-    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.plan_type = Some(PlanType::Free);
-    chat.has_chatgpt_account = true;
-
-    handle_error(
-        &mut chat,
-        "server fallback message",
-        Some(CodexErrorInfo::CyberPolicy),
-    );
-
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1);
-    assert!(lines_to_single_string(&cells[0]).contains("https://chatgpt.com/cyber/"));
 }
 
 #[tokio::test]
@@ -503,7 +514,6 @@ async fn configured_pet_load_is_deferred_until_after_construction() {
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
-        runtime_model_provider_base_url: None,
         initial_plan_type: None,
         model: Some(resolved_model),
         startup_tooltip_override: None,
@@ -976,6 +986,8 @@ async fn rolling_rate_limit_snapshot_preserves_prior_individual_limit() {
         .individual_limit
         .as_ref()
         .expect("rolling updates should preserve monthly limits");
+    // Merge-safety anchor: monthly-limit expectations use the shared locale-aware
+    // formatter rather than comma-grouped literals.
     assert_eq!(
         individual_limit.used,
         codex_protocol::num_format::format_with_separators(8_000)
@@ -2553,7 +2565,6 @@ async fn added_history_uses_pet_adjusted_terminal_width() {
     chat.add_to_history(WidthCell(std::sync::Arc::clone(&width)));
 
     assert_eq!(width.load(std::sync::atomic::Ordering::Relaxed), 69);
-    assert!(chat.transcript.needs_final_message_separator);
     let backend = VT100Backend::new(/*width*/ 80, /*height*/ 4);
     let mut terminal = crate::custom_terminal::Terminal::with_options(backend).expect("terminal");
     terminal.set_viewport_area(Rect::new(
@@ -3353,7 +3364,7 @@ async fn completed_turn_refreshes_estimated_thread_cost() {
     ));
 
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
 
     let request_id = std::iter::from_fn(|| rx.try_recv().ok())
@@ -3405,7 +3416,7 @@ async fn completed_turn_refreshes_credits_only_terminal_title() {
     ));
 
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
 
     let request_id = std::iter::from_fn(|| rx.try_recv().ok())
@@ -4539,7 +4550,7 @@ async fn runtime_metrics_websocket_timing_logs_and_final_separator_sums_totals()
     assert!(second_log.contains("TTFT: 80ms (iapi)"));
 
     chat.on_task_complete(
-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
+        /*last_agent_message*/ None, /*completion*/ None, /*from_replay*/ false,
     );
     let mut final_separator = None;
     while let Ok(event) = rx.try_recv() {
@@ -5750,7 +5761,9 @@ printf 'fenced within fenced\n'
 
     assert_chatwidget_snapshot!(
         "chatwidget_markdown_code_blocks_vt100_snapshot",
-        normalize_snapshot_paths(term.backend().vt100().screen().contents())
+        normalize_completion_timestamps(normalize_snapshot_paths(
+            term.backend().vt100().screen().contents()
+        ))
     );
 }
 

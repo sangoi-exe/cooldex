@@ -1,3 +1,4 @@
+use crate::context::GuardianContextMode;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -233,6 +234,7 @@ mod mcp_runtime;
 pub(crate) mod multi_agents;
 mod post_compact_recovery;
 mod realtime_history;
+mod reasoning_effort;
 pub(crate) mod recall;
 mod retained_context;
 mod review;
@@ -306,6 +308,7 @@ use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
+use crate::state::AcceptedUserInputResponse;
 use crate::state::AutoCompactWindowIds;
 use crate::state::AutoCompactWindowSnapshot;
 use crate::state::PendingRequestPermissions;
@@ -336,6 +339,7 @@ use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::PluginsManager;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
+use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
 use codex_history::InitialHistory;
 use codex_history::PostCompactRecoveryMarker;
@@ -705,15 +709,47 @@ impl Session {
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
         let auth = auth_manager.auth_cached();
-        token_budget::apply_experimental_context(Arc::make_mut(&mut config), auth.as_ref())?;
-        // Intentionally resolve `enabled` and `use_history_notes_extension` only at
-        // thread startup. Both activation flags stay fixed for this thread runtime,
-        // even if the selected model changes later.
-        token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
-        let configured_config = Arc::clone(&config);
+        // Forked subagents keep their parent's activation with the copied history.
+        // Fresh children restore configured preferences before applying startup defaults.
+        let inherits_token_budget = matches!(&conversation_history, InitialHistory::Forked(_))
+            && config.token_budget_startup_config.is_some();
+        if !inherits_token_budget {
+            Arc::make_mut(&mut config)
+                .prepare_token_budget_for_startup()
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            // Resolve activation for this runtime, including when resuming saved history.
+            token_budget::apply_experimental_context(
+                Arc::make_mut(&mut config),
+                auth.as_ref(),
+                &model_info,
+            )?;
+            token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
+        }
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version)
         });
+        // Merge-safety anchor: resumed V2 thread-spawn children restore their canonical birth
+        // binding before startup config is cloned; roots and Forked histories retain their
+        // existing runtime binding paths.
+        if let InitialHistory::Resumed(resumed) = &conversation_history
+            && multi_agent_version == Some(MultiAgentVersion::V2)
+            && matches!(
+                &session_source,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+            )
+        {
+            let binding = conversation_history
+                .get_resumed_agent_usage_hint_binding()
+                .flatten()
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "agent {} is missing a canonical agent_usage_hint_binding required to restore its identity snapshot",
+                        resumed.conversation_id
+                    ))
+                })?;
+            Arc::make_mut(&mut config).agent_usage_hint_binding = binding;
+        }
+        let configured_config = Arc::clone(&config);
         let history_mode = conversation_history.get_history_mode(
             requested_history_mode.unwrap_or_else(|| thread_store.default_history_mode()),
         );
@@ -1631,8 +1667,7 @@ impl Session {
             );
             state
                 .history
-                .restore_guardian_history(guardian_history.as_ref());
-            state.history.restore_retained_context(&retained_context);
+                .restore_review_context(Some(&retained_context), guardian_history.as_ref());
             if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
@@ -1885,7 +1920,25 @@ impl Session {
                     .features
                     .enabled(Feature::ShellTool),
             ),
+            configuration
+                .original_config_do_not_use
+                .agent_usage_hint_binding
+                .clone(),
         )
+    }
+
+    // Merge-safety anchor: public full-history V2 spawn derives its child identity from the
+    // parent turn's effective typed hint, while ordinary snapshots retain their live binding.
+    pub(crate) async fn full_history_agent_identity_snapshot(
+        &self,
+        turn_context: &crate::session::turn_context::TurnContext,
+    ) -> AgentIdentitySnapshot {
+        self.agent_identity_snapshot()
+            .await
+            .for_full_history(multi_agents::usage_hint_text(
+                turn_context,
+                &turn_context.session_source,
+            ))
     }
 
     pub(crate) async fn set_app_server_client_info(
@@ -2146,6 +2199,13 @@ impl Session {
                 turn_context.sub_id.clone(),
                 error,
             ));
+    }
+
+    /// Uses the extension-owned reviewer, or the same manager for standalone hosts.
+    pub(crate) fn guardian_review_session(&self) -> Arc<GuardianReviewSessionManager> {
+        self.services
+            .thread_extension_data
+            .get_or_init(GuardianReviewSessionManager::default)
     }
 
     /// Persist the event to rollout and send it to clients.
@@ -2843,7 +2903,6 @@ impl Session {
     ) -> Option<RequestPermissionsResponse> {
         let turn_context = &step_context.turn;
         let approval_policy = step_context.settings.approval_policy();
-        let approvals_reviewer = step_context.settings.approvals_reviewer();
         let Some(environment) = step_context
             .environments
             .turn_environments()
@@ -2890,7 +2949,6 @@ impl Session {
                 strict_auto_review: false,
             });
         };
-        if crate::guardian::routes_approval_policy_to_guardian(approval_policy, approvals_reviewer)
         {
             let originating_turn_state = {
                 let slot = self.active_turn.lock().await;
@@ -2899,13 +2957,13 @@ impl Session {
             let action = ApprovalAction::RequestPermissions {
                 id: call_id.clone(),
                 turn_id: turn_context.sub_id.clone(),
-                reason: args.reason,
+                reason: args.reason.clone(),
                 permissions: requested_permissions.clone(),
             };
             let approval_context = ApprovalContext {
                 review_context: crate::guardian::GuardianReviewContext::from(step_context),
                 cancellation_token: Some(cancellation_token.clone()),
-                call_id,
+                call_id: call_id.clone(),
                 tool_name: ToolName::plain("request_permissions"),
                 strict_auto_review: false,
                 approval_reason: None,
@@ -2920,54 +2978,53 @@ impl Session {
                     &approval_context,
                 ) => decision,
             };
-            let response = match decision {
-                ReviewDecision::Approved | ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
-                    RequestPermissionsResponse {
-                        permissions: requested_permissions.clone(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
+            if let Some(decision) = decision {
+                let (permissions, scope) = match decision {
+                    ReviewDecision::Approved
+                    | ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                    | ReviewDecision::NetworkPolicyAmendment {
+                        network_policy_amendment:
+                            NetworkPolicyAmendment {
+                                action: NetworkPolicyRuleAction::Allow,
+                                ..
+                            },
+                    } => (requested_permissions.clone(), PermissionGrantScope::Turn),
+                    ReviewDecision::ApprovedForSession => {
+                        (requested_permissions.clone(), PermissionGrantScope::Session)
                     }
-                }
-                ReviewDecision::ApprovedForSession => RequestPermissionsResponse {
-                    permissions: requested_permissions.clone(),
-                    scope: PermissionGrantScope::Session,
+                    ReviewDecision::ApprovedMcpPolicyAmendment
+                    | ReviewDecision::NetworkPolicyAmendment {
+                        network_policy_amendment:
+                            NetworkPolicyAmendment {
+                                action: NetworkPolicyRuleAction::Deny,
+                                ..
+                            },
+                    }
+                    | ReviewDecision::Abort
+                    | ReviewDecision::Denied { .. }
+                    | ReviewDecision::TimedOut => (
+                        RequestPermissionProfile::default(),
+                        PermissionGrantScope::Turn,
+                    ),
+                };
+                let response = RequestPermissionsResponse {
+                    permissions,
+                    scope,
                     strict_auto_review: false,
-                },
-                ReviewDecision::NetworkPolicyAmendment {
-                    network_policy_amendment,
-                } => match network_policy_amendment.action {
-                    NetworkPolicyRuleAction::Allow => RequestPermissionsResponse {
-                        permissions: requested_permissions.clone(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    },
-                    NetworkPolicyRuleAction::Deny => RequestPermissionsResponse {
-                        permissions: RequestPermissionProfile::default(),
-                        scope: PermissionGrantScope::Turn,
-                        strict_auto_review: false,
-                    },
-                },
-                ReviewDecision::ApprovedMcpPolicyAmendment
-                | ReviewDecision::Abort
-                | ReviewDecision::Denied { .. }
-                | ReviewDecision::TimedOut => RequestPermissionsResponse {
-                    permissions: RequestPermissionProfile::default(),
-                    scope: PermissionGrantScope::Turn,
-                    strict_auto_review: false,
-                },
-            };
-            let response = Self::normalize_request_permissions_response(
-                requested_permissions,
-                response,
-                &context,
-            );
-            self.record_granted_request_permissions_for_turn(
-                &response,
-                &environment.selection.environment_id,
-                originating_turn_state.as_ref(),
-            )
-            .await;
-            return Some(response);
+                };
+                let response = Self::normalize_request_permissions_response(
+                    requested_permissions,
+                    response,
+                    &context,
+                );
+                self.record_granted_request_permissions_for_turn(
+                    &response,
+                    &environment.selection.environment_id,
+                    originating_turn_state.as_ref(),
+                )
+                .await;
+                return Some(response);
+            }
         }
 
         let _elicitation = self.services.elicitations.register();
@@ -3021,12 +3078,12 @@ impl Session {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub async fn request_user_input(
+    pub(crate) async fn request_user_input(
         &self,
         turn_context: &TurnContext,
         call_id: String,
         args: RequestUserInputArgs,
-    ) -> Option<RequestUserInputResponse> {
+    ) -> Option<AcceptedUserInputResponse> {
         let _elicitation = self.services.elicitations.register();
         let sub_id = turn_context.sub_id.clone();
         let (tx_response, rx_response) = oneshot::channel();
@@ -3073,14 +3130,23 @@ impl Session {
             match slot.turn_state() {
                 Some(turn_state) => {
                     let mut ts = turn_state.lock().await;
-                    ts.remove_pending_user_input(sub_id)
+                    let sender = ts.remove_pending_user_input(sub_id);
+                    match sender {
+                        Some(sender) => Some((sender, self.reserve_user_input_order().await)),
+                        None => None,
+                    }
                 }
                 None => None,
             }
         };
         match entry {
-            Some(tx_response) => {
-                tx_response.send(response).ok();
+            Some((tx_response, acceptance_order)) => {
+                tx_response
+                    .send(AcceptedUserInputResponse {
+                        response,
+                        acceptance_order,
+                    })
+                    .ok();
             }
             None => {
                 warn!("No pending user input found for sub_id: {sub_id}");
@@ -3858,7 +3924,7 @@ impl Session {
         } else {
             None
         };
-        if self.enabled(Feature::GuardianThreadContext)
+        if self.guardian_context_mode == GuardianContextMode::ThreadOwned
             && let Some(checkpoint) = items.iter_mut().rev().find(|envelope| {
                 matches!(
                     envelope.item,
@@ -4744,14 +4810,24 @@ impl Session {
         turn_context: &TurnContext,
         input: &[UserInput],
         client_id: Option<String>,
+        acceptance_order: Option<u64>,
         persist_context: PersistContext,
     ) {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         let response_item = self.response_item_from_user_input(input.to_vec());
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        self.record_annotated_conversation_items(
+            turn_context,
+            vec![ResponseItemEnvelope {
+                item: response_item,
+                metadata: acceptance_order.map(|order| CodexHarnessMetadata {
+                    user_input_order: Some(order),
+                    ..Default::default()
+                }),
+            }],
+        )
+        .await;
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);
@@ -4880,6 +4956,7 @@ impl Session {
                         TurnInput::UserInput {
                             content: std::mem::take(content),
                             client_id: client_id.clone(),
+                            acceptance_order: self.reserve_user_input_order().await,
                         },
                         client_id,
                     )

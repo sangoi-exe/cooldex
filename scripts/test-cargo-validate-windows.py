@@ -665,6 +665,14 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 for check in preflight["execution_preflight"]
             )
         )
+        self.assertTrue(
+            all(
+                not check["yolo"]
+                and not check["bypassed_free_disk_floor"]
+                and not check["bypassed_available_memory_floor"]
+                for check in preflight["execution_preflight"]
+            )
+        )
         self.assertEqual(
             {
                 record["index"]: record["status"]
@@ -681,6 +689,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         command_result = next(
             record for record in result["command_results"] if record["index"] == 1
         )
+        self.assertFalse(command_result["command_preflight"]["yolo"])
         self.assertEqual(
             command_result["launch_file_name"], command_result["fake_tool_path"]
         )
@@ -1699,6 +1708,87 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(process.returncode, 1)
         self.assertEqual(summary["status"], "preflight-failed")
         self.assertIn("preflight fixture data requires", str(result["error"]))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_yolo_bypasses_only_resource_floors_and_records_it(self) -> None:
+        yolo_manifest = self.manifest([self.command(env=self.fixture_env())])
+        yolo_manifest["flags"].append("yolo")
+        low_resources = {
+            **DEFAULT_PREFLIGHT_FIXTURE,
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(119 * 1024**3),
+            "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES": str(29 * 1024**3),
+        }
+        process, summary, result = self.invoke(
+            yolo_manifest,
+            fixture_opt_in=True,
+            preflight_fixture=low_resources,
+        )
+        self.assertEqual(process.returncode, 0, msg=process.stderr)
+        self.assertEqual(summary["status"], "success")
+        evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+        preflight = json.loads(
+            (evidence_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(preflight["yolo"])
+        self.assertTrue(
+            all(
+                check["yolo"]
+                and check["bypassed_free_disk_floor"]
+                and check["bypassed_available_memory_floor"]
+                and check["free_disk_bytes"] == 119 * 1024**3
+                and check["required_free_disk_bytes"] == 120 * 1024**3
+                and check["available_memory_bytes"] == 29 * 1024**3
+                and check["required_available_memory_bytes"] == 30 * 1024**3
+                for check in preflight["execution_preflight"]
+            )
+        )
+        command_result = next(
+            record for record in result["command_results"] if record["index"] == 1
+        )
+        self.assertTrue(command_result["command_preflight"]["yolo"])
+        self.assertTrue(command_result["command_preflight"]["bypassed_free_disk_floor"])
+        self.assertTrue(
+            command_result["command_preflight"]["bypassed_available_memory_floor"]
+        )
+
+        for label, fixture, expected in (
+            (
+                "native-writer",
+                {
+                    **DEFAULT_PREFLIGHT_FIXTURE,
+                    "CARGO_VALIDATE_WINDOWS_TEST_NATIVE_PROCESS_STATE": "cargo",
+                },
+                "native Windows cargo writer",
+            ),
+            (
+                "wsl-writer",
+                {
+                    **DEFAULT_PREFLIGHT_FIXTURE,
+                    "CARGO_VALIDATE_WINDOWS_TEST_WSL_PROCESS_STATE": "rustc",
+                },
+                "WSL cargo writer",
+            ),
+        ):
+            with self.subTest(label=label):
+                manifest = self.manifest([self.command(env=self.fixture_env())])
+                manifest["flags"].append("yolo")
+                process, summary, result = self.invoke(
+                    manifest,
+                    fixture_opt_in=True,
+                    preflight_fixture=fixture,
+                )
+                self.assertEqual(process.returncode, 1)
+                self.assertEqual(summary["status"], "preflight-failed")
+                self.assertIn(expected.casefold(), str(result["error"]).casefold())
+                self.assertEqual([], result["command_results"])
+                evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+                preflight = json.loads(
+                    (evidence_dir / "preflight.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(preflight["yolo"])
+                self.assertTrue(preflight["execution_preflight"][0]["yolo"])
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"

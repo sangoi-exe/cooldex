@@ -304,6 +304,7 @@ async fn user_turn_selects_symlinked_skill_by_advertised_discovery_path() -> Res
     Ok(())
 }
 
+// Merge-safety anchor: idle TurnSlot admission preserves resolved skill instructions in the first request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_user_turn_includes_skill_instructions_in_the_first_request() -> Result<()> {
     skip_if_wine_exec!(

@@ -1,4 +1,64 @@
 use super::*;
+
+#[tokio::test]
+async fn older_server_notice_is_visible_in_agents_overview() {
+    let mut app = make_test_app().await;
+    app.update_server_version_overview_notice("0.153.0", Some("0.152.1"));
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    insta::assert_snapshot!(rendered.lines().take(2).collect::<Vec<_>>().join("\n"));
+}
+
+#[tokio::test]
+async fn server_version_overview_notice_updates_and_clears() {
+    let mut app = make_test_app().await;
+    app.update_server_version_overview_notice("0.153.0", Some("0.152.1"));
+    app.update_server_version_overview_notice("0.153.0", Some("0.151.0"));
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    insta::assert_snapshot!(rendered.lines().take(2).collect::<Vec<_>>().join("\n"), @"  Service v0.151.0 < Codex CLI v0.153.0
+  0 need input   0 working   0 ready");
+
+    app.update_server_version_overview_notice("0.153.0", /*older_server*/ None);
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
+    let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80);
+    insta::assert_snapshot!(rendered.lines().take(2).collect::<Vec<_>>().join("\n"), @"  Agent command center
+  0 need input   0 working   0 ready");
+}
+
+#[tokio::test]
+async fn older_server_notice_wraps_in_narrow_overview() {
+    let mut app = make_test_app().await;
+    app.update_server_version_overview_notice("0.153.0", Some("0.152.1"));
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    app.chat_widget.show_bottom_pane_view(Box::new(view));
+    insta::assert_snapshot!(
+        "older_server_narrow_overview",
+        render_bottom_popup(&app.chat_widget, /*width*/ 12)
+    );
+}
+
+#[tokio::test]
+async fn older_server_notice_falls_back_in_short_overview() {
+    let mut app = make_test_app().await;
+    app.update_server_version_overview_notice("0.153.0", Some("0.152.1"));
+    let view = app.agents_overview_view(Vec::new(), /*selected_thread_id*/ None);
+    let area = ratatui::layout::Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 24, /*height*/ 8,
+    );
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    view.render(area, &mut buffer);
+    let header = buffer
+        .content()
+        .iter()
+        .take(usize::from(area.width))
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    insta::assert_snapshot!(header.trim_end(), @"  Old srv");
+}
 use crate::app::test_support::make_test_app;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::bottom_pane::BottomPaneView;
@@ -232,6 +292,7 @@ fn overview_thread(
         id: thread_id.to_string(),
         extra: None,
         project_id: None,
+        daybreak_enabled: None,
         session_id: parent_thread_id.unwrap_or(thread_id).to_string(),
         forked_from_id: None,
         parent_thread_id: None,
@@ -461,6 +522,17 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
             )
             .await?;
     }
+    // A newer rollout missing from the index must not trigger a startup filesystem scan.
+    app_test_support::create_fake_rollout_with_source(
+        &app.config.codex_home,
+        "2025-01-23T12-00-00",
+        "2025-01-23T12:00:00Z",
+        "Unindexed task",
+        Some(&app.config.model_provider_id),
+        /*git_info*/ None,
+        codex_protocol::protocol::SessionSource::Cli,
+    )
+    .expect("materialize unindexed session");
     app.app_server_target = AppServerTarget::LocalDaemon {
         endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
             socket_path: test_path_buf("/tmp/unused.sock").abs(),
@@ -881,6 +953,72 @@ async fn agents_overview_reasoning_uses_existing_events_and_expires_with_attachm
 }
 
 #[tokio::test]
+async fn worktrees_overview_grouping_requires_feature() {
+    let mut app = make_test_app().await;
+    let root = tempfile::tempdir().unwrap();
+    let primary = root.path().join("primary");
+    let linked = root.path().join("linked");
+    let linked_subdir = linked.join("subdir/child");
+    let nested = primary.join("subdir");
+    let nested_child = nested.join("child");
+    let admin = primary.join(".git/worktrees/linked");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::create_dir_all(&linked_subdir).unwrap();
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested_child).unwrap();
+    std::fs::write(primary.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(admin.join("commondir"), "../..").unwrap();
+    std::fs::write(
+        admin.join("gitdir"),
+        linked.join(".git").display().to_string(),
+    )
+    .unwrap();
+    std::fs::write(linked.join(".git"), format!("gitdir: {}", admin.display())).unwrap();
+    let primary = dunce::canonicalize(primary).unwrap();
+    let threads = [primary.clone(), linked, linked_subdir, nested_child]
+        .into_iter()
+        .map(|cwd| {
+            let mut thread = overview_thread(
+                ThreadId::new(),
+                /*parent_thread_id*/ None,
+                "Task",
+                ThreadStatus::Idle,
+            );
+            thread.cwd = AbsolutePathBuf::from_absolute_path(cwd).unwrap();
+            thread
+        })
+        .collect::<Vec<_>>();
+    let grouped_heading = format!("{}  2", primary.join("").display());
+    let width = 160;
+    for enabled in [false, true] {
+        app.config
+            .features
+            .set_enabled(Feature::Worktrees, enabled)
+            .unwrap();
+        let view = app.agents_overview_view(threads.clone(), /*selected_thread_id*/ None);
+        app.chat_widget.show_bottom_pane_view(Box::new(view));
+        let popup = render_bottom_popup(&app.chat_widget, width);
+        assert_eq!(popup.contains(&grouped_heading), enabled, "{popup}");
+        if enabled {
+            let grouping = popup
+                .lines()
+                .map(|line| line.split('│').next().unwrap_or(line).trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(
+                    &primary.join("").display().to_string(),
+                    "/tmp/worktree-root/primary/",
+                )
+                .replace('\\', "/");
+            insta::with_settings!({snapshot_path => "../snapshots"}, {
+                insta::assert_snapshot!("agents_overview_worktree_grouping", grouping);
+            });
+        }
+    }
+}
+
+#[tokio::test]
 async fn shared_overview_shows_only_root_sessions() {
     assert_eq!(
         AgentsOverviewGroup::for_status(&ThreadStatus::SystemError),
@@ -937,6 +1075,7 @@ async fn shared_overview_shows_only_root_sessions() {
         view.rows.clone(),
         Some(first_root),
         /*exit_on_cancel*/ false,
+        /*worktrees_enabled*/ false,
         crate::app_event_sender::AppEventSender::new(event_tx),
         app.keymap.clone(),
         Arc::clone(&app.agents_overview.view_state),
@@ -1178,6 +1317,7 @@ async fn filtered_dashboard_actions_use_configured_shortcuts() {
         .rows,
         Some(first),
         /*exit_on_cancel*/ false,
+        /*worktrees_enabled*/ false,
         crate::app_event_sender::AppEventSender::new(event_tx),
         app.keymap.clone(),
         Arc::clone(&app.agents_overview.view_state),
@@ -1769,6 +1909,7 @@ async fn resuming_active_session_closes_command_center() -> Result<()> {
             SessionSelection::Resume(SessionTarget {
                 path: None,
                 thread_id,
+                cwd: None,
                 history_mode: None,
             })
         )
@@ -1827,6 +1968,7 @@ async fn resume_picker_round_trip_preserves_each_threads_input() -> Result<()> {
                 &id,
             )),
             thread_id: ThreadId::from_string(&id)?,
+            cwd: None,
             history_mode: None,
         });
     }
@@ -1926,6 +2068,7 @@ async fn command_center_handles_resume_failure_and_success() -> Result<()> {
             SessionSelection::Resume(SessionTarget {
                 path: None,
                 thread_id: ThreadId::new(),
+                cwd: None,
                 history_mode: None,
             })
         )
@@ -1949,6 +2092,7 @@ async fn command_center_handles_resume_failure_and_success() -> Result<()> {
             SessionSelection::Resume(SessionTarget {
                 path: Some(path),
                 thread_id,
+                cwd: None,
                 history_mode: None,
             })
         )

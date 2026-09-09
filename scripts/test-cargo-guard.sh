@@ -415,6 +415,7 @@ begin_case
 expect_ok --help
 assert_file_contains "${CURRENT_OUT}" '--range BASE[.][.]HEAD'
 assert_file_contains "${CURRENT_OUT}" '--commit <rev>'
+assert_file_contains "${CURRENT_OUT}" '--yolo: for native Windows validation plans only'
 assert_file_empty "${CURRENT_LOG}"
 
 begin_case
@@ -423,6 +424,7 @@ assert_file_contains "${CURRENT_OUT}" 'usage: cargo-validate'
 assert_file_contains "${CURRENT_OUT}" '--range'
 assert_file_contains "${CURRENT_OUT}" '--commit'
 assert_file_contains "${CURRENT_OUT}" '--json'
+assert_file_contains "${CURRENT_OUT}" '--yolo'
 assert_file_empty "${CURRENT_LOG}"
 
 begin_case

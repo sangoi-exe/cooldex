@@ -11,6 +11,7 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
@@ -212,6 +213,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             history_base: None,
             subagent_history_start_ordinal: None,
             multi_agent_version: None,
+            agent_usage_hint_binding: None,
             context_window: None,
         },
         git: None,
@@ -696,6 +698,12 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     };
     assert_eq!(session_meta.meta.session_id, session_id);
     assert_eq!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated);
+    // Merge-safety anchor: ordinary recorder creation persists an explicit Resolve binding rather
+    // than leaving a new thread indistinguishable from metadata written before this field existed.
+    assert_eq!(
+        session_meta.meta.agent_usage_hint_binding,
+        Some(AgentUsageHintBinding::Resolve)
+    );
     assert_eq!(
         session_meta
             .meta
@@ -1600,6 +1608,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         first_user_message: Some("filesystem message".to_string()),
         preview: Some("filesystem preview".to_string()),
         project_id: None,
+        daybreak_enabled: None,
         section: None,
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
@@ -1628,6 +1637,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         first_user_message: Some("state message".to_string()),
         preview: Some("state preview".to_string()),
         project_id: None,
+        daybreak_enabled: Some(true),
         section: Some(codex_state::ThreadSection {
             id: codex_state::PINNED_THREAD_SECTION_ID.to_string(),
             name: codex_state::PINNED_THREAD_SECTION_NAME.to_string(),
@@ -1658,6 +1668,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
 
     assert_eq!(item.path, filesystem_path);
     assert_eq!(item.thread_id, Some(filesystem_thread_id));
+    assert_eq!(item.daybreak_enabled, Some(true));
     assert_eq!(
         item.section,
         Some(codex_state::ThreadSection {

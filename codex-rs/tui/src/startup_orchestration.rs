@@ -12,6 +12,18 @@ pub(super) async fn run_main_inner(
     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
     let strict_config = cli.strict_config;
+    if cli.shared.worktree {
+        if explicit_remote_endpoint.is_some() {
+            return Err(std::io::Error::other(
+                "`--worktree` is only supported for local sessions",
+            ));
+        }
+        if cli.fork_picker || cli.fork_last {
+            return Err(std::io::Error::other(
+                "`codex fork --worktree` requires an explicit session ID",
+            ));
+        }
+    }
     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
         (
             Some(SandboxMode::DangerFullAccess),
@@ -137,7 +149,9 @@ pub(super) async fn run_main_inner(
         .await;
     }
 
-    let reuse_implicit_local_daemon = !workload_identity_selected
+    let reuse_implicit_local_daemon = !cli.shared.worktree
+        && !cli.oss
+        && !workload_identity_selected
         && (cli.agents_overview
             || can_reuse_implicit_local_daemon(
                 &cli_kv_overrides,
@@ -271,6 +285,14 @@ pub(super) async fn run_main_inner(
         workload_identity_selected,
         std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
     )?;
+    if cli.shared.worktree
+        && (app_server_target.uses_remote_workspace()
+            || prepared_environment_manager.default_environment_is_remote())
+    {
+        return Err(std::io::Error::other(
+            "`--worktree` is only supported for local sessions",
+        ));
+    }
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -364,7 +386,7 @@ pub(super) async fn run_main_inner(
 
     let additional_dirs = cli.add_dir.clone();
 
-    let overrides = ConfigOverrides {
+    let mut overrides = ConfigOverrides {
         model,
         approval_policy,
         sandbox_mode,
@@ -379,7 +401,7 @@ pub(super) async fn run_main_inner(
         ..Default::default()
     };
 
-    let config = startup_draft
+    let mut config = startup_draft
         .run_until(load_config_or_exit(
             cli_kv_overrides.clone(),
             overrides.clone(),
@@ -390,7 +412,7 @@ pub(super) async fn run_main_inner(
         .await?;
     startup_draft.apply_config(&config);
 
-    let cloud_config_bundle = if workload_identity_selected {
+    let mut cloud_config_bundle = if workload_identity_selected {
         cloud_config_bundle
     } else {
         startup_draft
@@ -400,6 +422,32 @@ pub(super) async fn run_main_inner(
             ))
             .await??
     };
+    let managed_worktree = if cli.shared.worktree {
+        let (destination, bundle, worktree) = startup_draft
+            .run_until(worktree_startup::prepare(
+                &mut cli,
+                config.clone(),
+                &mut overrides,
+                cli_kv_overrides.clone(),
+                loader_overrides.clone(),
+                strict_config,
+                &app_server_target,
+                &arg0_paths,
+                cloud_config_bundle.clone(),
+            ))
+            .await?
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        config = destination;
+        cloud_config_bundle = bundle;
+        startup_draft.apply_config(&config);
+        Some(worktree)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
+        codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
+    );
     let environment_manager = Arc::new(
         prepared_environment_manager
             .build(Some(local_runtime_paths), config.http_client_factory())
@@ -488,6 +536,9 @@ pub(super) async fn run_main_inner(
         {
             restore_terminal_before_fatal_exit();
             eprintln!("Error adding directories: {warning}");
+            if let Some(worktree) = managed_worktree.as_ref() {
+                worktree.report_startup_failure();
+            }
             std::process::exit(1);
         }
     }
@@ -500,6 +551,9 @@ pub(super) async fn run_main_inner(
         {
             restore_terminal_before_fatal_exit();
             eprintln!("{err}");
+            if let Some(worktree) = managed_worktree.as_ref() {
+                worktree.report_startup_failure();
+            }
             std::process::exit(1);
         }
     }
@@ -600,6 +654,7 @@ pub(super) async fn run_main_inner(
         log_db,
         state_db,
         environment_manager,
+        managed_worktree.clone(),
         startup_draft,
     )
     .await
@@ -607,6 +662,10 @@ pub(super) async fn run_main_inner(
         err.downcast::<std::io::Error>()
             .unwrap_or_else(|err| std::io::Error::other(err.to_string()))
     });
+
+    if let Some(worktree) = managed_worktree.as_ref() {
+        worktree.report_startup_failure();
+    }
 
     if let Some(otel) = otel
         && let Err(err) = otel

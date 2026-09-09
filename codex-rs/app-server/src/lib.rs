@@ -37,6 +37,7 @@ use crate::plugin_config_reload::PluginStartupConfig;
 use crate::transport::CHANNEL_CAPACITY;
 use crate::transport::ConnectionOrigin;
 use crate::transport::ConnectionState;
+use crate::transport::DaemonShutdownAccess;
 use crate::transport::OutboundConnectionState;
 use crate::transport::RemoteControlPolicy;
 use crate::transport::RemoteControlStartConfig;
@@ -141,6 +142,8 @@ mod thread_state;
 mod thread_status;
 mod transport;
 mod turn_cost_worker;
+mod user_verification;
+mod user_verification_response;
 
 pub use crate::code_mode_host::AppServerCodeModeHostArgs;
 pub use crate::code_mode_host::CodeModeHostTransport;
@@ -234,20 +237,8 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
                 std::future::pending::<()>().await;
             }
         };
-        let daemon_signal = async {
-            let result = codex_app_server_transport::daemon_shutdown_signal().await;
-            // The processor retries listener errors; the updater instead needs
-            // immediate errors from its nonblocking shutdown probe.
-            if result.is_err() {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            result
-        };
-        tokio::select! {
-            _ = console_signal => Ok(ShutdownSignal::Forceable),
-            result = daemon_signal =>
-                result.map(|_| ShutdownSignal::Forceable),
-        }
+        console_signal.await;
+        Ok(ShutdownSignal::Forceable)
     }
 }
 
@@ -620,6 +611,10 @@ pub async fn run_main_with_transport_options(
         }
     };
     config.auth_config().validate()?;
+    #[cfg(target_os = "macos")]
+    let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
+        codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
+    );
     let code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>> =
         match &runtime_options.code_mode_host_transport {
             CodeModeHostTransport::Local => None,
@@ -788,6 +783,8 @@ pub async fn run_main_with_transport_options(
     }
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let transport_shutdown_token = CancellationToken::new();
+    // Remote enrollment must cancel before RPC drain without shutting down telemetry.
+    let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
@@ -813,6 +810,14 @@ pub async fn run_main_with_transport_options(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
+                if cfg!(windows)
+                    && std::env::var_os(codex_app_server_transport::DAEMON_SHUTDOWN_SOCKET_ENV)
+                        .is_some()
+                {
+                    DaemonShutdownAccess::Managed
+                } else {
+                    DaemonShutdownAccess::Disabled
+                },
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -868,7 +873,7 @@ pub async fn run_main_with_transport_options(
         state_db.clone(),
         auth_manager.clone(),
         transport_event_tx.clone(),
-        transport_shutdown_token.clone(),
+        remote_control_shutdown_token.clone(),
         app_server_client_name_rx,
         remote_control_startup_mode,
     )
@@ -992,6 +997,9 @@ pub async fn run_main_with_transport_options(
             state_db: state_db.clone(),
             config_warnings,
             session_source,
+            user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
+                &auth_manager,
+            ))),
             auth_manager,
             installation_id,
             code_mode_session_provider,
@@ -1041,7 +1049,7 @@ pub async fn run_main_with_transport_options(
                         let running_turn_count = *running_turn_count_rx.borrow();
                         shutdown_state.on_signal(signal, connections.len(), running_turn_count);
                     }
-                    changed = running_turn_count_rx.changed(), if graceful_signal_restart_enabled && shutdown_state.requested() => {
+                    changed = running_turn_count_rx.changed(), if shutdown_state.requested() => {
                         if changed.is_err() {
                             warn!("running-turn watcher closed during graceful restart drain");
                         }
@@ -1051,6 +1059,9 @@ pub async fn run_main_with_transport_options(
                             break "transport_channel_closed";
                         };
                         match event {
+                            TransportEvent::DaemonShutdown => {
+                                shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow());
+                            }
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
@@ -1110,6 +1121,8 @@ pub async fn run_main_with_transport_options(
                                     break "outbound_router_closed";
                                 }
                                 if single_client_mode && stdio_closed {
+                                    // Pending remote enrollment must stop before RPCs drain.
+                                    remote_control_shutdown_token.cancel();
                                     break "stdio_connection_closed";
                                 }
                                 if shutdown_when_no_connections && connections.is_empty() {
@@ -1188,7 +1201,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping response from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_response(response).await;
+                                        processor.process_response(connection_id, response).await;
                                     }
                                     JSONRPCMessage::Notification(notification) => {
                                         if !connections.contains_key(&connection_id) {
@@ -1202,7 +1215,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping error from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_error(err).await;
+                                        processor.process_error(connection_id, err).await;
                                     }
                                 }
                             }

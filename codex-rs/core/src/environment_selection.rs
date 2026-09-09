@@ -780,8 +780,10 @@ impl TurnEnvironmentState {
     }
 }
 
+/// Existing environment bindings captured for a turn. Internal child threads can
+/// retain these bindings without resolving a different set of environments.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TurnEnvironmentSnapshot {
+pub struct TurnEnvironmentSnapshot {
     // Keep every selected environment, including failures, in its original order.
     pub(crate) environments: Vec<TurnEnvironmentState>,
 }
@@ -1308,6 +1310,8 @@ url = "ws://127.0.0.1:8765"
         assert_eq!(resolved.snapshot().await.to_selections(), vec![local]);
     }
 
+    // Merge-safety anchor: readiness is asserted through snapshot blocking and
+    // completion, not internal tracing spans.
     #[tokio::test]
     async fn blocking_snapshot_waits_for_starting_environment() {
         let listener = TcpListener::bind("127.0.0.1:0")

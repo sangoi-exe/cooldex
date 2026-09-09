@@ -195,6 +195,9 @@ pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, Fu
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
+    // Preserve activation for history forks without freezing the parent's model-owned prompts.
+    // Fresh child startup restores configured preferences from the retained snapshot.
+    config.token_budget = turn.configured_token_budget.clone();
     config.model = Some(turn.model_info().slug.clone());
     config.model_provider = turn.provider.info().clone();
     config.model_reasoning_effort = turn
@@ -228,6 +231,8 @@ pub(crate) fn reject_full_fork_agent_type_override(
     Ok(())
 }
 
+// Merge-safety anchor: V2 full-history forks inherit the parent identity and
+// reject every explicit agent_type, model, reasoning_effort, or service_tier override.
 pub(crate) fn reject_v2_full_history_identity_overrides(
     agent_type: Option<&str>,
     model: Option<&str>,

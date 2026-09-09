@@ -1,6 +1,8 @@
 use anyhow::Result;
 use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentUsageHintBinding;
+use codex_protocol::protocol::AgentUsageHintInstructions;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde_json::json;
@@ -82,6 +84,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             metadata: Some(CodexHarnessMetadata {
                 client_authored: true,
                 fallback_token_limit_override: Some(20_000),
+                inherited_user_message: true,
                 ..Default::default()
             }),
         }),
@@ -95,7 +98,11 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
             "ordinal": 7,
             "type": "response_item",
             "payload": response_item,
-            "metadata": { "client_authored": true, "fallback_token_limit_override": 20_000 },
+            "metadata": {
+                "client_authored": true,
+                "fallback_token_limit_override": 20_000,
+                "inherited_user_message": true,
+            },
         })
     );
     assert_eq!(serialized["payload"].get("metadata"), None);
@@ -109,6 +116,7 @@ fn response_item_envelope_stores_metadata_beside_rollout_payload() -> Result<()>
         Some(CodexHarnessMetadata {
             client_authored: true,
             fallback_token_limit_override: Some(20_000),
+            inherited_user_message: true,
             ..Default::default()
         })
     );
@@ -754,6 +762,73 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
         .get_history_mode(ThreadHistoryMode::Paginated),
         ThreadHistoryMode::Paginated
     );
+    Ok(())
+}
+
+// Merge-safety anchor: canonical resumed metadata distinguishes missing old child binding from
+// an inherited parent binding, so the identity restore boundary cannot silently fall through.
+#[test]
+fn resumed_usage_hint_binding_uses_only_the_first_canonical_session_meta() -> Result<()> {
+    let child_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000011")?;
+    let parent_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000012")?;
+    let child_meta_without_binding = RolloutItem::SessionMeta(SessionMetaLine {
+        meta: SessionMeta {
+            session_id: child_thread_id.into(),
+            id: child_thread_id,
+            agent_usage_hint_binding: None,
+            ..SessionMeta::default()
+        },
+        git: None,
+    });
+    let inherited_parent_meta = RolloutItem::SessionMeta(SessionMetaLine {
+        meta: SessionMeta {
+            session_id: parent_thread_id.into(),
+            id: parent_thread_id,
+            source: SessionSource::Exec,
+            agent_usage_hint_binding: Some(AgentUsageHintBinding::Inherited {
+                instructions: Some(AgentUsageHintInstructions {
+                    text: "parent hint".to_string(),
+                    marked: true,
+                }),
+            }),
+            ..SessionMeta::default()
+        },
+        git: None,
+    });
+    let history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: child_thread_id,
+        history: Arc::new(vec![
+            child_meta_without_binding,
+            inherited_parent_meta.clone(),
+        ]),
+        rollout_path: None,
+    });
+
+    assert_eq!(history.get_resumed_agent_usage_hint_binding(), Some(None));
+
+    let missing_canonical_meta = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: child_thread_id,
+        history: Arc::new(vec![
+            RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: Vec::new(),
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })),
+            inherited_parent_meta,
+        ]),
+        rollout_path: None,
+    });
+    assert_eq!(
+        missing_canonical_meta.get_resumed_agent_usage_hint_binding(),
+        None
+    );
+    assert!(matches!(
+        missing_canonical_meta.get_resumed_session_sources(),
+        Some((SessionSource::Exec, None))
+    ));
+
     Ok(())
 }
 
