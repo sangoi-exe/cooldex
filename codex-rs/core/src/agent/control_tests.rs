@@ -14,7 +14,8 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
-use crate::session::multi_agents::resolve_usage_hints;
+use crate::session::multi_agents::full_history_usage_hint_binding;
+use crate::session::multi_agents::usage_hint_text;
 use crate::session::step_context::StepContext;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
@@ -786,7 +787,12 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    check_v2_agent_reload(V2ReloadRoute::Sender, V2ReloadExpectation::FullIdentity).await;
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::FullIdentity,
+        FullHistoryUsageHintSource::Configured,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -794,6 +800,7 @@ async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
     check_v2_agent_reload(
         V2ReloadRoute::NestedParent,
         V2ReloadExpectation::FullIdentity,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
@@ -803,6 +810,7 @@ async fn ensure_v2_agent_loaded_recovers_settings_outside_bounded_model_context(
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::BoundedModelContext,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
@@ -812,6 +820,7 @@ async fn ensure_v2_agent_loaded_rejects_absent_persisted_settings_snapshot() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::MissingSettingsSnapshot,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
@@ -821,6 +830,7 @@ async fn ensure_v2_agent_loaded_rejects_legacy_missing_shell_state() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::MissingShellState,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
@@ -830,24 +840,35 @@ async fn ensure_v2_agent_loaded_restores_child_with_compressed_ancestor() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::CompressedAncestor,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
 
+#[test_case::test_case(FullHistoryUsageHintSource::Configured; "configured hint")]
+#[test_case::test_case(FullHistoryUsageHintSource::CatalogMarked; "catalog-marked hint")]
 #[tokio::test]
-async fn ensure_v2_agent_loaded_restores_full_history_usage_hint_binding() {
+async fn ensure_v2_agent_loaded_restores_full_history_usage_hint_binding(
+    usage_hint_source: FullHistoryUsageHintSource,
+) {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::FullHistoryUsageHint,
+        usage_hint_source,
     )
     .await;
 }
 
+#[test_case::test_case(FullHistoryUsageHintSource::Configured; "configured hint")]
+#[test_case::test_case(FullHistoryUsageHintSource::CatalogMarked; "catalog-marked hint")]
 #[tokio::test]
-async fn resumed_v2_root_restores_paginated_full_history_usage_hint_binding() {
+async fn resumed_v2_root_restores_paginated_full_history_usage_hint_binding(
+    usage_hint_source: FullHistoryUsageHintSource,
+) {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::ResumedRootFullHistoryUsageHint,
+        usage_hint_source,
     )
     .await;
 }
@@ -857,6 +878,7 @@ async fn resumed_v2_root_rejects_missing_canonical_usage_hint_binding() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::MissingUsageHintBinding,
+        FullHistoryUsageHintSource::Configured,
     )
     .await;
 }
@@ -877,6 +899,12 @@ enum V2ReloadExpectation {
     MissingShellState,
     MissingUsageHintBinding,
     CompressedAncestor,
+}
+
+#[derive(Clone, Copy)]
+enum FullHistoryUsageHintSource {
+    Configured,
+    CatalogMarked,
 }
 
 async fn spawn_v2_reload_test_child(
@@ -913,9 +941,13 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
-// Merge-safety anchor: V2 reload and fork tests retain the local persisted identity
-// and post-compaction recovery-proof invariants as rollout fields evolve upstream.
-async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpectation) {
+// Merge-safety anchor: V2 reload and fork tests retain persisted identity, raw usage-hint text,
+// catalog marker state, and post-compaction recovery-proof invariants as rollout fields evolve.
+async fn check_v2_agent_reload(
+    route: V2ReloadRoute,
+    expectation: V2ReloadExpectation,
+    usage_hint_source: FullHistoryUsageHintSource,
+) {
     let (home, mut config) = test_config().await;
     let uses_full_history_usage_hint = matches!(
         expectation,
@@ -935,10 +967,22 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
     }
     config.model = Some("gpt-5.6-sol".to_string());
     if uses_full_history_usage_hint {
-        config.multi_agent_v2.root_agent_usage_hint_text =
-            Some("full-history parent reload guidance".to_string());
-        config.multi_agent_v2.subagent_usage_hint_text =
-            Some("full-history parent subagent guidance".to_string());
+        match usage_hint_source {
+            FullHistoryUsageHintSource::Configured => {
+                config.multi_agent_v2.root_agent_usage_hint_text =
+                    Some("full-history parent reload guidance".to_string());
+                config.multi_agent_v2.subagent_usage_hint_text =
+                    Some("full-history parent subagent guidance".to_string());
+            }
+            FullHistoryUsageHintSource::CatalogMarked => {
+                assert!(
+                    config.multi_agent_v2.root_agent_usage_hint_text.is_none()
+                        && config.multi_agent_v2.subagent_usage_hint_text.is_none(),
+                    "catalog fixture must not configure a root or subagent usage hint"
+                );
+                config.model = Some("gpt-6-astra".to_string());
+            }
+        }
     }
     let role_path = config.codex_home.join("worker.toml");
     std::fs::write(&role_path, "model = \"role-file-model\"\n").expect("write worker role config");
@@ -990,6 +1034,26 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         }
     };
     let parent_thread_id = parent_thread.session.thread_id;
+    let (expected_usage_hint_binding, expected_usage_hint_text) = if uses_full_history_usage_hint {
+        let parent_turn = parent_thread.session.new_default_turn().await;
+        let expected_usage_hint = usage_hint_text(&parent_turn, &parent_thread.session_source)
+            .expect("full-history parent usage hint should resolve");
+        let expected_usage_hint_text = expected_usage_hint.body();
+        let expected_usage_hint_binding = full_history_usage_hint_binding(&parent_turn);
+        assert_eq!(
+            expected_usage_hint_binding,
+            AgentUsageHintBinding::Inherited {
+                instructions: Some(AgentUsageHintInstructions {
+                    text: expected_usage_hint_text.clone(),
+                    marked: matches!(usage_hint_source, FullHistoryUsageHintSource::CatalogMarked),
+                }),
+            },
+            "parent full-history binding should freeze the effective usage-hint text and marker"
+        );
+        (expected_usage_hint_binding, Some(expected_usage_hint_text))
+    } else {
+        (AgentUsageHintBinding::Resolve, None)
+    };
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
     child_config
@@ -1022,16 +1086,6 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
-    let expected_usage_hint_binding = if uses_full_history_usage_hint {
-        AgentUsageHintBinding::Inherited {
-            instructions: Some(AgentUsageHintInstructions {
-                text: "full-history parent reload guidance".to_string(),
-                marked: false,
-            }),
-        }
-    } else {
-        AgentUsageHintBinding::Resolve
-    };
     assert_eq!(
         child_thread
             .session
@@ -1364,6 +1418,9 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                 );
             }
             V2ReloadExpectation::ResumedRootFullHistoryUsageHint => {
+                let expected_usage_hint_text = expected_usage_hint_text
+                    .as_deref()
+                    .expect("full-history resumed-root test should capture a parent usage hint");
                 let resumed_root = resume_result
                     .expect("root resume should restore the full-history child metadata");
                 let resumed_control = resumed_root.thread.session.services.agent_control.clone();
@@ -1400,9 +1457,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
                     .map(|fragment| fragment.body())
                     .collect::<Vec<_>>();
                 assert!(
-                    rendered
-                        .iter()
-                        .any(|text| text == "full-history parent reload guidance"),
+                    rendered.iter().any(|text| text == expected_usage_hint_text),
                     "paginated resumed-root child should keep the frozen parent hint"
                 );
                 assert!(
@@ -1581,6 +1636,9 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
         expected_usage_hint_binding
     );
     if matches!(expectation, V2ReloadExpectation::FullHistoryUsageHint) {
+        let expected_usage_hint_text = expected_usage_hint_text
+            .as_deref()
+            .expect("full-history reload test should capture a parent usage hint");
         let step_context = StepContext::for_test(Arc::clone(&reloaded_turn));
         let rendered = reloaded_child
             .session
@@ -1592,9 +1650,7 @@ async fn check_v2_agent_reload(route: V2ReloadRoute, expectation: V2ReloadExpect
             .map(|fragment| fragment.body())
             .collect::<Vec<_>>();
         assert!(
-            rendered
-                .iter()
-                .any(|text| text == "full-history parent reload guidance"),
+            rendered.iter().any(|text| text == expected_usage_hint_text),
             "ordinary child follow-up context should retain the frozen parent hint"
         );
         assert!(
@@ -3474,10 +3530,13 @@ async fn full_history_v2_fork_preserves_parent_instruction_items_without_new_hin
         .expect("parent shutdown should submit");
 }
 
-#[test_case::test_case(true; "thread context enabled")]
-#[test_case::test_case(false; "thread context disabled")]
+#[test_case::test_case(FullHistoryUsageHintSource::Configured, true; "configured hint, thread context enabled")]
+#[test_case::test_case(FullHistoryUsageHintSource::Configured, false; "configured hint, thread context disabled")]
+#[test_case::test_case(FullHistoryUsageHintSource::CatalogMarked, true; "catalog-marked hint, thread context enabled")]
+#[test_case::test_case(FullHistoryUsageHintSource::CatalogMarked, false; "catalog-marked hint, thread context disabled")]
 #[tokio::test]
 async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
+    usage_hint_source: FullHistoryUsageHintSource,
     thread_context_enabled: bool,
 ) {
     let harness = AgentControlHarness::new().await;
@@ -3488,21 +3547,32 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         .expect("test context mode");
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
     parent_config.developer_instructions = Some("Parent developer instructions.".to_string());
-    parent_config.multi_agent_v2.root_agent_usage_hint_text =
-        Some("Parent root guidance.".to_string());
-    parent_config.multi_agent_v2.subagent_usage_hint_text =
-        Some("Parent subagent guidance.".to_string());
-    let parent_usage_hints = resolve_usage_hints(
-        &parent_config.multi_agent_v2,
-        /*catalog*/ None,
-        !parent_config.update_plan_enabled && parent_config.model_catalog.is_none(),
-    );
-    let expected_parent_root_hint = parent_usage_hints
-        .root
-        .as_ref()
-        .expect("configured parent root hint should resolve")
-        .render();
+    match usage_hint_source {
+        FullHistoryUsageHintSource::Configured => {
+            parent_config.multi_agent_v2.root_agent_usage_hint_text =
+                Some("Parent root guidance.".to_string());
+            parent_config.multi_agent_v2.subagent_usage_hint_text =
+                Some("Parent subagent guidance.".to_string());
+        }
+        FullHistoryUsageHintSource::CatalogMarked => {
+            assert!(
+                parent_config
+                    .multi_agent_v2
+                    .root_agent_usage_hint_text
+                    .is_none()
+                    && parent_config
+                        .multi_agent_v2
+                        .subagent_usage_hint_text
+                        .is_none(),
+                "catalog fixture must not configure a root or subagent usage hint"
+            );
+            parent_config.model = Some("gpt-6-astra".to_string());
+        }
+    }
     let mut child_config = harness.config.clone();
+    if matches!(usage_hint_source, FullHistoryUsageHintSource::CatalogMarked) {
+        child_config.model = Some("gpt-6-astra".to_string());
+    }
     child_config
         .features
         .set_enabled(Feature::GuardianThreadContext, thread_context_enabled)
@@ -3523,12 +3593,36 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
     let parent_thread_id = new_thread.thread_id;
     let parent_thread = new_thread.thread;
     let turn_context = parent_thread.session.new_default_turn().await;
+    let expected_parent_usage_hint = usage_hint_text(&turn_context, &parent_thread.session_source)
+        .expect("parent root usage hint should resolve");
+    let expected_parent_root_hint = expected_parent_usage_hint.render();
+    let expected_parent_usage_hint_text = expected_parent_usage_hint.body();
+    let expected_parent_usage_hint_binding = full_history_usage_hint_binding(&turn_context);
+    assert_eq!(
+        expected_parent_usage_hint_binding,
+        AgentUsageHintBinding::Inherited {
+            instructions: Some(AgentUsageHintInstructions {
+                text: expected_parent_usage_hint_text.clone(),
+                marked: matches!(usage_hint_source, FullHistoryUsageHintSource::CatalogMarked),
+            }),
+        },
+        "parent compacted-history binding should freeze the effective usage-hint text and marker"
+    );
     let parent_step_context = StepContext::for_test(Arc::clone(&turn_context));
     let parent_world_state = parent_thread
         .session
         .build_world_state_for_step(parent_step_context.as_ref())
         .await
         .expect("parent world state should build");
+    assert_eq!(
+        parent_world_state
+            .render_full()
+            .into_iter()
+            .filter(|fragment| fragment.body() == expected_parent_usage_hint_text)
+            .count(),
+        1,
+        "parent world state should render exactly the effective usage hint"
+    );
     let parent_world_state_snapshot = parent_world_state.snapshot().into_object();
     let expected_parent_usage_hint_snapshot = parent_world_state_snapshot
         .get("multi_agent_usage_hint")
@@ -3553,19 +3647,12 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        // This deliberately stale catalog fragment must not become the positive inherited hint.
         ContextualUserFragment::into(MultiAgentRoleInstructions::catalog(
             "Catalog parent root guidance.",
         )),
         parent_task.to_model_input_item(),
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Parent root guidance.".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        ContextualUserFragment::into(expected_parent_usage_hint),
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
@@ -3656,6 +3743,16 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         .get_thread(child_thread_id)
         .await
         .expect("child thread should be registered");
+    assert_eq!(
+        child_thread
+            .session
+            .new_default_turn()
+            .await
+            .config
+            .agent_usage_hint_binding,
+        expected_parent_usage_hint_binding,
+        "full-history child should retain the parent usage-hint binding through compaction"
+    );
     wait_for_recorded_user_message(child_thread.as_ref(), "child task").await;
     let history = child_thread.session.clone_history().await;
     child_thread
@@ -3668,18 +3765,17 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
     let child_rollout = codex_rollout::RolloutRecorder::get_rollout_history(&child_rollout_path)
         .await
         .expect("child rollout should load");
-    let inherited_usage_hint_snapshots = child_rollout
-        .get_rollout_items()
-        .iter()
-        .filter_map(|item| match item {
-            RolloutItem::WorldState(world_state) => {
-                world_state.state.get("multi_agent_usage_hint").cloned()
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
     assert!(
-        inherited_usage_hint_snapshots.contains(&expected_parent_usage_hint_snapshot),
+        child_rollout
+            .get_rollout_items()
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::WorldState(world_state) => {
+                    world_state.state.get("multi_agent_usage_hint").cloned()
+                }
+                _ => None,
+            })
+            .any(|snapshot| snapshot == expected_parent_usage_hint_snapshot),
         "full-history world-state snapshots must retain the frozen usage-hint state"
     );
     assert!(
@@ -3748,7 +3844,7 @@ async fn full_history_v2_fork_preserves_parent_usage_hints_in_compacted_history(
         "forked child history should not inherit compacted parent agent messages"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Parent root guidance."),
+        history_contains_text(history.raw_items(), &expected_parent_root_hint),
         "full-history child should preserve parent hints in compacted replacement history"
     );
     assert!(

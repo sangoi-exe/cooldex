@@ -160,6 +160,7 @@ pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
 fn retain_forked_developer_message(
     item: &mut ResponseItem,
     usage_hint_texts: &[String],
+    retained_usage_hint_text: Option<&str>,
     context_mode: GuardianContextMode,
 ) -> bool {
     if !matches!(item, ResponseItem::Message { role, .. } if role == "developer") {
@@ -179,7 +180,9 @@ fn retain_forked_developer_message(
             return true;
         };
 
-        !(MultiAgentRoleInstructions::matches_text(text)
+        let is_retained_usage_hint = retained_usage_hint_text
+            .is_some_and(|usage_hint_text| usage_hint_text == text.as_str());
+        !((MultiAgentRoleInstructions::matches_text(text) && !is_retained_usage_hint)
             || (context_mode == GuardianContextMode::ThreadOwned
                 && text.starts_with(
                     crate::guardian::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX,
@@ -1189,6 +1192,29 @@ impl AgentControl {
             } else {
                 Vec::new()
             };
+        // Merge-safety anchor: Full-history V2 forks retain their parent identity context and only
+        // the exact effective inherited usage-hint fragment rendered from the captured binding.
+        // They must not resolve mutable role/catalog state or append a child developer or usage-hint
+        // layer. Truncated forks rebuild after sanitization; Guardian-only authorization remains
+        // parent-owned.
+        let retained_usage_hint_text = if multi_agent_version == MultiAgentVersion::V2
+            && matches!(fork_mode, SpawnAgentForkMode::FullHistory)
+        {
+            match &config.agent_usage_hint_binding {
+                AgentUsageHintBinding::Inherited {
+                    instructions: Some(instructions),
+                } => Some(
+                    MultiAgentRoleInstructions::from_agent_usage_hint_instructions(
+                        instructions.clone(),
+                    )
+                    .render(),
+                ),
+                AgentUsageHintBinding::Resolve
+                | AgentUsageHintBinding::Inherited { instructions: None } => None,
+            }
+        } else {
+            None
+        };
         let mut preserve_reference_context_item =
             matches!(fork_mode, SpawnAgentForkMode::FullHistory);
         if preserve_reference_context_item {
@@ -1205,9 +1231,6 @@ impl AgentControl {
             }
         }
         let context_mode = GuardianContextMode::from_features(&config.features);
-        // Merge-safety anchor: Full-history V2 forks retain the parent's effective instruction
-        // and identity context without appending a child developer or usage-hint layer. Truncated
-        // forks rebuild after sanitization; Guardian-only authorization remains parent-owned.
         // Compaction stores response items separately, so sanitize both top-level messages and
         // compacted replacement histories with the same owner.
         let retain_forked_item = |envelope: &mut ResponseItemEnvelope| {
@@ -1229,6 +1252,7 @@ impl AgentControl {
             if !retain_forked_developer_message(
                 response_item,
                 &multi_agent_v2_usage_hint_texts_to_filter,
+                retained_usage_hint_text.as_deref(),
                 context_mode,
             ) {
                 return false;

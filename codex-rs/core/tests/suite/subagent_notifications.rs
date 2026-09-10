@@ -82,6 +82,7 @@ const REQUESTED_MODEL: &str = "gpt-5.4";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const V2_DEFAULT_MODEL: &str = "gpt-5.6-terra";
 const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+const CATALOG_MARKED_USAGE_HINT_MODEL: &str = "gpt-6-astra";
 const CONFIGURED_CHILD_INSTRUCTIONS: &str = "Use the configured V2 child snapshot.";
 const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
@@ -1476,7 +1477,8 @@ async fn grandchild_full_fork_preserves_context_baseline(
 }
 
 // Merge-safety anchor: full-history V2 request fixtures keep parent and child usage hints
-// deliberately unequal so a fresh child re-resolution cannot masquerade as inherited identity.
+// deliberately unequal and capture catalog-marked roles from normal requests, so stale or fresh
+// child re-resolution cannot masquerade as inherited identity.
 #[derive(Clone, Copy)]
 enum FullHistoryV2ModelSelection {
     InheritedIdentity,
@@ -1484,6 +1486,7 @@ enum FullHistoryV2ModelSelection {
     CurrentTimeReminders,
     MultiAgentModeInstructions,
     MultiAgentModePolicyInheritance,
+    CatalogMarkedUsageHint,
 }
 
 #[test_case(FullHistoryV2ModelSelection::InheritedIdentity; "full-history child inherits parent identity")]
@@ -1491,6 +1494,7 @@ enum FullHistoryV2ModelSelection {
 #[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork drops inherited current-time reminders")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork drops inherited multi-agent mode instructions")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModePolicyInheritance; "full fork inherits explicit policy state")]
+#[test_case(FullHistoryV2ModelSelection::CatalogMarkedUsageHint; "full fork preserves catalog-marked parent usage hint")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_context(
     selection: FullHistoryV2ModelSelection,
@@ -1509,6 +1513,10 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     )
     .await;
     let world_state_identity = matches!(selection, FullHistoryV2ModelSelection::WorldStateIdentity);
+    let catalog_marked_usage_hint = matches!(
+        selection,
+        FullHistoryV2ModelSelection::CatalogMarkedUsageHint
+    );
     let spawn_args = json!({
         "message": CHILD_PROMPT,
         "task_name": "worker",
@@ -1593,7 +1601,19 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
             config.multi_agent_v2.subagent_usage_hint_text =
                 Some(FULL_HISTORY_SUBAGENT_USAGE_HINT.to_string());
         }
-        config.model = Some(INHERITED_MODEL.to_string());
+        if catalog_marked_usage_hint {
+            assert!(
+                config.multi_agent_v2.root_agent_usage_hint_text.is_none()
+                    && config.multi_agent_v2.subagent_usage_hint_text.is_none(),
+                "catalog role fixture must not configure a root or subagent usage hint"
+            );
+        }
+        let parent_model = if catalog_marked_usage_hint {
+            CATALOG_MARKED_USAGE_HINT_MODEL
+        } else {
+            INHERITED_MODEL
+        };
+        config.model = Some(parent_model.to_string());
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
         config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
         config.agent_default_subagent_reasoning_effort = Some(V2_DEFAULT_REASONING_EFFORT);
@@ -1603,7 +1623,11 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     if world_state_identity {
         builder = builder.with_history_mode(ThreadHistoryMode::Paginated);
     }
-    let test = builder.build(&server).await?;
+    let test = if catalog_marked_usage_hint {
+        builder.build_with_auto_env(&server).await?
+    } else {
+        builder.build(&server).await?
+    };
     if world_state_identity {
         test.codex.submit(Op::Compact).await?;
         wait_for_event(&test.codex, |event| {
@@ -1615,7 +1639,53 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
     let parent_request = seed_turn.single_request();
     let parent_body = parent_request.body_json();
-    let parent_instructions = parent_request.instructions_text();
+    let parent_instructions = if catalog_marked_usage_hint {
+        None
+    } else {
+        Some(parent_request.instructions_text())
+    };
+    let parent_lite_base_instruction_group = if catalog_marked_usage_hint {
+        assert!(
+            parent_body.get("instructions").is_none(),
+            "Responses Lite should omit top-level instructions"
+        );
+        let parent_input = parent_request.input();
+        assert_eq!(
+            parent_input
+                .first()
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str),
+            Some("additional_tools"),
+            "Responses Lite should prefix prompt input with additional tools"
+        );
+        assert_eq!(
+            (
+                parent_input
+                    .get(1)
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                parent_input
+                    .get(1)
+                    .and_then(|item| item.get("role"))
+                    .and_then(Value::as_str),
+            ),
+            (Some("message"), Some("developer")),
+            "Responses Lite should place base instructions in the first developer message after additional tools"
+        );
+        let base_instruction_group = parent_request
+            .message_input_text_groups("developer")
+            .into_iter()
+            .next()
+            .expect("Responses Lite parent request should contain a base-instructions developer message");
+        assert_eq!(
+            base_instruction_group.len(),
+            1,
+            "Responses Lite should encode base instructions as one developer text group"
+        );
+        Some(base_instruction_group)
+    } else {
+        None
+    };
     test.submit_turn(TURN_1_PROMPT).await?;
     let parent_request = spawn_turn.single_request();
 
@@ -1636,6 +1706,32 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
         .collect::<Vec<_>>();
     assert_eq!(misaligned_child_messages, Vec::<Value>::new());
     let child_developer_messages = child_request.message_input_texts("developer");
+    if catalog_marked_usage_hint {
+        let marked_usage_hint_groups = |request: &ResponsesRequest| {
+            request
+                .message_input_text_groups("developer")
+                .into_iter()
+                .filter(|group| {
+                    matches!(
+                        group.as_slice(),
+                        [text] if text.starts_with("<multi_agent_role>")
+                            && text.ends_with("</multi_agent_role>")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let parent_marked_usage_hints = marked_usage_hint_groups(&parent_request);
+        assert_eq!(
+            parent_marked_usage_hints.len(),
+            1,
+            "catalog parent should emit exactly one standalone marked usage hint"
+        );
+        assert_eq!(
+            marked_usage_hint_groups(&child_request),
+            parent_marked_usage_hints,
+            "the first full-history child request should retain exactly the captured parent catalog hint without fresh child guidance"
+        );
+    }
     if matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeInstructions
@@ -1713,11 +1809,57 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     }
     let child_body = child_request.body_json();
     if !world_state_identity {
-        assert_eq!(child_request.instructions_text(), parent_instructions);
-        assert_ne!(
-            child_request.instructions_text(),
-            CONFIGURED_CHILD_INSTRUCTIONS
-        );
+        if let Some(parent_lite_base_instruction_group) = parent_lite_base_instruction_group {
+            assert!(
+                child_body.get("instructions").is_none(),
+                "Responses Lite child should omit top-level instructions"
+            );
+            let child_input = child_request.input();
+            assert_eq!(
+                child_input
+                    .first()
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str),
+                Some("additional_tools"),
+                "Responses Lite child should prefix prompt input with additional tools"
+            );
+            assert_eq!(
+                (
+                    child_input
+                        .get(1)
+                        .and_then(|item| item.get("type"))
+                        .and_then(Value::as_str),
+                    child_input
+                        .get(1)
+                        .and_then(|item| item.get("role"))
+                        .and_then(Value::as_str),
+                ),
+                (Some("message"), Some("developer")),
+                "Responses Lite child should retain base instructions as the first developer message after additional tools"
+            );
+            let child_lite_base_instruction_group = child_request
+                .message_input_text_groups("developer")
+                .into_iter()
+                .next()
+                .expect("Responses Lite child request should contain a base-instructions developer message");
+            assert_eq!(
+                child_lite_base_instruction_group, parent_lite_base_instruction_group,
+                "full-history child should inherit the parent's base-instructions developer group"
+            );
+            assert_ne!(
+                child_lite_base_instruction_group,
+                vec![CONFIGURED_CHILD_INSTRUCTIONS.to_string()],
+                "full-history child should not use configured child base instructions"
+            );
+        } else {
+            let parent_instructions = parent_instructions
+                .expect("non-Lite parent request should carry top-level instructions");
+            assert_eq!(child_request.instructions_text(), parent_instructions);
+            assert_ne!(
+                child_request.instructions_text(),
+                CONFIGURED_CHILD_INSTRUCTIONS
+            );
+        }
     }
     if world_state_identity {
         let child_thread_id = ThreadId::from_string(
