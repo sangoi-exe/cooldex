@@ -4031,6 +4031,8 @@ async fn spawn_agent_full_fork_does_not_append_child_instructions_after_compacti
         .expect("parent shutdown should submit");
 }
 
+// Merge-safety anchor: a legacy checkpoint clears the reference baseline while its suffix can
+// retain a captured marked hint; full-history initial-context reconstruction must show it once.
 /// A legacy compaction clears the child's baseline, so its first turn must
 /// rebuild the inherited parent developer instructions at most once.
 #[tokio::test]
@@ -4051,6 +4053,18 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
         let harness = AgentControlHarness::new().await;
         let mut parent_config = harness.config.clone();
         let _ = parent_config.features.enable(Feature::MultiAgentV2);
+        assert!(
+            parent_config
+                .multi_agent_v2
+                .root_agent_usage_hint_text
+                .is_none()
+                && parent_config
+                    .multi_agent_v2
+                    .subagent_usage_hint_text
+                    .is_none(),
+            "legacy checkpoint witness must resolve the bundled catalog role without configured overrides"
+        );
+        parent_config.model = Some("gpt-6-astra".to_string());
         parent_config.developer_instructions = parent_developer_instructions.map(str::to_string);
         let mut requirements = parent_config.config_layer_stack.requirements().clone();
         requirements.additional_developer_instructions = Some(codex_config::Sourced::new(
@@ -4079,6 +4093,22 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
         let parent_thread_id = new_thread.thread_id;
         let parent_thread = new_thread.thread;
         let turn_context = parent_thread.session.new_default_turn().await;
+        let expected_parent_usage_hint =
+            usage_hint_text(&turn_context, &parent_thread.session_source)
+                .expect("bundled catalog parent usage hint should resolve");
+        let expected_parent_usage_hint_rendered = expected_parent_usage_hint.render();
+        let expected_parent_usage_hint_text = expected_parent_usage_hint.body();
+        let expected_parent_usage_hint_binding = full_history_usage_hint_binding(&turn_context);
+        assert_eq!(
+            expected_parent_usage_hint_binding,
+            AgentUsageHintBinding::Inherited {
+                instructions: Some(AgentUsageHintInstructions {
+                    text: expected_parent_usage_hint_text,
+                    marked: true,
+                }),
+            },
+            "legacy checkpoint witness must capture the effective marked catalog hint"
+        );
         let parent_spawn_call_id = match parent_developer_instructions {
             Some(_) => "spawn-call-legacy-compact-with-parent",
             None => "spawn-call-legacy-compact-without-parent",
@@ -4142,6 +4172,9 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
         rollout_items.push(RolloutItem::TurnContext(
             turn_context.to_turn_context_item(),
         ));
+        rollout_items.push(rollout_response_item(ContextualUserFragment::into(
+            expected_parent_usage_hint,
+        )));
         rollout_items.push(rollout_response_item(spawn_agent_call(
             parent_spawn_call_id,
         )));
@@ -4193,8 +4226,19 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
         {
             tokio::task::yield_now().await;
         }
+        assert_eq!(
+            child_thread
+                .session
+                .new_default_turn()
+                .await
+                .config
+                .agent_usage_hint_binding,
+            expected_parent_usage_hint_binding,
+            "legacy checkpoint rebuild must retain the captured parent usage-hint binding"
+        );
         let history = child_thread.session.clone_history().await;
         let mut instruction_count = 0;
+        let mut inherited_usage_hint_count = 0;
         let mut managed_instructions = Vec::new();
         for item in history.raw_items() {
             let ResponseItem::Message { role, content, .. } = item else {
@@ -4206,6 +4250,8 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
             for content_item in content {
                 if let ContentItem::InputText { text } = content_item {
                     instruction_count += usize::from(text == "Parent developer instructions.");
+                    inherited_usage_hint_count +=
+                        usize::from(text == &expected_parent_usage_hint_rendered);
                     if ManagedDeveloperInstructions::matches_text(text) {
                         managed_instructions.push(text.as_str());
                     }
@@ -4213,12 +4259,17 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_parent_instructions_on
             }
         }
         assert_eq!(
-            (instruction_count, managed_instructions),
+            (
+                instruction_count,
+                inherited_usage_hint_count,
+                managed_instructions,
+            ),
             (
                 usize::from(parent_developer_instructions.is_some()),
+                1,
                 vec![current_managed_fragment.as_str()],
             ),
-            "{case}: canonical context reconstruction must preserve the inherited parent developer layer at most once while replacing stale managed instructions"
+            "{case}: canonical context reconstruction must preserve the inherited parent developer layer and marked usage hint at most once while replacing stale managed instructions"
         );
 
         let _ = harness

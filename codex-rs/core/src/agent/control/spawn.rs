@@ -1192,29 +1192,6 @@ impl AgentControl {
             } else {
                 Vec::new()
             };
-        // Merge-safety anchor: Full-history V2 forks retain their parent identity context and only
-        // the exact effective inherited usage-hint fragment rendered from the captured binding.
-        // They must not resolve mutable role/catalog state or append a child developer or usage-hint
-        // layer. Truncated forks rebuild after sanitization; Guardian-only authorization remains
-        // parent-owned.
-        let retained_usage_hint_text = if multi_agent_version == MultiAgentVersion::V2
-            && matches!(fork_mode, SpawnAgentForkMode::FullHistory)
-        {
-            match &config.agent_usage_hint_binding {
-                AgentUsageHintBinding::Inherited {
-                    instructions: Some(instructions),
-                } => Some(
-                    MultiAgentRoleInstructions::from_agent_usage_hint_instructions(
-                        instructions.clone(),
-                    )
-                    .render(),
-                ),
-                AgentUsageHintBinding::Resolve
-                | AgentUsageHintBinding::Inherited { instructions: None } => None,
-            }
-        } else {
-            None
-        };
         let mut preserve_reference_context_item =
             matches!(fork_mode, SpawnAgentForkMode::FullHistory);
         if preserve_reference_context_item {
@@ -1230,6 +1207,28 @@ impl AgentControl {
                 break;
             }
         }
+        // Merge-safety anchor: Full-history V2 retains its parent identity context only when the
+        // final reference baseline is preserved. In that branch, only the exact effective inherited
+        // usage-hint fragment rendered from the captured binding survives sanitization. A reference
+        // reset leaves hint emission to the existing reconstruction owner without resolving mutable
+        // role/catalog state or appending a child layer.
+        let retained_usage_hint_text =
+            if multi_agent_version == MultiAgentVersion::V2 && preserve_reference_context_item {
+                match &config.agent_usage_hint_binding {
+                    AgentUsageHintBinding::Inherited {
+                        instructions: Some(instructions),
+                    } => Some(
+                        MultiAgentRoleInstructions::from_agent_usage_hint_instructions(
+                            instructions.clone(),
+                        )
+                        .render(),
+                    ),
+                    AgentUsageHintBinding::Resolve
+                    | AgentUsageHintBinding::Inherited { instructions: None } => None,
+                }
+            } else {
+                None
+            };
         let context_mode = GuardianContextMode::from_features(&config.features);
         // Compaction stores response items separately, so sanitize both top-level messages and
         // compacted replacement histories with the same owner.
