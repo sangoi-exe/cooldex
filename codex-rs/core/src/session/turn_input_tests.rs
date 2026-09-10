@@ -202,12 +202,13 @@ async fn accepted_input_applies_thread_settings() {
     .await
     .expect("submit user turn");
 
-    let state = session.state.lock().await;
-    assert_eq!(
-        state.session_configuration.step_settings.approvals_reviewer,
-        codex_config::types::ApprovalsReviewer::AutoReview
-    );
-    drop(state);
+    {
+        let state = session.state.lock().await;
+        assert_eq!(
+            state.session_configuration.step_settings.approvals_reviewer,
+            codex_config::types::ApprovalsReviewer::AutoReview
+        );
+    }
     session.refresh_mcp_if_dirty().await;
     let binding = session
         .services
