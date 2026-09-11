@@ -653,6 +653,12 @@ Codex supports running connected app-server and exec-server on different operati
   `/home/lucas/work/codex/codex-rs/core/src/agent/identity.rs`, and
   `/home/lucas/work/codex/codex-rs/core/src/session/multi_agents.rs` — MultiAgentV2
   usage-hint binding, full-history identity, and contextual-rendering owners.
+<!-- Merge-safety anchor: V2 fan-in and list presentation remain bounded to existing
+handler owners; the PRD owns their behavior boundary and canonical statuses stay full. -->
+- `/home/lucas/work/codex/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs` and
+  `/home/lucas/work/codex/codex-rs/core/src/tools/handlers/multi_agents_v2/list_agents.rs`
+  — token-efficient V2 fan-in and body-free list-presentation owners; the
+  `master-refactor-v2` PRD / RFC owns their behavior boundary.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`,
   `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
   `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust

@@ -406,7 +406,9 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
 }
 
 #[test]
-fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
+// Merge-safety anchor: V2 schema must keep generic mailbox waiting and completion-body-redacted
+// known-target conditions distinct without inheriting the V1 status-body result contract.
+fn wait_agent_tool_v2_supports_generic_and_conditional_waits() {
     let ToolSpec::Function(ResponsesApiTool {
         description,
         parameters,
@@ -424,33 +426,113 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         parameters.schema_type,
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))
     );
-    let properties = parameters
+    let modes = parameters
+        .one_of
+        .as_ref()
+        .expect("wait_agent should define two argument modes");
+    assert_eq!(modes.len(), 2);
+    let generic = &modes[0];
+    let generic_properties = generic
         .properties
         .as_ref()
-        .expect("wait_agent should use object params");
-    assert!(!properties.contains_key("targets"));
-    assert!(properties.contains_key("timeout_ms"));
-    assert!(description.contains(
-        "Does not return the content; returns either a summary of which agents have updates (if any)"
-    ));
+        .expect("generic wait should define its properties");
+    assert_eq!(generic_properties.len(), 1);
+    assert!(generic_properties.contains_key("timeout_ms"));
+    assert_eq!(generic.required.as_ref(), None);
     assert_eq!(
-        properties
+        serde_json::to_value(generic).expect("generic schema should serialize")["additionalProperties"],
+        json!(false)
+    );
+
+    let conditional = &modes[1];
+    let conditional_properties = conditional
+        .properties
+        .as_ref()
+        .expect("conditional wait should define its properties");
+    assert!(!conditional_properties.contains_key("timeout_ms"));
+    assert!(conditional_properties.contains_key("targets"));
+    assert!(conditional_properties.contains_key("return_when"));
+    assert!(conditional_properties.contains_key("disable_timeout"));
+    assert_eq!(
+        conditional.required.as_ref(),
+        Some(&vec![
+            "targets".to_string(),
+            "return_when".to_string(),
+            "disable_timeout".to_string(),
+        ])
+    );
+    assert_eq!(
+        serde_json::to_value(conditional).expect("conditional schema should serialize")["additionalProperties"],
+        json!(false)
+    );
+    assert!(description.contains("Wait in one of two modes."));
+    assert!(description.contains("all_final for self-contained fan-in"));
+    assert!(description.contains("any_final for incremental completion"));
+    assert!(description.contains("Does not return mailbox or final-message body content;"));
+    assert!(description.contains("error status details remain available."));
+    assert_eq!(
+        generic_properties
             .get("timeout_ms")
             .and_then(|schema| schema.description.as_deref()),
-        Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
+        Some(
+            "Generic mailbox/steer timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+        )
     );
-    assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
-        output_schema.expect("wait output schema")["properties"]["message"]["description"],
+        conditional_properties
+            .get("targets")
+            .and_then(|schema| schema.min_items),
+        Some(1)
+    );
+    assert_eq!(
+        conditional_properties
+            .get("return_when")
+            .and_then(|schema| schema.enum_values.as_ref()),
+        Some(&vec![json!("any_final"), json!("all_final")])
+    );
+    assert_eq!(
+        conditional_properties
+            .get("disable_timeout")
+            .and_then(|schema| schema.enum_values.as_ref()),
+        Some(&vec![json!(true)])
+    );
+    let output_schema = output_schema.expect("wait output schema");
+    assert_eq!(
+        output_schema["properties"]["message"]["description"],
         json!(
             "Brief wait summary without the agent's final content, including any timeout adjustment."
         )
     );
+    assert_eq!(output_schema["required"], json!(["message", "timed_out"]));
+    assert!(output_schema["properties"].get("outcome").is_none());
+    assert_eq!(
+        output_schema["properties"]["status"]["additionalProperties"]["oneOf"][0]["enum"],
+        json!([
+            "pending_init",
+            "running",
+            "interrupted",
+            "shutdown",
+            "not_found"
+        ])
+    );
+    assert_eq!(
+        output_schema["properties"]["status"]["additionalProperties"]["oneOf"][1]["properties"]["completed"]
+            ["type"],
+        json!(["string", "null"])
+    );
+    assert_eq!(
+        output_schema["properties"]["status"]["additionalProperties"]["oneOf"][2]["properties"]["errored"]
+            ["type"],
+        json!("string")
+    );
 }
 
+// Merge-safety anchor: the V2 list tool must disclose that its completed status is a compact
+// presentation rather than a second canonical status schema.
 #[test]
 fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     let ToolSpec::Function(ResponsesApiTool {
+        description,
         parameters,
         output_schema,
         ..
@@ -458,6 +540,10 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
     else {
         panic!("list_agents should be a function tool");
     };
+    assert_eq!(
+        description,
+        "List live agents in the current root thread tree. Optionally filter by task-path prefix. Completed statuses omit final-response content."
+    );
     assert_eq!(
         parameters.schema_type,
         Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object))

@@ -3,6 +3,8 @@ use super::multi_agents_common::model_supports_multi_agent_backend;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::JsonSchema;
+use codex_tools::JsonSchemaPrimitiveType;
+use codex_tools::JsonSchemaType;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
@@ -280,7 +282,9 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
+        // Merge-safety anchor: V2 keeps generic mailbox/steer waiting distinct from explicit,
+        // completion-body-redacted known-target conditions; do not revive the V1 status-body contract.
+        description: "Wait in one of two modes. With only optional timeout_ms, wait for a mailbox update from any live agent or new user steer. For a known-target condition, provide non-empty unique targets, return_when (all_final for self-contained fan-in or any_final for incremental completion), and disable_timeout: true; targeted waits ignore mailbox activity without consuming it, but new user steer still interrupts. Does not return mailbox or final-message body content; error status details remain available."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -300,8 +304,10 @@ pub fn create_list_agents_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "list_agents".to_string(),
+        // Merge-safety anchor: V2 list output is a compact presentation; completed statuses
+        // must not expose canonical final-response bodies.
         description:
-            "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+            "List live agents in the current root thread tree. Optionally filter by task-path prefix. Completed statuses omit final-response content."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -507,6 +513,8 @@ fn wait_output_schema_v1() -> Value {
 }
 
 fn wait_output_schema_v2() -> Value {
+    // Merge-safety anchor: conditional V2 wait state redacts completed-message bodies while
+    // preserving canonical error payloads for the current tool and lifecycle consumers.
     json!({
         "type": "object",
         "properties": {
@@ -517,6 +525,11 @@ fn wait_output_schema_v2() -> Value {
             "timed_out": {
                 "type": "boolean",
                 "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+            },
+            "status": {
+                "type": "object",
+                "description": "Current target statuses keyed by the supplied target references. Present only for conditional waits; completed statuses omit their final-message content.",
+                "additionalProperties": agent_status_output_schema()
             }
         },
         "required": ["message", "timed_out"],
@@ -861,15 +874,58 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
 }
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
-    let properties = BTreeMap::from([(
+    let generic_properties = BTreeMap::from([(
         "timeout_ms".to_string(),
         JsonSchema::number(Some(format!(
-            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+            "Generic mailbox/steer timeout in milliseconds. Defaults to {}, min {}, max {}.",
             options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
         ))),
     )]);
+    let generic = JsonSchema::object(
+        generic_properties,
+        /*required*/ None,
+        Some(false.into()),
+    );
 
-    JsonSchema::object(properties, /*required*/ None, Some(false.into()))
+    let mut targets = JsonSchema::array(
+        JsonSchema::string(/*description*/ None),
+        Some(
+            "Known agent task paths or supported ids for a conditional wait. Must be non-empty and unique."
+                .to_string(),
+        ),
+    );
+    targets.min_items = Some(1);
+    let mut disable_timeout = JsonSchema::boolean(Some(
+        "Required as true with return_when and targets to wait for a target condition without a timeout. Cannot accompany timeout_ms."
+            .to_string(),
+    ));
+    disable_timeout.enum_values = Some(vec![json!(true)]);
+    let conditional_properties = BTreeMap::from([
+        ("targets".to_string(), targets),
+        (
+            "return_when".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("any_final"), json!("all_final")],
+                Some(
+                    "Conditional completion mode. Requires targets and disable_timeout: true."
+                        .to_string(),
+                ),
+            ),
+        ),
+        ("disable_timeout".to_string(), disable_timeout),
+    ]);
+    let conditional = JsonSchema::object(
+        conditional_properties,
+        Some(vec![
+            "targets".to_string(),
+            "return_when".to_string(),
+            "disable_timeout".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    let mut parameters = JsonSchema::one_of(vec![generic, conditional], None);
+    parameters.schema_type = Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Object));
+    parameters
 }
 
 #[cfg(test)]

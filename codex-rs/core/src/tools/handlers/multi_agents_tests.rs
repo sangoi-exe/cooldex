@@ -13,8 +13,12 @@ use crate::session::session::SessionSettingsUpdate;
 use crate::session::step_context::StepContext;
 use crate::session::step_settings::StepSettingsUpdate;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::state::TaskKind;
+use crate::tasks::SessionTask;
+use crate::tasks::SessionTaskResult;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
@@ -37,6 +41,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
+use codex_protocol::items::CollabAgentTool;
+use codex_protocol::items::CollabAgentToolCallItem;
+use codex_protocol::items::CollabAgentToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BaseInstructions;
@@ -50,6 +57,8 @@ use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::FileSystemAccessMode;
 use codex_protocol::protocol::FileSystemPath;
@@ -57,6 +66,7 @@ use codex_protocol::protocol::FileSystemSandboxEntry;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
@@ -65,12 +75,14 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_state::DirectionalThreadSpawnEdgeStatus;
 use core_test_support::TempDirExt;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -200,6 +212,194 @@ where
         }
         other => panic!("expected function output, got {other:?}"),
     }
+}
+
+#[derive(Clone, Copy)]
+struct SteerableConditionalWaitTask;
+
+impl SessionTask for SteerableConditionalWaitTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.multi_agent_v2_wait_test"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(Default::default())
+    }
+}
+
+// Merge-safety anchor: V2 conditional wait tests preserve generic mailbox wake behavior while
+// proving target-state fan-in reconciles closed nonfinal statuses, redacts only completion bodies,
+// and leaves mailbox content pending.
+async fn multi_agent_v2_wait_fixture() -> (
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+    ThreadManager,
+) {
+    let (session, turn, manager, _events) = multi_agent_v2_wait_fixture_with_events().await;
+    (session, turn, manager)
+}
+
+async fn multi_agent_v2_wait_fixture_with_events() -> (
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+    ThreadManager,
+    async_channel::Receiver<Event>,
+) {
+    let (mut session, mut turn, events) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    {
+        let session = Arc::get_mut(&mut session).expect("fixture session should be uniquely owned");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+    }
+    {
+        let turn = Arc::get_mut(&mut turn).expect("fixture turn should be uniquely owned");
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        set_turn_config(turn, config);
+    }
+    (session, turn, manager, events)
+}
+
+async fn spawn_multi_agent_v2_wait_target(
+    session: &Arc<crate::session::session::Session>,
+    turn: &Arc<TurnContext>,
+    task_name: &str,
+) -> ThreadId {
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": format!("boot {task_name}"),
+                "task_name": task_name,
+            })),
+        ))
+        .await
+        .expect("spawn worker");
+    session
+        .services
+        .agent_control
+        .resolve_agent_reference(session.thread_id, &turn.session_source, task_name)
+        .await
+        .expect("spawned task should resolve")
+}
+
+async fn complete_multi_agent_v2_wait_target(
+    manager: &ThreadManager,
+    agent_id: ThreadId,
+    final_message: &str,
+) {
+    let thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker thread should exist");
+    let child_turn = thread.session.new_default_turn().await;
+    thread
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some(final_message.to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+}
+
+async fn error_multi_agent_v2_wait_target(
+    manager: &ThreadManager,
+    agent_id: ThreadId,
+    error_message: &str,
+) {
+    let thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("worker thread should exist");
+    let child_turn = thread.session.new_default_turn().await;
+    thread
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: None,
+                error: Some(ErrorEvent {
+                    misalignment: None,
+                    message: error_message.to_string(),
+                    codex_error_info: None,
+                }),
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+}
+
+async fn next_completed_wait_lifecycle(
+    events: &async_channel::Receiver<Event>,
+) -> CollabAgentToolCallItem {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("event stream should stay open");
+            if let EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::CollabAgentToolCall(item),
+                ..
+            }) = event.msg
+                && item.tool == CollabAgentTool::Wait
+            {
+                return item;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for completed wait lifecycle item")
+}
+
+async fn next_started_wait_lifecycle(
+    events: &async_channel::Receiver<Event>,
+) -> CollabAgentToolCallItem {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("event stream should stay open");
+            if let EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::CollabAgentToolCall(item),
+                ..
+            }) = event.msg
+                && item.tool == CollabAgentTool::Wait
+            {
+                return item;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for started wait lifecycle item")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1477,6 +1677,8 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
     );
 }
 
+// Merge-safety anchor: V2 list output redacts only completed final-response bodies; canonical
+// lifecycle status remains available to internal control-plane consumers.
 #[tokio::test]
 async fn multi_agent_v2_list_agents_returns_completed_status() {
     let (mut session, mut turn) = make_session_and_context().await;
@@ -1518,6 +1720,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .await
         .expect("child thread should exist");
     let child_turn = child_thread.session.new_default_turn().await;
+    let final_message = "UNMISTAKABLY_SENSITIVE_LIST_AGENTS_FINAL_RESPONSE_BODY_".repeat(2048);
     child_thread
         .session
         .send_event(
@@ -1525,7 +1728,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: child_turn.sub_id.clone(),
                 started_at: None,
-                last_agent_message: Some("done".to_string()),
+                last_agent_message: Some(final_message.clone()),
                 error: None,
                 completed_at: None,
                 duration_ms: None,
@@ -1533,6 +1736,11 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
             }),
         )
         .await;
+
+    assert_eq!(
+        session.services.agent_control.get_status(agent_id).await,
+        AgentStatus::Completed(Some(final_message.clone()))
+    );
 
     let output = ListAgentsHandlerV2
         .handle(invocation(
@@ -1558,7 +1766,12 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .iter()
         .find(|agent| agent.agent_name == "/root/worker")
         .expect("worker agent should be listed");
-    assert_eq!(worker.agent_status, json!({"completed": "done"}));
+    assert_eq!(worker.agent_status, json!({"completed": null}));
+    assert!(!content.contains(final_message.as_str()));
+    assert!(
+        content.len() < final_message.len(),
+        "serialized list output should stay smaller than an omitted large final body"
+    );
     assert_eq!(success, Some(true));
 }
 
@@ -3245,6 +3458,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3292,6 +3506,7 @@ async fn multi_agent_v2_wait_agent_clamps_timeout_below_configured_min() {
                 "Wait timed out.\n\nRequested timeout of 1ms was clamped to the minimum of 50ms."
                     .to_string(),
             timed_out: true,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3327,6 +3542,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3382,6 +3598,7 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3422,6 +3639,7 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3487,6 +3705,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3749,6 +3968,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3833,6 +4053,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -3927,6 +4148,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            status: None,
         }
     );
     assert_eq!(success, None);
@@ -4018,10 +4240,812 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            status: None,
         }
     );
     assert!(!content.contains("sensitive child output"));
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_rejects_invalid_condition_arguments() {
+    let (session, turn, _manager) = multi_agent_v2_wait_fixture().await;
+    for (arguments, message) in [
+        (
+            json!({"return_when": "all_final"}),
+            "return_when requires disable_timeout to be true",
+        ),
+        (
+            json!({"disable_timeout": true}),
+            "disable_timeout requires return_when",
+        ),
+        (
+            json!({"targets": ["worker"]}),
+            "targets require return_when and disable_timeout to be true",
+        ),
+        (
+            json!({
+                "targets": ["worker"],
+                "return_when": "all_final",
+                "disable_timeout": false,
+            }),
+            "return_when requires disable_timeout to be true",
+        ),
+        (
+            json!({
+                "targets": ["worker"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+                "timeout_ms": 1,
+            }),
+            "timeout_ms cannot accompany disable_timeout",
+        ),
+    ] {
+        let Err(err) = WaitAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "wait_agent",
+                function_payload(arguments),
+            ))
+            .await
+        else {
+            panic!("invalid conditional arguments should be rejected");
+        };
+        assert_eq!(err, FunctionCallError::RespondToModel(message.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_rejects_invalid_condition_targets() {
+    let (session, turn, _manager) = multi_agent_v2_wait_fixture().await;
+    for (arguments, message) in [
+        (
+            json!({
+                "targets": [],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            }),
+            "targets must be non-empty for a conditional wait",
+        ),
+        (
+            json!({
+                "targets": ["worker", "worker"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            }),
+            "targets must not contain duplicates",
+        ),
+    ] {
+        let Err(err) = WaitAgentHandlerV2::default()
+            .handle(invocation(
+                session.clone(),
+                turn.clone(),
+                "wait_agent",
+                function_payload(arguments),
+            ))
+            .await
+        else {
+            panic!("invalid targets should be rejected");
+        };
+        assert_eq!(err, FunctionCallError::RespondToModel(message.to_string()));
+    }
+
+    let _ = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
+    let Err(err) = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["worker", "/root/worker"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+    else {
+        panic!("aliases resolving to one target should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel("targets must not resolve to the same agent".to_string())
+    );
+
+    let Err(err) = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["missing"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+    else {
+        panic!("unresolved targets should be rejected");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected a model-facing resolution error");
+    };
+    assert!(message.starts_with("target `missing` could not be resolved:"));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_resolves_absolute_targets_with_completion_body_redacted_statuses()
+ {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let agent_id = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
+    complete_multi_agent_v2_wait_target(&manager, agent_id, "sensitive final body").await;
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["/root/worker"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+        .expect("all-final wait should succeed for an already-final target");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([(
+                "/root/worker".to_string(),
+                AgentStatus::Completed(None),
+            )])),
+        }
+    );
+    assert!(!content.contains("sensitive final body"));
+    assert!(!content.contains("\"outcome\""));
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_any_final_waits_for_an_initially_nonfinal_target() {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let already_final = spawn_multi_agent_v2_wait_target(&session, &turn, "already_final").await;
+    let later_final = spawn_multi_agent_v2_wait_target(&session, &turn, "later_final").await;
+    complete_multi_agent_v2_wait_target(&manager, already_final, "first sensitive body").await;
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["already_final", "later_final"],
+            "return_when": "any_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "any_final must wait for an initially non-final target"
+    );
+
+    complete_multi_agent_v2_wait_target(&manager, later_final, "second sensitive body").await;
+    let output = wait.await.expect("any-final wait should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: a target reached a final status.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([
+                ("already_final".to_string(), AgentStatus::Completed(None)),
+                ("later_final".to_string(), AgentStatus::Completed(None)),
+            ])),
+        }
+    );
+    assert!(!content.contains("first sensitive body"));
+    assert!(!content.contains("second sensitive body"));
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_all_final_waits_for_every_target_in_sorted_output_order() {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let first = spawn_multi_agent_v2_wait_target(&session, &turn, "first").await;
+    let second = spawn_multi_agent_v2_wait_target(&session, &turn, "second").await;
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session,
+        turn,
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["second", "first"],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    complete_multi_agent_v2_wait_target(&manager, first, "first complete").await;
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "all_final must wait for every target"
+    );
+
+    complete_multi_agent_v2_wait_target(&manager, second, "second complete").await;
+    let output = wait.await.expect("all-final wait should succeed");
+    let (content, success) = expect_text_output(output);
+    assert_eq!(
+        content,
+        r#"{"message":"Wait completed: all targets are final.","timed_out":false,"status":{"first":{"completed":null},"second":{"completed":null}}}"#
+    );
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([
+                ("first".to_string(), AgentStatus::Completed(None)),
+                ("second".to_string(), AgentStatus::Completed(None)),
+            ])),
+        }
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_retires_closed_status_receivers_before_waiting_for_later_targets()
+ {
+    let (session, turn, manager, events) = multi_agent_v2_wait_fixture_with_events().await;
+    let first = spawn_multi_agent_v2_wait_target(&session, &turn, "first").await;
+    let second = spawn_multi_agent_v2_wait_target(&session, &turn, "second").await;
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn,
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["first", "second"],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    let started_item = next_started_wait_lifecycle(&events).await;
+    assert_eq!(started_item.receiver_thread_ids, vec![first, second]);
+
+    session
+        .services
+        .agent_control
+        .shutdown_live_agent(first)
+        .await
+        .expect("first target should shut down and close its status sender");
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "the first poll after shutdown should record its final status while the second remains nonfinal"
+    );
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "the next poll must retire the closed first receiver before the second target completes"
+    );
+    complete_multi_agent_v2_wait_target(&manager, second, "second complete").await;
+
+    let output = timeout(Duration::from_secs(1), wait.as_mut())
+        .await
+        .expect("closed status receiver must not starve a later target completion")
+        .expect("all-final wait should succeed after the later target completes");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([
+                ("first".to_string(), AgentStatus::Shutdown),
+                ("second".to_string(), AgentStatus::Completed(None)),
+            ])),
+        }
+    );
+    assert!(!content.contains("second complete"));
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_reconciles_closed_nonfinal_target_to_not_found() {
+    let (session, turn, manager, events) = multi_agent_v2_wait_fixture_with_events().await;
+    let worker = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("idle worker thread should start");
+    let worker_id = worker.thread_id;
+    drop(worker);
+    assert_eq!(
+        session.services.agent_control.get_status(worker_id).await,
+        AgentStatus::PendingInit,
+        "the removed target must still be nonfinal when the wait subscribes"
+    );
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": [worker_id.to_string()],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    let started_item = next_started_wait_lifecycle(&events).await;
+    assert_eq!(started_item.receiver_thread_ids, vec![worker_id]);
+
+    let removed = manager
+        .remove_thread(&worker_id)
+        .await
+        .expect("worker runtime should be removed while still nonfinal");
+    drop(removed);
+    assert_eq!(
+        session.services.agent_control.get_status(worker_id).await,
+        AgentStatus::NotFound,
+        "the canonical status owner must report the removed runtime unavailable"
+    );
+
+    let output = timeout(Duration::from_secs(1), wait.as_mut())
+        .await
+        .expect("closed nonfinal target must reconcile promptly")
+        .expect("all-final wait should succeed after the unavailable target becomes not found");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([(
+                worker_id.to_string(),
+                AgentStatus::NotFound,
+            )])),
+        }
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_any_final_returns_when_all_targets_were_final() {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let first = spawn_multi_agent_v2_wait_target(&session, &turn, "first").await;
+    let second = spawn_multi_agent_v2_wait_target(&session, &turn, "second").await;
+    complete_multi_agent_v2_wait_target(&manager, first, "first body").await;
+    complete_multi_agent_v2_wait_target(&manager, second, "second body").await;
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["first", "second"],
+                "return_when": "any_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+        .expect("any-final wait should return when every target was already final");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([
+                ("first".to_string(), AgentStatus::Completed(None)),
+                ("second".to_string(), AgentStatus::Completed(None)),
+            ])),
+        }
+    );
+    assert!(!content.contains("first body"));
+    assert!(!content.contains("second body"));
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_ends_for_errors_at_start_and_during_wait() {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let errored = spawn_multi_agent_v2_wait_target(&session, &turn, "errored").await;
+    error_multi_agent_v2_wait_target(&manager, errored, "sensitive start error").await;
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["errored"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+        .expect("errored target should end a condition wait");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait ended because a target errored.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([(
+                "errored".to_string(),
+                AgentStatus::Errored("sensitive start error".to_string()),
+            )])),
+        }
+    );
+    assert!(content.contains("sensitive start error"));
+    assert_eq!(success, None);
+
+    let later_error = spawn_multi_agent_v2_wait_target(&session, &turn, "later_error").await;
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session,
+        turn,
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["later_error"],
+            "return_when": "any_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    error_multi_agent_v2_wait_target(&manager, later_error, "sensitive later error").await;
+    let output = wait
+        .await
+        .expect("errored target should end an active condition wait");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait ended because a target errored.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([(
+                "later_error".to_string(),
+                AgentStatus::Errored("sensitive later error".to_string()),
+            )])),
+        }
+    );
+    assert!(content.contains("sensitive later error"));
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_ignores_mailbox_activity_until_the_condition_returns() {
+    let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
+    let agent_id = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
+    let worker_path = session
+        .services
+        .agent_control
+        .get_agent_metadata(agent_id)
+        .expect("worker metadata should exist")
+        .agent_path
+        .expect("worker path should exist");
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["worker"],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                worker_path,
+                AgentPath::root(),
+                Vec::new(),
+                "queued mailbox body".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            Default::default(),
+        )
+        .await;
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "mailbox activity must not end a targeted condition wait"
+    );
+    assert!(
+        session.input_queue.has_pending_mailbox_items().await,
+        "targeted condition waits must leave mailbox content pending"
+    );
+
+    complete_multi_agent_v2_wait_target(&manager, agent_id, "completion body").await;
+    let output = wait.await.expect("all-final wait should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait completed: all targets are final.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([(
+                "worker".to_string(),
+                AgentStatus::Completed(None),
+            )])),
+        }
+    );
+    assert!(
+        session.input_queue.has_pending_mailbox_items().await,
+        "queued mailbox content must remain available after the condition returns"
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_condition_returns_for_steer_after_mailbox_activity() {
+    let (session, turn, _manager) = multi_agent_v2_wait_fixture().await;
+    let agent_id = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
+    let worker_path = session
+        .services
+        .agent_control
+        .get_agent_metadata(agent_id)
+        .expect("worker metadata should exist")
+        .agent_path
+        .expect("worker path should exist");
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), SteerableConditionalWaitTask)
+        .await;
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["worker"],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                worker_path,
+                AgentPath::root(),
+                Vec::new(),
+                "mailbox before steer".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            Default::default(),
+        )
+        .await;
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    let mut steer = SubmittedTurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "stop waiting".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    };
+    assert_eq!(
+        session
+            .steer_submitted_input(
+                &mut steer,
+                /*additional_context*/ Default::default(),
+                Some(&turn.sub_id),
+                /*required_final_output_json_schema*/ None,
+                /*responsesapi_client_metadata*/ None,
+                /*incoming_root_turn_id*/ None,
+            )
+            .await
+            .expect("new user steer should be accepted"),
+        turn.sub_id
+    );
+
+    let output = wait.await.expect("steered condition wait should succeed");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(result.message, "Wait interrupted by new input.");
+    assert!(!result.timed_out);
+    assert!(
+        result
+            .status
+            .as_ref()
+            .is_some_and(|status| status.contains_key("worker")),
+        "steered condition output should retain the target status"
+    );
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_later_mailbox_activity()
+ {
+    let (session, turn, _manager) = multi_agent_v2_wait_fixture().await;
+    let agent_id = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
+    let worker_path = session
+        .services
+        .agent_control
+        .get_agent_metadata(agent_id)
+        .expect("worker metadata should exist")
+        .agent_path
+        .expect("worker path should exist");
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), SteerableConditionalWaitTask)
+        .await;
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": ["worker"],
+            "return_when": "all_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+
+    let mut steer = SubmittedTurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "stop waiting".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    };
+    assert_eq!(
+        session
+            .steer_submitted_input(
+                &mut steer,
+                /*additional_context*/ Default::default(),
+                Some(&turn.sub_id),
+                /*required_final_output_json_schema*/ None,
+                /*responsesapi_client_metadata*/ None,
+                /*incoming_root_turn_id*/ None,
+            )
+            .await
+            .expect("new user steer should be accepted"),
+        turn.sub_id
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            InterAgentCommunication::new(
+                worker_path,
+                AgentPath::root(),
+                Vec::new(),
+                "mailbox after steer".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            Default::default(),
+        )
+        .await;
+
+    let output = wait.await.expect("steered condition wait should succeed");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(result.message, "Wait interrupted by new input.");
+    assert!(!result.timed_out);
+    assert!(
+        result
+            .status
+            .as_ref()
+            .is_some_and(|status| status.contains_key("worker")),
+        "steered condition output should retain the target status"
+    );
+    assert!(
+        session.input_queue.has_pending_mailbox_items().await,
+        "mailbox activity that followed steer must remain queued"
+    );
+    assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_lifecycle_states_redact_completion_bodies_and_preserve_errors() {
+    let (session, turn, manager, events) = multi_agent_v2_wait_fixture_with_events().await;
+    let completed = spawn_multi_agent_v2_wait_target(&session, &turn, "completed").await;
+    complete_multi_agent_v2_wait_target(&manager, completed, "lifecycle completion body").await;
+
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["completed"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+        .expect("completed condition wait should succeed");
+    let (content, _) = expect_text_output(output);
+    assert!(!content.contains("lifecycle completion body"));
+    let completion_item = next_completed_wait_lifecycle(&events).await;
+    assert_eq!(completion_item.status, CollabAgentToolCallStatus::Completed);
+    assert_eq!(completion_item.receiver_thread_ids, vec![completed]);
+    assert_eq!(
+        completion_item.agents_states,
+        HashMap::from([(completed, AgentStatus::Completed(None))])
+    );
+    assert!(
+        !serde_json::to_string(&completion_item.agents_states)
+            .expect("lifecycle states should serialize")
+            .contains("lifecycle completion body")
+    );
+
+    let errored = spawn_multi_agent_v2_wait_target(&session, &turn, "errored").await;
+    error_multi_agent_v2_wait_target(&manager, errored, "lifecycle error detail").await;
+    let output = WaitAgentHandlerV2::default()
+        .handle(invocation(
+            session,
+            turn,
+            "wait_agent",
+            function_payload(json!({
+                "targets": ["errored"],
+                "return_when": "all_final",
+                "disable_timeout": true,
+            })),
+        ))
+        .await
+        .expect("errored condition wait should succeed");
+    let (content, _) = expect_text_output(output);
+    assert!(content.contains("lifecycle error detail"));
+    let error_item = next_completed_wait_lifecycle(&events).await;
+    assert_eq!(error_item.status, CollabAgentToolCallStatus::Failed);
+    assert_eq!(error_item.receiver_thread_ids, vec![errored]);
+    assert_eq!(
+        error_item.agents_states,
+        HashMap::from([(
+            errored,
+            AgentStatus::Errored("lifecycle error detail".to_string()),
+        )])
+    );
 }
 
 #[tokio::test]

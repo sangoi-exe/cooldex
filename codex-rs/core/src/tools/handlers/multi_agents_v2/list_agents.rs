@@ -2,6 +2,7 @@ use super::analytics::ToolCallAnalytics;
 use super::*;
 use crate::agent::control::ListedAgent;
 use crate::tools::handlers::multi_agents_spec::create_list_agents_tool;
+use codex_protocol::protocol::AgentStatus;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -51,6 +52,24 @@ impl Handler {
             .list_agents(&turn.session_source, args.path_prefix.as_deref())
             .await
             .map_err(collab_spawn_error)?;
+
+        // Merge-safety anchor: V2 list presentation omits completed final-response bodies while
+        // AgentControl keeps canonical statuses intact for internal lifecycle consumers.
+        let agents = agents
+            .into_iter()
+            .map(
+                |ListedAgent {
+                     agent_name,
+                     agent_status,
+                 }| ListedAgent {
+                    agent_name,
+                    agent_status: match agent_status {
+                        AgentStatus::Completed(Some(_)) => AgentStatus::Completed(None),
+                        status => status,
+                    },
+                },
+            )
+            .collect();
 
         Ok(boxed_tool_output(ListAgentsResult { agents }))
     }
