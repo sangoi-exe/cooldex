@@ -58,6 +58,39 @@
 - The delimited upstream core below must remain byte-identical to the blob named by its
   opening marker. Local policy belongs outside that core.
 
+<!-- Merge-safety anchor: local regular `codex` promotion preserves the guarded build,
+metadata-resolved candidate, atomic replacement without backup or rollback, and exclusions
+for companion command, package, host, and Computer Use surfaces. -->
+### One-shot local regular `codex` promotion
+
+- This procedure applies only to one-shot WSL/Linux promotion of the regular
+  `/home/lucas/.cargo/bin/codex` executable.
+- Before building, revalidate the relevant root branch/OID and clean task-owned source
+  state. Revalidate live command resolution, aliases, symlink or regular-file identity,
+  executable identity, and hashes with `type -a`, `alias -p`, `readlink -f`, and
+  `sha256sum` as applicable.
+- Build only through root `just build-codex-bin`, which delegates to
+  `scripts/cargo-guard.sh`; raw Cargo and `just install` are not promotion routes.
+- Resolve the effective Cargo target directory through guarded Cargo metadata in the build
+  context. Take the candidate from the metadata-resolved path rather than assuming
+  `codex-rs/target/debug/codex`.
+- Before replacement, prove that the candidate is a regular executable Linux x86-64 ELF
+  with the intended executable mode and SHA-256, then run `--version`, `--help`,
+  `exec --help`, and `app-server --help`.
+- Stage exactly one temporary sibling beneath `/home/lucas/.cargo/bin`, set its intended
+  executable mode, and atomically rename it to replace only
+  `/home/lucas/.cargo/bin/codex`; never overwrite that target in place.
+- Retain no backup or rollback copy. If post-write proof fails, stop and report the actual
+  installed state; never silently restore.
+- After replacement, prove candidate and installed SHA-256 equality; regular executable,
+  mode, and Linux x86-64 ELF identity; live command resolution and aliases; the same
+  bounded smoke results; and absence of the temporary sibling.
+- Already-running processes retain their old executable inode; only new processes use the
+  replacement.
+- `cdx`, `cdx-dev`, standalone packaging, aliases, shell profiles, `codex-code-mode-host`,
+  `codex-computer-use-mcp`, and Computer Use tooling are excluded unless direct dependency
+  evidence later proves an inseparable follower and the current user expands scope.
+
 ## Computer Use Operator Contract
 
 - The canonical local config owner for Computer Use runtime knobs is
