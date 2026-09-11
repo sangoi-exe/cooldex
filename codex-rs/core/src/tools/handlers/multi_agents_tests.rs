@@ -239,8 +239,8 @@ impl SessionTask for SteerableConditionalWaitTask {
 }
 
 // Merge-safety anchor: V2 conditional wait tests preserve generic mailbox wake behavior while
-// proving target-state fan-in reconciles closed nonfinal statuses, redacts only completion bodies,
-// and leaves mailbox content pending.
+// proving target-state fan-in refreshes cross-target errors after closed-receiver reconciliation,
+// redacts only completion bodies, and leaves mailbox content pending.
 async fn multi_agent_v2_wait_fixture() -> (
     Arc<crate::session::session::Session>,
     Arc<TurnContext>,
@@ -4628,6 +4628,112 @@ async fn multi_agent_v2_wait_agent_reconciles_closed_nonfinal_target_to_not_foun
         }
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_refreshes_cross_target_errors_after_closed_receiver() {
+    let (session, turn, manager, events) = multi_agent_v2_wait_fixture_with_events().await;
+    let first = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("first idle worker should start");
+    let second = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("second idle worker should start");
+    let first_id = first.thread_id;
+    let second_id = second.thread_id;
+    drop(first);
+    drop(second);
+    assert_eq!(
+        session.services.agent_control.get_status(first_id).await,
+        AgentStatus::PendingInit
+    );
+    assert_eq!(
+        session.services.agent_control.get_status(second_id).await,
+        AgentStatus::PendingInit
+    );
+
+    let handler = WaitAgentHandlerV2::default();
+    let wait = handler.handle(invocation(
+        session.clone(),
+        turn.clone(),
+        "wait_agent",
+        function_payload(json!({
+            "targets": [first_id.to_string(), second_id.to_string()],
+            "return_when": "any_final",
+            "disable_timeout": true,
+        })),
+    ));
+    tokio::pin!(wait);
+    assert!(futures::poll!(wait.as_mut()).is_pending());
+    let started_item = next_started_wait_lifecycle(&events).await;
+    assert_eq!(started_item.receiver_thread_ids, vec![first_id, second_id]);
+
+    let mut first_status_rx = session
+        .services
+        .agent_control
+        .subscribe_status(first_id)
+        .await
+        .expect("first target status should be subscribed");
+    let removed = manager
+        .remove_thread(&first_id)
+        .await
+        .expect("first idle runtime should be removed");
+    drop(removed);
+    assert!(
+        timeout(Duration::from_secs(1), first_status_rx.changed())
+            .await
+            .expect("removed target status sender should close")
+            .is_err(),
+        "the first status receiver must close before publishing the second target error"
+    );
+    assert_eq!(
+        session.services.agent_control.get_status(first_id).await,
+        AgentStatus::NotFound
+    );
+    error_multi_agent_v2_wait_target(&manager, second_id, "cross-target error").await;
+
+    let output = timeout(Duration::from_secs(1), wait.as_mut())
+        .await
+        .expect("closed receiver and unread error should end the conditional wait")
+        .expect("conditional wait should succeed with an error outcome");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
+            message: "Wait ended because a target errored.".to_string(),
+            timed_out: false,
+            status: Some(BTreeMap::from([
+                (first_id.to_string(), AgentStatus::NotFound),
+                (
+                    second_id.to_string(),
+                    AgentStatus::Errored("cross-target error".to_string()),
+                ),
+            ])),
+        }
+    );
+    assert!(content.contains("cross-target error"));
+    assert_eq!(success, None);
+
+    let lifecycle_item = next_completed_wait_lifecycle(&events).await;
+    assert_eq!(lifecycle_item.status, CollabAgentToolCallStatus::Failed);
+    assert_eq!(
+        lifecycle_item.receiver_thread_ids,
+        vec![first_id, second_id]
+    );
+    assert_eq!(
+        lifecycle_item.agents_states,
+        HashMap::from([
+            (first_id, AgentStatus::NotFound),
+            (
+                second_id,
+                AgentStatus::Errored("cross-target error".to_string()),
+            ),
+        ])
+    );
 }
 
 #[tokio::test]

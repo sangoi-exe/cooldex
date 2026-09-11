@@ -374,9 +374,8 @@ async fn wait_for_condition(
             Some((index, changed)) = status_changes.next() => {
                 if changed.is_err() {
                     retire_condition_target_status_receiver(session, &mut targets[index]).await;
-                } else {
-                    refresh_condition_target_statuses(targets);
                 }
+                refresh_condition_target_statuses(targets);
                 if let Some(outcome) = condition_outcome(targets, return_when) {
                     return outcome;
                 }
@@ -406,8 +405,8 @@ fn refresh_condition_target_statuses(targets: &mut [ConditionTarget]) {
     }
 }
 
-// Merge-safety anchor: a V2 condition wait must not retain a nonfinal target after its only
-// status receiver closes; reconcile its nonfinal snapshot through AgentControl instead.
+// Merge-safety anchor: after every V2 target-status wakeup, reconcile a closed receiver and
+// refresh every remaining subscription before error or final-success condition evaluation.
 async fn retire_condition_target_status_receiver(
     session: &crate::session::session::Session,
     target: &mut ConditionTarget,
