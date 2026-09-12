@@ -321,6 +321,8 @@ impl LunaSampler {
                 item.set_id(Some(ResponseItemId::new(prefix)));
             }
         }
+        // Merge-safety anchor: guardian scoring retains its existing uncapped Responses behavior;
+        // the optional cap is reserved for the isolated maintenance request path.
         let mut request = ResponsesApiRequest {
             model: MODEL.to_owned(),
             instructions: String::new(),
@@ -333,6 +335,7 @@ impl LunaSampler {
                 summary: None,
                 context: Some(ReasoningContext::AllTurns),
             }),
+            max_output_tokens: None,
             store: false,
             stream: true,
             stream_options: None,

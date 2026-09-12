@@ -9,6 +9,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::responses_request_properties_match;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -364,6 +365,136 @@ fn test_session_telemetry() -> SessionTelemetry {
         "test-terminal".to_string(),
         SessionSource::Cli,
     )
+}
+
+// Merge-safety anchor: maintenance sessions retain isolated continuation, fallback, and turn-state
+// ownership while normal turn sessions keep the existing shared behavior.
+#[test]
+fn prompt_max_output_tokens_is_propagated_and_participates_in_websocket_reuse() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut prompt = Prompt::default();
+    prompt.max_output_tokens = Some(128);
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let request = client
+        .build_responses_request(
+            &prompt,
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &responses_metadata,
+        )
+        .expect("build responses request");
+
+    assert_eq!(request.max_output_tokens, Some(128));
+    let request_with_same_cap = request.clone();
+    assert!(responses_request_properties_match(
+        &request,
+        &request_with_same_cap
+    ));
+
+    let mut request_with_different_cap = request.clone();
+    request_with_different_cap.max_output_tokens = Some(256);
+    assert!(!responses_request_properties_match(
+        &request,
+        &request_with_different_cap
+    ));
+}
+
+#[test]
+fn maintenance_session_keeps_websocket_and_turn_state_isolated() {
+    let mut provider =
+        create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ true,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+
+    let normal_session = client.new_session();
+    assert!(normal_session.turn_state.set("normal-state".to_string()).is_ok());
+    drop(normal_session);
+
+    let cached_request = client
+        .build_responses_request(
+            &Prompt::default(),
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &test_responses_metadata_for_client(
+                &client,
+                /*turn_id*/ None,
+                format!("{}:0", client.state.thread_id),
+                /*parent_thread_id*/ None,
+                TestCodexResponsesRequestKind::Turn,
+            ),
+        )
+        .expect("build cached responses request");
+    {
+        let mut cached_websocket_session = client
+            .state
+            .cached_websocket_session
+            .lock()
+            .expect("cached websocket session mutex should not be poisoned");
+        cached_websocket_session.last_request = Some(cached_request.clone());
+    }
+
+    let mut maintenance_session = client.new_maintenance_session();
+    assert!(maintenance_session.websocket_session.last_request.is_none());
+    assert_eq!(maintenance_session.turn_state.get(), None);
+    assert!(maintenance_session
+        .turn_state
+        .set("maintenance-state".to_string())
+        .is_ok());
+    let mut maintenance_request = cached_request.clone();
+    maintenance_request.max_output_tokens = Some(128);
+    maintenance_session.websocket_session.last_request = Some(maintenance_request.clone());
+    assert!(maintenance_session.responses_websocket_enabled());
+    assert!(maintenance_session.try_switch_fallback_transport(
+        &test_session_telemetry(),
+        &test_model_info()
+    ));
+    assert!(!maintenance_session.responses_websocket_enabled());
+    assert!(maintenance_session.websocket_session.last_request.is_none());
+    assert!(client.responses_websocket_enabled());
+    maintenance_session.websocket_session.last_request = Some(maintenance_request);
+    drop(maintenance_session);
+
+    {
+        let cached_websocket_session = client
+            .state
+            .cached_websocket_session
+            .lock()
+            .expect("cached websocket session mutex should not be poisoned");
+        assert_eq!(
+            cached_websocket_session.last_request.as_ref(),
+            Some(&cached_request)
+        );
+    }
+
+    let normal_session = client.new_session();
+    assert_eq!(normal_session.websocket_session.last_request.as_ref(), Some(&cached_request));
+    assert_eq!(normal_session.turn_state.get(), None);
+    assert!(normal_session.responses_websocket_enabled());
 }
 
 fn spawned_session_source() -> SessionSource {

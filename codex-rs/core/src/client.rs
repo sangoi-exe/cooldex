@@ -279,6 +279,8 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    session_kind: ModelClientSessionKind,
+    websocket_fallback_active: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -308,10 +310,21 @@ struct WebsocketSession {
     connection_reused: StdMutex<bool>,
 }
 
+// Merge-safety anchor: maintenance sessions must not consume, replace, or disable the normal
+// turn WebSocket continuation. Their cache and fallback ownership remain operation-local.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelClientSessionKind {
+    Turn,
+    #[allow(dead_code)]
+    Maintenance,
+}
+
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
 // `client_metadata`, while websocket reuse compares the input separately and ignores metadata.
 // Access programs are authorized per response, including continuations, without replaying input.
 // Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
+// Merge-safety anchor: a changed generation ceiling is a new provider request shape and cannot
+// reuse a prior WebSocket response continuation.
 fn responses_request_properties_match(
     previous: &ResponsesApiRequest,
     current: &ResponsesApiRequest,
@@ -324,6 +337,7 @@ fn responses_request_properties_match(
         tool_choice: previous_tool_choice,
         parallel_tool_calls: previous_parallel_tool_calls,
         reasoning: previous_reasoning,
+        max_output_tokens: previous_max_output_tokens,
         store: previous_store,
         stream: previous_stream,
         stream_options: _,
@@ -342,6 +356,7 @@ fn responses_request_properties_match(
         tool_choice: current_tool_choice,
         parallel_tool_calls: current_parallel_tool_calls,
         reasoning: current_reasoning,
+        max_output_tokens: current_max_output_tokens,
         store: current_store,
         stream: current_stream,
         stream_options: _,
@@ -359,6 +374,7 @@ fn responses_request_properties_match(
         && previous_tool_choice == current_tool_choice
         && previous_parallel_tool_calls == current_parallel_tool_calls
         && previous_reasoning == current_reasoning
+        && previous_max_output_tokens == current_max_output_tokens
         && previous_store == current_store
         && previous_stream == current_stream
         // Stream options control delivery for this response, not the context
@@ -523,6 +539,20 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            session_kind: ModelClientSessionKind::Turn,
+            websocket_fallback_active: false,
+            turn_state: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Creates an operation-local session for maintenance work that must not affect turn state.
+    #[allow(dead_code)]
+    pub(crate) fn new_maintenance_session(&self) -> ModelClientSession {
+        ModelClientSession {
+            client: self.clone(),
+            websocket_session: WebsocketSession::default(),
+            session_kind: ModelClientSessionKind::Maintenance,
+            websocket_fallback_active: false,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -983,6 +1013,7 @@ impl ModelClient {
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
             reasoning: Some(reasoning),
+            max_output_tokens: prompt.max_output_tokens,
             store: false,
             stream: true,
             stream_options,
@@ -1271,15 +1302,21 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
-        let websocket_session = std::mem::take(&mut self.websocket_session);
-        self.client
-            .store_cached_websocket_session(websocket_session);
+        if self.session_kind == ModelClientSessionKind::Turn {
+            let websocket_session = std::mem::take(&mut self.websocket_session);
+            self.client
+                .store_cached_websocket_session(websocket_session);
+        }
     }
 }
 
 impl ModelClientSession {
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
+    }
+
+    fn responses_websocket_enabled(&self) -> bool {
+        !self.websocket_fallback_active && self.client.responses_websocket_enabled()
     }
 
     fn reset_websocket_session(&mut self) {
@@ -1419,7 +1456,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> std::result::Result<(), ApiError> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.responses_websocket_enabled() {
             return Ok(());
         }
         if self.websocket_session.connection.is_some() {
@@ -1973,7 +2010,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        if !self.responses_websocket_enabled() {
             return Ok(());
         }
         if self.websocket_session.last_request.is_some() {
@@ -2038,7 +2075,7 @@ impl ModelClientSession {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                if self.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2077,10 +2114,10 @@ impl ModelClientSession {
         }
     }
 
-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+    /// Switches the current session to HTTP and resets its WebSocket state.
     ///
-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
-    /// the HTTP transport.
+    /// Turn sessions disable WebSockets for the remaining Codex session after exhausting the
+    /// provider retry budget. Isolated maintenance sessions keep that fallback operation-local.
     ///
     /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
     pub(crate) fn try_switch_fallback_transport(
@@ -2088,9 +2125,24 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         model_info: &ModelInfo,
     ) -> bool {
-        let activated = self
-            .client
-            .force_http_fallback(session_telemetry, model_info);
+        let activated = match self.session_kind {
+            ModelClientSessionKind::Turn => self
+                .client
+                .force_http_fallback(session_telemetry, model_info),
+            ModelClientSessionKind::Maintenance => {
+                let activated = self.responses_websocket_enabled();
+                if activated {
+                    warn!("falling back to HTTP for isolated maintenance session");
+                    session_telemetry.counter(
+                        "codex.transport.fallback_to_http",
+                        /*inc*/ 1,
+                        &[("from_wire_api", "responses_websocket")],
+                    );
+                }
+                self.websocket_fallback_active = true;
+                activated
+            }
+        };
         self.websocket_session = WebsocketSession::default();
         activated
     }

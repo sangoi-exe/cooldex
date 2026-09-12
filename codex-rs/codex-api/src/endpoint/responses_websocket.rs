@@ -937,9 +937,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    // Merge-safety anchor: direct payload parity covers the bounded-generation field on the
+    // `response.create` transport.
     #[test]
     fn direct_serialization_preserves_websocket_request_payload() {
-        let api_request = ResponsesApiRequest {
+        let mut api_request = ResponsesApiRequest {
             model: "gpt-test".to_string(),
             instructions: "Use the available tools.".to_string(),
             input: vec![ResponseItem::Message {
@@ -965,6 +967,7 @@ mod tests {
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
             reasoning: None,
+            max_output_tokens: Some(128),
             store: false,
             stream: true,
             stream_options: None,
@@ -997,6 +1000,26 @@ mod tests {
             serde_json::from_str::<Value>(&request_text).expect("parse websocket request");
 
         assert_eq!(wire_payload, expected_payload);
+        assert_eq!(wire_payload["max_output_tokens"], json!(128));
+
+        api_request.max_output_tokens = None;
+        let request_without_cap = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            previous_response_id: Some("resp-1".to_string()),
+            generate: Some(false),
+            ..ResponseCreateWsRequest::from(&api_request)
+        });
+        let mut expected_without_cap =
+            serde_json::to_value(&api_request).expect("serialize responses API request");
+        expected_without_cap["type"] = json!("response.create");
+        expected_without_cap["previous_response_id"] = json!("resp-1");
+        expected_without_cap["generate"] = json!(false);
+        let request_without_cap_text = serialize_websocket_request(&request_without_cap)
+            .expect("serialize websocket request");
+        let wire_payload_without_cap = serde_json::from_str::<Value>(&request_without_cap_text)
+            .expect("parse websocket request");
+
+        assert_eq!(wire_payload_without_cap, expected_without_cap);
+        assert_eq!(wire_payload_without_cap.get("max_output_tokens"), None);
     }
 
     #[test]

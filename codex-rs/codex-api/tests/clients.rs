@@ -31,6 +31,8 @@ use http::StatusCode;
 use pretty_assertions::assert_eq;
 use serde_json::value::RawValue;
 
+// Merge-safety anchor: Responses HTTP serialization must omit an unset generation cap and retain
+// an explicitly requested hard cap.
 fn assert_path_ends_with(requests: &[Request], suffix: &str) {
     assert_eq!(requests.len(), 1);
     let url = &requests[0].url;
@@ -346,6 +348,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
@@ -370,11 +373,39 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     let body: serde_json::Value =
         serde_json::from_slice(prepared.body.as_deref().expect("body should be JSON"))?;
     assert_eq!(body, expected);
+    assert_eq!(body.get("max_output_tokens"), None);
     assert_eq!(body["input"][0]["id"], "msg_1");
     assert_eq!(
         prepared.headers.get(http::header::CONTENT_TYPE),
         Some(&HeaderValue::from_static("application/json"))
     );
+    Ok(())
+}
+
+#[test]
+fn responses_api_request_serializes_max_output_tokens_when_set() -> Result<()> {
+    let request = ResponsesApiRequest {
+        model: "gpt-test".into(),
+        instructions: "Say hi".into(),
+        input: Vec::new(),
+        tools: Some(empty_tools().into()),
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        max_output_tokens: Some(128),
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        client_metadata: None,
+        access_programs: None,
+    };
+
+    let body = serde_json::to_value(request)?;
+    assert_eq!(body["max_output_tokens"], serde_json::json!(128));
     Ok(())
 }
 
@@ -434,6 +465,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
@@ -555,6 +587,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
+        max_output_tokens: None,
         store: true,
         stream: true,
         stream_options: None,

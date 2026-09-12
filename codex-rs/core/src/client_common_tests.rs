@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 use super::*;
 
+// Merge-safety anchor: the optional Responses generation cap stays absent for ordinary prompts
+// unless a maintenance caller explicitly requests it.
+
 fn empty_tools() -> Arc<RawValue> {
     Arc::from(RawValue::from_string("[]".to_string()).expect("valid tool JSON"))
 }
@@ -123,6 +126,7 @@ fn serializes_text_verbosity_when_set() {
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
@@ -171,6 +175,7 @@ fn serializes_text_schema_with_strict_format() {
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
@@ -233,6 +238,7 @@ fn omits_text_when_not_set() {
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
@@ -258,6 +264,7 @@ fn serializes_flex_service_tier_when_set() {
         tool_choice: "auto".to_string(),
         parallel_tool_calls: true,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
