@@ -33,6 +33,9 @@ pub use turn_metadata::detached_memory_responses_metadata;
 pub use user_message_admission::UserMessageAdmission;
 pub use user_message_admission::UserMessageAdmissionError;
 mod codex_thread;
+// Merge-safety anchor: pre-compaction handoff remains a private operation-local owner rather
+// than a second durable recovery state or normal sampling path.
+mod compact_handoff;
 mod compact_model_fallback;
 mod compact_remote;
 mod compact_remote_history;

@@ -176,78 +176,12 @@ impl Session {
             }
         };
 
-        let mut boundary_index = None;
-        for (index, item) in input.iter().enumerate() {
-            if item
-                .id()
-                .is_some_and(|item_id| item_id.as_str() == identity.boundary_item_id.as_str())
-                && boundary_index.replace(index).is_some()
-            {
-                return Err(self
-                    .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
-                    .await);
-            }
+        // Merge-safety anchor: normal sampling retains its current failure-to-block behavior;
+        // the extracted placement helper is also used by a read-only pre-compaction snapshot.
+        match insert_post_compact_recovery_packet(input, &identity, packet) {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(failure) => Err(self.block_post_compact_recovery(failure).await),
         }
-        let Some(boundary_index) = boundary_index else {
-            return Err(self
-                .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
-                .await);
-        };
-        let insertion_index = match classify_tool_item(&input[boundary_index]) {
-            ToolItemKind::Output => match complete_trailing_tool_batch(&input[..=boundary_index]) {
-                Ok(batch) => batch.range.start,
-                Err(reason) => {
-                    warn!(
-                        %reason,
-                        "post-compact recovery boundary ends an invalid native tool batch"
-                    );
-                    return Err(self
-                        .block_post_compact_recovery(
-                            PostCompactRecoveryFailureClass::BoundaryMismatch,
-                        )
-                        .await);
-                }
-            },
-            ToolItemKind::UnsupportedOutput => {
-                return Err(self
-                    .block_post_compact_recovery(PostCompactRecoveryFailureClass::BoundaryMismatch)
-                    .await);
-            }
-            ToolItemKind::Call | ToolItemKind::UnsupportedCall | ToolItemKind::NonTool => {
-                boundary_index + 1
-            }
-        };
-        let recall = packet.recall().cloned();
-        let compaction_window_id = &identity.compaction_window_id;
-        let item_count = if let Some(recall) = recall {
-            // Merge-safety anchor: replay recall as assistant output, not generic contextual input.
-            let mut recall_item = recall.into_response_item();
-            recall_item.set_id(Some(ResponseItemId::with_suffix(
-                "msg",
-                format_args!("{compaction_window_id}-recall"),
-            )));
-            let mut recovery_item = Box::new(packet).into_boxed_response_item();
-            recovery_item.set_id(Some(ResponseItemId::with_suffix(
-                "msg",
-                format_args!("{compaction_window_id}-recovery"),
-            )));
-            input.insert(insertion_index, recall_item);
-            input.insert(insertion_index + 1, recovery_item);
-            2
-        } else {
-            let mut recovery_item = Box::new(packet).into_boxed_response_item();
-            recovery_item.set_id(Some(ResponseItemId::with_suffix(
-                "msg",
-                format_args!("{compaction_window_id}-recovery"),
-            )));
-            input.insert(insertion_index, recovery_item);
-            1
-        };
-        Ok(Some(PreparedPostCompactRecovery {
-            identity,
-            insertion_index,
-            item_count,
-        }))
     }
 
     pub(crate) async fn record_post_compact_recovery_sampling_success(
@@ -304,6 +238,77 @@ impl Session {
         state.post_compact_recovery.block(failure);
         blocked_error(failure)
     }
+}
+
+/// Inserts one already-materialized packet at the canonical recovery boundary without touching
+/// session state. Callers own all recall loading, caching, and failure-state transitions.
+pub(super) fn insert_post_compact_recovery_packet(
+    input: &mut Vec<ResponseItem>,
+    identity: &PostCompactRecoveryIdentity,
+    packet: PostCompactRecoveryContext,
+) -> Result<PreparedPostCompactRecovery, PostCompactRecoveryFailureClass> {
+    let mut boundary_index = None;
+    for (index, item) in input.iter().enumerate() {
+        if item
+            .id()
+            .is_some_and(|item_id| item_id.as_str() == identity.boundary_item_id.as_str())
+            && boundary_index.replace(index).is_some()
+        {
+            return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
+        }
+    }
+    let Some(boundary_index) = boundary_index else {
+        return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
+    };
+    let insertion_index = match classify_tool_item(&input[boundary_index]) {
+        ToolItemKind::Output => match complete_trailing_tool_batch(&input[..=boundary_index]) {
+            Ok(batch) => batch.range.start,
+            Err(reason) => {
+                warn!(
+                    %reason,
+                    "post-compact recovery boundary ends an invalid native tool batch"
+                );
+                return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
+            }
+        },
+        ToolItemKind::UnsupportedOutput => {
+            return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
+        }
+        ToolItemKind::Call | ToolItemKind::UnsupportedCall | ToolItemKind::NonTool => {
+            boundary_index + 1
+        }
+    };
+    let recall = packet.recall().cloned();
+    let compaction_window_id = &identity.compaction_window_id;
+    let item_count = if let Some(recall) = recall {
+        // Merge-safety anchor: replay recall as assistant output, not generic contextual input.
+        let mut recall_item = recall.into_response_item();
+        recall_item.set_id(Some(ResponseItemId::with_suffix(
+            "msg",
+            format_args!("{compaction_window_id}-recall"),
+        )));
+        let mut recovery_item = Box::new(packet).into_boxed_response_item();
+        recovery_item.set_id(Some(ResponseItemId::with_suffix(
+            "msg",
+            format_args!("{compaction_window_id}-recovery"),
+        )));
+        input.insert(insertion_index, recall_item);
+        input.insert(insertion_index + 1, recovery_item);
+        2
+    } else {
+        let mut recovery_item = Box::new(packet).into_boxed_response_item();
+        recovery_item.set_id(Some(ResponseItemId::with_suffix(
+            "msg",
+            format_args!("{compaction_window_id}-recovery"),
+        )));
+        input.insert(insertion_index, recovery_item);
+        1
+    };
+    Ok(PreparedPostCompactRecovery {
+        identity: identity.clone(),
+        insertion_index,
+        item_count,
+    })
 }
 
 fn context_failure_class(

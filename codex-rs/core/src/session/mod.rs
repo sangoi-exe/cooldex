@@ -20,6 +20,7 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
+use crate::compact_handoff::PreCompactHandoffInputSnapshot;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ContextualUserFragment;
@@ -29,6 +30,7 @@ use crate::context::ManagedDeveloperInstructions;
 use crate::context::ModelSwitchInstructions;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::NetworkRuleSaved;
+use crate::context::PostCompactRecoveryContext;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
 use crate::current_time::TimeProvider;
@@ -1103,6 +1105,45 @@ async fn thread_title_from_thread_store(
     (!title.is_empty() && thread.preview.trim() != title).then(|| title.to_string())
 }
 
+// Merge-safety anchor: pre-compaction synthesis reuses the normal recovery insertion boundary
+// while keeping the source snapshot free of recall loading, cache population, and state mutation.
+pub(crate) fn pre_compact_handoff_input_snapshot_from_parts(
+    mut input: Vec<ResponseItem>,
+    base_instructions: BaseInstructions,
+    recovery_packet: Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>,
+) -> Result<PreCompactHandoffInputSnapshot, PostCompactRecoveryFailureClass> {
+    if let Some((identity, packet)) = recovery_packet {
+        post_compact_recovery::insert_post_compact_recovery_packet(
+            &mut input,
+            &identity,
+            packet,
+        )?;
+    }
+    Ok(PreCompactHandoffInputSnapshot::new(input, base_instructions))
+}
+
+// Merge-safety anchor: live request rendering and atomic pre-compaction snapshots share the
+// same model-provenance update-plan stripping decision without changing persisted instructions.
+fn render_prompt_base_instructions(
+    config: &Config,
+    instructions: BaseInstructions,
+) -> BaseInstructions {
+    if !config.update_plan_enabled
+        && config.model_catalog.is_none()
+        && matches!(
+            instructions.provenance,
+            Some(BaseInstructionsProvenance::Model { .. })
+        )
+    {
+        BaseInstructions {
+            text: crate::context::without_update_plan_instructions(&instructions.text),
+            ..instructions
+        }
+    } else {
+        instructions
+    }
+}
+
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
@@ -1397,20 +1438,43 @@ impl Session {
     pub(crate) async fn get_prompt_base_instructions(&self) -> BaseInstructions {
         let config = self.get_config().await;
         let instructions = self.get_base_instructions().await;
-        if !config.update_plan_enabled
-            && config.model_catalog.is_none()
-            && matches!(
-                instructions.provenance,
-                Some(BaseInstructionsProvenance::Model { .. })
+        render_prompt_base_instructions(config.as_ref(), instructions)
+    }
+
+    // Merge-safety anchor: a pre-compaction handoff snapshots live prompt source atomically and
+    // may overlay only an already-cached recovery packet without recall loading or state mutation.
+    pub(crate) async fn snapshot_pre_compact_handoff_input(
+        &self,
+        model_info: &ModelInfo,
+    ) -> CodexResult<PreCompactHandoffInputSnapshot> {
+        let (input, base_instructions, recovery_packet) = {
+            let state = self.state.lock().await;
+            let instructions = BaseInstructions {
+                text: state.session_configuration.base_instructions.clone(),
+                provenance: state.base_instructions_provenance.clone(),
+            };
+            let config = &state.session_configuration.original_config_do_not_use;
+            let base_instructions = render_prompt_base_instructions(config, instructions);
+            let recovery_packet = state
+                .post_compact_recovery
+                .pending_packet_snapshot()
+                .map_err(|failure| {
+                    CodexErr::Fatal(format!("post-compact recovery is blocked: {failure}"))
+                })?;
+            (
+                state
+                    .clone_history()
+                    .for_prompt(&model_info.input_modalities),
+                base_instructions,
+                recovery_packet,
             )
-        {
-            BaseInstructions {
-                text: crate::context::without_update_plan_instructions(&instructions.text),
-                ..instructions
-            }
-        } else {
-            instructions
-        }
+        };
+        pre_compact_handoff_input_snapshot_from_parts(input, base_instructions, recovery_packet)
+            .map_err(|failure| {
+                CodexErr::Fatal(format!(
+                    "post-compact recovery overlay could not be placed: {failure}"
+                ))
+            })
     }
 
     // Merges connector IDs into the session-level explicit connector selection.

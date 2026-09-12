@@ -8,6 +8,7 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::compact::InitialContextInjection;
+use crate::compact_handoff::PreCompactHandoffInputSnapshot;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
@@ -164,6 +165,7 @@ fn claimed_turn_slot_with_state() -> (TurnSlot, Arc<Mutex<crate::state::TurnStat
     (slot, claim.turn_state)
 }
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -392,6 +394,45 @@ async fn default_turn_context_assigns_missing_response_item_ids() {
         items[0]
             .id()
             .is_some_and(|item_id| item_id.starts_with("msg_"))
+    );
+}
+
+#[tokio::test]
+async fn pre_compact_snapshot_matches_prompt_base_instruction_rendering() {
+    let instructions = "Before.\n\n## Planning\nYou have access to an `update_plan` tool which tracks steps.\n\n### Examples\nKeep steps current.\n\n## Work\nImplement.\n\n## `update_plan`\nUpdate the checklist.\n\n# Next\n## Planning\nDiscuss architecture and inspect update_plan before editing.\n";
+    let (session, turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.base_instructions = Some(instructions.to_string());
+            config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+                model: "test-model".to_string(),
+            });
+            config.update_plan_enabled = false;
+            config.model_catalog = None;
+        },
+    )
+    .await;
+    {
+        let mut state = session.state.lock().await;
+        state.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+            model: "test-model".to_string(),
+        });
+    }
+
+    let ordinary = session.get_prompt_base_instructions().await;
+    let snapshot = session
+        .snapshot_pre_compact_handoff_input(turn_context.model_info())
+        .await
+        .expect("snapshot");
+
+    assert_eq!(
+        snapshot,
+        PreCompactHandoffInputSnapshot::new(Vec::new(), ordinary.clone())
+    );
+    assert_eq!(
+        ordinary.text,
+        "Before.\n\n## Work\nImplement.\n\n# Next\n## Planning\nDiscuss architecture and inspect update_plan before editing.\n"
     );
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::PostCompactRecoveryContext;
 use pretty_assertions::assert_eq;
 
 fn identity() -> PostCompactRecoveryIdentity {
@@ -61,4 +62,41 @@ fn matching_durable_application_clears_pending_state() {
         .expect("durable matching application should clear recovery");
 
     assert_eq!(state, PostCompactRecoveryRuntimeState::Absent);
+}
+
+#[test]
+fn pending_packet_snapshot_clones_only_an_already_cached_packet() {
+    // Merge-safety anchor: snapshot reads must not materialize recovery from recall or mutate the
+    // pending state while a later compaction prepares its own prompt source.
+    let identity = identity();
+    let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+
+    assert_eq!(
+        state
+            .pending_packet_snapshot()
+            .expect("pending state should be readable"),
+        None
+    );
+
+    let packet = PostCompactRecoveryContext::new(
+        &identity.compaction_window_id,
+        &identity.boundary_item_id,
+        "fixed boundary",
+        None,
+    )
+    .expect("recovery packet");
+    state
+        .cache_packet(&identity, packet.clone())
+        .expect("cache packet");
+
+    assert_eq!(
+        state
+            .pending_packet_snapshot()
+            .expect("cached packet snapshot"),
+        Some((identity.clone(), packet.clone()))
+    );
+    assert_eq!(
+        state.packet(&identity).expect("matching packet read"),
+        Some(packet)
+    );
 }

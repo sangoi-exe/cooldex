@@ -315,7 +315,6 @@ struct WebsocketSession {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelClientSessionKind {
     Turn,
-    #[allow(dead_code)]
     Maintenance,
 }
 
@@ -546,7 +545,6 @@ impl ModelClient {
     }
 
     /// Creates an operation-local session for maintenance work that must not affect turn state.
-    #[allow(dead_code)]
     pub(crate) fn new_maintenance_session(&self) -> ModelClientSession {
         ModelClientSession {
             client: self.clone(),

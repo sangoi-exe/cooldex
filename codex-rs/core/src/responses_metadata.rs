@@ -155,6 +155,9 @@ pub(crate) enum CodexResponsesRequestKind {
     Prewarm,
     Compaction(CompactionTurnMetadata),
     Memory,
+    // Merge-safety anchor: isolated pre-compaction handoff synthesis has distinct telemetry and
+    // must not be classified as normal continuation or provider-specific compaction work.
+    PreCompactHandoff,
 }
 
 impl CodexResponsesRequestKind {
@@ -164,6 +167,7 @@ impl CodexResponsesRequestKind {
             CodexResponsesRequestKind::Prewarm => ("prewarm", None),
             CodexResponsesRequestKind::Compaction(metadata) => ("compaction", Some(metadata)),
             CodexResponsesRequestKind::Memory => ("memory", None),
+            CodexResponsesRequestKind::PreCompactHandoff => ("pre_compact_handoff", None),
         }
     }
 

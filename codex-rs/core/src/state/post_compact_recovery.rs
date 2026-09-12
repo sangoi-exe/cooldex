@@ -59,6 +59,22 @@ impl PostCompactRecoveryRuntimeState {
         }
     }
 
+    // Merge-safety anchor: pre-compaction synthesis may observe a cached recovery packet but
+    // must not trigger recall loading, cache population, application, or state mutation.
+    pub(crate) fn pending_packet_snapshot(
+        &self,
+    ) -> Result<Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>, PostCompactRecoveryFailureClass>
+    {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Blocked(failure) => Err(*failure),
+            Self::Pending(pending) => Ok(pending
+                .packet
+                .clone()
+                .map(|packet| (pending.identity.clone(), packet))),
+        }
+    }
+
     pub(crate) fn blocked_failure(&self) -> Option<PostCompactRecoveryFailureClass> {
         match self {
             Self::Blocked(failure) => Some(*failure),
