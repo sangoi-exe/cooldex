@@ -1,12 +1,15 @@
 use super::compact::COMPACT_WARNING_MESSAGE;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_history::RolloutItem;
+use codex_protocol::AgentPath;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
@@ -25,9 +28,12 @@ use core_test_support::skip_if_no_network;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::submit_thread_settings;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::json;
+use tokio::sync::oneshot;
 
 // Merge-safety anchor: persisted rollout tests use codex_rollout's canonical JSONL decoder.
 
@@ -48,6 +54,13 @@ fn user_turn(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
         text: text.to_string(),
         text_elements: Vec::new(),
     }])
+}
+
+fn test_rollout_path(test: &TestCodex) -> PathBuf {
+    test.session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path")
 }
 
 fn read_rollout_items(path: &Path) -> Vec<RolloutItem> {
@@ -247,17 +260,200 @@ async fn post_compact_recovery_stream_closes_after_created_without_sampling_succ
         config.model_provider.stream_max_retries = Some(0);
     });
     let test = builder.build_with_streaming_server(&server).await?;
-    let rollout_path = test
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
+    let rollout_path = test_rollout_path(&test);
 
     seed_and_compact(&test.codex).await?;
     test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
     wait_for_failed_turn_complete(&test.codex).await;
 
     assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: mailbox preemption before response.completed leaves the exact pending
+// recovery packet intact, so the mailbox continuation—not an unaccepted stream—consumes it.
+async fn post_compact_recovery_mailbox_preemption_before_completed_keeps_packet_pending()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (release_preemption_tx, release_preemption_rx) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("first-message", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("pre-compact-handoff", "continue after compaction"),
+                ev_completed("pre-compact-handoff"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("compact-message", SUMMARY),
+                ev_completed("compact"),
+            ]),
+        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_response_created("preempted-response")]),
+            },
+            StreamingSseChunk {
+                gate: Some(release_preemption_rx),
+                body: sse(vec![
+                    json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "preempted-commentary",
+                            "content": [{"type": "output_text", "text": "working"}],
+                            "phase": "commentary",
+                        }
+                    }),
+                    ev_completed("preempted-response"),
+                ]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("continuation-closed")]),
+        }],
+    ])
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    let test = builder.build_with_streaming_server(&server).await?;
+    let rollout_path = test_rollout_path(&test);
+
+    seed_and_compact(&test.codex).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
+    server.wait_for_request_count(4).await;
+
+    test.codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "queued mailbox input".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            start_options: Default::default(),
+        })
+        .await?;
+    test.codex
+        .submit(Op::RealtimeConversationListVoices)
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RealtimeConversationListVoicesResponse(_))
+    })
+    .await;
+
+    release_preemption_tx
+        .send(())
+        .expect("release the preempted response");
+    wait_for_failed_turn_complete(&test.codex).await;
+    server.wait_for_request_count(5).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 5);
+    for request in [&requests[3], &requests[4]] {
+        assert!(
+            String::from_utf8_lossy(request).contains("<post_compact_recovery>"),
+            "pre-completion mailbox preemption must preserve recovery for the next sample"
+        );
+    }
+    assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: an accepted response persists recovery before draining a blocking tool,
+// so an interrupt cannot restore the packet or inject it into a later request.
+async fn post_compact_recovery_completion_before_blocking_tool_interrupt_remains_consumed()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let blocking_tool_args = serde_json::json!({
+        "cmd": "sleep 60",
+        "yield_time_ms": 60_000,
+    })
+    .to_string();
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("first-message", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact-message", SUMMARY),
+                ev_completed("compact"),
+            ]),
+            sse(vec![
+                ev_function_call("blocking-tool", "exec_command", &blocking_tool_args),
+                ev_completed("recovery-tool-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("after-interrupt", "continued after interruption"),
+                ev_completed("after-interrupt"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    let test = builder.build(&server).await?;
+    let rollout_path = test_rollout_path(&test);
+
+    seed_and_compact(&test.codex).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ExecCommandBegin(_))
+    })
+    .await;
+
+    let application_items_before_interrupt = read_rollout_items(&rollout_path)
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+        .count();
+    assert_eq!(requests.requests().len(), 3);
+
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    test.codex.submit(Op::CleanBackgroundTerminals).await?;
+
+    assert_eq!(
+        application_items_before_interrupt, 1,
+        "the accepted response must write one proof before the blocking tool is interrupted"
+    );
+    test.codex
+        .start_or_steer_turn(user_turn(AFTER_RECOVERY_USER))
+        .await?;
+    wait_for_successful_turn_complete(&test.codex).await;
+
+    let requests = requests.requests();
+    assert_eq!(requests.len(), 4);
+    let _ = recovery_fragments(&requests[2]);
+    assert_no_recovery_fragments(&requests[3]);
     Ok(())
 }
 
@@ -346,11 +542,7 @@ else:
             config.model_provider.stream_max_retries = Some(1);
         });
     let test = builder.build(&server).await?;
-    let rollout_path = test
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
+    let rollout_path = test_rollout_path(&test);
 
     seed_and_compact(&test.codex).await?;
     test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
@@ -546,11 +738,7 @@ print(json.dumps({{"systemMessage": "stop hook passed"}}))
             config.model_provider.stream_max_retries = Some(0);
         });
     let test = builder.build(&server).await?;
-    let rollout_path = test
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
+    let rollout_path = test_rollout_path(&test);
     let started_path = test
         .codex_home_path()
         .join("recovery_waiting_stop_hook_started");

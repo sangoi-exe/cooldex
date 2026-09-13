@@ -42,6 +42,7 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
+use crate::state::PostCompactRecoveryIdentity;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::InFlightFuture;
 use crate::stream_events_utils::TurnItemContributorPolicy;
@@ -1516,6 +1517,10 @@ async fn run_sampling_request(
             ),
             post_compact_recovery,
         };
+        let post_compact_recovery = prepared_prompt
+            .post_compact_recovery
+            .as_ref()
+            .map(PreparedPostCompactRecovery::identity);
         let sampling_result = try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -1525,26 +1530,13 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prepared_prompt.prompt,
+            post_compact_recovery,
             cancellation_token.child_token(),
         )
         .await;
         let err = match sampling_result {
             Ok(output) => {
-                let post_compact_recovery = prepared_prompt
-                    .post_compact_recovery
-                    .as_ref()
-                    .map(|recovery| recovery.identity().clone());
                 let attempt_input = prepared_prompt.into_original_input()?;
-                // Merge-safety anchor: persist the matching recovery application and clear live
-                // pending state immediately after an accepted completed response, before any
-                // tool, mailbox, async-hook, or stop-hook continuation can sample again.
-                if let Some(recovery) = post_compact_recovery {
-                    sess.record_post_compact_recovery_sampling_success(
-                        &recovery,
-                        &turn_context.sub_id,
-                    )
-                    .await?;
-                }
                 return Ok((output, original_input.unwrap_or(attempt_input)));
             }
             Err(err) => match err.details() {
@@ -2346,6 +2338,7 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    post_compact_recovery: Option<&PostCompactRecoveryIdentity>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let turn_context = Arc::clone(&step_context.turn);
@@ -2743,6 +2736,19 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
                 should_emit_turn_diff = true;
                 if let Err(err) = budget_result {
+                    break Err(err);
+                }
+                // Merge-safety anchor: acknowledge recovery only after this response.completed
+                // passes its accounting checks, before tool draining or cancellation can suppress
+                // the durable proof or let a continuation sample the pending packet again.
+                if let Some(recovery) = post_compact_recovery
+                    && let Err(err) = sess
+                        .record_post_compact_recovery_sampling_success(
+                            recovery,
+                            &turn_context.sub_id,
+                        )
+                        .await
+                {
                     break Err(err);
                 }
                 if let Some(false) = end_turn {
