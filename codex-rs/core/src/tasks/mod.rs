@@ -998,13 +998,17 @@ impl Session {
             }
             let transition_generation = retired_turn.transition_generation;
             let retired_turn_id = retired_turn.task.turn_context.sub_id.clone();
-            self.abort_retired_turn(retired_turn, reason.clone()).await;
+            let completed_with_error = self.abort_retired_turn(retired_turn, reason.clone()).await;
             if let Err(err) = self
                 .finish_transition_idle(transition_generation, &retired_turn_id)
                 .await
             {
                 warn!(%err, "failed to finish turn abort transition");
                 return;
+            }
+            if completed_with_error {
+                self.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Failed)
+                    .await;
             }
             if reason == TurnAbortReason::Interrupted {
                 self.maybe_start_turn_for_pending_work().await;
@@ -1089,13 +1093,17 @@ impl Session {
             }
             let transition_generation = retired_turn.transition_generation;
             let retired_turn_id = retired_turn.task.turn_context.sub_id.clone();
-            self.abort_retired_turn(retired_turn, reason.clone()).await;
+            let completed_with_error = self.abort_retired_turn(retired_turn, reason.clone()).await;
             if let Err(err) = self
                 .finish_transition_idle(transition_generation, &retired_turn_id)
                 .await
             {
                 warn!(%err, "failed to finish targeted turn abort transition");
                 return false;
+            }
+            if completed_with_error {
+                self.emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Failed)
+                    .await;
             }
             if reason == TurnAbortReason::Interrupted {
                 self.maybe_start_turn_for_pending_work().await;
@@ -1108,20 +1116,24 @@ impl Session {
         self: &Arc<Self>,
         retired_turn: RetiredTurn,
         reason: TurnAbortReason,
-    ) {
+    ) -> bool {
         let RetiredTurn {
             task, turn_state, ..
         } = retired_turn;
         let turn_context = Arc::clone(&task.turn_context);
-        self.handle_task_abort(task, reason.clone(), turn_state.as_ref())
+        let completed_with_error = self
+            .handle_task_abort(task, reason.clone(), turn_state.as_ref())
             .await;
-        self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
-            .await;
+        if !completed_with_error {
+            self.emit_turn_abort_lifecycle(reason, turn_context.extension_data.as_ref())
+                .await;
+        }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue
             .clear_pending_for_turn_state(turn_state.as_ref())
             .await;
+        completed_with_error
     }
 
     async fn finish_transition_idle(
@@ -1468,10 +1480,10 @@ impl Session {
         task: RunningTask,
         reason: TurnAbortReason,
         turn_state: &Mutex<TurnState>,
-    ) {
+    ) -> bool {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
-            return;
+            return false;
         }
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
@@ -1506,6 +1518,60 @@ impl Session {
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
             .await;
+
+        // Merge-safety anchor: an accepted recovery-proof failure that reaches terminal error
+        // reporting while tools drain must finish as that error, not a later TurnAborted.
+        let terminal_error = {
+            let terminal_error = task.turn_context.terminal_error.lock().await;
+            terminal_error.clone()
+        };
+        if let Some(error) = terminal_error {
+            let started_at = task
+                .turn_context
+                .turn_timing_state
+                .started_at_unix_secs()
+                .await;
+            let (completed_at, duration_ms, profile) = task
+                .turn_context
+                .turn_timing_state
+                .complete_profile_and_duration_ms()
+                .await;
+            self.services
+                .analytics_events_client
+                .track_turn_profile(TurnProfileFact {
+                    turn_id: task.turn_context.sub_id.clone(),
+                    profile,
+                });
+            let time_to_first_token_ms = task
+                .turn_context
+                .turn_timing_state
+                .time_to_first_token_ms()
+                .await;
+            self.emit_turn_stop_lifecycle(task.turn_context.extension_data.as_ref())
+                .await;
+            self.send_event(
+                task.turn_context.as_ref(),
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: task.turn_context.sub_id.clone(),
+                    last_agent_message: None,
+                    error: Some(error),
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                    time_to_first_token_ms,
+                }),
+            )
+            .await;
+            self.services
+                .guardian_rejection_circuit_breaker
+                .lock()
+                .await
+                .clear_turn(&task.turn_context.sub_id);
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush rollout after emitting terminal turn event: {err}");
+            }
+            return true;
+        }
 
         if reason == TurnAbortReason::Interrupted
             && let Some(marker) = interrupted_turn_history_marker(
@@ -1565,6 +1631,7 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
+        false
     }
 }
 

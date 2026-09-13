@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
+use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::EventMsg;
@@ -454,6 +455,145 @@ async fn post_compact_recovery_completion_before_blocking_tool_interrupt_remains
     assert_eq!(requests.len(), 4);
     let _ = recovery_fragments(&requests[2]);
     assert_no_recovery_fragments(&requests[3]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: a fatal recovery-proof write remains the terminal error after the
+// already-started blocking tool is cleaned up and a later interrupt cancels the turn.
+async fn post_compact_recovery_application_failure_survives_blocking_tool_interrupt() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let (release_completed_tx, release_completed_rx) = oneshot::channel();
+    let blocking_tool_args = json!({
+        "questions": [{
+            "id": "confirm",
+            "header": "Confirm",
+            "question": "Keep the turn blocked until cancellation?",
+            "options": [{
+                "label": "Continue",
+                "description": "Keep waiting."
+            }]
+        }]
+    })
+    .to_string();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("first-message", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("pre-compact-handoff", "continue after compaction"),
+                ev_completed("pre-compact-handoff"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("compact-message", SUMMARY),
+                ev_completed("compact"),
+            ]),
+        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_function_call(
+                    "blocking-tool",
+                    "request_user_input",
+                    &blocking_tool_args,
+                )]),
+            },
+            StreamingSseChunk {
+                gate: Some(release_completed_rx),
+                body: sse(vec![ev_completed("recovery-tool-response")]),
+            },
+        ],
+    ])
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+        config
+            .features
+            .enable(Feature::DefaultModeRequestUserInput)
+            .expect("enable request_user_input in Default mode");
+    });
+    let test = builder.build_with_streaming_server(&server).await?;
+
+    seed_and_compact(&test.codex).await?;
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::RequestUserInput(_))
+    })
+    .await;
+    test.thread_store
+        .shutdown_thread(test.session_configured.thread_id)
+        .await?;
+
+    release_completed_tx
+        .send(())
+        .expect("release the completed recovery response");
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RawResponseCompleted(completed)
+                if completed.response_id == "recovery-tool-response"
+        )
+    })
+    .await;
+    // RawResponseCompleted is emitted immediately before recovery acknowledgement. Yield once so
+    // the sampling task enters its already-started tool drain after the injected write failure.
+    tokio::task::yield_now().await;
+    test.codex.submit(Op::Interrupt).await?;
+
+    let terminal = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::Error(_) | EventMsg::TurnAborted(_))
+    })
+    .await;
+    let EventMsg::Error(error) = terminal else {
+        panic!(
+            "the recovery persistence failure must win over a later interrupt, got {terminal:?}"
+        );
+    };
+    assert!(
+        error
+            .message
+            .starts_with("Fatal error: failed to persist post-compact recovery application proof:"),
+        "the recovery persistence failure, not TurnAborted, must reach the terminal error path: {error:?}"
+    );
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error.as_ref(), Some(&error));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let event = test
+                    .codex
+                    .next_event()
+                    .await
+                    .expect("event stream should remain open after the terminal error");
+                if matches!(event.msg, EventMsg::TurnAborted(_)) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "a recovery persistence failure must not be followed by TurnAborted"
+    );
+    test.codex.submit(Op::CleanBackgroundTerminals).await?;
     Ok(())
 }
 

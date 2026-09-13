@@ -2385,6 +2385,7 @@ async fn try_run_sampling_request(
     )> = None;
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
+    let mut post_compact_recovery_application_error = None;
     const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
     let mut analytics_tool_call_ids = Vec::new();
     let reasoning_effort = step_context
@@ -2739,8 +2740,8 @@ async fn try_run_sampling_request(
                     break Err(err);
                 }
                 // Merge-safety anchor: acknowledge recovery only after this response.completed
-                // passes its accounting checks, before tool draining or cancellation can suppress
-                // the durable proof or let a continuation sample the pending packet again.
+                // passes its accounting checks. Preserve a durable-proof failure through tool
+                // draining and cancellation so it cannot be hidden by a later abort result.
                 if let Some(recovery) = post_compact_recovery
                     && let Err(err) = sess
                         .record_post_compact_recovery_sampling_success(
@@ -2749,7 +2750,11 @@ async fn try_run_sampling_request(
                         )
                         .await
                 {
-                    break Err(err);
+                    post_compact_recovery_application_error = Some(err);
+                    break Ok(SamplingRequestResult {
+                        needs_follow_up,
+                        last_agent_message,
+                    });
                 }
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
@@ -2923,8 +2928,12 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    let drain_result = drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await;
     drop(tool_blocking_timing_guard);
+
+    if post_compact_recovery_application_error.is_none() {
+        drain_result?;
+    }
 
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token
@@ -2932,6 +2941,10 @@ async fn try_run_sampling_request(
         // turn is waiting on the user. This also needs to happen before returning cancellation so
         // token usage already recorded from the completed response is still persisted.
         sess.send_token_count_event(&turn_context).await;
+    }
+
+    if let Some(error) = post_compact_recovery_application_error {
+        return Err(error);
     }
 
     if cancellation_token.is_cancelled() {
