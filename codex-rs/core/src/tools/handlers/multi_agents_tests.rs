@@ -5041,10 +5041,7 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_mailbox_pending_at_entr
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
-            status: Some(BTreeMap::from([(
-                "worker".to_string(),
-                expected_status,
-            )])),
+            status: Some(BTreeMap::from([("worker".to_string(), expected_status,)])),
         }
     );
     assert!(!content.contains("entry mailbox body"));
@@ -5053,8 +5050,7 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_mailbox_pending_at_entr
 }
 
 #[tokio::test]
-async fn multi_agent_v2_wait_agent_condition_ignores_stale_mailbox_activity_without_pending_mail()
-{
+async fn multi_agent_v2_wait_agent_condition_ignores_stale_mailbox_activity_without_pending_mail() {
     let (session, turn, manager) = multi_agent_v2_wait_fixture().await;
     let agent_id = spawn_multi_agent_v2_wait_target(&session, &turn, "worker").await;
     let worker_path = session
@@ -5089,7 +5085,9 @@ async fn multi_agent_v2_wait_agent_condition_ignores_stale_mailbox_activity_with
     );
 
     complete_multi_agent_v2_wait_target(&manager, agent_id, "completion body").await;
-    let output = wait.await.expect("all-final wait should still wait for the target");
+    let output = wait
+        .await
+        .expect("all-final wait should still wait for the target");
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");

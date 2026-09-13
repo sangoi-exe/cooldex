@@ -155,9 +155,7 @@ impl Handler {
                 let lifecycle_status = match outcome {
                     WaitConditionOutcome::AnyFinal
                     | WaitConditionOutcome::AllFinal
-                    | WaitConditionOutcome::MailboxActivity => {
-                        CollabAgentToolCallStatus::Completed
-                    }
+                    | WaitConditionOutcome::MailboxActivity => CollabAgentToolCallStatus::Completed,
                     WaitConditionOutcome::Errored => CollabAgentToolCallStatus::Failed,
                     WaitConditionOutcome::Steered => CollabAgentToolCallStatus::Interrupted,
                 };
@@ -354,8 +352,7 @@ async fn wait_for_condition(
     return_when: ReturnWhen,
     activity_rx: &mut watch::Receiver<InputQueueActivity>,
 ) -> WaitConditionOutcome {
-    if let Some(outcome) =
-        reconcile_condition_wait(session, turn_state, targets, return_when).await
+    if let Some(outcome) = reconcile_condition_wait(session, turn_state, targets, return_when).await
     {
         return outcome;
     }

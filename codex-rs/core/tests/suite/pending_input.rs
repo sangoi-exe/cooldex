@@ -821,18 +821,21 @@ async fn targeted_wait_delivers_pending_child_mail_to_next_parent_request(return
         .expect("spawn should create the running worker");
     let child = test
         .thread_manager
-        .get_thread(child_thread_id.clone())
+        .get_thread(child_thread_id)
         .await
         .expect("look up spawned worker");
 
     wait_for_event_match(test.codex.as_ref(), |event| match event {
         EventMsg::CollabWaitingBegin(wait)
             if wait.call_id == PARENT_WAIT_CALL_ID
-                && wait.receiver_thread_ids == vec![child_thread_id.clone()] =>
+                && wait.receiver_thread_ids == vec![child_thread_id] =>
         {
             Some(())
         }
-        EventMsg::Error(error) => panic!("parent failed before entering targeted wait: {}", error.message),
+        EventMsg::Error(error) => panic!(
+            "parent failed before entering targeted wait: {}",
+            error.message
+        ),
         EventMsg::TurnComplete(completed) => {
             panic!("parent completed before entering targeted wait: {completed:?}")
         }
@@ -840,7 +843,9 @@ async fn targeted_wait_delivers_pending_child_mail_to_next_parent_request(return
     })
     .await;
     wait_for_event_match(child.as_ref(), |event| match event {
-        EventMsg::CollabWaitingBegin(wait) if wait.call_id == CHILD_INITIAL_WAIT_CALL_ID => Some(()),
+        EventMsg::CollabWaitingBegin(wait) if wait.call_id == CHILD_INITIAL_WAIT_CALL_ID => {
+            Some(())
+        }
         EventMsg::Error(error) => panic!("child failed before holding: {}", error.message),
         EventMsg::TurnComplete(completed) => {
             panic!("child completed before sending its update: {completed:?}")
@@ -866,7 +871,10 @@ async fn targeted_wait_delivers_pending_child_mail_to_next_parent_request(return
     .await;
     wait_for_event_match(test.codex.as_ref(), |event| match event {
         EventMsg::TurnComplete(completed) if completed.error.is_none() => Some(()),
-        EventMsg::Error(error) => panic!("parent failed while returning from targeted wait: {}", error.message),
+        EventMsg::Error(error) => panic!(
+            "parent failed while returning from targeted wait: {}",
+            error.message
+        ),
         EventMsg::TurnComplete(completed) => {
             panic!("parent completed with an error after targeted wait: {completed:?}")
         }

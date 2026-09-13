@@ -452,9 +452,9 @@ async fn multi_agent_v2_wait_guidance_uses_overridable_developer_instructions(
 
     let request = response.single_request();
     let developer_messages = request.message_input_texts("developer");
-    let has_wait_guidance = developer_messages.iter().any(|message| {
-        message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER)
-    });
+    let has_wait_guidance = developer_messages
+        .iter()
+        .any(|message| message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER));
     assert_eq!(has_wait_guidance, expected_wait_guidance);
 
     let body = request.body_json();
@@ -823,9 +823,7 @@ wait_agent_enabled = {wait_agent_enabled}
         request
             .message_input_texts("developer")
             .iter()
-            .any(|message| {
-                message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER)
-            }),
+            .any(|message| { message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER) }),
         wait_agent_enabled
     );
 
