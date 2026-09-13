@@ -147,6 +147,26 @@ do not reconstruct it from mutable configuration, hashes, thread settings, event
 - `.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` owns planned
   requirements, architecture boundaries, and shipped-status interpretation.
 
+## Voice Support Boundary
+
+<!-- Merge-safety anchor: Cooldex intentionally leaves the upstream voice-host surface
+unsupported on every route; preserve its source only for synchronization until an explicit
+current-user rescope. -->
+- Cooldex voice support and `codex-voice-host` are intentionally unsupported on every
+  operator and validation route. Do not build, test, validate, package, install, promote,
+  or otherwise enable `codex-voice-host`, and do not install GLib, GStreamer, or another
+  voice dependency for Cooldex work.
+- This local boundary overrides the imported upstream-core's generic complete-workspace
+  `just test` instruction: use `just test --workspace --exclude codex-voice-host` for a
+  supported complete-workspace test; never use bare `just test`, which includes the
+  voice-host package.
+- A failure confined to `codex-voice-host` or a dependency exclusive to it is Scope-excluded
+  and nonblocking. Disclose the exclusion instead of repairing the failure or satisfying its
+  dependency.
+- Retain voice source and workspace membership only as an upstream synchronization surface;
+  do not modify or remove either to circumvent this boundary. Future voice support requires a
+  new explicit current-user rescope.
+
 ## Repository Boundaries
 
 - `.sangoi/` is a separate Git repository and is intentionally ignored by the root
