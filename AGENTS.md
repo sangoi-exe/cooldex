@@ -701,6 +701,15 @@ Codex supports running connected app-server and exec-server on different operati
   product requirements, architecture boundaries, and shipped-status interpretation.
 - `/home/lucas/work/codex/.sangoi/reference/areas/cooldex-fork-feature-inventory.md` —
   detailed current fork-feature inventory, operator-support layout, and evidence limits.
+<!-- Merge-safety anchor: pre-compaction handoff synthesis stays operation-local, while
+the existing compaction installer and recovery owner atomically bind and consume it. -->
+- `/home/lucas/work/codex/codex-rs/core/src/compact_handoff.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/session/mod.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/session/turn.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/context/post_compact_recovery.rs`, and
+  `/home/lucas/work/codex/codex-rs/core/src/state/post_compact_recovery.rs` — bounded
+  pre-compaction prompt-to-self synthesis, atomic recovery binding, typed context,
+  pending state, and first-accepted-response consumption owners.
 - `/home/lucas/work/codex/codex-rs/protocol/src/protocol.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/config/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/agent/identity.rs`, and
