@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::ResponseStream;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::context::PostCompactRecoveryContext;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -27,6 +28,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::field;
 use tracing::trace_span;
+use tracing::warn;
 
 pub(crate) const PRE_COMPACT_HANDOFF_MAX_OUTPUT_TOKENS: u32 = 2_000;
 pub(crate) const PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS: usize = 1_200;
@@ -152,6 +154,7 @@ pub(crate) enum PreCompactHandoffOutcome {
 pub(crate) struct PreparedPreCompactHandoff {
     source: PreCompactHandoffSource,
     outcome: PreCompactHandoffOutcome,
+    recovery_instructions: String,
 }
 
 impl PreparedPreCompactHandoff {
@@ -161,6 +164,14 @@ impl PreparedPreCompactHandoff {
 
     pub(crate) fn outcome(&self) -> &PreCompactHandoffOutcome {
         &self.outcome
+    }
+
+    pub(crate) fn settings(&self) -> &PreCompactHandoffSettings {
+        &self.source.settings
+    }
+
+    pub(crate) fn recovery_instructions(&self) -> &str {
+        &self.recovery_instructions
     }
 
     pub(crate) fn handoff_text(&self) -> Option<&str> {
@@ -187,6 +198,12 @@ pub(crate) async fn prepare_pre_compact_handoff(
         .snapshot_pre_compact_handoff_input(&settings.model_info)
         .await?;
     let source = PreCompactHandoffSource::from_snapshot(snapshot, settings);
+    let recovery_instructions = turn_context
+        .config
+        .post_compact_recovery_instructions
+        .as_deref()
+        .unwrap_or(PostCompactRecoveryContext::default_instructions())
+        .to_string();
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
@@ -194,6 +211,7 @@ pub(crate) async fn prepare_pre_compact_handoff(
         return Ok(PreparedPreCompactHandoff {
             source,
             outcome: PreCompactHandoffOutcome::UnsupportedNoLiveThread,
+            recovery_instructions,
         });
     }
 
@@ -213,12 +231,19 @@ pub(crate) async fn prepare_pre_compact_handoff(
     {
         Ok(Ok(text)) => PreCompactHandoffOutcome::Available(text),
         Ok(Err(failure)) => PreCompactHandoffOutcome::Unavailable(failure),
-        Err(error) => return boundary_outcome_from_error(error).map(|outcome| PreparedPreCompactHandoff {
-            source,
-            outcome,
-        }),
+        Err(error) => boundary_outcome_from_error(error)?,
     };
-    Ok(PreparedPreCompactHandoff { source, outcome })
+    if let PreCompactHandoffOutcome::Unavailable(failure) = &outcome {
+        warn!(
+            handoff_failure = ?failure,
+            "pre-compaction handoff synthesis unavailable; continuing with boundary-only recovery"
+        );
+    }
+    Ok(PreparedPreCompactHandoff {
+        source,
+        outcome,
+        recovery_instructions,
+    })
 }
 
 async fn synthesize_pre_compact_handoff(

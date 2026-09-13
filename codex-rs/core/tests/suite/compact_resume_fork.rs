@@ -51,6 +51,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
+// Merge-safety anchor: resume/fork snapshots retain only durable compaction boundaries; generated
+// handoff text is transient and must use the post-compact-handoff marker while live.
 const AFTER_SECOND_RESUME: &str = "AFTER_SECOND_RESUME";
 const AFTER_ROLLBACK: &str = "AFTER_ROLLBACK";
 const CHECKPOINT_METADATA_KEY: &str = "replacement_history_metadata";
@@ -191,7 +193,7 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if text.starts_with("<post_compact_recall>") {
+                if text.starts_with("<post_compact_handoff>") {
                     return false;
                 }
                 if item.get("role").and_then(Value::as_str) == Some("developer") {

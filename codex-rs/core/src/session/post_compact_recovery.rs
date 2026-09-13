@@ -7,10 +7,8 @@ use tracing::warn;
 
 use super::Session;
 use super::TurnContext;
-use super::recall::RecallContextError;
-use super::recall::RecallLoadError;
 use crate::context::ContextualUserFragment;
-use crate::context::PostCompactRecallContext;
+use crate::context::PostCompactHandoffContext;
 use crate::context::PostCompactRecoveryContext;
 use crate::context::PostCompactRecoveryContextError;
 use crate::state::PostCompactRecoveryFailureClass;
@@ -32,7 +30,7 @@ impl PreparedPostCompactRecovery {
     }
 
     pub(super) fn remove_from_input(self, input: &mut Vec<ResponseItem>) -> CodexResult<()> {
-        let has_recall_item = self.item_count == 1
+        let has_handoff_item = self.item_count == 1
             || input.get(self.insertion_index).is_some_and(|item| {
                 matches!(
                     item,
@@ -42,7 +40,7 @@ impl PreparedPostCompactRecovery {
                                 matches!(
                                     content,
                                     codex_protocol::models::ContentItem::OutputText { text }
-                                        if PostCompactRecallContext::matches_text(text)
+                                        if PostCompactHandoffContext::matches_text(text)
                                 )
                             })
                 )
@@ -62,7 +60,7 @@ impl PreparedPostCompactRecovery {
                         })
             )
         });
-        if !has_recovery_item || !has_recall_item {
+        if !has_recovery_item || !has_handoff_item {
             return Err(CodexErr::Fatal(
                 "post-compact recovery prompt carrier lost a transient item".to_string(),
             ));
@@ -96,36 +94,6 @@ impl Session {
         let packet = match cached_packet {
             Some(packet) => packet,
             None => {
-                let recall = match self.load_current_thread_recall_context(turn_context).await {
-                    Ok(recall) if recall.is_available() => Some(recall),
-                    Ok(_) => {
-                        warn!("post-compact recall unavailable; injecting fixed boundary only");
-                        None
-                    }
-                    Err(RecallLoadError::Source(error)) => {
-                        warn!(
-                            %error,
-                            "post-compact recall source unavailable; injecting boundary only"
-                        );
-                        None
-                    }
-                    Err(RecallLoadError::Context(RecallContextError::ThreadMismatch {
-                        ..
-                    })) => {
-                        return Err(self
-                            .block_post_compact_recovery(
-                                PostCompactRecoveryFailureClass::ThreadMismatch,
-                            )
-                            .await);
-                    }
-                    Err(RecallLoadError::Context(RecallContextError::Build(error))) => {
-                        warn!(
-                            %error,
-                            "post-compact recall could not be reconstructed; injecting boundary only"
-                        );
-                        None
-                    }
-                };
                 let instructions = turn_context
                     .config
                     .post_compact_recovery_instructions
@@ -135,28 +103,9 @@ impl Session {
                     &identity.compaction_window_id,
                     &identity.boundary_item_id,
                     instructions,
-                    recall.as_ref(),
+                    None,
                 ) {
                     Ok(packet) => packet,
-                    Err(error) if recall.is_some() => {
-                        warn!(
-                            %error,
-                            "bounded post-compact recall packet unavailable; injecting boundary only"
-                        );
-                        match PostCompactRecoveryContext::new(
-                            &identity.compaction_window_id,
-                            &identity.boundary_item_id,
-                            instructions,
-                            None,
-                        ) {
-                            Ok(packet) => packet,
-                            Err(error) => {
-                                return Err(self
-                                    .block_post_compact_recovery(context_failure_class(&error))
-                                    .await);
-                            }
-                        }
-                    }
                     Err(error) => {
                         return Err(self
                             .block_post_compact_recovery(context_failure_class(&error))
@@ -241,7 +190,7 @@ impl Session {
 }
 
 /// Inserts one already-materialized packet at the canonical recovery boundary without touching
-/// session state. Callers own all recall loading, caching, and failure-state transitions.
+/// session state. Callers own packet construction, caching, and failure-state transitions.
 pub(super) fn insert_post_compact_recovery_packet(
     input: &mut Vec<ResponseItem>,
     identity: &PostCompactRecoveryIdentity,
@@ -278,21 +227,22 @@ pub(super) fn insert_post_compact_recovery_packet(
             boundary_index + 1
         }
     };
-    let recall = packet.recall().cloned();
+    let handoff = packet.handoff().cloned();
     let compaction_window_id = &identity.compaction_window_id;
-    let item_count = if let Some(recall) = recall {
-        // Merge-safety anchor: replay recall as assistant output, not generic contextual input.
-        let mut recall_item = recall.into_response_item();
-        recall_item.set_id(Some(ResponseItemId::with_suffix(
+    let item_count = if let Some(handoff) = handoff {
+        // Merge-safety anchor: replay the generated handoff as assistant output, not generic
+        // contextual input.
+        let mut handoff_item = handoff.into_response_item();
+        handoff_item.set_id(Some(ResponseItemId::with_suffix(
             "msg",
-            format_args!("{compaction_window_id}-recall"),
+            format_args!("{compaction_window_id}-handoff"),
         )));
         let mut recovery_item = Box::new(packet).into_boxed_response_item();
         recovery_item.set_id(Some(ResponseItemId::with_suffix(
             "msg",
             format_args!("{compaction_window_id}-recovery"),
         )));
-        input.insert(insertion_index, recall_item);
+        input.insert(insertion_index, handoff_item);
         input.insert(insertion_index + 1, recovery_item);
         2
     } else {
@@ -315,9 +265,6 @@ fn context_failure_class(
     error: &PostCompactRecoveryContextError,
 ) -> PostCompactRecoveryFailureClass {
     match error {
-        PostCompactRecoveryContextError::RecallParse(_) => {
-            PostCompactRecoveryFailureClass::RecallParse
-        }
         PostCompactRecoveryContextError::Serialization(_) => {
             PostCompactRecoveryFailureClass::Serialization
         }

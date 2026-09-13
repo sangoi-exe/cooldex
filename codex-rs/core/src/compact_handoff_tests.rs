@@ -3,6 +3,8 @@
 use super::*;
 use crate::ResponseStream;
 use crate::client_common::ResponseEvent;
+use crate::compact::CompactedHistoryMetadata;
+use crate::context::PostCompactRecoveryContext;
 use crate::context::ContextualUserFragment;
 use crate::session::pre_compact_handoff_input_snapshot_from_parts;
 use crate::session::tests::make_session_and_context;
@@ -498,4 +500,65 @@ async fn no_live_thread_prepares_without_inference_or_history_occupancy_change()
         history_before
     );
     assert_eq!(session.token_usage_info().await, token_usage_before);
+}
+
+#[tokio::test]
+async fn stale_prepared_source_rejects_installation_before_replacement() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[message(None, "user", "admitted before preparation")],
+        )
+        .await;
+    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let settings = PreCompactHandoffSettings::from_step_context(&step_context);
+    let source = PreCompactHandoffSource::from_snapshot(
+        session
+            .snapshot_pre_compact_handoff_input(&settings.model_info)
+            .await
+            .expect("snapshot prepared source"),
+        settings,
+    );
+    let prepared = PreparedPreCompactHandoff {
+        source,
+        outcome: PreCompactHandoffOutcome::Available("operation-local handoff".to_string()),
+        recovery_instructions: PostCompactRecoveryContext::default_instructions().to_string(),
+    };
+    session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[message(None, "user", "newly admitted after preparation")],
+        )
+        .await;
+    let history_before = session.clone_history().await.annotated_items().to_vec();
+    let window_before = session.current_window().await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+
+    let error = session
+        .replace_compacted_history(
+            vec![message(None, "user", "replacement must not install").into()],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            }
+            .with_prepared_handoff(prepared),
+        )
+        .await
+        .expect_err("a source changed after preparation must fail before installation");
+
+    assert!(error
+        .to_string()
+        .contains("prepared pre-compaction handoff source no longer matches"));
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        history_before.as_slice()
+    );
+    assert_eq!(session.current_window().await, window_before);
 }

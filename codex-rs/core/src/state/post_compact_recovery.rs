@@ -26,8 +26,6 @@ pub(crate) enum PostCompactRecoveryFailureClass {
     BoundaryMismatch,
     #[error("thread_mismatch")]
     ThreadMismatch,
-    #[error("recall_parse")]
-    RecallParse,
     #[error("serialization")]
     Serialization,
     #[error("packet_cap")]
@@ -52,6 +50,16 @@ impl PostCompactRecoveryRuntimeState {
         })
     }
 
+    pub(crate) fn pending_with_packet(
+        identity: PostCompactRecoveryIdentity,
+        packet: PostCompactRecoveryContext,
+    ) -> Self {
+        Self::Pending(PendingPostCompactRecovery {
+            identity,
+            packet: Some(packet),
+        })
+    }
+
     pub(crate) fn pending_identity(&self) -> Option<&PostCompactRecoveryIdentity> {
         match self {
             Self::Pending(pending) => Some(&pending.identity),
@@ -59,8 +67,8 @@ impl PostCompactRecoveryRuntimeState {
         }
     }
 
-    // Merge-safety anchor: pre-compaction synthesis may observe a cached recovery packet but
-    // must not trigger recall loading, cache population, application, or state mutation.
+    // Merge-safety anchor: pre-compaction synthesis may observe a cached handoff/recovery packet
+    // but must not trigger packet construction, cache population, application, or state mutation.
     pub(crate) fn pending_packet_snapshot(
         &self,
     ) -> Result<Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>, PostCompactRecoveryFailureClass>

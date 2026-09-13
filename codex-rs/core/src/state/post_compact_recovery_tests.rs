@@ -100,3 +100,25 @@ fn pending_packet_snapshot_clones_only_an_already_cached_packet() {
         Some(packet)
     );
 }
+
+#[test]
+fn pending_with_packet_publishes_one_immutable_handoff_recovery_packet() {
+    let identity = identity();
+    let packet = PostCompactRecoveryContext::new(
+        &identity.compaction_window_id,
+        &identity.boundary_item_id,
+        "fixed boundary",
+        Some("operation-local handoff"),
+    )
+    .expect("recovery packet");
+    let state = PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet.clone());
+
+    assert_eq!(state.pending_identity(), Some(&identity));
+    assert_eq!(
+        state
+            .pending_packet_snapshot()
+            .expect("prepared packet should be readable without mutation"),
+        Some((identity.clone(), packet.clone()))
+    );
+    assert_eq!(state.packet(&identity).expect("matching packet read"), Some(packet));
+}

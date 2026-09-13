@@ -1037,7 +1037,7 @@ async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> 
     Ok(())
 }
 
-// Merge-safety anchor: token-budget history-drop assertions exclude post-compact recall.
+// Merge-safety anchor: token-budget history-drop assertions exclude the transient handoff.
 #[test_case(false; "token_budget_only")]
 #[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1057,6 +1057,14 @@ async fn token_budget_context_uses_new_window_after_compaction(
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
         ],
+    )
+    .await;
+    let handoff = core_test_support::responses::mount_pre_compact_handoff_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("token-handoff", "TOKEN_BUDGET_HANDOFF"),
+            ev_completed("token-handoff"),
+        ]),
     )
     .await;
     let compact = mount_compact_json_once(&server, json!({ "output": [] })).await;
@@ -1103,6 +1111,21 @@ async fn token_budget_context_uses_new_window_after_compaction(
         compact.requests().is_empty(),
         "token budget compaction should not call server-side compaction"
     );
+    let handoff_request = handoff.single_request();
+    assert!(
+        handoff_request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "before compact"),
+        "token-budget handoff should receive admitted history"
+    );
+    assert!(
+        !handoff_request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "after compact"),
+        "token-budget handoff must not receive later user input"
+    );
 
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
@@ -1142,22 +1165,39 @@ async fn token_budget_context_uses_new_window_after_compaction(
     );
     assert_ne!(post_compaction_window_id, initial_window_id);
     assert!(
-        !requests[1].body_contains_message_text_outside_recall("before compact"),
+        !requests[1].body_contains_message_text_outside_handoff("before compact"),
         "token budget compaction should drop prior user messages"
     );
     assert!(
-        !requests[1].body_contains_message_text_outside_recall("assistant before compact"),
+        !requests[1].body_contains_message_text_outside_handoff("assistant before compact"),
         "token budget compaction should drop prior assistant messages"
     );
     assert_eq!(
-        requests[1].body_contains_message_text_outside_recall("CLIENT_DEVELOPER_INSTRUCTIONS"),
+        requests[1].body_contains_message_text_outside_handoff("CLIENT_DEVELOPER_INSTRUCTIONS"),
         retain_client_developer_messages,
         "token budget compaction should retain client-authored developer messages when enabled"
     );
     assert!(
-        requests[1].body_contains_message_text_outside_recall("after compact"),
+        requests[1].body_contains_message_text_outside_handoff("after compact"),
         "follow-up should still include the new turn input"
     );
+    let post_compact_input = requests[1].input();
+    let handoff_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item.to_string().contains("<post_compact_handoff>")
+                && item.to_string().contains("TOKEN_BUDGET_HANDOFF")
+        })
+        .expect("token-budget follow-up handoff");
+    let recovery_index = post_compact_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                && item.to_string().contains("<post_compact_recovery>")
+        })
+        .expect("token-budget follow-up recovery boundary");
+    assert!(handoff_index < recovery_index);
 
     Ok(())
 }
@@ -1291,7 +1331,7 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
     );
     assert!(
         !requests.iter().any(|request| {
-            request.body_contains_message_text_outside_recall(
+            request.body_contains_message_text_outside_handoff(
                 "Use the model-owned context-window guidance.",
             )
         }),
@@ -1299,7 +1339,7 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
     );
     assert!(
         !requests.iter().any(|request| {
-            request.body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT)
+            request.body_contains_message_text_outside_handoff(AUTO_COMPACT_FALLBACK_PROMPT)
         }),
         "an explicit token-budget config must not enable model-owned fallback"
     );
@@ -1325,11 +1365,11 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
         Some(initial_window_id.as_str())
     );
     assert!(
-        !requests[1].body_contains_message_text_outside_recall("trigger mid-turn auto compaction"),
+        !requests[1].body_contains_message_text_outside_handoff("trigger mid-turn auto compaction"),
         "fresh token-budget windows should drop prior user messages"
     );
     assert_eq!(
-        requests[1].body_contains_message_text_outside_recall("MID_TURN_CLIENT_INSTRUCTIONS"),
+        requests[1].body_contains_message_text_outside_handoff("MID_TURN_CLIENT_INSTRUCTIONS"),
         retain_client_developer_messages,
         "mid-turn token-budget compaction should retain client-authored developer messages when enabled"
     );
@@ -1429,7 +1469,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
         Some(initial_window_id.as_str())
     );
     assert_ne!(follow_up_window_id, initial_window_id);
-    assert!(!requests[3].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[3].body_contains_message_text_outside_handoff(AUTO_COMPACT_FALLBACK_PROMPT));
     assert_eq!(
         requests[3].function_call_output_text(fallback_call_id),
         None
@@ -1497,8 +1537,8 @@ async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<
             .iter()
             .any(|text| text == AUTO_COMPACT_FALLBACK_PROMPT)
     );
-    assert!(!requests[2].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
-    assert!(!requests[2].body_contains_message_text_outside_recall("exhaust the fallback buffer"));
+    assert!(!requests[2].body_contains_message_text_outside_handoff(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[2].body_contains_message_text_outside_handoff("exhaust the fallback buffer"));
     assert_eq!(requests[2].function_call_output_text("buffer-call"), None);
 
     Ok(())
@@ -1568,7 +1608,7 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 3);
-    assert!(!requests[1].body_contains_message_text_outside_recall(AUTO_COMPACT_FALLBACK_PROMPT));
+    assert!(!requests[1].body_contains_message_text_outside_handoff(AUTO_COMPACT_FALLBACK_PROMPT));
     assert!(
         tool_names(&requests[0])
             .iter()

@@ -489,6 +489,15 @@ async fn amazon_bedrock_manual_compaction_uses_v2_responses_endpoint() -> Result
     )
     .await;
 
+    let handoff_mock = responses::mount_pre_compact_handoff_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_assistant_message("remote-v2-handoff", "REMOTE_V2_HANDOFF"),
+            responses::ev_completed("remote-v2-handoff"),
+        ]),
+    )
+    .await;
+
     harness.test().submit_turn("before compact").await?;
     harness.test().codex.submit(Op::Compact).await?;
     wait_for_turn_complete(&harness.test().codex).await;
@@ -524,6 +533,31 @@ async fn amazon_bedrock_manual_compaction_uses_v2_responses_endpoint() -> Result
         item["type"] == "compaction"
             && item["encrypted_content"] == "BEDROCK_REMOTE_COMPACTED_SUMMARY"
     }));
+    let handoff_request = handoff_mock.single_request();
+    assert!(
+        handoff_request
+            .body_json()
+            .to_string()
+            .contains("before compact"),
+        "remote-v2 handoff should receive admitted history before compaction"
+    );
+    let follow_up_input = response_requests[2].input();
+    let handoff_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item.to_string().contains("<post_compact_handoff>")
+                && item.to_string().contains("REMOTE_V2_HANDOFF")
+        })
+        .expect("remote-v2 follow-up handoff");
+    let recovery_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                && item.to_string().contains("<post_compact_recovery>")
+        })
+        .expect("remote-v2 follow-up recovery boundary");
+    assert!(handoff_index < recovery_index);
 
     Ok(())
 }
@@ -857,6 +891,15 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     )
     .await;
 
+    let handoff_mock = responses::mount_pre_compact_handoff_once(
+        harness.server(),
+        responses::sse(vec![
+            responses::ev_assistant_message("remote-v1-handoff", "REMOTE_V1_HANDOFF"),
+            responses::ev_completed("remote-v1-handoff"),
+        ]),
+    )
+    .await;
+
     let compacted_history = vec![ResponseItem::Compaction {
         id: None,
         encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
@@ -992,6 +1035,20 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         compact_body_text.contains("FIRST_REMOTE_REPLY"),
         "expected compact request to include assistant history"
     );
+    let handoff_request = handoff_mock.single_request();
+    let handoff_metadata: Value = serde_json::from_str(
+        &handoff_request
+            .header("x-codex-turn-metadata")
+            .expect("hidden handoff request metadata"),
+    )?;
+    assert_eq!(
+        handoff_metadata["request_kind"].as_str(),
+        Some("pre_compact_handoff")
+    );
+    assert!(
+        handoff_request.body_json().to_string().contains("hello remote compact"),
+        "remote-v1 handoff should receive admitted history before compaction"
+    );
 
     let response_requests = responses_mock.requests();
     let follow_up_request = response_requests.last().expect("follow-up request missing");
@@ -1037,13 +1094,30 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         "expected follow-up request to include the returned compaction summary"
     );
     assert!(
-        !follow_up_request.body_contains_message_text_outside_recall("FIRST_REMOTE_REPLY"),
+        !follow_up_request.body_contains_message_text_outside_handoff("FIRST_REMOTE_REPLY"),
         "expected follow-up request to drop pre-compaction assistant messages"
     );
     assert!(
-        !follow_up_request.body_contains_message_text_outside_recall("hello remote compact"),
+        !follow_up_request.body_contains_message_text_outside_handoff("hello remote compact"),
         "expected follow-up request to drop compacted-away user turns when remote output omits them"
     );
+    let follow_up_input = follow_up_request.input();
+    let handoff_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && item.to_string().contains("<post_compact_handoff>")
+                && item.to_string().contains("REMOTE_V1_HANDOFF")
+        })
+        .expect("remote-v1 follow-up handoff");
+    let recovery_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                && item.to_string().contains("<post_compact_recovery>")
+        })
+        .expect("remote-v1 follow-up recovery boundary");
+    assert!(handoff_index < recovery_index);
 
     insta::assert_snapshot!(
         "remote_manual_compact_with_history_shapes",
@@ -4604,25 +4678,25 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
         .iter()
         .position(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
         .expect("compaction checkpoint");
-    let recall_index = post_compact_input.iter().position(|item| {
-        item_text(item).is_some_and(|text| text.starts_with("<post_compact_recall>"))
+    let handoff_index = post_compact_input.iter().position(|item| {
+        item_text(item).is_some_and(|text| text.starts_with("<post_compact_handoff>"))
     });
-    if let Some(recall_index) = recall_index {
-        let recall = &post_compact_input[recall_index];
+    if let Some(handoff_index) = handoff_index {
+        let handoff = &post_compact_input[handoff_index];
         assert_eq!(
-            recall.get("role").and_then(Value::as_str),
+            handoff.get("role").and_then(Value::as_str),
             Some("assistant"),
-            "post-compact recall must not create a new user-authority item"
+            "post-compact handoff must not create a new user-authority item"
         );
         assert_eq!(
-            recall
+            handoff
                 .get("content")
                 .and_then(Value::as_array)
                 .and_then(|content| content.first())
                 .and_then(|content| content.get("type"))
                 .and_then(Value::as_str),
             Some("output_text"),
-            "assistant recall must use native assistant message content"
+            "assistant handoff must use native assistant message content"
         );
     }
     let recovery_index = post_compact_input
@@ -4635,12 +4709,12 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
 
     assert!(
         retained_user_index < compaction_index
-            && recall_index.is_none_or(|recall_index| {
-                compaction_index < recall_index && recall_index < recovery_index
+            && handoff_index.is_none_or(|handoff_index| {
+                compaction_index < handoff_index && handoff_index < recovery_index
             })
             && compaction_index < recovery_index
             && recovery_index + 1 == post_compact_input.len(),
-        "expected historical user < compaction < optional recall < recovery directive, with no native tool batch"
+        "expected historical user < compaction < optional handoff < recovery directive, with no native tool batch"
     );
 
     Ok(())
@@ -4758,9 +4832,9 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
             .iter()
             .rposition(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
             .expect("latest compaction checkpoint");
-        let recall = input.iter().enumerate().find_map(|(index, item)| {
+        let handoff = input.iter().enumerate().find_map(|(index, item)| {
             item_text(item)
-                .filter(|text| text.starts_with("<post_compact_recall>"))
+                .filter(|text| text.starts_with("<post_compact_handoff>"))
                 .map(|text| (index, item, text))
         });
         let recovery_index = input
@@ -4772,15 +4846,15 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
             })
             .expect("developer recovery directive");
         assert!(retained_user_index < compaction_index);
-        if let Some((recall_index, recall_item, recall_text)) = recall {
-            assert!(compaction_index < recall_index && recall_index < recovery_index);
+        if let Some((handoff_index, handoff_item, handoff_text)) = handoff {
+            assert!(compaction_index < handoff_index && handoff_index < recovery_index);
             assert_eq!(
-                recall_item.get("role").and_then(Value::as_str),
+                handoff_item.get("role").and_then(Value::as_str),
                 Some("assistant"),
-                "request {request_index} must carry recall as assistant history"
+                "request {request_index} must carry handoff as assistant history"
             );
             assert_eq!(
-                recall_item
+                handoff_item
                     .get("content")
                     .and_then(Value::as_array)
                     .and_then(|content| content.first())
@@ -4790,8 +4864,8 @@ async fn remote_mid_turn_compact_v2_keeps_three_successive_recoveries_structural
                 "request {request_index} must use native assistant message content"
             );
             assert!(
-                !recall_text.contains(RETAINED_USER),
-                "request {request_index} repeated the natively retained user inside recall"
+                !handoff_text.contains(RETAINED_USER),
+                "request {request_index} repeated the natively retained user inside handoff"
             );
         } else {
             assert!(compaction_index < recovery_index);

@@ -9,6 +9,8 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::compact::InitialContextInjection;
 use crate::compact_handoff::PreCompactHandoffInputSnapshot;
+use crate::compact_handoff::PreCompactHandoffSettings;
+use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
@@ -6097,6 +6099,67 @@ async fn compaction_checkpoint_waits_for_accepted_settings_persistence() {
             (Some(session.thread_id), restored),
         ]
     );
+}
+
+#[tokio::test]
+async fn compaction_prepared_source_validation_holds_settings_persistence_before_state() {
+    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |_| {},
+    )
+    .await;
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let cancellation_token = CancellationToken::new();
+    let prepared_handoff = prepare_pre_compact_handoff(
+        &session,
+        step_context.turn.as_ref(),
+        PreCompactHandoffSettings::from_step_context(&step_context),
+        &step_context.turn.session_telemetry,
+        &cancellation_token,
+    )
+    .await
+    .expect("persistence-disabled preparation must stay boundary-only");
+    attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+
+    let settings_guard = session
+        .thread_settings_persistence
+        .acquire()
+        .await
+        .expect("settings persistence semaphore");
+    let state_guard = session.state.lock().await;
+    let mut checkpoint = Box::pin(tokio::task::unconstrained(
+        session.replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message("compacted history"))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "summary".to_string(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            }
+            .with_prepared_handoff(prepared_handoff),
+        ),
+    ));
+    assert!(futures::poll!(checkpoint.as_mut()).is_pending());
+
+    drop(settings_guard);
+    assert!(futures::poll!(checkpoint.as_mut()).is_pending());
+    // Merge-safety anchor: prepared-source validation owns the persistence permit before it
+    // reaches session state, preventing a settings update from landing between validation and
+    // the compaction checkpoint.
+    assert!(
+        session.thread_settings_persistence.try_acquire().is_err(),
+        "compaction must retain the settings-persistence permit while source validation waits on state"
+    );
+
+    drop(state_guard);
+    checkpoint
+        .await
+        .expect("prepared handoff checkpoint persists after state is available");
 }
 
 #[tokio::test]
@@ -12605,6 +12668,9 @@ async fn legacy_compaction_retains_only_the_selected_step(first_attempt: FirstAt
         ],
     };
     let requests = responses::mount_compact_response_sequence(&server, replies).await;
+    // Merge-safety anchor: direct remote-v1 coverage uses the task-scoped cancellation token so
+    // the canonical route cannot regress to an uncancellable compatibility wrapper.
+    let cancellation_token = CancellationToken::new();
     crate::compact_remote::run_inline_remote_auto_compact_task(
         Arc::clone(&session),
         Arc::clone(&primary),
@@ -12613,6 +12679,7 @@ async fn legacy_compaction_retains_only_the_selected_step(first_attempt: FirstAt
         InitialContextInjection::DoNotInject,
         CompactionReason::ModelDownshift,
         CompactionPhase::PreTurn,
+        &cancellation_token,
     )
     .await
     .expect("compaction succeeds");

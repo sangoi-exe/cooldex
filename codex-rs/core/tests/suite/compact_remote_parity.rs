@@ -27,6 +27,8 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 
+// Merge-safety anchor: parity normalization excludes only the transient automatic handoff, never
+// a persisted raw-recall carrier or a second recovery path.
 const FIXED_CWD: &str = "/tmp/codex_remote_compaction_parity_workspace";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 const SUMMARY: &str = "REMOTE_COMPACTION_PARITY_ENCRYPTED_SUMMARY";
@@ -789,7 +791,7 @@ fn follow_up_request_view(body: &Value) -> Value {
                 .flatten()
                 .filter_map(|content| content.get("text").and_then(Value::as_str))
                 .any(|text| {
-                    text.starts_with("<post_compact_recall>")
+                    text.starts_with("<post_compact_handoff>")
                         || text.starts_with("<post_compact_recovery>")
                 })
         })

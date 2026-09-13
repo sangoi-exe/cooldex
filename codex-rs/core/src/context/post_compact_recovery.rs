@@ -4,23 +4,19 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Serialize;
-use serde_json::Value;
 
 use super::ContextualUserFragment;
-use super::RecallContext;
 
 const OPEN_MARKER: &str = "<post_compact_recovery>";
 const CLOSE_MARKER: &str = "</post_compact_recovery>";
-const RECALL_OPEN_MARKER: &str = "<post_compact_recall>";
-const RECALL_CLOSE_MARKER: &str = "</post_compact_recall>";
+const HANDOFF_OPEN_MARKER: &str = "<post_compact_handoff>";
+const HANDOFF_CLOSE_MARKER: &str = "</post_compact_handoff>";
 const MAX_PACKET_BYTES: usize = 40 * 1024;
 const MAX_PACKET_TOKENS: usize = 9_000;
 const DEFAULT_RECOVERY_INSTRUCTIONS: &str = "A context compaction just occurred.";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PostCompactRecoveryContextError {
-    #[error("failed to parse bounded recall document: {0}")]
-    RecallParse(serde_json::Error),
     #[error("failed to serialize post-compact recovery document: {0}")]
     Serialization(serde_json::Error),
     #[error("post-compact recovery packet exceeds its hard cap")]
@@ -30,11 +26,11 @@ pub(crate) enum PostCompactRecoveryContextError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PostCompactRecoveryContext {
     body: String,
-    recall: Option<PostCompactRecallContext>,
+    handoff: Option<PostCompactHandoffContext>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PostCompactRecallContext {
+pub(crate) struct PostCompactHandoffContext {
     body: String,
 }
 
@@ -60,7 +56,7 @@ impl PostCompactRecoveryContext {
         compaction_window_id: &str,
         boundary_item_id: &str,
         instructions: &str,
-        recall: Option<&RecallContext>,
+        handoff: Option<&str>,
     ) -> Result<Self, PostCompactRecoveryContextError> {
         let document = PostCompactRecoveryDocument {
             compaction_window_id,
@@ -77,14 +73,13 @@ impl PostCompactRecoveryContext {
         let json = serde_json::to_string(&document)
             .map_err(PostCompactRecoveryContextError::Serialization)?;
         let body = format!("\n{}\n", escape_historical_delimiters(&json));
-        let recall = recall
-            .filter(|recall| recall.is_available())
-            .map(PostCompactRecallContext::new)
-            .transpose()?;
-        let context = Self { body, recall };
+        let context = Self {
+            body,
+            handoff: handoff.map(PostCompactHandoffContext::new),
+        };
         let mut rendered = context.render();
-        if let Some(recall) = context.recall.as_ref() {
-            rendered.push_str(&recall.render());
+        if let Some(handoff) = context.handoff.as_ref() {
+            rendered.push_str(&handoff.render());
         }
         if rendered.len() > MAX_PACKET_BYTES || approx_token_count(&rendered) > MAX_PACKET_TOKENS {
             return Err(PostCompactRecoveryContextError::PacketCap);
@@ -96,20 +91,16 @@ impl PostCompactRecoveryContext {
         DEFAULT_RECOVERY_INSTRUCTIONS
     }
 
-    pub(crate) fn recall(&self) -> Option<&PostCompactRecallContext> {
-        self.recall.as_ref()
+    pub(crate) fn handoff(&self) -> Option<&PostCompactHandoffContext> {
+        self.handoff.as_ref()
     }
 }
 
-impl PostCompactRecallContext {
-    fn new(recall: &RecallContext) -> Result<Self, PostCompactRecoveryContextError> {
-        let recall: Value = serde_json::from_str(recall.json())
-            .map_err(PostCompactRecoveryContextError::RecallParse)?;
-        let json = serde_json::to_string(&recall)
-            .map_err(PostCompactRecoveryContextError::Serialization)?;
-        Ok(Self {
-            body: format!("\n{}\n", escape_historical_delimiters(&json)),
-        })
+impl PostCompactHandoffContext {
+    fn new(handoff: &str) -> Self {
+        Self {
+            body: format!("\n{}\n", escape_historical_delimiters(handoff)),
+        }
     }
 
     fn output_content(&self) -> Vec<ContentItem> {
@@ -118,8 +109,8 @@ impl PostCompactRecallContext {
         }]
     }
 
-    // Merge-safety anchor: recall remains assistant `OutputText` with its content-kind metadata;
-    // generic contextual conversion emits input text.
+    // Merge-safety anchor: the transient handoff remains assistant `OutputText` with its
+    // content-kind metadata; generic contextual conversion emits input text.
     pub(crate) fn into_response_item(self) -> ResponseItem {
         let role = self.role().to_string();
         let content = self.output_content();
@@ -161,9 +152,9 @@ impl ContextualUserFragment for PostCompactRecoveryContext {
     }
 }
 
-impl ContextualUserFragment for PostCompactRecallContext {
+impl ContextualUserFragment for PostCompactHandoffContext {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("compaction.post_compact_recall".to_string())
+        ContentItemKind("compaction.post_compact_handoff".to_string())
     }
 
     fn role(&self) -> &'static str {
@@ -175,7 +166,7 @@ impl ContextualUserFragment for PostCompactRecallContext {
     }
 
     fn type_markers() -> (&'static str, &'static str) {
-        (RECALL_OPEN_MARKER, RECALL_CLOSE_MARKER)
+        (HANDOFF_OPEN_MARKER, HANDOFF_CLOSE_MARKER)
     }
 
     fn body(&self) -> String {

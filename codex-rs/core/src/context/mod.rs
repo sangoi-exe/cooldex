@@ -33,8 +33,8 @@ mod node_repl_review_evidence;
 mod permissions_instructions;
 mod personality_spec_instructions;
 mod plugin_instructions;
-// Merge-safety anchor: post-compaction recovery and Recall context fragments
-// remain registered so recovery information reaches the model.
+// Merge-safety anchor: post-compaction recovery and transient handoff fragments
+// remain registered so recovery information reaches the model without automatic recall loading.
 mod post_compact_recovery;
 mod realtime_delegation;
 mod realtime_end_instructions;
@@ -103,7 +103,7 @@ pub use permissions_instructions::ApprovalPromptContext;
 pub use permissions_instructions::PermissionsInstructions;
 pub(crate) use personality_spec_instructions::PersonalitySpecInstructions;
 pub(crate) use plugin_instructions::PluginInstructions;
-pub(crate) use post_compact_recovery::PostCompactRecallContext;
+pub(crate) use post_compact_recovery::PostCompactHandoffContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContextError;
 pub(crate) use realtime_delegation::RealtimeDelegation;

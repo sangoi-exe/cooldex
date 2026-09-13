@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use crate::compact::InitialContextInjection;
+use crate::compact_handoff::PreCompactHandoffSettings;
+use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::context::world_state::WorldState;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -16,6 +18,8 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use tokio_util::sync::CancellationToken;
 
+// Merge-safety anchor: token-budget rollover follows the same accepted-hook, transient-handoff,
+// and shared installer boundary as provider-backed compaction without adding a server fallback.
 /// Runs token-budget manual compaction as a normal compaction lifecycle.
 ///
 /// Token-budget compaction skips model/server summarization and installs a fresh context window
@@ -24,13 +28,21 @@ use tokio_util::sync::CancellationToken;
 pub(crate) async fn run_manual_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     // Manual compaction runs outside run_turn, so it captures its own current step.
     let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
     let world_state = Arc::new(sess.build_world_state_for_step(&step_context).await?);
-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Manual).await
+    run_compact_task_inner(
+        &sess,
+        &step_context,
+        world_state,
+        CompactionTrigger::Manual,
+        cancellation_token,
+    )
+    .await
 }
 
 /// Runs token-budget inline auto-compaction as a normal compaction lifecycle.
@@ -42,6 +54,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     initial_context_injection: InitialContextInjection,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let world_state = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage { world_state, .. } => world_state,
@@ -49,7 +62,14 @@ pub(crate) async fn run_inline_auto_compact_task(
             Arc::new(sess.build_world_state_for_step(&step_context).await?)
         }
     };
-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Auto).await
+    run_compact_task_inner(
+        &sess,
+        &step_context,
+        world_state,
+        CompactionTrigger::Auto,
+        cancellation_token,
+    )
+    .await
 }
 
 async fn run_compact_task_inner(
@@ -57,6 +77,7 @@ async fn run_compact_task_inner(
     step_context: &Arc<StepContext>,
     world_state: Arc<WorldState>,
     trigger: CompactionTrigger,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
@@ -64,11 +85,19 @@ async fn run_compact_task_inner(
         PreCompactHookOutcome::Continue => {}
         PreCompactHookOutcome::Stopped => return Err(CodexErr::TurnAborted),
     }
+    let prepared_handoff = prepare_pre_compact_handoff(
+        sess,
+        turn_context,
+        PreCompactHandoffSettings::from_step_context(step_context),
+        &step_context.session_telemetry,
+        cancellation_token,
+    )
+    .await?;
 
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    sess.start_new_context_window(step_context, world_state)
+    sess.start_new_context_window_with_prepared_handoff(step_context, world_state, prepared_handoff)
         .await?;
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;

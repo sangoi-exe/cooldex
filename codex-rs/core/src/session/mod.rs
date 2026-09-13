@@ -19,8 +19,10 @@ use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::attestation::AttestationProvider;
 use crate::compact;
+use crate::compact::CompactedHistoryInstallation;
 use crate::compact::CompactedHistoryMetadata;
 use crate::compact_handoff::PreCompactHandoffInputSnapshot;
+use crate::compact_handoff::PreparedPreCompactHandoff;
 use crate::config::ManagedFeatures;
 use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ContextualUserFragment;
@@ -3957,8 +3959,19 @@ impl Session {
         mut items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
-        metadata: CompactedHistoryMetadata,
+        metadata: impl Into<CompactedHistoryInstallation>,
     ) -> CodexResult<()> {
+        // Merge-safety anchor: compacted history, recovery identity, and the final transient
+        // handoff/recovery packet are prepared before durable persistence and published together
+        // only after that checkpoint succeeds; generated handoff text never enters rollout data.
+        let CompactedHistoryInstallation {
+            metadata,
+            prepared_handoff,
+        } = metadata.into();
+        // Merge-safety anchor: take the settings-persistence permit before validating a
+        // prepared source or building its recovery packet, then retain it through the durable
+        // checkpoint and live publication so later settings cannot cross that boundary.
+        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -3987,6 +4000,33 @@ impl Session {
             })
         } else {
             None
+        };
+        if let Some(prepared_handoff) = prepared_handoff.as_ref()
+            && !prepared_handoff
+                .source()
+                .is_current_for(self, prepared_handoff.settings())
+                .await?
+        {
+            return Err(CodexErr::Fatal(
+                "prepared pre-compaction handoff source no longer matches live admitted prompt source/settings"
+                    .to_string(),
+            ));
+        }
+        let recovery_packet = match (recovery_identity.as_ref(), prepared_handoff.as_ref()) {
+            (Some(identity), Some(prepared_handoff)) => Some(
+                PostCompactRecoveryContext::new(
+                    &identity.compaction_window_id,
+                    &identity.boundary_item_id,
+                    prepared_handoff.recovery_instructions(),
+                    prepared_handoff.handoff_text(),
+                )
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to build post-compact handoff/recovery packet: {error}"
+                    ))
+                })?,
+            ),
+            (Some(_), None) | (None, Some(_)) | (None, None) => None,
         };
         if self.guardian_context_mode == GuardianContextMode::ThreadOwned
             && let Some(checkpoint) = items.iter_mut().rev().find(|envelope| {
@@ -4023,9 +4063,6 @@ impl Session {
             latest_token_usage_record: None,
         };
 
-        // Wait for accepted updates to finish persisting, then keep later updates from
-        // overtaking the current settings snapshot while its checkpoint is written.
-        let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
         let world_state_snapshot = world_state_baseline
             .as_ref()
             .map(|world_state| world_state.snapshot());
@@ -4079,6 +4116,7 @@ impl Session {
                 }
                 Some((
                     recovery_identity,
+                    recovery_packet,
                     items,
                     reference_context_item,
                     world_state_snapshot,
@@ -4102,8 +4140,13 @@ impl Session {
                 None
             }
         };
-        let Some((recovery_identity, items, reference_context_item, world_state_snapshot)) =
-            live_recovery
+        let Some((
+            recovery_identity,
+            recovery_packet,
+            items,
+            reference_context_item,
+            world_state_snapshot,
+        )) = live_recovery
         else {
             self.persist_rollout_items(&rollout_items).await;
             return Ok(());
@@ -4139,8 +4182,12 @@ impl Session {
             if let Some(snapshot) = world_state_snapshot {
                 state.history.set_world_state_baseline(snapshot);
             }
-            state.post_compact_recovery =
-                PostCompactRecoveryRuntimeState::pending(recovery_identity);
+            state.post_compact_recovery = match recovery_packet {
+                Some(packet) => {
+                    PostCompactRecoveryRuntimeState::pending_with_packet(recovery_identity, packet)
+                }
+                None => PostCompactRecoveryRuntimeState::pending(recovery_identity),
+            };
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
         Ok(())
@@ -4533,6 +4580,30 @@ impl Session {
         step_context: &StepContext,
         world_state: Arc<WorldState>,
     ) -> CodexResult<u64> {
+        self.start_new_context_window_with_optional_handoff(step_context, world_state, None)
+            .await
+    }
+
+    pub(crate) async fn start_new_context_window_with_prepared_handoff(
+        &self,
+        step_context: &StepContext,
+        world_state: Arc<WorldState>,
+        prepared_handoff: PreparedPreCompactHandoff,
+    ) -> CodexResult<u64> {
+        self.start_new_context_window_with_optional_handoff(
+            step_context,
+            world_state,
+            Some(prepared_handoff),
+        )
+        .await
+    }
+
+    async fn start_new_context_window_with_optional_handoff(
+        &self,
+        step_context: &StepContext,
+        world_state: Arc<WorldState>,
+        prepared_handoff: Option<PreparedPreCompactHandoff>,
+    ) -> CodexResult<u64> {
         let turn_context = step_context.turn.as_ref();
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
@@ -4568,19 +4639,33 @@ impl Session {
             .chain(retained_client_developer_messages)
             .collect();
         let turn_context_item = turn_context.to_turn_context_item();
-        self.replace_compacted_history(
-            context_items,
-            Some(turn_context_item),
-            Some(world_state),
-            CompactedHistoryMetadata {
-                message: String::new(),
-                window_number,
-                window_ids,
-                compaction_response_id: None,
-                compaction_model_hash: None,
-            },
-        )
-        .await?;
+        let metadata = CompactedHistoryMetadata {
+            message: String::new(),
+            window_number,
+            window_ids,
+            compaction_response_id: None,
+            compaction_model_hash: None,
+        };
+        match prepared_handoff {
+            Some(prepared_handoff) => {
+                self.replace_compacted_history(
+                    context_items,
+                    Some(turn_context_item),
+                    Some(world_state),
+                    metadata.with_prepared_handoff(prepared_handoff),
+                )
+                .await?;
+            }
+            None => {
+                self.replace_compacted_history(
+                    context_items,
+                    Some(turn_context_item),
+                    Some(world_state),
+                    metadata,
+                )
+                .await?;
+            }
+        }
         self.recompute_token_usage(turn_context).await;
         Ok(window_number)
     }

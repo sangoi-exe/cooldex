@@ -80,6 +80,24 @@ impl ResponseMock {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreCompactHandoffRequest;
+
+impl Match for PreCompactHandoffRequest {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        is_pre_compact_handoff_request(request)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NonPreCompactHandoffRequest;
+
+impl Match for NonPreCompactHandoffRequest {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !is_pre_compact_handoff_request(request)
+    }
+}
+
 pub fn assert_parent_turn(body: &Value, expected: Option<&str>) -> Result<()> {
     assert_turn_id(body, "parent_turn_id", expected)
 }
@@ -116,6 +134,30 @@ fn decode_body_bytes(body: &[u8], content_encoding: Option<&str>) -> Vec<u8> {
     } else {
         body.to_vec()
     }
+}
+
+fn is_pre_compact_handoff_request(request: &wiremock::Request) -> bool {
+    let body = decode_body_bytes(
+        &request.body,
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let Ok(body): Result<Value, _> = serde_json::from_slice(&body) else {
+        return false;
+    };
+    let Some(metadata) = body
+        .get("client_metadata")
+        .and_then(|metadata| metadata.get("x-codex-turn-metadata"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(metadata): Result<Value, _> = serde_json::from_str(metadata) else {
+        return false;
+    };
+    metadata.get("request_kind").and_then(Value::as_str) == Some("pre_compact_handoff")
 }
 
 /// Returns a response item without internal transport metadata for semantic assertions.
@@ -208,16 +250,16 @@ impl ResponsesRequest {
         self.body_json().to_string().contains(&json_fragment)
     }
 
-    // Merge-safety anchor: history-drop assertions exclude post-compact recall.
-    /// Returns true if any message text outside a post-compact recall block
+    // Merge-safety anchor: history-drop assertions exclude the transient post-compact handoff.
+    /// Returns true if any message text outside a post-compact handoff block
     /// contains the provided substring.
-    pub fn body_contains_message_text_outside_recall(&self, text: &str) -> bool {
+    pub fn body_contains_message_text_outside_handoff(&self, text: &str) -> bool {
         self.inputs_of_type("message")
             .into_iter()
             .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
             .flatten()
             .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
-            .filter(|message_text| !message_text.starts_with("<post_compact_recall>"))
+            .filter(|message_text| !message_text.starts_with("<post_compact_handoff>"))
             .any(|message_text| message_text.contains(text))
     }
 
@@ -1063,7 +1105,42 @@ pub fn sse_response(body: String) -> ResponseTemplate {
         .set_body_raw(body, "text/event-stream")
 }
 
+const DEFAULT_PRE_COMPACT_HANDOFF: &str = "resume from the compacted state";
+
+// Merge-safety anchor: ordinary response mocks keep hidden handoff synthesis off their ordered
+// response sequences so compaction tests can opt into exact handoff evidence independently.
+async fn mount_default_pre_compact_handoff_response(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(PreCompactHandoffRequest)
+        .respond_with(sse_response(sse(vec![
+            ev_assistant_message("pre-compact-handoff", DEFAULT_PRE_COMPACT_HANDOFF),
+            ev_completed("pre-compact-handoff"),
+        ])))
+        .with_priority(2)
+        .mount(server)
+        .await;
+}
+
+pub async fn mount_pre_compact_handoff_once(
+    server: &MockServer,
+    body: String,
+) -> ResponseMock {
+    let response_mock = ResponseMock::new();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(PreCompactHandoffRequest)
+        .and(response_mock.clone())
+        .respond_with(sse_response(body))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    response_mock
+}
+
 pub async fn mount_response_once(server: &MockServer, response: ResponseTemplate) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     let (mock, response_mock) = base_mock();
     mock.respond_with(response)
         .up_to_n_times(1)
@@ -1080,6 +1157,7 @@ pub async fn mount_response_once_match<M>(
 where
     M: wiremock::Match + Send + Sync + 'static,
 {
+    mount_default_pre_compact_handoff_response(server).await;
     let (mock, response_mock) = base_mock();
     mock.and(matcher)
         .respond_with(response)
@@ -1093,6 +1171,7 @@ fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
         .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(NonPreCompactHandoffRequest)
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1117,6 +1196,7 @@ pub async fn mount_sse_once_match<M>(server: &MockServer, matcher: M, body: Stri
 where
     M: wiremock::Match + Send + Sync + 'static,
 {
+    mount_default_pre_compact_handoff_response(server).await;
     let (mock, response_mock) = base_mock();
     mock.and(matcher)
         .respond_with(sse_response(body))
@@ -1127,6 +1207,7 @@ where
 }
 
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     let (mock, response_mock) = base_mock();
     mock.respond_with(sse_response(body))
         .up_to_n_times(1)
@@ -1161,6 +1242,7 @@ pub async fn mount_compact_user_history_with_summary_sequence(
     server: &MockServer,
     summary_texts: Vec<String>,
 ) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1240,6 +1322,7 @@ pub async fn mount_compact_response_once(
     server: &MockServer,
     response: ResponseTemplate,
 ) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     let (mock, response_mock) = compact_mock();
     mock.respond_with(response)
         .up_to_n_times(1)
@@ -1558,6 +1641,7 @@ pub async fn mount_function_call_agent_response(
 /// POST to `/v1/responses`. Panics if more requests are received than bodies
 /// provided. Also asserts the exact number of expected calls.
 pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1602,6 +1686,7 @@ pub async fn mount_response_sequence(
     server: &MockServer,
     responses: Vec<ResponseTemplate>,
 ) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1641,6 +1726,7 @@ pub async fn mount_compact_response_sequence(
     server: &MockServer,
     responses: Vec<ResponseTemplate>,
 ) -> ResponseMock {
+    mount_default_pre_compact_handoff_response(server).await;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 

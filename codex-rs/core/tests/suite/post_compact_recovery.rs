@@ -102,9 +102,13 @@ fn recovery_fragment(
 }
 
 fn recovery_fragments(request: &ResponsesRequest) -> (RecoveryFragment, Option<RecoveryFragment>) {
-    let mut recall =
-        matching_recovery_fragments(request, "assistant", "output_text", "<post_compact_recall>");
-    let recall_carrier_count = request
+    let mut handoff = matching_recovery_fragments(
+        request,
+        "assistant",
+        "output_text",
+        "<post_compact_handoff>",
+    );
+    let handoff_carrier_count = request
         .input()
         .iter()
         .filter(|item| {
@@ -113,17 +117,17 @@ fn recovery_fragments(request: &ResponsesRequest) -> (RecoveryFragment, Option<R
                 .and_then(|content| content.first())
                 .and_then(|content| content.get("text"))
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.starts_with("<post_compact_recall>"))
+                .is_some_and(|text| text.starts_with("<post_compact_handoff>"))
         })
         .count();
     assert_eq!(
-        recall.len(),
-        recall_carrier_count,
-        "every post-compact recall carrier must use assistant/output_text"
+        handoff.len(),
+        handoff_carrier_count,
+        "every post-compact handoff carrier must use assistant/output_text"
     );
     assert!(
-        recall.len() <= 1,
-        "request should contain at most one post-compact recall item"
+        handoff.len() <= 1,
+        "request should contain at most one post-compact handoff item"
     );
     (
         recovery_fragment(
@@ -132,14 +136,14 @@ fn recovery_fragments(request: &ResponsesRequest) -> (RecoveryFragment, Option<R
             "input_text",
             "<post_compact_recovery>",
         ),
-        recall.pop(),
+        handoff.pop(),
     )
 }
 
 fn assert_no_recovery_fragments(request: &ResponsesRequest) {
     let serialized = serde_json::to_string(&request.input()).expect("serialize request input");
     assert!(!serialized.contains("<post_compact_recovery>"));
-    assert!(!serialized.contains("<post_compact_recall>"));
+    assert!(!serialized.contains("<post_compact_handoff>"));
 }
 
 fn assert_pending_marker_without_application(items: &[RolloutItem]) {
@@ -211,6 +215,16 @@ async fn post_compact_recovery_stream_closes_after_created_without_sampling_succ
             body: sse(vec![
                 ev_assistant_message("first-message", FIRST_REPLY),
                 ev_completed("first"),
+            ]),
+        }],
+        // Merge-safety anchor: streaming recovery fixtures reserve the operation-local handoff
+        // request before local provider compaction so the later failed sampling stream remains
+        // the user turn under test.
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("pre-compact-handoff", "continue after compaction"),
+                ev_completed("pre-compact-handoff"),
             ]),
         }],
         vec![StreamingSseChunk {
@@ -346,20 +360,20 @@ else:
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 7);
-    let ((failed_recovery_index, failed_recovery), failed_recall) =
+    let ((failed_recovery_index, failed_recovery), failed_handoff) =
         recovery_fragments(&requests[2]);
-    let ((retry_recovery_index, retry_recovery), retry_recall) = recovery_fragments(&requests[3]);
-    let ((follow_up_recovery_index, follow_up_recovery), follow_up_recall) =
+    let ((retry_recovery_index, retry_recovery), retry_handoff) = recovery_fragments(&requests[3]);
+    let ((follow_up_recovery_index, follow_up_recovery), follow_up_handoff) =
         recovery_fragments(&requests[4]);
-    let ((stop_hook_recovery_index, stop_hook_recovery), stop_hook_recall) =
+    let ((stop_hook_recovery_index, stop_hook_recovery), stop_hook_handoff) =
         recovery_fragments(&requests[5]);
     assert_eq!(failed_recovery, retry_recovery);
     assert_eq!(failed_recovery, follow_up_recovery);
     assert_eq!(failed_recovery, stop_hook_recovery);
     assert!(failed_recovery.1.contains(CUSTOM_RECOVERY_INSTRUCTIONS));
-    assert_eq!(failed_recall, retry_recall);
-    assert_eq!(failed_recall, follow_up_recall);
-    assert_eq!(failed_recall, stop_hook_recall);
+    assert_eq!(failed_handoff, retry_handoff);
+    assert_eq!(failed_handoff, follow_up_handoff);
+    assert_eq!(failed_handoff, stop_hook_handoff);
     assert_no_recovery_fragments(&requests[6]);
 
     let items = read_rollout_items(&rollout_path);
@@ -368,8 +382,8 @@ else:
         "the transient recovery packet must never enter persisted rollout items"
     );
     assert!(
-        !serde_json::to_string(&items)?.contains("<post_compact_recall>"),
-        "the transient recall packet must never enter persisted rollout items"
+        !serde_json::to_string(&items)?.contains("<post_compact_handoff>"),
+        "the transient handoff packet must never enter persisted rollout items"
     );
     let compacted = items
         .iter()
@@ -383,26 +397,26 @@ else:
         .post_compact_recovery
         .as_ref()
         .expect("recovery marker");
-    for (request, recovery_index, recall_index) in [
+    for (request, recovery_index, handoff_index) in [
         (
             &requests[2],
             failed_recovery_index,
-            failed_recall.as_ref().map(|(index, _)| *index),
+            failed_handoff.as_ref().map(|(index, _)| *index),
         ),
         (
             &requests[3],
             retry_recovery_index,
-            retry_recall.as_ref().map(|(index, _)| *index),
+            retry_handoff.as_ref().map(|(index, _)| *index),
         ),
         (
             &requests[4],
             follow_up_recovery_index,
-            follow_up_recall.as_ref().map(|(index, _)| *index),
+            follow_up_handoff.as_ref().map(|(index, _)| *index),
         ),
         (
             &requests[5],
             stop_hook_recovery_index,
-            stop_hook_recall.as_ref().map(|(index, _)| *index),
+            stop_hook_handoff.as_ref().map(|(index, _)| *index),
         ),
     ] {
         let input = request.input();
@@ -413,8 +427,8 @@ else:
                     == Some(marker.boundary_item_id.as_str())
             })
             .expect("prompt should retain exact compaction boundary item");
-        if let Some(recall_index) = recall_index {
-            assert_eq!(recall_index, boundary_index + 1);
+        if let Some(handoff_index) = handoff_index {
+            assert_eq!(handoff_index, boundary_index + 1);
             assert_eq!(recovery_index, boundary_index + 2);
         } else {
             assert_eq!(recovery_index, boundary_index + 1);
@@ -586,10 +600,10 @@ print(json.dumps({{"systemMessage": "stop hook passed"}}))
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 4);
-    let ((_first_recovery_index, first_recovery), first_recall) = recovery_fragments(&requests[2]);
-    let ((steer_recovery_index, steer_recovery), steer_recall) = recovery_fragments(&requests[3]);
+    let ((_first_recovery_index, first_recovery), first_handoff) = recovery_fragments(&requests[2]);
+    let ((steer_recovery_index, steer_recovery), steer_handoff) = recovery_fragments(&requests[3]);
     assert_eq!(first_recovery, steer_recovery);
-    assert_eq!(first_recall, steer_recall);
+    assert_eq!(first_handoff, steer_handoff);
 
     let steer_input = requests[3].input();
     let steer_user_index = steer_input

@@ -1,6 +1,6 @@
 ---
 source: core/tests/suite/compact_remote.rs
-assertion_line: 3847
+assertion_line: 4000
 expression: "format_labeled_requests_snapshot(\"Remote manual /compact while realtime remains active: the next regular turn restates realtime-start instructions after compaction clears the baseline.\",\n&[(\"Remote Compaction Request\", &compact_request),\n(\"Remote Post-Compaction History Layout\", post_compact_request),])"
 ---
 Scenario: Remote manual /compact while realtime remains active: the next regular turn restates realtime-start instructions after compaction clears the baseline.
@@ -15,7 +15,7 @@ Scenario: Remote manual /compact while realtime remains active: the next regular
 
 ## Remote Post-Compaction History Layout
 00:compaction:encrypted=true
-01:message/assistant:<POST_COMPACT_RECALL>
+01:message/assistant:<POST_COMPACT_HANDOFF>
 02:message/developer:<POST_COMPACT_RECOVERY>
 03:message/developer[2]:
     [01] <realtime_conversation>\nRealtime conversation started.\n\nYou a...

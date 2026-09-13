@@ -8,6 +8,9 @@ use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact_handoff::PreCompactHandoffSettings;
+use crate::compact_handoff::PreparedPreCompactHandoff;
+use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote_history::HistoryItemGroup;
@@ -50,6 +53,8 @@ use request::run_remote_compact_attempt;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+// Merge-safety anchor: remote-v1 compaction prepares one transient handoff after the accepted
+// hook and carries it only to the shared durable-before-live installer.
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
@@ -58,6 +63,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Auto,
@@ -72,6 +78,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
         Some(turn_state),
         initial_context_injection,
         compaction_metadata,
+        cancellation_token,
     )
     .await?;
     Ok(())
@@ -80,10 +87,11 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 pub(crate) async fn run_remote_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     // Standalone compaction is its own request boundary, so it captures a fresh step.
     let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Manual,
@@ -98,6 +106,7 @@ pub(crate) async fn run_remote_compact_task(
         /*turn_state*/ None,
         InitialContextInjection::DoNotInject,
         compaction_metadata,
+        cancellation_token,
     )
     .await?;
     Ok(())
@@ -110,6 +119,7 @@ async fn run_remote_compact_task_inner(
     turn_state: Option<Arc<OnceLock<String>>>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let trigger = compaction_metadata.trigger();
@@ -145,6 +155,14 @@ async fn run_remote_compact_task_inner(
             return Err(error);
         }
     }
+    let prepared_handoff = prepare_pre_compact_handoff(
+        sess,
+        turn_context,
+        PreCompactHandoffSettings::from_step_context(step_context),
+        &step_context.session_telemetry,
+        cancellation_token,
+    )
+    .await?;
     let result = run_remote_compact_task_inner_impl(
         sess,
         step_context,
@@ -153,6 +171,7 @@ async fn run_remote_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         &mut analytics_details,
+        prepared_handoff,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -188,6 +207,7 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    prepared_handoff: PreparedPreCompactHandoff,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let context_compaction_item = ContextCompactionItem::new();
@@ -298,7 +318,8 @@ async fn run_remote_compact_task_inner_impl(
             window_ids: new_window_ids,
             compaction_response_id: None,
             compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
-        },
+        }
+        .with_prepared_handoff(prepared_handoff),
     )
     .await?;
     sess.recompute_token_usage(compaction_turn_context).await;

@@ -73,6 +73,9 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::MockServer;
+
+// Merge-safety anchor: local compaction coverage distinguishes the hidden operation-local
+// handoff request from provider compaction and verifies the assistant/developer recovery order.
 // --- Test helpers -----------------------------------------------------------
 
 pub(super) const FIRST_REPLY: &str = "FIRST_REPLY";
@@ -668,7 +671,7 @@ async fn summarize_context_three_requests_and_instructions(
     }
 
     // No previous assistant messages should remain. The runtime injects one
-    // assistant recall carrier between compacted history and recovery guidance.
+    // assistant handoff carrier between compacted history and recovery guidance.
     let assistant_messages = input3
         .iter()
         .filter(|item| item.get("role").and_then(|role| role.as_str()) == Some("assistant"))
@@ -676,17 +679,17 @@ async fn summarize_context_three_requests_and_instructions(
     assert_eq!(
         assistant_messages.len(),
         1,
-        "only the post-compact recall carrier should remain as assistant history"
+        "only the post-compact handoff carrier should remain as assistant history"
     );
     assert_eq!(
         assistant_messages[0]["content"][0]["type"], "output_text",
-        "post-compact recall should use assistant output text"
+        "post-compact handoff should use assistant output text"
     );
     assert!(
         assistant_messages[0]["content"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("<post_compact_recall>")),
-        "assistant history should contain only the post-compact recall carrier"
+            .is_some_and(|text| text.starts_with("<post_compact_handoff>")),
+        "assistant history should contain only the post-compact handoff carrier"
     );
     assert!(
         messages
@@ -1352,7 +1355,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                 if response_item_text_starts_with(&value, "<post_compact_recovery>") {
                     return None;
                 }
-                if response_item_text_starts_with(&value, "<post_compact_recall>") {
+                if response_item_text_starts_with(&value, "<post_compact_handoff>") {
                     return None;
                 }
 
@@ -1410,21 +1413,21 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             .iter()
             .position(|item| response_item_text_starts_with(item, expected_summary))
             .expect("request after compaction should include the expected summary");
-        let recall_indices = input
+        let handoff_indices = input
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                response_item_text_starts_with(item, "<post_compact_recall>").then_some(index)
+                response_item_text_starts_with(item, "<post_compact_handoff>").then_some(index)
             })
             .collect::<Vec<_>>();
         assert!(
-            recall_indices.len() <= 1,
-            "request after compaction at index {i} should contain at most one recall carrier"
+            handoff_indices.len() <= 1,
+            "request after compaction at index {i} should contain at most one handoff carrier"
         );
-        if let Some(recall_index) = recall_indices.first() {
+        if let Some(handoff_index) = handoff_indices.first() {
             assert!(
-                summary_index < *recall_index && *recall_index < recovery_indices[0],
-                "request after compaction at index {i} should order history before recall before recovery"
+                summary_index < *handoff_index && *handoff_index < recovery_indices[0],
+                "request after compaction at index {i} should order history before handoff before recovery"
             );
         }
         assert!(
@@ -4191,7 +4194,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         request
             .message_input_texts("user")
             .into_iter()
-            .filter(|text| !text.starts_with("<post_compact_recall>"))
+            .filter(|text| !text.starts_with("<post_compact_handoff>"))
             .collect::<Vec<_>>()
     };
     let first_request_user_texts = native_user_input_texts(&requests[0]);
@@ -4207,11 +4210,11 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 
     let final_request = requests.last().expect("final turn request missing");
     let final_request_input = final_request.input();
-    let recall_indices = final_request_input
+    let handoff_indices = final_request_input
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            response_item_text_starts_with(item, "<post_compact_recall>").then_some(index)
+            response_item_text_starts_with(item, "<post_compact_handoff>").then_some(index)
         })
         .collect::<Vec<_>>();
     let recovery_indices = final_request_input
@@ -4222,9 +4225,9 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        recall_indices.len(),
+        handoff_indices.len(),
         1,
-        "final request should contain exactly one transient recall carrier"
+        "final request should contain exactly one transient handoff carrier"
     );
     assert_eq!(
         recovery_indices.len(),
@@ -4240,10 +4243,10 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         .position(|item| response_item_text_starts_with(item, final_user_message))
         .expect("final request should include the submitted user message");
     assert!(
-        summary_index < recall_indices[0]
-            && recall_indices[0] < recovery_indices[0]
+        summary_index < handoff_indices[0]
+            && handoff_indices[0] < recovery_indices[0]
             && recovery_indices[0] < final_user_index,
-        "final request should order retained history before recall before recovery before new user input"
+        "final request should order retained history before handoff before recovery before new user input"
     );
 
     let final_request_user_texts = native_user_input_texts(final_request);
@@ -5620,7 +5623,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
         .iter()
         .filter(|item| {
             !response_item_text_starts_with(item, "<post_compact_recovery>")
-                && !response_item_text_starts_with(item, "<post_compact_recall>")
+                && !response_item_text_starts_with(item, "<post_compact_handoff>")
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -5632,7 +5635,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     assert!(
         resumed_input.iter().all(|item| {
             !response_item_text_starts_with(item, "<post_compact_recovery>")
-                && !response_item_text_starts_with(item, "<post_compact_recall>")
+                && !response_item_text_starts_with(item, "<post_compact_handoff>")
         }),
         "remote-v2 cold resume must not persist transient recovery carriers"
     );
@@ -5641,6 +5644,271 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
         vec![PathUri::from_abs_path(&source)],
         "cold-resumed thread reports the same rewritten source path"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_pre_compact_handoff_excludes_unadmitted_input_and_precedes_recovery() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const HANDOFF: &str = "LOCAL_PRE_COMPACT_HANDOFF";
+    let server = start_mock_server().await;
+    let handoff_mock = responses::mount_pre_compact_handoff_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("handoff-local", HANDOFF),
+            ev_completed("handoff-local"),
+        ]),
+    )
+    .await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("local-first", "LOCAL_FIRST_REPLY"),
+                ev_completed_with_tokens("local-first", /*total_tokens*/ 60),
+            ]),
+            sse(vec![
+                ev_assistant_message("local-second", "LOCAL_SECOND_REPLY"),
+                ev_completed_with_tokens("local-second", /*total_tokens*/ 500),
+            ]),
+            sse(vec![
+                ev_assistant_message("local-summary", "LOCAL_PRETURN_SUMMARY"),
+                ev_completed_with_tokens("local-summary", /*total_tokens*/ 100),
+            ]),
+            sse(vec![
+                ev_assistant_message("local-follow-up", "LOCAL_FOLLOW_UP_REPLY"),
+                ev_completed_with_tokens("local-follow-up", /*total_tokens*/ 80),
+            ]),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            config.model_auto_compact_token_limit = Some(200);
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await?
+        .codex;
+
+    for user in ["LOCAL_ADMITTED_ONE", "LOCAL_ADMITTED_TWO", "LOCAL_UNADMITTED_THREE"] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: user.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    }
+
+    let handoff_request = handoff_mock.single_request();
+    let metadata: Value = serde_json::from_str(
+        &handoff_request
+            .header("x-codex-turn-metadata")
+            .expect("handoff metadata"),
+    )?;
+    assert_eq!(
+        metadata["request_kind"].as_str(),
+        Some("pre_compact_handoff")
+    );
+    assert!(
+        handoff_request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "LOCAL_ADMITTED_ONE")
+    );
+    assert!(
+        handoff_request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "LOCAL_ADMITTED_TWO")
+    );
+    assert!(
+        !handoff_request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "LOCAL_UNADMITTED_THREE"),
+        "the incoming pre-turn user message must not enter hidden synthesis"
+    );
+    assert!(
+        !handoff_request.body_json().to_string().contains(SUMMARIZATION_PROMPT),
+        "hidden synthesis must not inherit the provider compaction trigger"
+    );
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    let follow_up = &requests[3];
+    let input = follow_up.input();
+    let handoff_index = input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("assistant")
+                && response_item_text_starts_with(item, "<post_compact_handoff>")
+                && item.to_string().contains(HANDOFF)
+        })
+        .expect("follow-up should contain the prepared handoff");
+    let recovery_index = input
+        .iter()
+        .position(|item| {
+            item.get("role").and_then(Value::as_str) == Some("developer")
+                && response_item_text_starts_with(item, "<post_compact_recovery>")
+        })
+        .expect("follow-up should contain the fixed recovery boundary");
+    assert!(
+        handoff_index < recovery_index,
+        "assistant handoff must precede developer recovery guidance"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_compact_hook_veto_stops_before_hidden_handoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let handoff_mock = responses::mount_pre_compact_handoff_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("unexpected-handoff", "UNEXPECTED_HANDOFF"),
+            ev_completed("unexpected-handoff"),
+        ]),
+    )
+    .await;
+    let normal_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("unexpected-compact", "UNEXPECTED_COMPACT"),
+            ev_completed("unexpected-compact"),
+        ]),
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            let script_path = home.join("veto_pre_compact.py");
+            fs::write(
+                &script_path,
+                "import json\nprint(json.dumps({'continue': False, 'stopReason': 'stop compact'}))\n",
+            )
+            .expect("write pre-compact veto hook");
+            fs::write(
+                home.join("hooks.json"),
+                json!({
+                    "hooks": {
+                        "PreCompact": [{
+                            "matcher": "manual",
+                            "hooks": [{
+                                "type": "command",
+                                "command": python_hook_command(&script_path),
+                            }]
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .expect("write pre-compact veto hook configuration");
+        })
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            trust_discovered_hooks(config);
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await?;
+
+    test.codex.submit(Op::Compact).await?;
+    let hook = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::HookCompleted(completed)
+            if completed.run.event_name == HookEventName::PreCompact =>
+        {
+            Some(completed.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(hook.run.status, HookRunStatus::Stopped);
+    let aborted = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnAborted(aborted) => Some(aborted.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        aborted.reason,
+        codex_protocol::protocol::TurnAbortReason::Interrupted
+    );
+    assert!(handoff_mock.requests().is_empty());
+    assert!(normal_mock.requests().is_empty());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_handoff_continues_local_compaction_with_boundary_only_recovery() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let handoff_mock = responses::mount_pre_compact_handoff_once(
+        &server,
+        sse_failed("handoff-unavailable", "server_error", "handoff unavailable"),
+    )
+    .await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("before-unavailable", "BEFORE_UNAVAILABLE"),
+                ev_completed("before-unavailable"),
+            ]),
+            sse(vec![
+                ev_assistant_message("unavailable-summary", "UNAVAILABLE_SUMMARY"),
+                ev_completed("unavailable-summary"),
+            ]),
+            sse(vec![
+                ev_assistant_message("after-unavailable", "AFTER_UNAVAILABLE"),
+                ev_completed("after-unavailable"),
+            ]),
+        ],
+    )
+    .await;
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await?
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "before unavailable handoff".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "after unavailable handoff".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(handoff_mock.requests().len(), 1);
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let follow_up = requests[2].body_json().to_string();
+    assert!(follow_up.contains("<post_compact_recovery>"));
+    assert!(!follow_up.contains("<post_compact_handoff>"));
+    assert!(!follow_up.contains("<post_compact_recall>"));
 
     Ok(())
 }

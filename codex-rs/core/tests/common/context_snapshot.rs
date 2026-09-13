@@ -408,8 +408,10 @@ fn canonicalize_snapshot_text(text: &str) -> String {
     if text.starts_with("<post_compact_recovery>") {
         return "<POST_COMPACT_RECOVERY>".to_string();
     }
-    if text.starts_with("<post_compact_recall>") {
-        return "<POST_COMPACT_RECALL>".to_string();
+    // Merge-safety anchor: automatic compaction snapshots render the transient assistant handoff
+    // under its runtime marker; they must not preserve the retired raw-recall carrier label.
+    if text.starts_with("<post_compact_handoff>") {
+        return "<POST_COMPACT_HANDOFF>".to_string();
     }
     if text.starts_with("<environment_context>") {
         let subagent_count = text

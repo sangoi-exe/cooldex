@@ -15,6 +15,8 @@ use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
+// Merge-safety anchor: manual compact task cancellation flows through every selected compaction
+// implementation before transient handoff preparation and never interrupts installation.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CompactTask;
 
@@ -40,11 +42,16 @@ impl SessionTask for CompactTask {
         session: Arc<Session>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
         if ctx.config.features.enabled(Feature::TokenBudget) {
-            crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
+            crate::compact_token_budget::run_manual_compact_task(
+                session,
+                ctx,
+                &cancellation_token,
+            )
+            .await?;
             return Ok(Default::default());
         }
 
@@ -57,7 +64,12 @@ impl SessionTask for CompactTask {
                     "remote_v2",
                     /*manual*/ true,
                 );
-                crate::compact_remote_v2::run_remote_compact_task(session.clone(), ctx).await
+                crate::compact_remote_v2::run_remote_compact_task(
+                    session.clone(),
+                    ctx,
+                    &cancellation_token,
+                )
+                .await
             }
             RemoteCompactionSupport::V2 => {
                 emit_compact_metric(
@@ -65,7 +77,12 @@ impl SessionTask for CompactTask {
                     "remote",
                     /*manual*/ true,
                 );
-                crate::compact_remote::run_remote_compact_task(session.clone(), ctx).await
+                crate::compact_remote::run_remote_compact_task(
+                    session.clone(),
+                    ctx,
+                    &cancellation_token,
+                )
+                .await
             }
             RemoteCompactionSupport::Unsupported => {
                 emit_compact_metric(
@@ -83,7 +100,8 @@ impl SessionTask for CompactTask {
                     // Compaction prompt is synthesized; no UI element ranges to preserve.
                     text_elements: Vec::new(),
                 }];
-                crate::compact::run_compact_task(session.clone(), ctx, input).await
+                crate::compact::run_compact_task(session.clone(), ctx, input, &cancellation_token)
+                    .await
             }
         };
         if let Err(err) = result
