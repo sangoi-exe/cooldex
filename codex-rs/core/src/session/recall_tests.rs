@@ -468,9 +468,11 @@ async fn excludes_a_user_message_already_retained_by_the_current_replacement() {
         .await
         .expect("build first-window recall");
 
+    // Merge-safety anchor: explicit recall projects only history absent from the current
+    // replacement, so retained user input never appears twice in its bounded JSON.
     assert!(
         !context.json().contains(RETAINED_USER),
-        "a natively retained user message must not be repeated in automatic recall"
+        "a natively retained user message must not be repeated in explicit recall"
     );
     assert!(context.json().contains(UNRETAINED_HISTORY));
 }
@@ -899,8 +901,9 @@ async fn reports_unavailable_source_and_missing_compaction() {
         .build_recall_context(&turn_context, incomplete)
         .await
         .expect("work limit result");
+    // Merge-safety anchor: explicit recall availability is asserted from the bounded JSON
+    // contract, rather than from a redundant internal boolean.
     assert_eq!(parsed(&work_limit)["availability"], "work_limit");
-    assert!(!work_limit.is_available());
 
     let no_compaction = session
         .build_recall_context(
@@ -913,7 +916,6 @@ async fn reports_unavailable_source_and_missing_compaction() {
         .await
         .expect("no compaction result");
     assert_eq!(parsed(&no_compaction)["availability"], "no_compaction");
-    assert!(!no_compaction.is_available());
 }
 
 #[tokio::test]
@@ -944,7 +946,6 @@ async fn reports_projected_historical_schema_drift_without_reconstruction() {
         .expect("schema drift should become a bounded recall result");
     let value = parsed(&context);
 
-    assert!(!context.is_available());
     assert_eq!(value["availability"], "unsupported_schema");
     assert_eq!(value["diagnostic_class"], "historical_schema_drift");
     assert_eq!(value["source"]["path"], "/tmp/copied-rollout.jsonl");
@@ -978,7 +979,6 @@ async fn oversized_source_metadata_uses_a_fixed_bounded_unavailable_result() {
         .expect("oversized source metadata should use a fixed bounded fallback");
     let value = parsed(&context);
 
-    assert!(!context.is_available());
     assert!(context.json().len() <= RECALL_RESULT_MAX_BYTES);
     assert!(approx_token_count(context.json()) <= RECALL_RESULT_MAX_TOKENS);
     assert_eq!(value["availability"], "unsupported_schema");
@@ -1009,7 +1009,6 @@ fn renders_source_failures_as_bounded_nonfatal_recall_results() {
         .as_str()
         .expect("diagnostic message");
 
-    assert!(!context.is_available());
     assert_eq!(value["availability"], "source_error");
     assert_eq!(value["diagnostic_class"], "source_read_error");
     assert!(diagnostic.len() <= RECALL_DIAGNOSTIC_MAX_BYTES);

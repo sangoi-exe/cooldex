@@ -5695,7 +5695,11 @@ async fn local_pre_compact_handoff_excludes_unadmitted_input_and_precedes_recove
         .await?
         .codex;
 
-    for user in ["LOCAL_ADMITTED_ONE", "LOCAL_ADMITTED_TWO", "LOCAL_UNADMITTED_THREE"] {
+    for user in [
+        "LOCAL_ADMITTED_ONE",
+        "LOCAL_ADMITTED_TWO",
+        "LOCAL_UNADMITTED_THREE",
+    ] {
         codex
             .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
                 text: user.to_string(),
@@ -5735,7 +5739,10 @@ async fn local_pre_compact_handoff_excludes_unadmitted_input_and_precedes_recove
         "the incoming pre-turn user message must not enter hidden synthesis"
     );
     assert!(
-        !handoff_request.body_json().to_string().contains(SUMMARIZATION_PROMPT),
+        !handoff_request
+            .body_json()
+            .to_string()
+            .contains(SUMMARIZATION_PROMPT),
         "hidden synthesis must not inherit the provider compaction trigger"
     );
 
@@ -5848,7 +5855,8 @@ async fn pre_compact_hook_veto_stops_before_hidden_handoff() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unavailable_handoff_continues_local_compaction_with_boundary_only_recovery() -> Result<()> {
+async fn unavailable_handoff_continues_local_compaction_with_boundary_only_recovery() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;

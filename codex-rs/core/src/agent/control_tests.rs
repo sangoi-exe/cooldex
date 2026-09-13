@@ -2700,7 +2700,11 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
         .load_current_thread_recall_context(recall_turn.as_ref())
         .await
         .expect("resumed copied child recall should load");
-    assert!(recall.is_available());
+    // Merge-safety anchor: copied-child recall preserves explicit availability through its
+    // rendered JSON contract, not a duplicate implementation boolean.
+    let recall_value: serde_json::Value =
+        serde_json::from_str(recall.json()).expect("parse copied-child recall JSON");
+    assert_eq!(recall_value["availability"], "available");
     assert!(recall.json().contains(&child_thread_id.to_string()));
     assert!(recall.json().contains(&mapped_before_shutdown[1].3));
     for source_id in [

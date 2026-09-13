@@ -1013,8 +1013,8 @@ mod tests {
         expected_without_cap["type"] = json!("response.create");
         expected_without_cap["previous_response_id"] = json!("resp-1");
         expected_without_cap["generate"] = json!(false);
-        let request_without_cap_text = serialize_websocket_request(&request_without_cap)
-            .expect("serialize websocket request");
+        let request_without_cap_text =
+            serialize_websocket_request(&request_without_cap).expect("serialize websocket request");
         let wire_payload_without_cap = serde_json::from_str::<Value>(&request_without_cap_text)
             .expect("parse websocket request");
 

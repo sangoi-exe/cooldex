@@ -262,7 +262,9 @@ async fn post_compact_recovery_stream_closes_after_created_without_sampling_succ
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consumes_once()
+// Merge-safety anchor: the first accepted normal sampling response consumes recovery before
+// tool and stop-hook continuations can form another request.
+async fn post_compact_recovery_retry_reuses_fragments_and_sampling_success_consumes_before_continuations()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
@@ -363,18 +365,12 @@ else:
     let ((failed_recovery_index, failed_recovery), failed_handoff) =
         recovery_fragments(&requests[2]);
     let ((retry_recovery_index, retry_recovery), retry_handoff) = recovery_fragments(&requests[3]);
-    let ((follow_up_recovery_index, follow_up_recovery), follow_up_handoff) =
-        recovery_fragments(&requests[4]);
-    let ((stop_hook_recovery_index, stop_hook_recovery), stop_hook_handoff) =
-        recovery_fragments(&requests[5]);
     assert_eq!(failed_recovery, retry_recovery);
-    assert_eq!(failed_recovery, follow_up_recovery);
-    assert_eq!(failed_recovery, stop_hook_recovery);
     assert!(failed_recovery.1.contains(CUSTOM_RECOVERY_INSTRUCTIONS));
     assert_eq!(failed_handoff, retry_handoff);
-    assert_eq!(failed_handoff, follow_up_handoff);
-    assert_eq!(failed_handoff, stop_hook_handoff);
-    assert_no_recovery_fragments(&requests[6]);
+    for request in [&requests[4], &requests[5], &requests[6]] {
+        assert_no_recovery_fragments(request);
+    }
 
     let items = read_rollout_items(&rollout_path);
     assert!(
@@ -407,16 +403,6 @@ else:
             &requests[3],
             retry_recovery_index,
             retry_handoff.as_ref().map(|(index, _)| *index),
-        ),
-        (
-            &requests[4],
-            follow_up_recovery_index,
-            follow_up_handoff.as_ref().map(|(index, _)| *index),
-        ),
-        (
-            &requests[5],
-            stop_hook_recovery_index,
-            stop_hook_handoff.as_ref().map(|(index, _)| *index),
         ),
     ] {
         let input = request.input();
@@ -451,10 +437,8 @@ else:
             "the recovery directive must precede genuinely new user input"
         );
     }
-    let stop_hook_prompt_index = requests[5]
-        .input()
-        .iter()
-        .position(|item| {
+    assert!(
+        requests[5].input().iter().any(|item| {
             item.get("role").and_then(serde_json::Value::as_str) == Some("user")
                 && item
                     .get("content")
@@ -463,11 +447,8 @@ else:
                     .and_then(|content| content.get("text"))
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|text| text.contains(STOP_CONTINUATION_PROMPT))
-        })
-        .expect("stop hook continuation prompt");
-    assert!(
-        stop_hook_recovery_index < stop_hook_prompt_index,
-        "the recovery directive must remain before stop-hook continuation input"
+        }),
+        "stop hook continuation should be sampled after recovery consumption"
     );
 
     let application_items = items
@@ -490,8 +471,7 @@ else:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_steer_during_stop_hook_waits_for_task_terminal_boundary()
--> Result<()> {
+async fn post_compact_recovery_steer_during_stop_hook_uses_consumed_recovery_state() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let requests = mount_sse_sequence(
@@ -593,22 +573,25 @@ print(json.dumps({{"systemMessage": "stop hook passed"}}))
         },
     )
     .await?;
-    assert_pending_marker_without_application(&read_rollout_items(&rollout_path));
+    // Merge-safety anchor: recovery is applied after the accepted response and before a
+    // blocked stop hook permits a steered continuation.
+    let application_count = read_rollout_items(&rollout_path)
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+        .count();
+    assert_eq!(application_count, 1);
 
     fs::write(&release_path, "release").expect("release waiting stop hook");
     wait_for_successful_turn_complete(&test.codex).await;
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 4);
-    let ((_first_recovery_index, first_recovery), first_handoff) = recovery_fragments(&requests[2]);
-    let ((steer_recovery_index, steer_recovery), steer_handoff) = recovery_fragments(&requests[3]);
-    assert_eq!(first_recovery, steer_recovery);
-    assert_eq!(first_handoff, steer_handoff);
+    let _ = recovery_fragments(&requests[2]);
+    assert_no_recovery_fragments(&requests[3]);
 
     let steer_input = requests[3].input();
-    let steer_user_index = steer_input
-        .iter()
-        .position(|item| {
+    assert!(
+        steer_input.iter().any(|item| {
             item.get("role").and_then(serde_json::Value::as_str) == Some("user")
                 && item
                     .get("content")
@@ -617,11 +600,8 @@ print(json.dumps({{"systemMessage": "stop hook passed"}}))
                     .and_then(|content| content.get("text"))
                     .and_then(serde_json::Value::as_str)
                     == Some(STEER_DURING_STOP)
-        })
-        .expect("steered user input should be sampled before task completion");
-    assert!(
-        steer_recovery_index < steer_user_index,
-        "the recovery directive must survive until the steered continuation request"
+        }),
+        "steered user input should be sampled before task completion"
     );
 
     let application_count = read_rollout_items(&rollout_path)

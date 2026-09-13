@@ -46,12 +46,8 @@ impl SessionTask for CompactTask {
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
         if ctx.config.features.enabled(Feature::TokenBudget) {
-            crate::compact_token_budget::run_manual_compact_task(
-                session,
-                ctx,
-                &cancellation_token,
-            )
-            .await?;
+            crate::compact_token_budget::run_manual_compact_task(session, ctx, &cancellation_token)
+                .await?;
             return Ok(Default::default());
         }
 

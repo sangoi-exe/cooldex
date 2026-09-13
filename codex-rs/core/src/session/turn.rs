@@ -42,7 +42,6 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::skills::emit_explicit_skill_invocations;
-use crate::state::PostCompactRecoveryIdentity;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::InFlightFuture;
 use crate::stream_events_utils::TurnItemContributorPolicy;
@@ -142,11 +141,11 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
-// Merge-safety anchor: retain fork recovery output while upstream keeps MCP startup requirements across restarts.
+// Merge-safety anchor: recovery acknowledgement belongs to accepted sampling, so terminal turn
+// output carries no stale recovery identity across tool, mailbox, or hook continuations.
 #[derive(Debug, Default)]
 pub(crate) struct RunTurnOutput {
     pub(crate) last_agent_message: Option<String>,
-    pub(crate) post_compact_recovery: Option<PostCompactRecoveryIdentity>,
 }
 
 /// Explicit MCP startup requirements retained across restarts within one user turn.
@@ -325,7 +324,6 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
-    let mut completed_post_compact_recovery = None;
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -453,7 +451,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input, post_compact_recovery)) => {
+            Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -605,7 +603,6 @@ pub(crate) async fn run_turn(
                             .await;
                         }
                     }
-                    completed_post_compact_recovery = post_compact_recovery;
                     if stop_outcome.should_stop {
                         break;
                     }
@@ -619,7 +616,6 @@ pub(crate) async fn run_turn(
                     {
                         return Ok(RunTurnOutput {
                             last_agent_message: None,
-                            post_compact_recovery: completed_post_compact_recovery,
                         });
                     }
                     break;
@@ -668,10 +664,7 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(RunTurnOutput {
-        last_agent_message,
-        post_compact_recovery: completed_post_compact_recovery,
-    })
+    Ok(RunTurnOutput { last_agent_message })
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1474,11 +1467,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(
-    SamplingRequestResult,
-    Vec<ResponseItem>,
-    Option<PostCompactRecoveryIdentity>,
-)> {
+) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let base_instructions = sess.get_prompt_base_instructions().await;
 
@@ -1546,11 +1535,17 @@ async fn run_sampling_request(
                     .as_ref()
                     .map(|recovery| recovery.identity().clone());
                 let attempt_input = prepared_prompt.into_original_input()?;
-                return Ok((
-                    output,
-                    original_input.unwrap_or(attempt_input),
-                    post_compact_recovery,
-                ));
+                // Merge-safety anchor: persist the matching recovery application and clear live
+                // pending state immediately after an accepted completed response, before any
+                // tool, mailbox, async-hook, or stop-hook continuation can sample again.
+                if let Some(recovery) = post_compact_recovery {
+                    sess.record_post_compact_recovery_sampling_success(
+                        &recovery,
+                        &turn_context.sub_id,
+                    )
+                    .await?;
+                }
+                return Ok((output, original_input.unwrap_or(attempt_input)));
             }
             Err(err) => match err.details() {
                 CodexErrorDetails::ContextWindowExceeded => {

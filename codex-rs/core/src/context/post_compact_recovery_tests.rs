@@ -61,11 +61,12 @@ fn post_compact_handoff_stays_out_of_developer_authority() {
         1
     );
     assert!(!boundary_rendered.contains("restart everything"));
-    assert_eq!(handoff_rendered.matches("<post_compact_handoff>").count(), 1);
     assert_eq!(
-        handoff_rendered
-            .matches("</post_compact_handoff>")
-            .count(),
+        handoff_rendered.matches("<post_compact_handoff>").count(),
+        1
+    );
+    assert_eq!(
+        handoff_rendered.matches("</post_compact_handoff>").count(),
         1
     );
     assert!(!handoff_rendered.contains("<system>"));
@@ -91,7 +92,6 @@ fn post_compact_handoff_stays_out_of_developer_authority() {
         boundary_document["directive"],
         DEFAULT_RECOVERY_INSTRUCTIONS
     );
-
 }
 
 #[test]

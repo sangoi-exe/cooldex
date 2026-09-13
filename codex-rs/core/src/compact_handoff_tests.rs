@@ -4,8 +4,8 @@ use super::*;
 use crate::ResponseStream;
 use crate::client_common::ResponseEvent;
 use crate::compact::CompactedHistoryMetadata;
-use crate::context::PostCompactRecoveryContext;
 use crate::context::ContextualUserFragment;
+use crate::context::PostCompactRecoveryContext;
 use crate::session::pre_compact_handoff_input_snapshot_from_parts;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
@@ -98,7 +98,8 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
         )
         .await;
 
-    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
     let source = PreCompactHandoffSource::from_snapshot(
         session
@@ -111,19 +112,24 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
     assert_eq!(source.base_instructions.text, "current base sentinel");
     assert!(source.input.iter().any(|item| {
         matches!(item, ResponseItem::Message { role, content, .. }
-            if role == "user" && content.iter().any(|content| {
-                matches!(content, ContentItem::InputText { text }
-                    if text == "pre-compaction history sentinel")
-            }))
+        if role == "user" && content.iter().any(|content| {
+            matches!(content, ContentItem::InputText { text }
+                if text == "pre-compaction history sentinel")
+        }))
     }));
     assert!(!source.input.iter().any(|item| {
         matches!(item, ResponseItem::Message { content, .. }
-            if content.iter().any(|content| {
-                matches!(content, ContentItem::InputText { text }
-                    if text == "unadmitted incoming input")
-            }))
+        if content.iter().any(|content| {
+            matches!(content, ContentItem::InputText { text }
+                if text == "unadmitted incoming input")
+        }))
     }));
-    assert!(source.is_current_for(&session, &settings).await.expect("source match"));
+    assert!(
+        source
+            .is_current_for(&session, &settings)
+            .await
+            .expect("source match")
+    );
 
     session
         .record_conversation_items(
@@ -146,7 +152,9 @@ async fn cached_recovery_packet_is_read_only_overlay_at_the_existing_boundary() 
         boundary_item_id: "msg-boundary-handoff".to_string(),
     };
     let input = vec![message(
-        Some(ResponseItemId::from_server(identity.boundary_item_id.clone())),
+        Some(ResponseItemId::from_server(
+            identity.boundary_item_id.clone(),
+        )),
         "user",
         "recovery boundary",
     )];
@@ -176,7 +184,10 @@ async fn cached_recovery_packet_is_read_only_overlay_at_the_existing_boundary() 
     let boundary_index = snapshot
         .input
         .iter()
-        .position(|item| item.id().is_some_and(|id| id.as_str() == identity.boundary_item_id))
+        .position(|item| {
+            item.id()
+                .is_some_and(|id| id.as_str() == identity.boundary_item_id)
+        })
         .expect("boundary in snapshot");
     let ResponseItem::Message { role, content, .. } = &snapshot.input[boundary_index + 1] else {
         panic!("recovery boundary must be inserted immediately after a non-tool boundary");
@@ -189,9 +200,7 @@ async fn cached_recovery_packet_is_read_only_overlay_at_the_existing_boundary() 
 
     assert_eq!(state.pending_identity(), Some(&identity));
     assert_eq!(
-        state
-            .packet(&identity)
-            .expect("matching packet read"),
+        state.packet(&identity).expect("matching packet read"),
         Some(packet)
     );
 }
@@ -206,7 +215,9 @@ async fn pending_identity_without_cached_packet_neither_loads_recall_nor_mutates
     let state_before = state.clone();
     let snapshot = pre_compact_handoff_input_snapshot_from_parts(
         vec![message(
-            Some(ResponseItemId::from_server(identity.boundary_item_id.clone())),
+            Some(ResponseItemId::from_server(
+                identity.boundary_item_id.clone(),
+            )),
             "user",
             "recovery boundary",
         )],
@@ -221,27 +232,23 @@ async fn pending_identity_without_cached_packet_neither_loads_recall_nor_mutates
     .expect("missing cached packet must not fail snapshot");
     assert!(!snapshot.input.iter().any(|item| {
         matches!(item, ResponseItem::Message { content, .. }
-            if content.iter().any(|content| {
-                matches!(content, ContentItem::InputText { text }
-                    if crate::context::PostCompactRecoveryContext::matches_text(text))
-            }))
+        if content.iter().any(|content| {
+            matches!(content, ContentItem::InputText { text }
+                if crate::context::PostCompactRecoveryContext::matches_text(text))
+        }))
     }));
 
     assert_eq!(state, state_before);
     assert_eq!(state.pending_identity(), Some(&identity));
-    assert_eq!(
-        state
-            .packet(&identity)
-            .expect("matching packet read"),
-        None
-    );
+    assert_eq!(state.packet(&identity).expect("matching packet read"), None);
 }
 
 #[tokio::test]
 async fn synthesis_prompt_is_tool_free_bounded_and_uses_frozen_settings() {
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
-    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
     let source = PreCompactHandoffSource::from_snapshot(
         session
@@ -261,10 +268,10 @@ async fn synthesis_prompt_is_tool_free_bounded_and_uses_frozen_settings() {
     assert_eq!(source.settings, settings);
     assert!(prompt.input.last().is_some_and(|item| {
         matches!(item, ResponseItem::Message { role, content, .. }
-            if role == "developer" && content.iter().any(|content| {
-                matches!(content, ContentItem::InputText { text }
-                    if text == PRE_COMPACT_HANDOFF_INSTRUCTIONS)
-            }))
+        if role == "developer" && content.iter().any(|content| {
+            matches!(content, ContentItem::InputText { text }
+                if text == PRE_COMPACT_HANDOFF_INSTRUCTIONS)
+        }))
     }));
     let metadata = session
         .responses_metadata(
@@ -272,10 +279,9 @@ async fn synthesis_prompt_is_tool_free_bounded_and_uses_frozen_settings() {
             crate::responses_metadata::CodexResponsesRequestKind::PreCompactHandoff,
         )
         .await;
-    let metadata: serde_json::Value = serde_json::from_str(
-        &metadata.turn_metadata_json().expect("request metadata"),
-    )
-    .expect("metadata JSON");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata.turn_metadata_json().expect("request metadata"))
+            .expect("metadata JSON");
     assert_eq!(
         metadata["request_kind"].as_str(),
         Some("pre_compact_handoff")
@@ -315,7 +321,9 @@ async fn collector_ignores_reasoning_before_assistant_text() {
                 summary_index: 0,
             }),
             Ok(ResponseEvent::OutputItemDone(reasoning)),
-            Ok(ResponseEvent::OutputItemDone(assistant_message("handoff only"))),
+            Ok(ResponseEvent::OutputItemDone(assistant_message(
+                "handoff only",
+            ))),
             Ok(completed()),
         ]),
         &CancellationToken::new(),
@@ -343,7 +351,8 @@ async fn collector_discards_all_partial_text_for_invalid_or_incomplete_output() 
         role: "developer".to_string(),
         tools: Vec::new(),
     };
-    let oversized = assistant_message(&vec!["word"; PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS + 100].join(" "));
+    let oversized =
+        assistant_message(&vec!["word"; PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS + 100].join(" "));
     let cases = vec![
         (
             response_stream(vec![
@@ -437,7 +446,8 @@ async fn collector_propagates_cancellation_as_turn_aborted() {
 async fn preparation_propagates_cancellation_before_hidden_inference() {
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
-    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -472,7 +482,8 @@ async fn no_live_thread_prepares_without_inference_or_history_occupancy_change()
         .cloned()
         .collect::<Vec<_>>();
     let token_usage_before = session.token_usage_info().await;
-    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
 
     let prepared = prepare_pre_compact_handoff(
@@ -485,10 +496,6 @@ async fn no_live_thread_prepares_without_inference_or_history_occupancy_change()
     .await
     .expect("persistence-disabled session must retain upstream behavior");
 
-    assert_eq!(
-        prepared.outcome(),
-        &PreCompactHandoffOutcome::UnsupportedNoLiveThread
-    );
     assert_eq!(prepared.handoff_text(), None);
     assert_eq!(
         session
@@ -512,7 +519,8 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
             &[message(None, "user", "admitted before preparation")],
         )
         .await;
-    let step_context = crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
     let source = PreCompactHandoffSource::from_snapshot(
         session
@@ -553,9 +561,11 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
         .await
         .expect_err("a source changed after preparation must fail before installation");
 
-    assert!(error
-        .to_string()
-        .contains("prepared pre-compaction handoff source no longer matches"));
+    assert!(
+        error
+            .to_string()
+            .contains("prepared pre-compaction handoff source no longer matches")
+    );
     assert_eq!(
         session.clone_history().await.annotated_items(),
         history_before.as_slice()

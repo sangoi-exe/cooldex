@@ -89,9 +89,10 @@ impl SessionTask for RegularTask {
             // Terminal errors are already reported. Let task completion preserve pending
             // input instead of restarting the failed turn for that same input.
             if ctx.terminal_error.lock().await.is_some() {
+                // Merge-safety anchor: recovery proof is committed by accepted sampling, so
+                // regular-task output retains only terminal presentation state.
                 return Ok(SessionTaskOutput {
                     last_agent_message: turn_output.last_agent_message,
-                    post_compact_recovery: turn_output.post_compact_recovery,
                 });
             }
             match sess
@@ -104,7 +105,6 @@ impl SessionTask for RegularTask {
                 RegularTaskContinuation::Sealed => {
                     return Ok(SessionTaskOutput {
                         last_agent_message: turn_output.last_agent_message,
-                        post_compact_recovery: turn_output.post_compact_recovery,
                     });
                 }
             }

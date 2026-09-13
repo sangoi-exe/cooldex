@@ -1115,13 +1115,12 @@ pub(crate) fn pre_compact_handoff_input_snapshot_from_parts(
     recovery_packet: Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>,
 ) -> Result<PreCompactHandoffInputSnapshot, PostCompactRecoveryFailureClass> {
     if let Some((identity, packet)) = recovery_packet {
-        post_compact_recovery::insert_post_compact_recovery_packet(
-            &mut input,
-            &identity,
-            packet,
-        )?;
+        post_compact_recovery::insert_post_compact_recovery_packet(&mut input, &identity, packet)?;
     }
-    Ok(PreCompactHandoffInputSnapshot::new(input, base_instructions))
+    Ok(PreCompactHandoffInputSnapshot::new(
+        input,
+        base_instructions,
+    ))
 }
 
 // Merge-safety anchor: live request rendering and atomic pre-compaction snapshots share the
@@ -4575,35 +4574,14 @@ impl Session {
         state.take_new_context_window_request()
     }
 
-    pub(crate) async fn start_new_context_window(
-        &self,
-        step_context: &StepContext,
-        world_state: Arc<WorldState>,
-    ) -> CodexResult<u64> {
-        self.start_new_context_window_with_optional_handoff(step_context, world_state, None)
-            .await
-    }
-
     pub(crate) async fn start_new_context_window_with_prepared_handoff(
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
         prepared_handoff: PreparedPreCompactHandoff,
     ) -> CodexResult<u64> {
-        self.start_new_context_window_with_optional_handoff(
-            step_context,
-            world_state,
-            Some(prepared_handoff),
-        )
-        .await
-    }
-
-    async fn start_new_context_window_with_optional_handoff(
-        &self,
-        step_context: &StepContext,
-        world_state: Arc<WorldState>,
-        prepared_handoff: Option<PreparedPreCompactHandoff>,
-    ) -> CodexResult<u64> {
+        // Merge-safety anchor: token-budget context windows install through the same prepared
+        // handoff/recovery checkpoint as every other compaction route.
         let turn_context = step_context.turn.as_ref();
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
@@ -4646,26 +4624,13 @@ impl Session {
             compaction_response_id: None,
             compaction_model_hash: None,
         };
-        match prepared_handoff {
-            Some(prepared_handoff) => {
-                self.replace_compacted_history(
-                    context_items,
-                    Some(turn_context_item),
-                    Some(world_state),
-                    metadata.with_prepared_handoff(prepared_handoff),
-                )
-                .await?;
-            }
-            None => {
-                self.replace_compacted_history(
-                    context_items,
-                    Some(turn_context_item),
-                    Some(world_state),
-                    metadata,
-                )
-                .await?;
-            }
-        }
+        self.replace_compacted_history(
+            context_items,
+            Some(turn_context_item),
+            Some(world_state),
+            metadata.with_prepared_handoff(prepared_handoff),
+        )
+        .await?;
         self.recompute_token_usage(turn_context).await;
         Ok(window_number)
     }

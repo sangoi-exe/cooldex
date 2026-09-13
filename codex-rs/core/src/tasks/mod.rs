@@ -36,7 +36,6 @@ use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
 use crate::session::turn_context::NewTurnContextOptions;
 use crate::session::turn_context::TurnContext;
-use crate::state::PostCompactRecoveryIdentity;
 use crate::state::RetiredTurn;
 use crate::state::RunningTask;
 use crate::state::SteerAdmission;
@@ -101,10 +100,11 @@ enum AbortSlotAction {
     Retire(RetiredTurn),
 }
 
+// Merge-safety anchor: post-compact recovery is durably acknowledged inside the first accepted
+// sampling request; task finalization must not delay or repeat that application.
 #[derive(Debug, Default)]
 pub(crate) struct SessionTaskOutput {
     pub(crate) last_agent_message: Option<String>,
-    pub(crate) post_compact_recovery: Option<PostCompactRecoveryIdentity>,
 }
 
 pub(crate) type SessionTaskResult = CodexResult<SessionTaskOutput>;
@@ -1139,7 +1139,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
-        let (mut task_output, abort_reason) = match task_result {
+        let (task_output, abort_reason) = match task_result {
             Ok(task_output) => (task_output, None),
             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => (
                 SessionTaskOutput::default(),
@@ -1199,7 +1199,6 @@ impl Session {
         };
         self.pending_user_message_admissions
             .complete_task_end(&turn_context.sub_id);
-        let steer_admission = task.steer_admission;
         task.handle.detach();
 
         if let Err(err) = self.flush_rollout().await {
@@ -1215,33 +1214,6 @@ impl Session {
             .await;
         }
 
-        let mut recovery_application_error = None;
-        if let Some(recovery) = task_output.post_compact_recovery.take() {
-            let result = if steer_admission == SteerAdmission::Sealed {
-                self.record_post_compact_recovery_sampling_success(&recovery, &turn_context.sub_id)
-                    .await
-            } else {
-                Err(CodexErr::Fatal(
-                    "post-compact recovery reached task completion before steer admission was sealed"
-                        .to_string(),
-                ))
-            };
-            if let Err(err) = result {
-                warn!(%err, "failed to record post-compact recovery application");
-                task_output.last_agent_message = None;
-                recovery_application_error = Some(err);
-            }
-        }
-        if let Some(error) = recovery_application_error.as_ref() {
-            self.emit_turn_error_lifecycle(turn_context.as_ref(), error.to_codex_protocol_error())
-                .await;
-            self.track_turn_codex_error(turn_context.as_ref(), error);
-            self.send_event(
-                turn_context.as_ref(),
-                EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
-            )
-            .await;
-        }
         let last_agent_message = task_output.last_agent_message;
         let pending_input = self
             .input_queue

@@ -1046,7 +1046,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         Some("pre_compact_handoff")
     );
     assert!(
-        handoff_request.body_json().to_string().contains("hello remote compact"),
+        handoff_request
+            .body_json()
+            .to_string()
+            .contains("hello remote compact"),
         "remote-v1 handoff should receive admitted history before compaction"
     );
 

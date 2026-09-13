@@ -162,10 +162,6 @@ impl PreparedPreCompactHandoff {
         &self.source
     }
 
-    pub(crate) fn outcome(&self) -> &PreCompactHandoffOutcome {
-        &self.outcome
-    }
-
     pub(crate) fn settings(&self) -> &PreCompactHandoffSettings {
         &self.source.settings
     }
@@ -297,7 +293,8 @@ fn boundary_result_from_error(
 ) -> CodexResult<Result<String, PreCompactHandoffFailure>> {
     boundary_outcome_from_error(error).map(|outcome| match outcome {
         PreCompactHandoffOutcome::Unavailable(failure) => Err(failure),
-        PreCompactHandoffOutcome::Available(_) | PreCompactHandoffOutcome::UnsupportedNoLiveThread => {
+        PreCompactHandoffOutcome::Available(_)
+        | PreCompactHandoffOutcome::UnsupportedNoLiveThread => {
             unreachable!("request failures can only produce boundary-only degradation")
         }
     })

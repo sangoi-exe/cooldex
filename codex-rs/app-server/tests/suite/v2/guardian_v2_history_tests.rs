@@ -189,7 +189,29 @@ async fn guardians_retain_evidence_after_compaction_and_discard_it_after_rollbac
                     let parent_requests = Arc::clone(&parent_requests);
                     let review_requests = Arc::clone(&review_requests);
                     async move {
-                        let events = if request["model"] == "gpt-5.6-luna" {
+                        let is_pre_compact_handoff =
+                            request["client_metadata"]["x-codex-turn-metadata"]
+                                .as_str()
+                                .is_some_and(|metadata| {
+                                    match serde_json::from_str::<Value>(metadata) {
+                                        Ok(metadata) => {
+                                            metadata.get("request_kind").and_then(Value::as_str)
+                                                == Some("pre_compact_handoff")
+                                        }
+                                        Err(_) => false,
+                                    }
+                                });
+                        let events = if is_pre_compact_handoff {
+                            // Merge-safety anchor: hidden handoff synthesis is transient and
+                            // must not advance this fixture's parent-response sequence.
+                            vec![
+                                responses::ev_assistant_message(
+                                    "pre-compact-handoff",
+                                    "resume from the compacted state",
+                                ),
+                                responses::ev_completed("pre-compact-handoff"),
+                            ]
+                        } else if request["model"] == "gpt-5.6-luna" {
                             luna_response(&classifier, request).await
                         } else if request["client_metadata"]["x-openai-subagent"] == "guardian" {
                             review_requests
@@ -623,26 +645,26 @@ async fn guardians_retain_evidence_after_compaction_and_discard_it_after_rollbac
                     parent_input
                         .iter()
                         .filter(|item| {
-                            let is_historical_recall = item
+                            let is_historical_handoff = item
                                 ["internal_chat_message_metadata_passthrough"]
                                 ["content_item_kinds"]
-                                == json!(["compaction.post_compact_recall"]);
-                            if is_historical_recall {
+                                == json!(["compaction.post_compact_handoff"]);
+                            if is_historical_handoff {
                                 assert_eq!(item["role"], "assistant");
                                 let content =
-                                    item["content"].as_array().expect("recall content array");
+                                    item["content"].as_array().expect("handoff content array");
                                 assert_eq!(content.len(), 1);
                                 assert_eq!(content[0]["type"], "output_text");
                             }
-                            !is_historical_recall
+                            !is_historical_handoff
                         })
                         .collect::<Vec<_>>()
                 } else {
                     parent_input.iter().collect::<Vec<_>>()
                 };
                 let checked_parent_input = serde_json::to_string(&checked_parent_input)?;
-                // Merge-safety anchor: Filter only tagged post-compaction recall from
-                // compacted-history checks; full rollback checks the complete parent input.
+                // Merge-safety anchor: filter only the tagged transient post-compaction handoff
+                // from compacted-history checks; full rollback checks the complete parent input.
                 assert!(
                     !checked_parent_input.contains(RESTRICTION),
                     "checked parent input retains the restriction at iteration {index}: {checked_parent_input}"

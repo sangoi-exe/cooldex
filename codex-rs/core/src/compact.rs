@@ -5,8 +5,8 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
-use crate::compact_handoff::PreparedPreCompactHandoff;
 use crate::compact_handoff::PreCompactHandoffSettings;
+use crate::compact_handoff::PreparedPreCompactHandoff;
 use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
@@ -306,7 +306,7 @@ async fn run_compact_task_inner_impl(
 ) -> CodexResult<String> {
     let turn_context = &step_context.turn;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
+    sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
@@ -365,7 +365,7 @@ async fn run_compact_task_inner_impl(
             Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
@@ -381,7 +381,7 @@ async fn run_compact_task_inner_impl(
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
                 sess.track_turn_codex_error(turn_context.as_ref(), &e);
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
+                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) => {
@@ -399,7 +399,7 @@ async fn run_compact_task_inner_impl(
                 } else {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
+                    sess.send_event(turn_context, event).await;
                     return Err(e);
                 }
             }
@@ -415,12 +415,15 @@ async fn run_compact_task_inner_impl(
         compaction_output.usage_metadata.as_ref(),
     )
     .await;
-    sess.update_token_usage_info(turn_context.as_ref(), compaction_output.token_usage.as_ref())
-        .await?;
+    sess.update_token_usage_info(
+        turn_context.as_ref(),
+        compaction_output.token_usage.as_ref(),
+    )
+    .await?;
 
     let history_items = frozen_history.annotated_items();
-    let summary_suffix = get_last_assistant_message_from_turn(compaction_output.items.iter())
-        .unwrap_or_default();
+    let summary_suffix =
+        get_last_assistant_message_from_turn(compaction_output.items.iter()).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let identity = if sess.guardian_context_mode == GuardianContextMode::ThreadOwned {
         CompactedMessageIdentity::Preserve
@@ -464,14 +467,14 @@ async fn run_compact_task_inner_impl(
         .with_prepared_handoff(prepared_handoff),
     )
     .await?;
-    sess.recompute_token_usage(&turn_context).await;
+    sess.recompute_token_usage(turn_context).await;
 
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
+    sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
     let warning = EventMsg::Warning(WarningEvent {
         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
     });
-    sess.send_event(&turn_context, warning).await;
+    sess.send_event(turn_context, warning).await;
     Ok(summary_suffix)
 }
 

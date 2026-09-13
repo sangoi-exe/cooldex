@@ -3540,8 +3540,8 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 }
 
 #[tokio::test]
-async fn start_new_context_window_persists_checkpoint_state() {
-    let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+async fn replace_compacted_history_persists_checkpoint_state() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
         Vec::new(),
         |_| {},
@@ -3561,21 +3561,25 @@ async fn start_new_context_window_persists_checkpoint_state() {
         thread_token_usage: TokenUsage::default(),
     };
     session.state.lock().await.latest_token_usage_record = Some(token_usage_record.clone());
-    let step_context = session
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
-        .await
-        .expect("a fresh cancellation token cannot be cancelled");
-    let world_state = Arc::new(
-        session
-            .build_world_state_for_step(&step_context)
-            .await
-            .expect("world state should build"),
-    );
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
 
     session
-        .start_new_context_window(&step_context, world_state)
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message(
+                "compacted checkpoint",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: String::new(),
+                window_number,
+                window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            },
+        )
         .await
-        .expect("new context window should persist");
+        .expect("compacted checkpoint should persist");
 
     let live_history = session.clone_history().await;
     assert!(live_history.raw_items().next().is_some());
@@ -3616,7 +3620,7 @@ async fn start_new_context_window_persists_checkpoint_state() {
         persisted_compacted
             .post_compact_recovery
             .as_ref()
-            .expect("token-budget compaction recovery marker")
+            .expect("compaction recovery marker")
             .boundary_item_id,
         persisted_compacted
             .replacement_history
@@ -12179,19 +12183,18 @@ impl SessionTask for CompletingTask {
     }
 }
 
-struct SealedRecoveryTask {
-    recovery: PostCompactRecoveryIdentity,
+struct SealedTask {
     sealed_tx: async_channel::Sender<()>,
     release_rx: async_channel::Receiver<()>,
 }
 
-impl SessionTask for SealedRecoveryTask {
+impl SessionTask for SealedTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
     }
 
     fn span_name(&self) -> &'static str {
-        "session_task.sealed_recovery"
+        "session_task.sealed"
     }
 
     async fn run(
@@ -12216,8 +12219,7 @@ impl SessionTask for SealedRecoveryTask {
             .await
             .expect("sealed task should be released");
         Ok(SessionTaskOutput {
-            last_agent_message: Some("sealed recovery completed".to_string()),
-            post_compact_recovery: Some(self.recovery.clone()),
+            last_agent_message: Some("sealed task completed".to_string()),
         })
     }
 }
@@ -12993,108 +12995,6 @@ async fn post_compact_recovery_successful_task_without_sampling_response_does_no
     assert_eq!(3, calls.flush_thread);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn post_compact_recovery_sealed_task_defers_late_steer_until_completion() {
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
-    attach_in_memory_thread_store(
-        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
-    )
-    .await;
-    let identity = install_test_post_compact_recovery(session.as_ref()).await;
-    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
-    let (release_tx, release_rx) = async_channel::bounded(1);
-
-    session
-        .spawn_task(
-            Arc::clone(&turn_context),
-            Vec::new(),
-            SealedRecoveryTask {
-                recovery: identity.clone(),
-                sealed_tx,
-                release_rx,
-            },
-        )
-        .await;
-    timeout(Duration::from_secs(2), sealed_rx.recv())
-        .await
-        .expect("task should seal steer admission")
-        .expect("sealed-task observer should remain open");
-
-    let late_input = vec![UserInput::Text {
-        text: "late steer after the final queue decision".to_string(),
-        text_elements: Vec::new(),
-    }];
-    let mut submitted_late_input = SubmittedTurnInput::UserInput {
-        content: late_input.clone(),
-        client_id: None,
-    };
-    let steer = session.steer_submitted_input(
-        &mut submitted_late_input,
-        /*additional_context*/ Default::default(),
-        Some(&turn_context.sub_id),
-        /*required_final_output_json_schema*/ None,
-        /*responsesapi_client_metadata*/ None,
-        /*incoming_root_turn_id*/ None,
-    );
-    tokio::pin!(steer);
-    tokio::select! {
-        biased;
-        result = &mut steer => panic!("sealed steer completed before task completion: {result:?}"),
-        _ = tokio::task::yield_now() => {}
-    }
-
-    assert_eq!(
-        session
-            .state
-            .lock()
-            .await
-            .post_compact_recovery
-            .pending_identity(),
-        Some(&identity)
-    );
-    release_tx
-        .send(())
-        .await
-        .expect("sealed task should still be waiting");
-
-    let completed = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
-    assert!(matches!(
-        completed.msg,
-        EventMsg::TurnComplete(TurnCompleteEvent {
-            last_agent_message: Some(ref message),
-            error: None,
-            ..
-        }) if message == "sealed recovery completed"
-    ));
-
-    let error = timeout(Duration::from_secs(2), steer)
-        .await
-        .expect("late steer should resume after task completion")
-        .expect_err("completed task should no longer accept same-turn steering");
-    assert_eq!(error, SteerInputError::NoActiveTurn(late_input));
-    assert_eq!(
-        session
-            .state
-            .lock()
-            .await
-            .post_compact_recovery
-            .pending_identity(),
-        None
-    );
-
-    let application_count = session
-        .live_thread()
-        .expect("test live thread")
-        .load_history(/*include_archived*/ false)
-        .await
-        .expect("load persisted history")
-        .items
-        .into_iter()
-        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
-        .count();
-    assert_eq!(application_count, 1);
-}
-
 async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
     let (mut session, turn_context, _rx) = make_session_and_context_with_rx().await;
     attach_in_memory_thread_store(
@@ -13109,8 +13009,7 @@ async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
         .spawn_task(
             Arc::clone(&turn_context),
             Vec::new(),
-            SealedRecoveryTask {
-                recovery: identity.clone(),
+            SealedTask {
                 sealed_tx,
                 release_rx,
             },
@@ -13173,6 +13072,102 @@ async fn assert_forced_abort_releases_sealed_steer(reason: TurnAbortReason) {
         Some(&identity)
     );
     assert!(session.active_turn.lock().await.is_idle());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: a cached older packet remains intact until the later durable
+// compaction checkpoint installs its replacement.
+async fn failed_later_compaction_preserves_cached_recovery_until_successful_install_supersedes_it()
+{
+    let (mut session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let first_identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let mut first_prompt = session
+        .clone_history()
+        .await
+        .for_prompt(&turn_context.model_info().input_modalities);
+    session
+        .prepare_post_compact_recovery(turn_context.as_ref(), &mut first_prompt)
+        .await
+        .expect("first recovery should prepare")
+        .expect("first recovery should be pending");
+    let recovery_before_failed_install = {
+        let state = session.state.lock().await;
+        state.post_compact_recovery.clone()
+    };
+    let (old_identity, old_packet) = recovery_before_failed_install
+        .pending_packet_snapshot()
+        .expect("cached recovery should remain readable")
+        .expect("first recovery should cache a packet");
+    assert_eq!(old_identity, first_identity);
+
+    let (next_window_number, next_window_ids) = session.prepare_auto_compact_window().await;
+    let error = session
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message(
+                "failed later compaction boundary",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "failed later compaction".to_string(),
+                window_number: next_window_number + 1,
+                window_ids: next_window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            },
+        )
+        .await
+        .expect_err("stale later compaction must not install");
+    assert!(
+        error
+            .to_string()
+            .contains("prepared auto-compact window no longer matches live session state")
+    );
+    assert_eq!(
+        session.state.lock().await.post_compact_recovery.clone(),
+        recovery_before_failed_install
+    );
+
+    session
+        .replace_compacted_history(
+            vec![ResponseItemEnvelope::new(user_message(
+                "successful later compaction boundary",
+            ))],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedHistoryMetadata {
+                message: "successful later compaction".to_string(),
+                window_number: next_window_number,
+                window_ids: next_window_ids,
+                compaction_response_id: None,
+                compaction_model_hash: None,
+            },
+        )
+        .await
+        .expect("later compaction should install");
+    let mut second_prompt = session
+        .clone_history()
+        .await
+        .for_prompt(&turn_context.model_info().input_modalities);
+    session
+        .prepare_post_compact_recovery(turn_context.as_ref(), &mut second_prompt)
+        .await
+        .expect("later recovery should prepare")
+        .expect("later recovery should be pending");
+    let (new_identity, new_packet) = session
+        .state
+        .lock()
+        .await
+        .post_compact_recovery
+        .pending_packet_snapshot()
+        .expect("later cached recovery should remain readable")
+        .expect("later recovery should cache a packet");
+    assert_ne!(new_identity, old_identity);
+    assert_ne!(new_packet, old_packet);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13467,7 +13462,30 @@ async fn post_compact_recovery_forced_replacement_defers_no_id_steer_until_succe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_compact_recovery_application_persistence_failure_fails_the_turn() {
-    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let server = start_mock_server().await;
+    let sampled_request = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("post-compact-recovery-sampling"),
+            ev_assistant_message(
+                "post-compact-recovery-sampling",
+                "response before application persistence failure",
+            ),
+            ev_completed("post-compact-recovery-sampling"),
+        ]),
+    )
+    .await;
+    let (mut session, turn_context, rx) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        },
+    )
+    .await;
     attach_in_memory_thread_store(
         Arc::get_mut(&mut session).expect("session should be uniquely owned"),
     )
@@ -13477,28 +13495,21 @@ async fn post_compact_recovery_application_persistence_failure_fails_the_turn() 
         .expect("session should be uniquely owned")
         .services
         .live_thread = None;
-    let (sealed_tx, sealed_rx) = async_channel::bounded(1);
-    let (release_tx, release_rx) = async_channel::bounded(1);
 
     session
         .spawn_task(
             Arc::clone(&turn_context),
-            Vec::new(),
-            SealedRecoveryTask {
-                recovery: identity.clone(),
-                sealed_tx,
-                release_rx,
-            },
+            vec![TurnInput::UserInput {
+                acceptance_order: None,
+                content: vec![UserInput::Text {
+                    text: "sample the pending post-compact recovery".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }],
+            crate::tasks::RegularTask::new(),
         )
         .await;
-    timeout(Duration::from_secs(2), sealed_rx.recv())
-        .await
-        .expect("task should seal steer admission")
-        .expect("sealed-task observer should remain open");
-    release_tx
-        .send(())
-        .await
-        .expect("sealed task should still be waiting");
 
     let error = timeout(Duration::from_secs(2), async {
         loop {
@@ -13549,6 +13560,15 @@ async fn post_compact_recovery_application_persistence_failure_fails_the_turn() 
     })
     .await
     .expect("terminal recovery failure should finish the turn transition");
+
+    let request = sampled_request.single_request();
+    assert!(
+        request
+            .body_json()
+            .to_string()
+            .contains("<post_compact_recovery>"),
+        "the persistence failure must occur after a real recovery-bearing sampling request"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

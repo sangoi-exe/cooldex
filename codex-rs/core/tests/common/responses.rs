@@ -1122,10 +1122,7 @@ async fn mount_default_pre_compact_handoff_response(server: &MockServer) {
         .await;
 }
 
-pub async fn mount_pre_compact_handoff_once(
-    server: &MockServer,
-    body: String,
-) -> ResponseMock {
+pub async fn mount_pre_compact_handoff_once(server: &MockServer, body: String) -> ResponseMock {
     let response_mock = ResponseMock::new();
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))

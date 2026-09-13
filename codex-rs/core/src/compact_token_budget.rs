@@ -97,8 +97,12 @@ async fn run_compact_task_inner(
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    sess.start_new_context_window_with_prepared_handoff(step_context, world_state, prepared_handoff)
-        .await?;
+    sess.start_new_context_window_with_prepared_handoff(
+        step_context,
+        world_state,
+        prepared_handoff,
+    )
+    .await?;
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
 

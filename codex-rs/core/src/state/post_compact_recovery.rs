@@ -24,8 +24,6 @@ pub(crate) enum PostCompactRecoveryFailureClass {
     MalformedApplicationProof,
     #[error("boundary_mismatch")]
     BoundaryMismatch,
-    #[error("thread_mismatch")]
-    ThreadMismatch,
     #[error("serialization")]
     Serialization,
     #[error("packet_cap")]
@@ -71,8 +69,10 @@ impl PostCompactRecoveryRuntimeState {
     // but must not trigger packet construction, cache population, application, or state mutation.
     pub(crate) fn pending_packet_snapshot(
         &self,
-    ) -> Result<Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>, PostCompactRecoveryFailureClass>
-    {
+    ) -> Result<
+        Option<(PostCompactRecoveryIdentity, PostCompactRecoveryContext)>,
+        PostCompactRecoveryFailureClass,
+    > {
         match self {
             Self::Absent => Ok(None),
             Self::Blocked(failure) => Err(*failure),
@@ -132,6 +132,8 @@ impl PostCompactRecoveryRuntimeState {
         identity: &PostCompactRecoveryIdentity,
         turn_id: &str,
     ) -> Result<PostCompactRecoveryAppliedItem, PostCompactRecoveryFailureClass> {
+        // Merge-safety anchor: only a matching durable application may consume pending recovery;
+        // explicit recall retains its independent thread-mismatch diagnostics.
         match self {
             Self::Blocked(failure) => Err(*failure),
             Self::Pending(pending)

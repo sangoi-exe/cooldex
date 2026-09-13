@@ -237,7 +237,9 @@ pub struct RecallRolloutSourceIssue {
     pub message: String,
 }
 
-/// Bounded reconstruction projection returned for explicit and automatic recall.
+// Merge-safety anchor: stored recall tails feed explicit recall only; post-compaction recovery
+// remains boundary/packet based and must not reconstruct raw history.
+/// Bounded reconstruction projection returned for explicit recall.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredRecallRolloutTail {
     pub thread_id: ThreadId,

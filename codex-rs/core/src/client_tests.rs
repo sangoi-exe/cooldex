@@ -430,7 +430,12 @@ fn maintenance_session_keeps_websocket_and_turn_state_isolated() {
     );
 
     let normal_session = client.new_session();
-    assert!(normal_session.turn_state.set("normal-state".to_string()).is_ok());
+    assert!(
+        normal_session
+            .turn_state
+            .set("normal-state".to_string())
+            .is_ok()
+    );
     drop(normal_session);
 
     let cached_request = client
@@ -461,18 +466,20 @@ fn maintenance_session_keeps_websocket_and_turn_state_isolated() {
     let mut maintenance_session = client.new_maintenance_session();
     assert!(maintenance_session.websocket_session.last_request.is_none());
     assert_eq!(maintenance_session.turn_state.get(), None);
-    assert!(maintenance_session
-        .turn_state
-        .set("maintenance-state".to_string())
-        .is_ok());
+    assert!(
+        maintenance_session
+            .turn_state
+            .set("maintenance-state".to_string())
+            .is_ok()
+    );
     let mut maintenance_request = cached_request.clone();
     maintenance_request.max_output_tokens = Some(128);
     maintenance_session.websocket_session.last_request = Some(maintenance_request.clone());
     assert!(maintenance_session.responses_websocket_enabled());
-    assert!(maintenance_session.try_switch_fallback_transport(
-        &test_session_telemetry(),
-        &test_model_info()
-    ));
+    assert!(
+        maintenance_session
+            .try_switch_fallback_transport(&test_session_telemetry(), &test_model_info())
+    );
     assert!(!maintenance_session.responses_websocket_enabled());
     assert!(maintenance_session.websocket_session.last_request.is_none());
     assert!(client.responses_websocket_enabled());
@@ -492,7 +499,10 @@ fn maintenance_session_keeps_websocket_and_turn_state_isolated() {
     }
 
     let normal_session = client.new_session();
-    assert_eq!(normal_session.websocket_session.last_request.as_ref(), Some(&cached_request));
+    assert_eq!(
+        normal_session.websocket_session.last_request.as_ref(),
+        Some(&cached_request)
+    );
     assert_eq!(normal_session.turn_state.get(), None);
     assert!(normal_session.responses_websocket_enabled());
 }

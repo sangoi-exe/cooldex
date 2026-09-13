@@ -111,7 +111,8 @@ fn pending_with_packet_publishes_one_immutable_handoff_recovery_packet() {
         Some("operation-local handoff"),
     )
     .expect("recovery packet");
-    let state = PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet.clone());
+    let state =
+        PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet.clone());
 
     assert_eq!(state.pending_identity(), Some(&identity));
     assert_eq!(
@@ -120,5 +121,8 @@ fn pending_with_packet_publishes_one_immutable_handoff_recovery_packet() {
             .expect("prepared packet should be readable without mutation"),
         Some((identity.clone(), packet.clone()))
     );
-    assert_eq!(state.packet(&identity).expect("matching packet read"), Some(packet));
+    assert_eq!(
+        state.packet(&identity).expect("matching packet read"),
+        Some(packet)
+    );
 }
