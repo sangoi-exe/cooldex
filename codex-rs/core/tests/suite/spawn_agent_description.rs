@@ -39,6 +39,12 @@ use tokio::time::sleep;
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
+// Merge-safety anchor: root V2 usage-hint and schema followers preserve the split generic/conditional
+// wait shape while describing mailbox-aware targeted fan-in rather than the obsolete timeout-only contract.
+const V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER: &str =
+    "Targeted condition waits return for actual pending agent communication";
+const V2_GENERIC_WAIT_TIMEOUT_DESCRIPTION: &str =
+    "Generic mailbox/steer timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.";
 
 fn spawn_agent_description(body: &Value) -> Option<String> {
     namespace_child_tool(body, MULTI_AGENT_V1_NAMESPACE, SPAWN_AGENT_TOOL_NAME)
@@ -51,6 +57,21 @@ fn spawn_agent_exposes_agent_type(body: &Value, namespace: &str) -> bool {
     namespace_child_tool(body, namespace, SPAWN_AGENT_TOOL_NAME)
         .and_then(|tool| tool.pointer("/parameters/properties/agent_type"))
         .is_some()
+}
+
+fn assert_v2_wait_agent_tool_schema(wait_agent_tool: &Value) {
+    assert_eq!(
+        wait_agent_tool
+            .pointer("/parameters/oneOf/0/properties/timeout_ms/description")
+            .and_then(Value::as_str),
+        Some(V2_GENERIC_WAIT_TIMEOUT_DESCRIPTION)
+    );
+    assert!(
+        wait_agent_tool
+            .pointer("/parameters/oneOf/1/properties/targets")
+            .is_some(),
+        "V2 wait_agent must retain its known-target conditional argument mode"
+    );
 }
 
 fn resolved_root_usage_hint(config: &Config, request: &ResponsesRequest) -> String {
@@ -432,21 +453,14 @@ async fn multi_agent_v2_wait_guidance_uses_overridable_developer_instructions(
     let request = response.single_request();
     let developer_messages = request.message_input_texts("developer");
     let has_wait_guidance = developer_messages.iter().any(|message| {
-        message.contains(
-            "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.",
-        )
+        message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER)
     });
     assert_eq!(has_wait_guidance, expected_wait_guidance);
 
     let body = request.body_json();
     let wait_agent_tool = namespace_child_tool(&body, MULTI_AGENT_V2_NAMESPACE, "wait_agent")
         .expect("wait_agent should be exposed");
-    assert_eq!(
-        wait_agent_tool
-            .pointer("/parameters/properties/timeout_ms/description")
-            .and_then(Value::as_str),
-        Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
-    );
+    assert_v2_wait_agent_tool_schema(wait_agent_tool);
 
     Ok(())
 }
@@ -465,8 +479,7 @@ async fn multi_agent_v2_cold_resume_refreshes_legacy_usage_hints_once(
 ) -> Result<()> {
     let resumed_root_agent_usage_hint_text = resumed_root_agent_usage_hint_text.map(str::to_string);
     let legacy_root_agent_usage_hint_text = "Legacy root instructions.";
-    let wait_guidance =
-        "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.";
+    let wait_guidance = V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER;
     let config_toml = format!(
         "[features.multi_agent_v2]\nenabled = true\nwait_agent_enabled = {wait_agent_enabled}\n"
     );
@@ -618,12 +631,7 @@ async fn multi_agent_v2_cold_resume_refreshes_legacy_usage_hints_once(
         let wait_agent_tool = namespace_child_tool(&body, MULTI_AGENT_V2_NAMESPACE, "wait_agent");
         assert_eq!(wait_agent_tool.is_some(), wait_agent_enabled);
         if let Some(wait_agent_tool) = wait_agent_tool {
-            assert_eq!(
-                wait_agent_tool
-                    .pointer("/parameters/properties/timeout_ms/description")
-                    .and_then(Value::as_str),
-                Some("Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000.")
-            );
+            assert_v2_wait_agent_tool_schema(wait_agent_tool);
         }
     }
 
@@ -639,8 +647,7 @@ async fn multi_agent_v2_resume_refreshes_changed_wait_guidance(
     initial_wait_agent_enabled: bool,
     resumed_wait_agent_enabled: bool,
 ) -> Result<()> {
-    let wait_guidance =
-        "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.";
+    let wait_guidance = V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER;
     let initial_config_toml = format!(
         "[features.multi_agent_v2]\nenabled = true\nwait_agent_enabled = {initial_wait_agent_enabled}\n"
     );
@@ -817,9 +824,7 @@ wait_agent_enabled = {wait_agent_enabled}
             .message_input_texts("developer")
             .iter()
             .any(|message| {
-                message.contains(
-                "When calling `wait_agent`, prefer longer waits (minutes) to avoid busy polling.",
-            )
+                message.contains(V2_WAIT_AGENT_USAGE_GUIDANCE_MARKER)
             }),
         wait_agent_enabled
     );

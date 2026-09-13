@@ -406,8 +406,8 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
 }
 
 #[test]
-// Merge-safety anchor: V2 schema must keep generic mailbox waiting and completion-body-redacted
-// known-target conditions distinct without inheriting the V1 status-body result contract.
+// Merge-safety anchor: V2 schema must keep generic mailbox waiting and mailbox-aware,
+// completion-body-redacted known-target conditions distinct without inheriting the V1 status-body contract.
 fn wait_agent_tool_v2_supports_generic_and_conditional_waits() {
     let ToolSpec::Function(ResponsesApiTool {
         description,
@@ -468,6 +468,15 @@ fn wait_agent_tool_v2_supports_generic_and_conditional_waits() {
     assert!(description.contains("Wait in one of two modes."));
     assert!(description.contains("all_final for self-contained fan-in"));
     assert!(description.contains("any_final for incremental completion"));
+    assert!(description.contains("targeted waits return for actual pending agent communication"));
+    assert!(
+        description.contains(
+            "new user steer wins; target errors win over requested final-state success, and both win over mailbox activity."
+        )
+    );
+    assert!(description.contains("Queued communication is not embedded in the wait result;"));
+    assert!(description.contains("processed by the next parent sampling step."));
+    assert!(!description.contains("targeted waits ignore mailbox activity"));
     assert!(description.contains("Does not return mailbox or final-message body content;"));
     assert!(description.contains("error status details remain available."));
     assert_eq!(

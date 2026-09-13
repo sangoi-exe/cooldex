@@ -149,12 +149,13 @@ impl Handler {
                     &mut targets,
                     return_when,
                     &mut activity_rx,
-                    pending_activity,
                 )
                 .await;
                 let result = WaitAgentResult::from_condition(outcome, &targets);
                 let lifecycle_status = match outcome {
-                    WaitConditionOutcome::AnyFinal | WaitConditionOutcome::AllFinal => {
+                    WaitConditionOutcome::AnyFinal
+                    | WaitConditionOutcome::AllFinal
+                    | WaitConditionOutcome::MailboxActivity => {
                         CollabAgentToolCallStatus::Completed
                     }
                     WaitConditionOutcome::Errored => CollabAgentToolCallStatus::Failed,
@@ -343,6 +344,7 @@ enum WaitConditionOutcome {
     AllFinal,
     Errored,
     Steered,
+    MailboxActivity,
 }
 
 async fn wait_for_condition(
@@ -351,12 +353,10 @@ async fn wait_for_condition(
     targets: &mut [ConditionTarget],
     return_when: ReturnWhen,
     activity_rx: &mut watch::Receiver<InputQueueActivity>,
-    pending_activity: Option<InputQueueActivity>,
 ) -> WaitConditionOutcome {
-    if pending_activity == Some(InputQueueActivity::Steer) {
-        return WaitConditionOutcome::Steered;
-    }
-    if let Some(outcome) = condition_outcome(targets, return_when) {
+    if let Some(outcome) =
+        reconcile_condition_wait(session, turn_state, targets, return_when).await
+    {
         return outcome;
     }
 
@@ -371,12 +371,10 @@ async fn wait_for_condition(
         }
 
         tokio::select! {
-            Some((index, changed)) = status_changes.next() => {
-                if changed.is_err() {
-                    retire_condition_target_status_receiver(session, &mut targets[index]).await;
-                }
-                refresh_condition_target_statuses(targets);
-                if let Some(outcome) = condition_outcome(targets, return_when) {
+            Some((_index, _changed)) = status_changes.next() => {
+                if let Some(outcome) =
+                    reconcile_condition_wait(session, turn_state, targets, return_when).await
+                {
                     return outcome;
                 }
             }
@@ -384,10 +382,10 @@ async fn wait_for_condition(
                 match changed {
                     Ok(()) => {
                         drop(activity_rx.borrow_and_update());
-                        let (_, pending_activity) =
-                            session.input_queue.subscribe_activity(turn_state).await;
-                        if pending_activity == Some(InputQueueActivity::Steer) {
-                            return WaitConditionOutcome::Steered;
+                        if let Some(outcome) =
+                            reconcile_condition_wait(session, turn_state, targets, return_when).await
+                        {
+                            return outcome;
                         }
                     }
                     Err(_) => activity_closed = true,
@@ -395,6 +393,39 @@ async fn wait_for_condition(
             }
         }
     }
+}
+
+// Merge-safety anchor: every V2 conditional-wait reconciliation refreshes target state and
+// retires closed receivers through canonical lookup before lower-priority mailbox selection.
+async fn reconcile_condition_wait(
+    session: &crate::session::session::Session,
+    turn_state: Option<&Mutex<crate::state::TurnState>>,
+    targets: &mut [ConditionTarget],
+    return_when: ReturnWhen,
+) -> Option<WaitConditionOutcome> {
+    for target in targets.iter_mut() {
+        if target
+            .status_rx
+            .as_ref()
+            .is_some_and(|status_rx| status_rx.has_changed().is_err())
+        {
+            retire_condition_target_status_receiver(session, target).await;
+        }
+    }
+    refresh_condition_target_statuses(targets);
+
+    let (_, pending_activity) = session.input_queue.subscribe_activity(turn_state).await;
+
+    if pending_activity == Some(InputQueueActivity::Steer) {
+        return Some(WaitConditionOutcome::Steered);
+    }
+    if let Some(outcome) = condition_outcome(targets, return_when) {
+        return Some(outcome);
+    }
+    if pending_activity == Some(InputQueueActivity::Mailbox) {
+        return Some(WaitConditionOutcome::MailboxActivity);
+    }
+    None
 }
 
 fn refresh_condition_target_statuses(targets: &mut [ConditionTarget]) {
@@ -405,8 +436,6 @@ fn refresh_condition_target_statuses(targets: &mut [ConditionTarget]) {
     }
 }
 
-// Merge-safety anchor: after every V2 target-status wakeup, reconcile a closed receiver and
-// refresh every remaining subscription before error or final-success condition evaluation.
 async fn retire_condition_target_status_receiver(
     session: &crate::session::session::Session,
     target: &mut ConditionTarget,
@@ -492,6 +521,7 @@ impl WaitAgentResult {
             WaitConditionOutcome::AllFinal => "Wait completed: all targets are final.",
             WaitConditionOutcome::Errored => "Wait ended because a target errored.",
             WaitConditionOutcome::Steered => "Wait interrupted by new input.",
+            WaitConditionOutcome::MailboxActivity => "Wait completed.",
         };
         Self {
             message: message.to_string(),

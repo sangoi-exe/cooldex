@@ -22,6 +22,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
@@ -49,6 +50,7 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::from_slice;
@@ -277,6 +279,21 @@ fn function_call_output_text<'a>(body: &'a Value, call_id: &str) -> Option<&'a s
         })?
         .get("output")?
         .as_str()
+}
+
+fn request_body_contains(request: &wiremock::Request, text: &str) -> bool {
+    let body = match request
+        .headers
+        .get("content-encoding")
+        .and_then(|encoding| encoding.to_str().ok())
+    {
+        Some(encoding) if encoding.eq_ignore_ascii_case("zstd") => {
+            zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok()
+        }
+        _ => Some(request.body.clone()),
+    };
+    body.and_then(|body| String::from_utf8(body).ok())
+        .is_some_and(|body| body.contains(text))
 }
 
 fn assert_interrupted_sleep_output(output: Option<&str>) {
@@ -633,6 +650,267 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     );
 
     server.shutdown().await;
+}
+
+#[test_case("all_final"; "all final")]
+#[test_case("any_final"; "any final")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: a V2 targeted wait returns on real pending child mail without consuming it;
+// the next parent sampling request owns the normal agent-message delivery.
+async fn targeted_wait_delivers_pending_child_mail_to_next_parent_request(return_when: &str) {
+    const ROOT_PROMPT: &str = "spawn and wait for a running worker";
+    const CHILD_PROMPT: &str = "remain available while the parent waits";
+    const CHILD_STEER_PROMPT: &str = "send the parent an update and remain available";
+    const CHILD_MESSAGE: &str = "the running worker has an update";
+    const SPAWN_CALL_ID: &str = "spawn-running-worker";
+    const CHILD_INITIAL_WAIT_CALL_ID: &str = "hold-running-worker";
+    const CHILD_SEND_CALL_ID: &str = "send-running-worker-update";
+    const CHILD_SECOND_WAIT_CALL_ID: &str = "hold-after-sending-update";
+    const PARENT_WAIT_CALL_ID: &str = "wait-for-running-worker";
+
+    let server = responses::start_mock_server().await;
+    let spawn_arguments = json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+        "fork_turns": "none",
+    })
+    .to_string();
+    let parent_wait_arguments = json!({
+        "targets": ["/root/worker"],
+        "return_when": return_when,
+        "disable_timeout": true,
+    })
+    .to_string();
+    let child_send_arguments = json!({
+        "target": "/root",
+        "message": CHILD_MESSAGE,
+    })
+    .to_string();
+    let mut child_send_event = ev_function_call_with_namespace(
+        CHILD_SEND_CALL_ID,
+        "collaboration",
+        "send_message",
+        &child_send_arguments,
+    );
+    child_send_event["item"]["encrypted_function_args"] = json!([]);
+
+    let _root_spawn_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, ROOT_PROMPT)
+                && !request_body_contains(request, SPAWN_CALL_ID)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-root-spawn"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                "collaboration",
+                "spawn_agent",
+                &spawn_arguments,
+            ),
+            ev_completed("resp-root-spawn"),
+        ]),
+    )
+    .await;
+    let _child_initial_wait_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, CHILD_PROMPT)
+                && !request_body_contains(request, ROOT_PROMPT)
+                && !request_body_contains(request, CHILD_INITIAL_WAIT_CALL_ID)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-child-wait"),
+            ev_function_call_with_namespace(
+                CHILD_INITIAL_WAIT_CALL_ID,
+                "collaboration",
+                "wait_agent",
+                r#"{"timeout_ms":3600000}"#,
+            ),
+            ev_completed("resp-child-wait"),
+        ]),
+    )
+    .await;
+    let _root_wait_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, ROOT_PROMPT)
+                && request_body_contains(request, SPAWN_CALL_ID)
+                && !request_body_contains(request, PARENT_WAIT_CALL_ID)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-root-wait"),
+            ev_function_call_with_namespace(
+                PARENT_WAIT_CALL_ID,
+                "collaboration",
+                "wait_agent",
+                &parent_wait_arguments,
+            ),
+            ev_completed("resp-root-wait"),
+        ]),
+    )
+    .await;
+    let _child_send_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, CHILD_PROMPT)
+                && request_body_contains(request, CHILD_STEER_PROMPT)
+                && request_body_contains(request, CHILD_INITIAL_WAIT_CALL_ID)
+                && !request_body_contains(request, CHILD_SEND_CALL_ID)
+                && !request_body_contains(request, ROOT_PROMPT)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-child-send"),
+            child_send_event,
+            ev_completed("resp-child-send"),
+        ]),
+    )
+    .await;
+    let _child_second_wait_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, CHILD_PROMPT)
+                && request_body_contains(request, CHILD_SEND_CALL_ID)
+                && !request_body_contains(request, CHILD_SECOND_WAIT_CALL_ID)
+                && !request_body_contains(request, ROOT_PROMPT)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-child-second-wait"),
+            ev_function_call_with_namespace(
+                CHILD_SECOND_WAIT_CALL_ID,
+                "collaboration",
+                "wait_agent",
+                r#"{"timeout_ms":3600000}"#,
+            ),
+            ev_completed("resp-child-second-wait"),
+        ]),
+    )
+    .await;
+    let next_parent_request = responses::mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body_contains(request, ROOT_PROMPT)
+                && request_body_contains(request, PARENT_WAIT_CALL_ID)
+        },
+        responses::sse(vec![
+            ev_response_created("resp-root-delivery"),
+            ev_completed("resp-root-delivery"),
+        ]),
+    )
+    .await;
+
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            for feature in [Feature::Collab, Feature::MultiAgentV2] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("test config should allow feature update");
+            }
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build Codex test session");
+    let mut created_threads = test.thread_manager.subscribe_thread_created();
+
+    submit_user_input(test.codex.as_ref(), ROOT_PROMPT).await;
+    let child_thread_id = created_threads
+        .recv()
+        .await
+        .expect("spawn should create the running worker");
+    let child = test
+        .thread_manager
+        .get_thread(child_thread_id.clone())
+        .await
+        .expect("look up spawned worker");
+
+    wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::CollabWaitingBegin(wait)
+            if wait.call_id == PARENT_WAIT_CALL_ID
+                && wait.receiver_thread_ids == vec![child_thread_id.clone()] =>
+        {
+            Some(())
+        }
+        EventMsg::Error(error) => panic!("parent failed before entering targeted wait: {}", error.message),
+        EventMsg::TurnComplete(completed) => {
+            panic!("parent completed before entering targeted wait: {completed:?}")
+        }
+        _ => None,
+    })
+    .await;
+    wait_for_event_match(child.as_ref(), |event| match event {
+        EventMsg::CollabWaitingBegin(wait) if wait.call_id == CHILD_INITIAL_WAIT_CALL_ID => Some(()),
+        EventMsg::Error(error) => panic!("child failed before holding: {}", error.message),
+        EventMsg::TurnComplete(completed) => {
+            panic!("child completed before sending its update: {completed:?}")
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        child.agent_status().await,
+        AgentStatus::Running,
+        "the sender must remain nonfinal before it sends mail"
+    );
+
+    steer_user_input(child.as_ref(), CHILD_STEER_PROMPT).await;
+    wait_for_event_match(child.as_ref(), |event| match event {
+        EventMsg::CollabWaitingBegin(wait) if wait.call_id == CHILD_SECOND_WAIT_CALL_ID => Some(()),
+        EventMsg::Error(error) => panic!("child failed before its second hold: {}", error.message),
+        EventMsg::TurnComplete(completed) => {
+            panic!("child completed after sending its update: {completed:?}")
+        }
+        _ => None,
+    })
+    .await;
+    wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::TurnComplete(completed) if completed.error.is_none() => Some(()),
+        EventMsg::Error(error) => panic!("parent failed while returning from targeted wait: {}", error.message),
+        EventMsg::TurnComplete(completed) => {
+            panic!("parent completed with an error after targeted wait: {completed:?}")
+        }
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(
+        child.agent_status().await,
+        AgentStatus::Running,
+        "the sender must remain nonfinal after its mail releases the parent"
+    );
+    let request = next_parent_request.single_request();
+    let body = request.body_json();
+    let wait_output = function_call_output_text(&body, PARENT_WAIT_CALL_ID)
+        .expect("next parent request should contain targeted wait output");
+    assert_eq!(
+        serde_json::from_str::<Value>(wait_output).expect("parse targeted wait output"),
+        json!({
+            "message": "Wait completed.",
+            "timed_out": false,
+            "status": {"/root/worker": "running"},
+        })
+    );
+    assert!(
+        !wait_output.contains(CHILD_MESSAGE),
+        "queued mail must not be embedded in the targeted wait result"
+    );
+    assert_eq!(
+        responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(
+            Value::Array(request.inputs_of_type("agent_message")),
+        )),
+        Value::Array(vec![json!({
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [{
+                "type": "input_text",
+                "text": format!(
+                    "Message Type: MESSAGE\nTask name: /root\nSender: /root/worker\nPayload:\n{CHILD_MESSAGE}"
+                ),
+            }],
+        })])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

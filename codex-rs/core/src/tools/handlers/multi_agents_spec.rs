@@ -283,8 +283,8 @@ pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
         // Merge-safety anchor: V2 keeps generic mailbox/steer waiting distinct from explicit,
-        // completion-body-redacted known-target conditions; do not revive the V1 status-body contract.
-        description: "Wait in one of two modes. With only optional timeout_ms, wait for a mailbox update from any live agent or new user steer. For a known-target condition, provide non-empty unique targets, return_when (all_final for self-contained fan-in or any_final for incremental completion), and disable_timeout: true; targeted waits ignore mailbox activity without consuming it, but new user steer still interrupts. Does not return mailbox or final-message body content; error status details remain available."
+        // mailbox-aware, completion-body-redacted known-target conditions; do not revive the V1 status-body contract.
+        description: "Wait in one of two modes. With only optional timeout_ms, wait for a mailbox update from any live agent or new user steer. For a known-target condition, provide non-empty unique targets, return_when (all_final for self-contained fan-in or any_final for incremental completion), and disable_timeout: true; targeted waits return for actual pending agent communication before their requested final-state condition is reached. When concurrently observed, new user steer wins; target errors win over requested final-state success, and both win over mailbox activity. Queued communication is not embedded in the wait result; it is processed by the next parent sampling step. Does not return mailbox or final-message body content; error status details remain available."
             .to_string(),
         strict: false,
         defer_loading: None,
