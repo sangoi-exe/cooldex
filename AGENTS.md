@@ -706,10 +706,12 @@ the existing compaction installer and recovery owner atomically bind and consume
 - `/home/lucas/work/codex/codex-rs/core/src/compact_handoff.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/session/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/session/turn.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/tasks/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/context/post_compact_recovery.rs`, and
   `/home/lucas/work/codex/codex-rs/core/src/state/post_compact_recovery.rs` — bounded
   pre-compaction prompt-to-self synthesis, atomic recovery binding, typed context,
-  pending state, and first-accepted-response consumption owners.
+  pending state, first-accepted-response consumption, and fatal recovery-error
+  propagation through task-abort cleanup owners.
 - `/home/lucas/work/codex/codex-rs/protocol/src/protocol.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/config/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/agent/identity.rs`, and
