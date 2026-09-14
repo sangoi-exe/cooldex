@@ -5721,6 +5721,13 @@ async fn local_pre_compact_handoff_excludes_unadmitted_input_and_precedes_recove
     );
     assert!(
         handoff_request
+            .body_json()
+            .get("max_output_tokens")
+            .is_none(),
+        "hidden handoff request must omit unsupported max_output_tokens"
+    );
+    assert!(
+        handoff_request
             .message_input_texts("user")
             .iter()
             .any(|text| text == "LOCAL_ADMITTED_ONE")

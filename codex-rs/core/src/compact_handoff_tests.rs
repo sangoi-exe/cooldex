@@ -244,7 +244,7 @@ async fn pending_identity_without_cached_packet_neither_loads_recall_nor_mutates
 }
 
 #[tokio::test]
-async fn synthesis_prompt_is_tool_free_bounded_and_uses_frozen_settings() {
+async fn synthesis_prompt_is_tool_free_without_output_token_limit_and_uses_frozen_settings() {
     let (session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
     let step_context =
@@ -261,10 +261,7 @@ async fn synthesis_prompt_is_tool_free_bounded_and_uses_frozen_settings() {
 
     assert!(prompt.tools.is_empty());
     assert!(!prompt.parallel_tool_calls);
-    assert_eq!(
-        prompt.max_output_tokens,
-        Some(PRE_COMPACT_HANDOFF_MAX_OUTPUT_TOKENS)
-    );
+    assert_eq!(prompt.max_output_tokens, None);
     assert_eq!(source.settings, settings);
     assert!(prompt.input.last().is_some_and(|item| {
         matches!(item, ResponseItem::Message { role, content, .. }
@@ -303,6 +300,23 @@ async fn collector_combines_assistant_text_only_after_completed() {
     .expect("collector transport");
 
     assert_eq!(result, Ok("first second".to_string()));
+}
+
+#[tokio::test]
+async fn collector_accepts_completed_assistant_text_above_removed_carrier_threshold() {
+    let handoff = vec!["word"; 1_201].join(" ");
+    let result = collect_handoff_response(
+        response_stream(vec![
+            Ok(ResponseEvent::OutputItemDone(assistant_message(&handoff))),
+            Ok(completed()),
+        ]),
+        &CancellationToken::new(),
+        |_| {},
+    )
+    .await
+    .expect("collector transport");
+
+    assert_eq!(result, Ok(handoff));
 }
 
 #[tokio::test]
@@ -351,8 +365,6 @@ async fn collector_discards_all_partial_text_for_invalid_or_incomplete_output() 
         role: "developer".to_string(),
         tools: Vec::new(),
     };
-    let oversized =
-        assistant_message(&vec!["word"; PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS + 100].join(" "));
     let cases = vec![
         (
             response_stream(vec![
@@ -403,13 +415,6 @@ async fn collector_discards_all_partial_text_for_invalid_or_incomplete_output() 
         (
             response_stream(vec![Err(CodexErr::ContextWindowExceeded)]),
             PreCompactHandoffFailure::ContextWindowExceeded,
-        ),
-        (
-            response_stream(vec![
-                Ok(ResponseEvent::OutputItemDone(oversized)),
-                Ok(completed()),
-            ]),
-            PreCompactHandoffFailure::CarrierBudgetExceeded,
         ),
     ];
 

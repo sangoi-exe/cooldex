@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use super::*;
 
-// Merge-safety anchor: the optional Responses generation cap stays absent for ordinary prompts
-// unless a maintenance caller explicitly requests it.
+// Merge-safety anchor: optional Responses output-token ceilings stay absent unless a caller
+// explicitly supplies one.
 
 fn empty_tools() -> Arc<RawValue> {
     Arc::from(RawValue::from_string("[]".to_string()).expect("valid tool JSON"))

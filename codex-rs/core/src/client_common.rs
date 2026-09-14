@@ -35,8 +35,8 @@ pub struct Prompt {
     /// Whether the Responses API should strictly validate `output_schema`.
     pub output_schema_strict: bool,
 
-    /// Merge-safety anchor: maintenance synthesis needs a provider-enforced generation ceiling,
-    /// which must propagate identically to both Responses transports.
+    /// Merge-safety anchor: an optional output-token ceiling must propagate identically to both
+    /// Responses transports when a caller supplies one.
     pub(crate) max_output_tokens: Option<u32>,
 
     pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,

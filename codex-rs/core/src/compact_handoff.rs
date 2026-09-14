@@ -23,15 +23,12 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::field;
 use tracing::trace_span;
 use tracing::warn;
 
-pub(crate) const PRE_COMPACT_HANDOFF_MAX_OUTPUT_TOKENS: u32 = 2_000;
-pub(crate) const PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS: usize = 1_200;
 pub(crate) const PRE_COMPACT_HANDOFF_INSTRUCTIONS: &str = "Prepare a concise, execution-ready prompt-to-self for continuing this work after context compaction. Target about 1,000 visible tokens. Preserve the objective, current execution state, accepted decisions and constraints, essential concrete anchors, uncertainty, and the next action only when work remains. Clearly distinguish established facts and accepted decisions from proposals or uncertainty. Do not invent pending user input, do not answer a historical user request again, and do not use tools.";
 
 /// Frozen request inputs whose equality can reject installation from a stale source.
@@ -126,7 +123,7 @@ impl PreCompactHandoffSource {
             base_instructions: self.base_instructions.clone(),
             output_schema: None,
             output_schema_strict: true,
-            max_output_tokens: Some(PRE_COMPACT_HANDOFF_MAX_OUTPUT_TOKENS),
+            max_output_tokens: None,
             cyber_access_program: None,
         }
     }
@@ -139,7 +136,6 @@ pub(crate) enum PreCompactHandoffFailure {
     UnexpectedOutput,
     EmptyOutput,
     StreamEnded,
-    CarrierBudgetExceeded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,9 +377,6 @@ impl HandoffOutputCollector {
             ResponseEvent::Completed { .. } => {
                 if self.text.trim().is_empty() {
                     return Err(PreCompactHandoffFailure::EmptyOutput);
-                }
-                if approx_token_count(&self.text) > PRE_COMPACT_HANDOFF_CARRIER_MAX_TOKENS {
-                    return Err(PreCompactHandoffFailure::CarrierBudgetExceeded);
                 }
                 Ok(Some(std::mem::take(&mut self.text)))
             }

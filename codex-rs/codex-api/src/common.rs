@@ -289,8 +289,8 @@ pub struct ResponsesApiRequest {
     pub tool_choice: String,
     pub parallel_tool_calls: bool,
     pub reasoning: Option<Reasoning>,
-    // Merge-safety anchor: keep the hard generation ceiling wire-identical across HTTP and
-    // `response.create` so bounded maintenance requests cannot lose their provider cap.
+    // Merge-safety anchor: an optional output-token ceiling remains wire-identical across HTTP
+    // and `response.create`, including omission when no caller supplies one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     pub store: bool,
