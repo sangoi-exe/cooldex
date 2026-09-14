@@ -99,8 +99,8 @@ impl AutoCompactWindow {
             && ids.window_id.get_version_num() == 7
     }
 
-    // Merge-safety anchor: a prepared window advance validates its generation and predecessor
-    // window/boundary identities before atomically resetting per-window state.
+    // Merge-safety anchor: a prepared window advance validates the next window number and UUID
+    // lineage before atomically resetting per-window state.
     pub(super) fn install_prepared_advance(
         &mut self,
         window_number: u64,

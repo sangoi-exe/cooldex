@@ -326,8 +326,8 @@ async fn start_or_steer(
     }
 }
 
-// Merge-safety anchor: idle start reserves an idle TurnSlot, then rechecks admission and cancels
-// the uninstalled claim while returning original input on rejection.
+// Merge-safety anchor: idle start reserves an idle TurnSlot, rechecks admission, and cancels the
+// uninstalled claim while returning a rejection reason.
 async fn start_if_idle(
     session: &Arc<Session>,
     request: TurnInputRequest,

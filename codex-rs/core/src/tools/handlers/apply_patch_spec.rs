@@ -6,7 +6,7 @@ const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("../../../assets/tools/apply
 
 /// Returns a custom tool that can be used to edit files. Well-suited for GPT-5 models
 /// https://platform.openai.com/docs/guides/function-calling#custom-tools
-// Merge-safety anchor: the model-facing apply-patch contract preserves the one-path-per-operation
+// Merge-safety anchor: the model-facing apply-patch contract preserves the one-operation-per-path
 // rule and existing freeform grammar.
 pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpec {
     let definition = if include_environment_id {
