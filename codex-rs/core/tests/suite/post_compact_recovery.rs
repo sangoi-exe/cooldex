@@ -717,7 +717,7 @@ else:
         "the transient handoff packet must never enter persisted rollout items"
     );
     assert!(
-        !persisted_items.contains("continue after compaction"),
+        !persisted_items.contains("resume from the compacted state"),
         "generated handoff content must never enter persisted rollout items"
     );
     let compacted = items
