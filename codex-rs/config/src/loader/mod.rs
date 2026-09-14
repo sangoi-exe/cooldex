@@ -81,6 +81,7 @@ const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "model_provider",
     "model_providers",
     "notify",
+    // Merge-safety anchor: project-local config cannot override post-compact recovery instructions.
     "post_compact_recovery_instructions",
     "profile",
     "profiles",

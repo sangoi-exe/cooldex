@@ -125,6 +125,8 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
     }
 }
 
+// Merge-safety anchor: fork truncation keeps a recovery-application proof only when its
+// (compaction_window_id, boundary_item_id) pair remains owned by retained history.
 pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
     let owned_recovery_identities = items
         .iter()

@@ -17,6 +17,8 @@ enum RolloutReader {
     Compressed(File),
 }
 
+// Merge-safety anchor: bounded source opening distinguishes direct plain reads, decoded compressed
+// sources, and physical-source limit exhaustion.
 /// Seekable rollout input opened under a physical source-byte limit.
 pub enum SourceByteLimitedSeekableReader {
     /// The returned file is the physical rollout source. The caller must apply the byte limit to
@@ -68,6 +70,8 @@ pub fn open_rollout_seekable_reader(path: &Path) -> io::Result<File> {
 /// Compressed files must be consumed from the beginning, so this returns
 /// [`SourceByteLimitedSeekableReader::LimitExceeded`] before decoding when the complete compressed
 /// source is larger than `max_source_bytes`.
+// Merge-safety anchor: plain sources remain directly bounded, while oversized compressed sources
+// reject physical source bytes before decode.
 pub fn open_rollout_seekable_reader_with_source_byte_limit(
     path: &Path,
     max_source_bytes: u64,

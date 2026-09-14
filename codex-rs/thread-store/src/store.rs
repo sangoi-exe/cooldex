@@ -164,6 +164,8 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
+    // Merge-safety anchor: ThreadStore preserves fallback settings-snapshot and bounded-tail
+    // contracts, with recall projection separate.
     /// Loads the newest persisted thread settings snapshot.
     ///
     /// Implementations with a targeted persisted-history reader should override this method.

@@ -807,6 +807,8 @@ impl Session {
         let restore_child_window = matches!(&initial_history, InitialHistory::Forked(_))
             && session_configuration.session_source.is_non_root_agent()
             && config.features.enabled(Feature::TokenBudget);
+        // Merge-safety anchor: child checkpoint restoration validates UUID-v7 lineage and remaps
+        // retained recovery-application identities to the checkpoint window.
         if restore_child_window && let InitialHistory::Forked(items) = &mut initial_history {
             #[derive(Clone)]
             struct SourceCheckpoint {

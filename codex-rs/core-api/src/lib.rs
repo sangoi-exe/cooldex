@@ -11,6 +11,7 @@ pub use codex_config::ConfigLayerStack;
 pub use codex_config::config_toml::ProjectConfig;
 pub use codex_config::config_toml::RealtimeAudioConfig;
 pub use codex_config::config_toml::RealtimeConfig;
+// Merge-safety anchor: public facade retains the local AppServerMode re-export for runtime callers.
 pub use codex_config::types::AppServerMode;
 pub use codex_config::types::AuthCredentialsStoreMode;
 pub use codex_config::types::AuthKeyringBackendKind;
@@ -94,6 +95,7 @@ pub use codex_features::Feature;
 pub use codex_features::Features;
 pub use codex_history::InitialHistory;
 pub use codex_home::CodexHomeUserInstructionsProvider;
+// Merge-safety anchor: public facade retains GlobalInstructionsMode re-export for runtime callers.
 pub use codex_home::GlobalInstructionsMode;
 pub use codex_image_generation_extension::install as install_image_generation_extension;
 pub use codex_login::AuthHeaders;

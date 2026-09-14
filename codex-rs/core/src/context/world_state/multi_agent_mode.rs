@@ -21,6 +21,8 @@ impl EffectiveMultiAgentMode {
     }
 }
 
+// Merge-safety anchor: serialized mode state retains bounded explanation and usage-hint identity,
+// rerendering whenever either changes.
 /// Effective multi-agent mode currently visible to the model.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct MultiAgentModeState {

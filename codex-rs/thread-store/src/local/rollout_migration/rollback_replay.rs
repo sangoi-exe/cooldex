@@ -75,6 +75,8 @@ impl ModelReplayPlanner {
             | RolloutItem::ResponseItem(_)
             | RolloutItem::EventMsg(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            // Merge-safety anchor: recovery proof records create neither rollback nor
+            // model-history boundaries.
             | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::TokenUsageRecord(_)

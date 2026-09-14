@@ -23,6 +23,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM HUP
 
+# Merge-safety anchor: Build under cargo-guard, resolve the Cargo metadata target directory, then launch long-lived binaries outside the guard.
 (
   cd "$cargo_root"
   CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \

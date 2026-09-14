@@ -42,6 +42,7 @@ setup_remote_env() {
     return 1
   fi
 
+  # Merge-safety anchor: Remote-env tests build under cargo-guard and resolve the Codex binary from the Cargo metadata target directory.
   (
     cd "${REPO_ROOT}/codex-rs"
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \

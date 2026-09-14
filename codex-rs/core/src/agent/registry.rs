@@ -50,6 +50,8 @@ impl RegisteredAgent {
     }
 }
 
+// Merge-safety anchor: registry metadata carries the captured identity snapshot so reload never
+// reconstructs identity from mutable role/config state.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AgentMetadata {
     pub(crate) agent_id: Option<ThreadId>,

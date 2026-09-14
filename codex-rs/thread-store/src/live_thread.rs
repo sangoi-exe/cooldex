@@ -226,6 +226,8 @@ impl LiveThread {
         Ok(())
     }
 
+    // Merge-safety anchor: canonical history append/flush is durable before rebuildable metadata
+    // projection; projection failure remains pending for retry.
     /// Appends one canonical history batch and waits until it is durable/readable.
     ///
     /// Rebuildable metadata remains a projection: a projection failure after the
@@ -307,6 +309,8 @@ impl LiveThread {
         self.flush_pending_metadata_update().await
     }
 
+    // Merge-safety anchor: canonical history flush precedes rebuildable metadata projection flush
+    // and preserves retryability.
     /// Flushes only canonical history, without making rebuildable metadata part
     /// of the durability result.
     pub async fn flush_history(&self) -> ThreadStoreResult<()> {

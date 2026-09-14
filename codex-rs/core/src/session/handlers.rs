@@ -253,6 +253,8 @@ pub async fn compact(sess: &Arc<Session>, sub_id: String) {
     sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
 }
 
+// Merge-safety anchor: rollback waits only through transient TurnSlot transitions, rejects a
+// live active turn, and fails closed when the generation channel closes.
 pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32) {
     if num_turns == 0 {
         sess.send_event_raw(Event {

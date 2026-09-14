@@ -76,6 +76,8 @@ pub fn builder_from_items(
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        // Merge-safety anchor: internal recovery proof records stay outside rollout and
+        // memory-mode metadata.
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
@@ -169,6 +171,8 @@ pub async fn extract_metadata_from_rollout(
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
+            // Merge-safety anchor: internal recovery proof records do not supply memory-mode
+            // metadata.
             | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)

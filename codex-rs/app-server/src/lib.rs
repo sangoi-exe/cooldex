@@ -483,6 +483,8 @@ impl Default for AppServerRuntimeOptions {
     }
 }
 
+// Merge-safety anchor: instance-child launch requires matching `AppServerMode` marker and Unix
+// socket validation; Profile V2 selection is a separate config seam.
 fn validate_app_server_launch_mode(
     configured_mode: AppServerMode,
     launch_mode: AppServerLaunchMode,
@@ -788,6 +790,8 @@ pub async fn run_main_with_transport_options(
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
+    // Merge-safety anchor: instance-child mode terminates after its final connection, while direct
+    // Unix-socket service remains multi-client.
     let shutdown_when_no_connections =
         single_client_mode || runtime_options.launch_mode == AppServerLaunchMode::InstanceChild;
     let graceful_signal_restart_enabled =

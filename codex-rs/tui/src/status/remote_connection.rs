@@ -16,6 +16,8 @@ pub(crate) struct ServerVersionNotice {
     pub(crate) offer_update: bool,
 }
 
+// Merge-safety anchor: InstanceChild shares Embedded's local status identity and has no remote
+// endpoint; preserve that in both status-value rendering and version-notice key hashing.
 pub(crate) fn remote_connection_status_value(
     app_server_target: &AppServerTarget,
     server_version: Option<&str>,

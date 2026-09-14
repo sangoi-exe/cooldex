@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# Merge-safety anchor: Package helpers preserve script-derived repository-root resolution and validation of any CODEX_REPO_ROOT override.
 def repo_root_from_script() -> Path:
     return Path(__file__).resolve().parents[2]
 

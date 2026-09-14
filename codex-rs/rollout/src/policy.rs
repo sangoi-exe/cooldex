@@ -15,6 +15,8 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev, history_mode),
         RolloutItem::RealtimeItem(_) => matches!(history_mode, ThreadHistoryMode::Paginated),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
+        // Merge-safety anchor: post-compact recovery application proof remains canonical
+        // persisted control history.
         RolloutItem::Compacted(_)
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TurnContext(_)

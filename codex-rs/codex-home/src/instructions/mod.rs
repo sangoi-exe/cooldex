@@ -40,6 +40,8 @@ impl CodexHomeUserInstructionsProvider {
     }
 
     async fn load_from_codex_home(&self) -> LoadedUserInstructions {
+        // Merge-safety anchor: exclusion returns no global instructions before file reads;
+        // inclusion retains AGENTS.override.md-before-AGENTS.md precedence.
         if self.mode == GlobalInstructionsMode::Exclude {
             return LoadedUserInstructions::default();
         }

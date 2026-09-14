@@ -71,6 +71,7 @@ pub use types::ListItemsParams;
 pub use types::ListThreadsParams;
 pub use types::ListTimelineParams;
 pub use types::ListTurnsParams;
+// Merge-safety anchor: retain public bounded rollout-tail and recall-tail API type exports.
 pub use types::LoadRolloutTailParams;
 pub use types::LoadThreadHistoryParams;
 pub use types::MoveThreadToSectionParams;

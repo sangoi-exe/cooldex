@@ -66,6 +66,8 @@ pub fn is_structured_feature_path<S: AsRef<str>>(path: &[S]) -> bool {
         _ => return false,
     };
 
+    // Merge-safety anchor: Computer Use remains in this structured-feature match so boolean/table
+    // merges retain nested runtime settings across config layers.
     features.as_ref() == "features"
         && matches!(
             feature.as_ref(),

@@ -661,6 +661,8 @@ pub(crate) fn construct_model_info_from_candidates(
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
     let model_info = if let Some(mut remote) = remote {
+        // Merge-safety anchor: catalog-resolved GPT-5.6 Sol/Terra/Luna disable Responses Lite;
+        // unrelated models retain catalog-driven behavior.
         if matches!(
             remote.slug.as_str(),
             "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"

@@ -162,6 +162,8 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
+// Merge-safety anchor: generic bounded-tail inputs/results retain physical-byte, record-count,
+// reached-start, and segment accounting independently of the narrower recall projection.
 /// Parameters for a bounded newest-to-oldest read of one thread's canonical rollout.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadRolloutTailParams {
@@ -197,6 +199,8 @@ pub struct StoredModelContext {
     pub items: Vec<RolloutItem>,
 }
 
+// Merge-safety anchor: stored rollout tails retain reached-start plus physical byte, record, and
+// segment accounting.
 /// Bounded canonical rollout items returned in replay order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredRolloutTail {

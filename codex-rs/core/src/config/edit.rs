@@ -874,6 +874,8 @@ impl ConfigEditsBuilder {
         self
     }
 
+    // Merge-safety anchor: structured feature toggles preserve nested settings; network_proxy
+    // retains its credential-broker exception when disabled.
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
     /// Disabling a default-false feature clears the key instead of

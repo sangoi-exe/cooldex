@@ -718,12 +718,16 @@ pub struct Config {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: bool,
 
+    // Merge-safety anchor: root-thread global AGENTS inclusion is an explicit setting, separate
+    // from project-document discovery.
     /// Whether root threads load global AGENTS instructions from the Codex home directory.
     pub include_global_agents_md: bool,
 
     /// Compact prompt override.
     pub compact_prompt: Option<String>,
 
+    // Merge-safety anchor: post-compact recovery instructions remain a separate model-visible
+    // configuration channel.
     /// Model-visible developer instructions included in post-compact recovery context.
     pub post_compact_recovery_instructions: Option<String>,
 
@@ -774,6 +778,8 @@ pub struct Config {
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     pub tui_raw_output_mode: bool,
 
+    // Merge-safety anchor: interactive TUI app-server ownership remains a distinct local runtime
+    // setting.
     /// Selects the local app-server ownership mode for an interactive TUI.
     pub tui_app_server_mode: AppServerMode,
 
@@ -1155,6 +1161,8 @@ impl Default for CodeModeConfig {
     }
 }
 
+// Merge-safety anchor: Computer Use retains explicit runtime path and timeout fields at this
+// configuration owner.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ComputerUseConfig {
     pub mcp_bin: Option<PathBuf>,
@@ -1307,6 +1315,8 @@ impl Default for CurrentTimeReminderConfig {
     }
 }
 
+// Merge-safety anchor: MultiAgentV2 retains explicit policy and defaults at this runtime
+// configuration owner before feature-table resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MultiAgentV2Config {
     pub policy: MultiAgentV2Policy,
@@ -2738,6 +2748,8 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     }
 }
 
+// Merge-safety anchor: this resolver maps Computer Use paths and timing settings from the
+// dedicated feature table; unavailable runtime pairs have no invented fallback.
 fn resolve_computer_use_config(config_toml: &ConfigToml) -> ComputerUseConfig {
     let base = computer_use_toml_config(config_toml.features.as_ref());
 
@@ -2752,6 +2764,8 @@ fn resolve_computer_use_config(config_toml: &ConfigToml) -> ComputerUseConfig {
     }
 }
 
+// Merge-safety anchor: MultiAgentV2 policy resolves through this feature-table owner with its
+// configured concurrency and instruction settings.
 fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
     let max_concurrent_threads_per_session = base

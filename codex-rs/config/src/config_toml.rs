@@ -252,6 +252,8 @@ pub struct ConfigToml {
     /// Whether to inject the `<environment_context>` user block.
     pub include_environment_context: Option<bool>,
 
+    // Merge-safety anchor: fork-owned top-level `include_global_agents_md` remains an explicit
+    // config seam, independent of developer-instruction precedence.
     /// Whether to load global AGENTS instructions from the Codex home directory.
     pub include_global_agents_md: Option<bool>,
 
@@ -264,6 +266,8 @@ pub struct ConfigToml {
     /// Compact prompt used for history compaction.
     pub compact_prompt: Option<String>,
 
+    // Merge-safety anchor: fork-owned top-level `post_compact_recovery_instructions` remains an
+    // explicit config seam, independent of developer-instruction precedence.
     /// Model-visible developer instructions included in post-compact recovery context.
     pub post_compact_recovery_instructions: Option<String>,
 

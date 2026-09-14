@@ -13,6 +13,8 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ### Installing and running Cooldex
 
+<!-- Merge-safety anchor: Cooldex Quickstart preserves its fork-owned release URL, x86_64 Linux/WSL support boundary, and fork inventory. -->
+
 Cooldex standalone releases currently support x86_64 Linux, including WSL on x86_64.
 
 ```shell

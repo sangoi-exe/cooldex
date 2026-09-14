@@ -101,6 +101,7 @@ remote_repo_root="$HOME/code/codex-sync"
 remote_codex_rs="$remote_repo_root/codex-rs"
 
 cd "${remote_codex_rs}"
+# Merge-safety anchor: Remote exec-server startup builds under cargo-guard and resolves the Cargo metadata target directory before launch.
 CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" \
   bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
 remote_target_dir="$(

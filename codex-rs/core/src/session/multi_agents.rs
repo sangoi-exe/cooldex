@@ -68,6 +68,8 @@ pub(crate) struct ResolvedMultiAgentV2UsageHints {
     pub(crate) subagent: Option<MultiAgentRoleInstructions>,
 }
 
+// Merge-safety anchor: V2 usage hints retain captured-binding, configured, then catalog/bundled
+// precedence and omit operator-facing text for internal or non-thread-spawn subagent sources.
 pub(crate) fn usage_hint_text(
     turn_context: &TurnContext,
     session_source: &SessionSource,
@@ -173,6 +175,8 @@ pub(crate) fn resolve_usage_hints(
     }
 }
 
+// Merge-safety anchor: effective V2 mode follows config policy and remains absent for internal or
+// non-thread-spawn subagent sources.
 pub(crate) fn effective_multi_agent_mode(
     turn_context: &TurnContext,
 ) -> Option<EffectiveMultiAgentMode> {

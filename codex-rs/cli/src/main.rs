@@ -1118,6 +1118,8 @@ struct FeatureSetArgs {
     feature: String,
 }
 
+// Merge-safety anchor: hidden `--psp` stays process-only and maps only to the
+// runtime `features.psp=true` override.
 fn apply_runtime_psp_override(psp: bool, overrides: &mut CliConfigOverrides) {
     if psp {
         overrides
@@ -1350,6 +1352,10 @@ async fn cli_main(
                 root_remote_auth_token_env.as_deref(),
                 subcommand.as_ref(),
             )?;
+            // Merge-safety anchor: TUI-owned InstanceChild rejects tooling and remote control.
+            // It forces disabled ephemeral remote control and `InstanceChild` launch mode,
+            // preserves CLI session source, and keeps config-mode exec-server/debug
+            // prompt-input use rejected.
             validate_instance_child_app_server_command(
                 instance_child,
                 remote_control,
@@ -1363,6 +1369,8 @@ async fn cli_main(
                         listen
                     };
                     let auth = auth.try_into_settings()?;
+                    // Merge-safety anchor: InstanceChild startup forces disabled ephemeral
+                    // remote control, `InstanceChild` launch mode, and the CLI session source.
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
                         code_mode_host_transport: code_mode_host.into(),
                         remote_control_startup_mode: if instance_child {
@@ -2244,6 +2252,8 @@ async fn load_exec_server_config(
     Ok(builder.build().await?)
 }
 
+// Merge-safety anchor: config-mode InstanceChild remains unavailable to exec-server and debug
+// prompt-input entry points.
 fn reject_instance_child_mode(
     config: &codex_core::config::Config,
     entrypoint: &str,

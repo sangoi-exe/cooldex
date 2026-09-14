@@ -74,6 +74,8 @@ impl AutoCompactWindow {
         self.ids = ids;
     }
 
+    // Merge-safety anchor: candidate advance creation is non-mutating; generation and predecessor
+    // validation remain separate before install/reset.
     pub(super) fn prepare_advance(&self) -> (u64, AutoCompactWindowIds) {
         (
             self.window_number.saturating_add(1),
@@ -97,6 +99,8 @@ impl AutoCompactWindow {
             && ids.window_id.get_version_num() == 7
     }
 
+    // Merge-safety anchor: a prepared window advance validates its generation and predecessor
+    // window/boundary identities before atomically resetting per-window state.
     pub(super) fn install_prepared_advance(
         &mut self,
         window_number: u64,

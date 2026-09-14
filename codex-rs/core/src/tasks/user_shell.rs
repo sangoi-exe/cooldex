@@ -49,6 +49,8 @@ use codex_protocol::models::PermissionProfile;
 
 const USER_SHELL_TIMEOUT_MS: u64 = 60 * 60 * 1000; // 1 hour
 
+// Merge-safety anchor: standalone shell owns turn lifecycle and durable persistence; auxiliary
+// execution must not emit a duplicate lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserShellCommandMode {
     /// Executes as an independent turn whose task startup barrier owns
@@ -439,6 +441,8 @@ fn prepare_user_shell_exec_command_with_path_prepend(
     )
 }
 
+// Merge-safety anchor: standalone shell materializes durable rollout output, while auxiliary
+// execution injects its output without opening a second turn.
 async fn persist_user_shell_output(
     session: &Session,
     turn_context: &TurnContext,

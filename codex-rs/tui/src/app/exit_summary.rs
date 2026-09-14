@@ -31,6 +31,8 @@ impl App {
         };
         let disconnect_info = thread_id.and_then(|_| {
             let command = match &self.app_server_target {
+                // Merge-safety anchor: InstanceChild is owned by this TUI process and must not
+                // emit reconnect or stop command guidance.
                 AppServerTarget::Embedded | AppServerTarget::InstanceChild => return None,
                 AppServerTarget::LocalDaemon { .. } => vec!["codex".to_string()],
                 AppServerTarget::Remote { endpoint } => {

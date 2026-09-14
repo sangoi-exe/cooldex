@@ -11,6 +11,8 @@ Use Node.js 22 and Python 3.10 or later.
 
 ## Run the conformance gate
 
+<!-- Merge-safety anchor: MCP conformance builds the Codex executable through the guarded Cargo route. -->
+
 From the repository root, first install the frozen workspace dependencies and build Codex through the guarded Cargo route:
 
 ```bash

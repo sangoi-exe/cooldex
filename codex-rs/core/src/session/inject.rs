@@ -167,6 +167,8 @@ impl Session {
             .await;
     }
 
+    // Merge-safety anchor: automatic idle admission rechecks trigger-turn mail, rejects Plan-mode
+    // auto-start, returns original input, and cancels an uninstalled claim.
     /// Starts a regular turn with the provided input only if automatic idle work
     /// is allowed for the current session state.
     ///

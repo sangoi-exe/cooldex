@@ -2212,6 +2212,8 @@ pub struct ThreadSettingsSnapshot {
     pub collaboration_mode: CollaborationMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    // Merge-safety anchor: persisted full-history `shell_tool_enabled` crosses protocol,
+    // reconstruction, and thread-store consumers; keep those surfaces aligned.
     pub shell_tool_enabled: Option<bool>,
 }
 

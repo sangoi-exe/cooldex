@@ -406,6 +406,8 @@ impl Session {
         }
     }
 
+    // Merge-safety anchor: start/replacement shares generation-bound retirement with abort before
+    // installing a successor task.
     async fn replace_or_start_task(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -1146,6 +1148,8 @@ impl Session {
         Ok(())
     }
 
+    // Merge-safety anchor: task completion retains terminal transition, submitted-message cleanup,
+    // durable terminal flush, and idle handoff as one lifecycle.
     pub async fn on_task_finished(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,

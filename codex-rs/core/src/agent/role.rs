@@ -140,6 +140,8 @@ async fn apply_role_to_config_inner(
         }
     }
 
+    // Merge-safety anchor: a role overlay cannot set the instruction-snapshot file or disable V2
+    // while a live snapshot exists.
     let role_layer_toml = TomlValue::try_from(&overrides)?;
     if raw_role_layer_toml
         .get("features")
@@ -162,6 +164,8 @@ async fn apply_role_to_config_inner(
     {
         return Ok(());
     }
+    // Merge-safety anchor: model/compaction role overrides apply to cloned config, and a live
+    // instruction snapshot re-enables V2 after feature overrides.
     *config = role_overrides::build_next_config(
         config,
         role_layer_toml,

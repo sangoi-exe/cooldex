@@ -81,6 +81,8 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        // Merge-safety anchor: persisted post-compact recovery proof records remain omitted from
+        // the public thread-history projection.
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::TokenUsageRecord(_)

@@ -291,6 +291,8 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        // Merge-safety anchor: internal recovery proof records produce no user-visible
+        // conversation-search text.
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::RealtimeItem(_)
         | RolloutItem::RetainedContext(_)

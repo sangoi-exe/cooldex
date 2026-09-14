@@ -232,6 +232,8 @@ pub(super) async fn handle_recovery(
     start_if_idle(session, request, submission_id, TurnStartKind::Recovery).await
 }
 
+// Merge-safety anchor: start-or-steer projects typed SteerInputError results; only NoActiveTurn
+// falls through to regular-turn creation.
 async fn start_or_steer(
     session: &Arc<Session>,
     request: TurnInputRequest,
@@ -324,6 +326,8 @@ async fn start_or_steer(
     }
 }
 
+// Merge-safety anchor: idle start reserves an idle TurnSlot, then rechecks admission and cancels
+// the uninstalled claim while returning original input on rejection.
 async fn start_if_idle(
     session: &Arc<Session>,
     request: TurnInputRequest,
@@ -443,6 +447,8 @@ async fn start_if_idle(
     })
 }
 
+// Merge-safety anchor: explicit steering retains expected-turn routing and typed SteerInputError
+// projection without falling back to a new task.
 async fn steer(
     session: &Arc<Session>,
     request: TurnInputRequest,

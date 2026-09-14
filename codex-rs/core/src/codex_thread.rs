@@ -388,6 +388,8 @@ impl CodexThread {
             .await
     }
 
+    // Merge-safety anchor: paired immediate/persisted admission APIs keep typed outcomes;
+    // persisted admission requires client identity and awaits durable rollout acknowledgement.
     /// Waits until Core has started a turn or steered the active turn.
     pub async fn submit_user_input_and_wait_for_admission(
         &self,
@@ -573,6 +575,8 @@ impl CodexThread {
         }
     }
 
+    // Merge-safety anchor: shared admission registration preserves the selected immediate/persisted
+    // state through routing, so only the persisted path completes after durable rollout flush.
     async fn submit_user_input_and_wait_for_admission_inner(
         &self,
         mut request: TurnInputRequest,

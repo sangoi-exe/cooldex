@@ -36,6 +36,8 @@ impl MultiAgentModeInstructions {
     }
 }
 
+// Merge-safety anchor: built-in/custom mode instructions and optional explanation stay inside one
+// tagged 400-token context budget.
 pub(super) fn bounded_mode_and_explanation(
     multi_agent_mode: MultiAgentMode,
     explanation: Option<&str>,

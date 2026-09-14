@@ -416,6 +416,8 @@ mod job {
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
+                // Merge-safety anchor: internal PostCompactRecoveryApplied records stay out of
+                // memory prompt serialization.
                 | RolloutItem::PostCompactRecoveryApplied(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::TokenUsageRecord(_)
