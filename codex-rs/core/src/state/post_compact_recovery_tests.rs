@@ -1,5 +1,6 @@
 use super::*;
 use crate::context::PostCompactRecoveryContext;
+use codex_history::PostCompactRecoveryPayloadKind;
 use pretty_assertions::assert_eq;
 
 fn identity() -> PostCompactRecoveryIdentity {
@@ -10,23 +11,40 @@ fn identity() -> PostCompactRecoveryIdentity {
 }
 
 #[test]
-fn sampling_success_builds_application_without_clearing_pending_state() {
+fn sampling_success_builds_application_for_the_exact_cached_packet_without_clearing_pending_state()
+{
     let identity = identity();
-    let state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+    for (handoff, payload_kind) in [
+        (
+            Some("operation-local handoff"),
+            PostCompactRecoveryPayloadKind::HandoffAndRecovery,
+        ),
+        (None, PostCompactRecoveryPayloadKind::RecoveryOnly),
+    ] {
+        let packet = PostCompactRecoveryContext::new(
+            &identity.compaction_window_id,
+            &identity.boundary_item_id,
+            "fixed boundary",
+            handoff,
+        )
+        .expect("recovery packet");
+        let state = PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet);
 
-    let application = state
-        .application_for_sampling_success(&identity, "turn_with_response")
-        .expect("matching sampling success");
+        let application = state
+            .application_for_sampling_success(&identity, "turn_with_response")
+            .expect("matching sampling success");
 
-    assert_eq!(state.pending_identity(), Some(&identity));
-    assert_eq!(
-        application,
-        PostCompactRecoveryAppliedItem {
-            compaction_window_id: identity.compaction_window_id,
-            boundary_item_id: identity.boundary_item_id,
-            turn_id: "turn_with_response".to_string(),
-        }
-    );
+        assert_eq!(state.pending_identity(), Some(&identity));
+        assert_eq!(
+            application,
+            PostCompactRecoveryAppliedItem {
+                compaction_window_id: identity.compaction_window_id.clone(),
+                boundary_item_id: identity.boundary_item_id.clone(),
+                turn_id: "turn_with_response".to_string(),
+                payload_kind,
+            }
+        );
+    }
 }
 
 #[test]
@@ -52,7 +70,14 @@ fn sampling_success_rejects_mismatched_identity_or_empty_turn() {
 #[test]
 fn matching_durable_application_clears_pending_state() {
     let identity = identity();
-    let mut state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+    let packet = PostCompactRecoveryContext::new(
+        &identity.compaction_window_id,
+        &identity.boundary_item_id,
+        "fixed boundary",
+        None,
+    )
+    .expect("recovery packet");
+    let mut state = PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet);
     let application = state
         .application_for_sampling_success(&identity, "turn_with_response")
         .expect("matching sampling success");

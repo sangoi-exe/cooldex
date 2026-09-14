@@ -1,5 +1,6 @@
 use codex_history::CompactedItem;
 use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResponseItemEnvelope;
 use codex_history::RolloutItem;
 use codex_protocol::models::ContentItem;
@@ -1158,6 +1159,7 @@ async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
                         compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
                         boundary_item_id: "msg_boundary".to_string(),
                         turn_id: "turn_consuming".to_string(),
+                        payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
                     }),
                     rollout_response_item(message("assistant", "model-visible history")),
                     compacted("summary", Some(Vec::new())),

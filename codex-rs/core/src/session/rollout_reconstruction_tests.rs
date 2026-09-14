@@ -6,9 +6,11 @@ use super::tests::raw_history_items;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
 use codex_history::CompactedItem;
+use codex_history::HandoffPreparation;
 use codex_history::InitialHistory;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
@@ -293,6 +295,7 @@ async fn record_initial_history_restores_pending_post_compact_recovery() {
             window_id: Some(compaction_window_id.clone()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
             mcp_resource_origins: None,
             compaction_response_id: None,
@@ -357,6 +360,7 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
             window_id: Some(compaction_window_id.clone()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
             mcp_resource_origins: None,
             compaction_response_id: None,
@@ -385,6 +389,7 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
             compaction_window_id: compaction_window_id.clone(),
             boundary_item_id: boundary_item_id.to_string(),
             turn_id: consuming_turn_id.to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         }),
     ];
 

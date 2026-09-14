@@ -12,6 +12,7 @@ use crate::session::step_context::StepContext;
 use crate::session::step_settings::ResolvedStepSettings;
 use crate::session::turn_context::TurnContext;
 use codex_async_utils::OrCancelExt;
+use codex_history::HandoffPreparation;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::error::CodexErr;
@@ -145,6 +146,24 @@ pub(crate) enum PreCompactHandoffOutcome {
     UnsupportedNoLiveThread,
 }
 
+impl PreCompactHandoffOutcome {
+    fn handoff_preparation(&self) -> HandoffPreparation {
+        match self {
+            Self::Available(_) => HandoffPreparation::Available,
+            Self::Unavailable(failure) => match failure {
+                PreCompactHandoffFailure::RequestFailed => HandoffPreparation::RequestFailed,
+                PreCompactHandoffFailure::ContextWindowExceeded => {
+                    HandoffPreparation::ContextWindowExceeded
+                }
+                PreCompactHandoffFailure::UnexpectedOutput => HandoffPreparation::UnexpectedOutput,
+                PreCompactHandoffFailure::EmptyOutput => HandoffPreparation::EmptyOutput,
+                PreCompactHandoffFailure::StreamEnded => HandoffPreparation::StreamEnded,
+            },
+            Self::UnsupportedNoLiveThread => HandoffPreparation::NotAttempted,
+        }
+    }
+}
+
 /// A completed pre-compaction preparation, held only by the compaction operation.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PreparedPreCompactHandoff {
@@ -164,6 +183,10 @@ impl PreparedPreCompactHandoff {
 
     pub(crate) fn recovery_instructions(&self) -> &str {
         &self.recovery_instructions
+    }
+
+    pub(crate) fn handoff_preparation(&self) -> HandoffPreparation {
+        self.outcome.handoff_preparation()
     }
 
     pub(crate) fn handoff_text(&self) -> Option<&str> {

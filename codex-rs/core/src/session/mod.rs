@@ -345,6 +345,7 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
+use codex_history::HandoffPreparation;
 use codex_history::InitialHistory;
 use codex_history::PostCompactRecoveryMarker;
 use codex_history::ResponseItemEnvelope;
@@ -4040,6 +4041,10 @@ impl Session {
                 .get_or_insert_default()
                 .compaction_model_hash = metadata.compaction_model_hash;
         }
+        let handoff_preparation = prepared_handoff
+            .as_ref()
+            .map(PreparedPreCompactHandoff::handoff_preparation)
+            .unwrap_or(HandoffPreparation::NotAttempted);
         let mut compacted_item = CompactedItem {
             message: metadata.message,
             replacement_history: Some(items.clone()),
@@ -4056,6 +4061,7 @@ impl Session {
             post_compact_recovery: recovery_identity.as_ref().map(|identity| {
                 PostCompactRecoveryMarker {
                     boundary_item_id: identity.boundary_item_id.clone(),
+                    handoff_preparation,
                 }
             }),
             compaction_response_id: metadata.compaction_response_id,

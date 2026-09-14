@@ -207,9 +207,52 @@ pub struct CompactedItem {
     pub latest_token_usage_record: Option<TokenUsageRecord>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum HandoffPreparation {
+    NotAttempted,
+    Available,
+    RequestFailed,
+    ContextWindowExceeded,
+    UnexpectedOutput,
+    EmptyOutput,
+    StreamEnded,
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
+    #[default]
+    LegacyUnknown,
+}
+
+impl HandoffPreparation {
+    fn is_legacy_unknown(value: &Self) -> bool {
+        matches!(value, Self::LegacyUnknown)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum PostCompactRecoveryPayloadKind {
+    HandoffAndRecovery,
+    RecoveryOnly,
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
+    #[default]
+    LegacyUnknown,
+}
+
+impl PostCompactRecoveryPayloadKind {
+    fn is_legacy_unknown(value: &Self) -> bool {
+        matches!(value, Self::LegacyUnknown)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub struct PostCompactRecoveryMarker {
     pub boundary_item_id: String,
+    #[serde(default, skip_serializing_if = "HandoffPreparation::is_legacy_unknown")]
+    pub handoff_preparation: HandoffPreparation,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
@@ -217,6 +260,11 @@ pub struct PostCompactRecoveryAppliedItem {
     pub compaction_window_id: String,
     pub boundary_item_id: String,
     pub turn_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "PostCompactRecoveryPayloadKind::is_legacy_unknown"
+    )]
+    pub payload_kind: PostCompactRecoveryPayloadKind,
 }
 
 impl Serialize for CompactedItem {

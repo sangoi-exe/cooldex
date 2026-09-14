@@ -24,9 +24,11 @@ use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_history::CompactedItem;
+use codex_history::HandoffPreparation;
 use codex_history::InitialHistory;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
 use codex_login::AuthManager;
@@ -2137,6 +2139,7 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
             window_id: Some(compaction_window_id),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
             compaction_response_id: None,
             latest_token_usage_record: None,
@@ -2223,6 +2226,7 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
             compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
             boundary_item_id: "msg_boundary".to_string(),
             turn_id: "turn_consuming".to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         });
     let owned_window_id = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
     let owned_boundary_id = "msg_owned_boundary";
@@ -2249,6 +2253,7 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
         window_id: Some(owned_window_id.to_string()),
         post_compact_recovery: Some(PostCompactRecoveryMarker {
             boundary_item_id: owned_boundary_id.to_string(),
+            handoff_preparation: HandoffPreparation::Available,
         }),
         compaction_response_id: None,
         latest_token_usage_record: None,
@@ -2258,6 +2263,7 @@ fn partial_fork_drops_application_proof_when_its_compaction_is_outside_owned_his
             compaction_window_id: owned_window_id.to_string(),
             boundary_item_id: owned_boundary_id.to_string(),
             turn_id: "turn_owned_consuming".to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         });
     let user_message = rollout_response_item(ResponseItem::Message {
         id: None,
@@ -2316,6 +2322,7 @@ async fn full_history_fork_inherits_pending_post_compact_recovery() {
                 window_id: Some(compaction_window_id.clone()),
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: boundary_item_id.to_string(),
+                    handoff_preparation: HandoffPreparation::Available,
                 }),
                 compaction_response_id: None,
                 latest_token_usage_record: None,
@@ -2461,6 +2468,7 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 window_id: Some(SOURCE_OMITTED_CHECKPOINT.to_string()),
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: OMITTED_BOUNDARY.to_string(),
+                    handoff_preparation: HandoffPreparation::Available,
                 }),
                 compaction_response_id: None,
                 latest_token_usage_record: None,
@@ -2485,6 +2493,7 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 compaction_window_id: SOURCE_OMITTED_CHECKPOINT.to_string(),
                 boundary_item_id: OMITTED_BOUNDARY.to_string(),
                 turn_id: OMITTED_PROOF_TURN.to_string(),
+                payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: OMITTED_PROOF_TURN.to_string(),
@@ -2510,6 +2519,7 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 window_id: Some(SOURCE_RETAINED_CHECKPOINT.to_string()),
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: RETAINED_BOUNDARY.to_string(),
+                    handoff_preparation: HandoffPreparation::Available,
                 }),
                 compaction_response_id: None,
                 latest_token_usage_record: None,
@@ -2525,6 +2535,7 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 compaction_window_id: SOURCE_RETAINED_CHECKPOINT.to_string(),
                 boundary_item_id: RETAINED_BOUNDARY.to_string(),
                 turn_id: RETAINED_PROOF_TURN.to_string(),
+                payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: RETAINED_PROOF_TURN.to_string(),
@@ -2550,6 +2561,7 @@ async fn paginated_copied_fork_preserves_compressed_lineage_through_resume_and_c
                 window_id: Some(SOURCE_RETAINED_SIBLING.to_string()),
                 post_compact_recovery: Some(PostCompactRecoveryMarker {
                     boundary_item_id: SIBLING_BOUNDARY.to_string(),
+                    handoff_preparation: HandoffPreparation::Available,
                 }),
                 compaction_response_id: None,
                 latest_token_usage_record: None,

@@ -134,9 +134,11 @@ use codex_execpolicy::NetworkRuleProtocol;
 use codex_execpolicy::Policy;
 use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
+use codex_history::HandoffPreparation;
 use codex_history::InitialHistory;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
@@ -3616,12 +3618,12 @@ async fn replace_compacted_history_persists_checkpoint_state() {
         persisted_compacted.replacement_history.clone(),
         Some(live_history.annotated_items().to_vec())
     );
+    let recovery_marker = persisted_compacted
+        .post_compact_recovery
+        .as_ref()
+        .expect("compaction recovery marker");
     assert_eq!(
-        persisted_compacted
-            .post_compact_recovery
-            .as_ref()
-            .expect("compaction recovery marker")
-            .boundary_item_id,
+        recovery_marker.boundary_item_id,
         persisted_compacted
             .replacement_history
             .as_ref()
@@ -3629,6 +3631,11 @@ async fn replace_compacted_history_persists_checkpoint_state() {
             .and_then(|envelope| envelope.item.id())
             .expect("persisted replacement boundary")
             .as_str(),
+    );
+    assert_eq!(
+        recovery_marker.handoff_preparation,
+        HandoffPreparation::NotAttempted,
+        "a current recovery-identity-only checkpoint records that synthesis was not attempted"
     );
     assert_eq!(
         (
@@ -7202,12 +7209,14 @@ fn repeated_boundary_fork_rollout(boundary_item_id: &str) -> Vec<RolloutItem> {
             window_id: Some(older_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
             compaction_window_id: older_window_id.to_string(),
             boundary_item_id: boundary_item_id.to_string(),
             turn_id: older_turn_id.to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         }),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
             turn_id: older_turn_id.to_string(),
@@ -7240,6 +7249,7 @@ fn repeated_boundary_fork_rollout(boundary_item_id: &str) -> Vec<RolloutItem> {
             window_id: Some(latest_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -7806,6 +7816,7 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
             window_id: Some(source_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -7821,6 +7832,7 @@ async fn forked_subagent_does_not_rebase_malformed_recovery_window_identity() {
             compaction_window_id: source_window_id.to_string(),
             boundary_item_id: boundary_item_id.to_string(),
             turn_id: consuming_turn_id.to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         }),
     ];
     let parent_thread_id = ThreadId::new();
@@ -7912,6 +7924,7 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
             window_id: Some(older_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: older_boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::Compacted(CompactedItem {
@@ -7928,6 +7941,7 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
             window_id: Some(latest_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: latest_boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -7943,6 +7957,7 @@ async fn forked_subagent_does_not_rebase_hybrid_recovery_identity_pair() {
             compaction_window_id: older_window_id.to_string(),
             boundary_item_id: latest_boundary_item_id.to_string(),
             turn_id: consuming_turn_id.to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         }),
     ];
     let parent_thread_id = ThreadId::new();
@@ -8034,6 +8049,7 @@ async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof
             window_id: Some(older_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: older_boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -8049,6 +8065,7 @@ async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof
             compaction_window_id: older_window_id.to_string(),
             boundary_item_id: older_boundary_item_id.to_string(),
             turn_id: consuming_turn_id.to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
         }),
         RolloutItem::Compacted(CompactedItem {
             message: "latest summary".to_string(),
@@ -8064,6 +8081,7 @@ async fn forked_subagent_keeps_latest_recovery_pending_after_earlier_exact_proof
             window_id: Some(latest_window_id.to_string()),
             post_compact_recovery: Some(PostCompactRecoveryMarker {
                 boundary_item_id: latest_boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }),
         }),
     ];

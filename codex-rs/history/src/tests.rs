@@ -702,11 +702,37 @@ fn post_compact_recovery_marker_only_locked_old_reader_ignores_marker() -> Resul
 }
 
 #[test]
+fn post_compact_recovery_marker_serializes_concrete_handoff_preparation() -> Result<()> {
+    let marker = PostCompactRecoveryMarker {
+        boundary_item_id: "msg_boundary".to_string(),
+        handoff_preparation: HandoffPreparation::Available,
+    };
+
+    assert_eq!(
+        serde_json::to_value(marker)?,
+        json!({
+            "boundary_item_id": "msg_boundary",
+            "handoff_preparation": "available",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(HandoffPreparation::ContextWindowExceeded)?,
+        json!("context_window_exceeded")
+    );
+    assert_eq!(
+        serde_json::to_value(HandoffPreparation::NotAttempted)?,
+        json!("not_attempted")
+    );
+    Ok(())
+}
+
+#[test]
 fn post_compact_recovery_applied_serializes_exact_internal_tag() -> Result<()> {
     let item = RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
         compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
         boundary_item_id: "msg_boundary".to_string(),
         turn_id: "turn_consuming".to_string(),
+        payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
     });
 
     assert_eq!(
@@ -716,10 +742,50 @@ fn post_compact_recovery_applied_serializes_exact_internal_tag() -> Result<()> {
             "payload": {
                 "compaction_window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
                 "boundary_item_id": "msg_boundary",
-                "turn_id": "turn_consuming"
+                "turn_id": "turn_consuming",
+                "payload_kind": "handoff_and_recovery"
             }
         })
     );
+    assert_eq!(
+        serde_json::to_value(PostCompactRecoveryPayloadKind::RecoveryOnly)?,
+        json!("recovery_only")
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_post_compact_recovery_telemetry_deserializes_as_legacy_unknown() -> Result<()> {
+    let legacy_marker = json!({
+        "boundary_item_id": "msg_boundary",
+    });
+    let marker = serde_json::from_value::<PostCompactRecoveryMarker>(legacy_marker.clone())?;
+    assert_eq!(
+        marker,
+        PostCompactRecoveryMarker {
+            boundary_item_id: "msg_boundary".to_string(),
+            handoff_preparation: HandoffPreparation::LegacyUnknown,
+        }
+    );
+    assert_eq!(serde_json::to_value(marker)?, legacy_marker);
+
+    let legacy_application = json!({
+        "compaction_window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
+        "boundary_item_id": "msg_boundary",
+        "turn_id": "turn_consuming",
+    });
+    let application =
+        serde_json::from_value::<PostCompactRecoveryAppliedItem>(legacy_application.clone())?;
+    assert_eq!(
+        application,
+        PostCompactRecoveryAppliedItem {
+            compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
+            boundary_item_id: "msg_boundary".to_string(),
+            turn_id: "turn_consuming".to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::LegacyUnknown,
+        }
+    );
+    assert_eq!(serde_json::to_value(application)?, legacy_application);
     Ok(())
 }
 

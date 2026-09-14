@@ -11,6 +11,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
 use crate::state::PostCompactRecoveryIdentity;
 use crate::state::PostCompactRecoveryRuntimeState;
+use codex_history::HandoffPreparation;
 use codex_login::CodexAuth;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
@@ -241,6 +242,35 @@ async fn pending_identity_without_cached_packet_neither_loads_recall_nor_mutates
     assert_eq!(state, state_before);
     assert_eq!(state.pending_identity(), Some(&identity));
     assert_eq!(state.packet(&identity).expect("matching packet read"), None);
+}
+
+#[test]
+fn handoff_outcomes_expose_content_free_persisted_preparation() {
+    let preparations = [
+        PreCompactHandoffOutcome::Available("operation-local handoff".to_string()),
+        PreCompactHandoffOutcome::Unavailable(PreCompactHandoffFailure::RequestFailed),
+        PreCompactHandoffOutcome::Unavailable(PreCompactHandoffFailure::ContextWindowExceeded),
+        PreCompactHandoffOutcome::Unavailable(PreCompactHandoffFailure::UnexpectedOutput),
+        PreCompactHandoffOutcome::Unavailable(PreCompactHandoffFailure::EmptyOutput),
+        PreCompactHandoffOutcome::Unavailable(PreCompactHandoffFailure::StreamEnded),
+        PreCompactHandoffOutcome::UnsupportedNoLiveThread,
+    ]
+    .iter()
+    .map(super::PreCompactHandoffOutcome::handoff_preparation)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        preparations,
+        vec![
+            HandoffPreparation::Available,
+            HandoffPreparation::RequestFailed,
+            HandoffPreparation::ContextWindowExceeded,
+            HandoffPreparation::UnexpectedOutput,
+            HandoffPreparation::EmptyOutput,
+            HandoffPreparation::StreamEnded,
+            HandoffPreparation::NotAttempted,
+        ]
+    );
 }
 
 #[tokio::test]

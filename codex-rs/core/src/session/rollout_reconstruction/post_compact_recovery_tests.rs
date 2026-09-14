@@ -1,6 +1,8 @@
 use super::*;
+use codex_history::HandoffPreparation;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryMarker;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
@@ -47,6 +49,7 @@ fn compaction(
         post_compact_recovery: marker_boundary_id.map(|boundary_item_id| {
             PostCompactRecoveryMarker {
                 boundary_item_id: boundary_item_id.to_string(),
+                handoff_preparation: HandoffPreparation::Available,
             }
         }),
         compaction_response_id: None,
@@ -59,6 +62,7 @@ fn application(window_id: &str, boundary_item_id: &str, turn_id: &str) -> Rollou
         compaction_window_id: window_id.to_string(),
         boundary_item_id: boundary_item_id.to_string(),
         turn_id: turn_id.to_string(),
+        payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
     })
 }
 
@@ -126,6 +130,20 @@ fn matching_application_consumes_without_generic_turn_complete() {
         marked_compaction(),
         application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
     ]);
+
+    assert_eq!(state, PostCompactRecoveryRuntimeState::Absent);
+}
+
+#[test]
+fn available_preparation_with_recovery_only_application_is_valid_after_reconstruction() {
+    let application = RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+        compaction_window_id: WINDOW_ID.to_string(),
+        boundary_item_id: BOUNDARY_ID.to_string(),
+        turn_id: TURN_ID.to_string(),
+        payload_kind: PostCompactRecoveryPayloadKind::RecoveryOnly,
+    });
+
+    let state = reconstruct(&[marked_compaction(), application]);
 
     assert_eq!(state, PostCompactRecoveryRuntimeState::Absent);
 }

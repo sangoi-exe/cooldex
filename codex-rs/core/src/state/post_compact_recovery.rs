@@ -1,4 +1,5 @@
 use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryPayloadKind;
 
 use crate::context::PostCompactRecoveryContext;
 
@@ -139,10 +140,18 @@ impl PostCompactRecoveryRuntimeState {
             Self::Pending(pending)
                 if pending.identity == *identity && !turn_id.trim().is_empty() =>
             {
+                let payload_kind = match pending.packet.as_ref() {
+                    Some(packet) if packet.handoff().is_some() => {
+                        PostCompactRecoveryPayloadKind::HandoffAndRecovery
+                    }
+                    Some(_) => PostCompactRecoveryPayloadKind::RecoveryOnly,
+                    None => return Err(PostCompactRecoveryFailureClass::BoundaryMismatch),
+                };
                 Ok(PostCompactRecoveryAppliedItem {
                     compaction_window_id: identity.compaction_window_id.clone(),
                     boundary_item_id: identity.boundary_item_id.clone(),
                     turn_id: turn_id.to_string(),
+                    payload_kind,
                 })
             }
             Self::Absent | Self::Pending(_) => {

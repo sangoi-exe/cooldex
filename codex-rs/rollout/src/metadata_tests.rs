@@ -9,6 +9,7 @@ use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
 use codex_history::PostCompactRecoveryAppliedItem;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::GitInfo;
@@ -335,6 +336,7 @@ fn post_compact_recovery_current_projections_ignore_internal_metadata() {
         compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
         boundary_item_id: "msg_boundary".to_string(),
         turn_id: "turn_consuming".to_string(),
+        payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
     });
 
     assert!(

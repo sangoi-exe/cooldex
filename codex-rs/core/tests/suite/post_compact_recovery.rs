@@ -7,6 +7,8 @@ use std::time::Duration;
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
+use codex_history::HandoffPreparation;
+use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::RolloutItem;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::EventMsg;
@@ -705,13 +707,18 @@ else:
     }
 
     let items = read_rollout_items(&rollout_path);
+    let persisted_items = serde_json::to_string(&items)?;
     assert!(
-        !serde_json::to_string(&items)?.contains("<post_compact_recovery>"),
+        !persisted_items.contains("<post_compact_recovery>"),
         "the transient recovery packet must never enter persisted rollout items"
     );
     assert!(
-        !serde_json::to_string(&items)?.contains("<post_compact_handoff>"),
+        !persisted_items.contains("<post_compact_handoff>"),
         "the transient handoff packet must never enter persisted rollout items"
+    );
+    assert!(
+        !persisted_items.contains("continue after compaction"),
+        "generated handoff content must never enter persisted rollout items"
     );
     let compacted = items
         .iter()
@@ -725,6 +732,11 @@ else:
         .post_compact_recovery
         .as_ref()
         .expect("recovery marker");
+    assert_eq!(
+        &marker.handoff_preparation,
+        &HandoffPreparation::Available,
+        "the marker records successful synthesis without generated handoff content"
+    );
     for (request, recovery_index, handoff_index) in [
         (
             &requests[2],
@@ -791,6 +803,11 @@ else:
         })
         .collect::<Vec<_>>();
     assert_eq!(application_items.len(), 1);
+    assert_eq!(
+        &application_items[0].payload_kind,
+        &PostCompactRecoveryPayloadKind::HandoffAndRecovery,
+        "the proof describes the exact recovery packet sampled by the accepted response"
+    );
     assert_eq!(
         application_items[0].compaction_window_id,
         compacted.window_id.clone().expect("compaction window id")
