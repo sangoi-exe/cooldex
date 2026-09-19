@@ -52,6 +52,24 @@
   the integrated candidate. Every batch continues through errors to terminal
   completion before failure investigation or correction. Do not freeze particular refs in durable
   guidance or redesign unrelated upstream code.
+
+### Durable branch-promotion and upstream-sync route
+
+- Fast-forward local `master` and `origin/master` from a reviewed `dev` candidate;
+  do not rewrite either history.
+- Fetch `upstream/main`, fast-forward local `main`, then mirror that exact tip to
+  `origin/main` while retaining local `main`'s `upstream/main` tracking relationship.
+- Merge the updated `main` into `dev` with a normal two-parent merge that preserves
+  Cooldex as the first-parent lineage.
+- Preserve admitted Cooldex behavior by adapting fork-owned islands to current upstream
+  canonical owners, contracts, and architecture; do not retain obsolete local structure
+  through aliases, wrappers, dual reads, fallbacks, or whole-side conflict selection.
+- Reconcile direct followers and complete the selected resident profile's validation and
+  review route before publishing the final `dev` candidate to `origin/dev`; that profile
+  retains task classification, planning, Worker, Gate, lifecycle, and completion ownership.
+- Commit and publish task-owned sync documentation from the separate `.sangoi` repository,
+  excluding unrelated dirty inner-repository work.
+
 - When the current thread explicitly attaches a plan, verify its root branch and Git
   object, separate `.sangoi` branch and Git object, upstream instruction blob, and review
   anchors before mutation. Do not infer plan attachment from workspace files, completed
