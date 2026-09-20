@@ -1,4 +1,5 @@
 use crate::agent::AgentIdentitySnapshot;
+use crate::agent::types::AgentMetadata;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -20,7 +21,7 @@ use std::sync::atomic::Ordering;
 /// the current implementation, it limits:
 /// * Total number of sub-agents (i.e. threads) per user session
 ///
-/// This structure is shared by all agents in the same user session (because the `AgentControl`
+/// This structure is shared by all agents in the same user session (because the `LocalAgentControl`
 /// is).
 #[derive(Default)]
 pub(crate) struct AgentRegistry {
@@ -39,26 +40,26 @@ struct ActiveAgents {
 struct RegisteredAgent {
     path: String,
     evicted_environments: Option<Vec<TurnEnvironmentSelection>>,
+    // Merge-safety anchor: persisted V2 identity remains registry-private metadata so reload
+    // restores the captured snapshot instead of reconstructing from mutable role/config state.
+    identity_snapshot: Option<AgentIdentitySnapshot>,
 }
 
 impl RegisteredAgent {
     fn new(path: String) -> Self {
+        Self::with_identity_snapshot(path, None)
+    }
+
+    fn with_identity_snapshot(
+        path: String,
+        identity_snapshot: Option<AgentIdentitySnapshot>,
+    ) -> Self {
         Self {
             path,
             evicted_environments: None,
+            identity_snapshot,
         }
     }
-}
-
-// Merge-safety anchor: registry metadata carries the captured identity snapshot so reload never
-// reconstructs identity from mutable role/config state.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct AgentMetadata {
-    pub(crate) agent_id: Option<ThreadId>,
-    pub(crate) agent_path: Option<AgentPath>,
-    pub(crate) agent_nickname: Option<String>,
-    pub(crate) agent_role: Option<String>,
-    pub(crate) identity_snapshot: Option<AgentIdentitySnapshot>,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
@@ -180,6 +181,18 @@ impl AgentRegistry {
             .cloned()
     }
 
+    pub(crate) fn agent_identity_snapshot_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<AgentIdentitySnapshot> {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .thread_paths
+            .get(&thread_id)
+            .and_then(|agent| agent.identity_snapshot.clone())
+    }
+
     pub(crate) fn save_evicted_environments(
         &self,
         thread_id: ThreadId,
@@ -232,7 +245,16 @@ impl AgentRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
+        self.register_spawned_thread_with_identity_snapshot(agent_metadata, None);
+    }
+
+    fn register_spawned_thread_with_identity_snapshot(
+        &self,
+        agent_metadata: AgentMetadata,
+        identity_snapshot: Option<AgentIdentitySnapshot>,
+    ) {
         let Some(thread_id) = agent_metadata.agent_id else {
             return;
         };
@@ -248,10 +270,10 @@ impl AgentRegistry {
         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
             active_agents.used_agent_nicknames.insert(agent_nickname);
         }
-        if let Some(previous_agent) = active_agents
-            .thread_paths
-            .insert(thread_id, RegisteredAgent::new(key.clone()))
-            && previous_agent.path != key
+        if let Some(previous_agent) = active_agents.thread_paths.insert(
+            thread_id,
+            RegisteredAgent::with_identity_snapshot(key.clone(), identity_snapshot),
+        ) && previous_agent.path != key
         {
             active_agents
                 .agent_tree
@@ -386,10 +408,19 @@ impl SpawnReservation {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self, agent_metadata: AgentMetadata) {
+    pub(crate) fn commit(self, agent_metadata: AgentMetadata) {
+        self.commit_with_identity_snapshot(agent_metadata, None);
+    }
+
+    pub(crate) fn commit_with_identity_snapshot(
+        mut self,
+        agent_metadata: AgentMetadata,
+        identity_snapshot: Option<AgentIdentitySnapshot>,
+    ) {
         self.reserved_agent_nickname = None;
         self.reserved_agent_path = None;
-        self.state.register_spawned_thread(agent_metadata);
+        self.state
+            .register_spawned_thread_with_identity_snapshot(agent_metadata, identity_snapshot);
         self.active = false;
     }
 }

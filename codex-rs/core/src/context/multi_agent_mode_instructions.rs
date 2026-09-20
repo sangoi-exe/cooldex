@@ -1,4 +1,5 @@
 use super::ContextualUserFragment;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
@@ -7,8 +8,6 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::truncate_text;
 
-const EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT: &str = "Any earlier instruction enabling proactive multi-agent delegation no longer applies. Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
-const PROACTIVE_MULTI_AGENT_MODE_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 const MULTI_AGENT_MODE_MAX_TOKENS: usize = 400;
 const EXPLANATION_SEPARATOR: &str = "\n\n";
 
@@ -73,10 +72,11 @@ fn bound_text(text: &str, max_bytes: usize) -> String {
     bounded
 }
 
-fn built_in_mode_text(multi_agent_mode: &MultiAgentMode) -> &'static str {
+fn built_in_mode_text(multi_agent_mode: &MultiAgentMode) -> String {
+    let bundled = ResolvedModelMessages::bundled().multi_agent();
     match multi_agent_mode {
-        MultiAgentMode::ExplicitRequestOnly => EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT,
-        MultiAgentMode::Proactive => PROACTIVE_MULTI_AGENT_MODE_TEXT,
+        MultiAgentMode::ExplicitRequestOnly => bundled.explicit.text().to_owned(),
+        MultiAgentMode::Proactive => bundled.proactive.text().to_owned(),
         MultiAgentMode::Custom(_) => unreachable!("custom mode has no built-in instructions"),
     }
 }
@@ -99,15 +99,15 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
     }
 
     fn body(&self) -> String {
+        // `effective_multi_agent_mode` selects the policy-owned bundled text.
+        // Configured and catalog text is carried separately as a bounded explanation.
         match &self.multi_agent_mode {
             MultiAgentMode::Custom(hint_text) => hint_text.clone(),
             mode @ (MultiAgentMode::ExplicitRequestOnly | MultiAgentMode::Proactive) => {
                 let base_text = built_in_mode_text(mode);
                 match self.explanation.as_deref() {
-                    Some(explanation) => {
-                        format!("{base_text}{EXPLANATION_SEPARATOR}{explanation}")
-                    }
-                    None => base_text.to_string(),
+                    Some(explanation) => format!("{base_text}{EXPLANATION_SEPARATOR}{explanation}"),
+                    None => base_text,
                 }
             }
         }

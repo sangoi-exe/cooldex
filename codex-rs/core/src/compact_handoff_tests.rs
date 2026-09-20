@@ -95,6 +95,7 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
     session
         .record_conversation_items(
             turn_context.as_ref(),
+            turn_context.model_info(),
             &[message(None, "user", "pre-compaction history sentinel")],
         )
         .await;
@@ -135,6 +136,7 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
     session
         .record_conversation_items(
             turn_context.as_ref(),
+            turn_context.model_info(),
             &[message(None, "user", "newly admitted input")],
         )
         .await;
@@ -302,7 +304,7 @@ async fn synthesis_prompt_is_tool_free_without_output_token_limit_and_uses_froze
     }));
     let metadata = session
         .responses_metadata(
-            &turn_context,
+            &step_context,
             crate::responses_metadata::CodexResponsesRequestKind::PreCompactHandoff,
         )
         .await;
@@ -483,19 +485,12 @@ async fn preparation_propagates_cancellation_before_hidden_inference() {
     let turn_context = Arc::new(turn_context);
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
-    let settings = PreCompactHandoffSettings::from_step_context(&step_context);
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 
-    let error = prepare_pre_compact_handoff(
-        &session,
-        turn_context.as_ref(),
-        settings,
-        &turn_context.session_telemetry,
-        &cancellation,
-    )
-    .await
-    .expect_err("cancellation must not degrade to a no-handoff outcome");
+    let error = prepare_pre_compact_handoff(&session, &step_context, &cancellation)
+        .await
+        .expect_err("cancellation must not degrade to a no-handoff outcome");
 
     assert!(matches!(error.details(), CodexErrorDetails::TurnAborted));
 }
@@ -507,6 +502,7 @@ async fn no_live_thread_prepares_without_inference_or_history_occupancy_change()
     session
         .record_conversation_items(
             turn_context.as_ref(),
+            turn_context.model_info(),
             &[message(None, "user", "history sentinel")],
         )
         .await;
@@ -519,17 +515,9 @@ async fn no_live_thread_prepares_without_inference_or_history_occupancy_change()
     let token_usage_before = session.token_usage_info().await;
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
-    let settings = PreCompactHandoffSettings::from_step_context(&step_context);
-
-    let prepared = prepare_pre_compact_handoff(
-        &session,
-        turn_context.as_ref(),
-        settings,
-        &turn_context.session_telemetry,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("persistence-disabled session must retain upstream behavior");
+    let prepared = prepare_pre_compact_handoff(&session, &step_context, &CancellationToken::new())
+        .await
+        .expect("persistence-disabled session must retain upstream behavior");
 
     assert_eq!(prepared.handoff_text(), None);
     assert_eq!(
@@ -551,6 +539,7 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
     session
         .record_conversation_items(
             turn_context.as_ref(),
+            turn_context.model_info(),
             &[message(None, "user", "admitted before preparation")],
         )
         .await;
@@ -572,6 +561,7 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
     session
         .record_conversation_items(
             turn_context.as_ref(),
+            turn_context.model_info(),
             &[message(None, "user", "newly admitted after preparation")],
         )
         .await;
@@ -590,6 +580,7 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
                 window_ids,
                 compaction_response_id: None,
                 compaction_model_hash: None,
+                reviewer_compaction_hash: None,
             }
             .with_prepared_handoff(prepared),
         )

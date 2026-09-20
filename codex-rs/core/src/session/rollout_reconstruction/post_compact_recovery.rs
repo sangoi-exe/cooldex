@@ -43,6 +43,18 @@ pub(super) fn reconstruct_post_compact_recovery(
         };
     };
 
+    if compacted.post_compact_recovery.is_none() {
+        return if replay[compaction_index + 1..].iter().any(|replay_item| {
+            matches!(replay_item.item, RolloutItem::PostCompactRecoveryApplied(_))
+        }) {
+            PostCompactRecoveryRuntimeState::Blocked(
+                PostCompactRecoveryFailureClass::MalformedApplicationProof,
+            )
+        } else {
+            PostCompactRecoveryRuntimeState::Absent
+        };
+    }
+
     let identity = match identity_from_compaction(compacted) {
         Ok(identity) => identity,
         Err(failure) => return PostCompactRecoveryRuntimeState::Blocked(failure),
@@ -98,29 +110,25 @@ pub(super) fn reconstruct_post_compact_recovery(
 fn identity_from_compaction(
     compacted: &CompactedItem,
 ) -> Result<PostCompactRecoveryIdentity, PostCompactRecoveryFailureClass> {
-    let marker_is_present = compacted.post_compact_recovery.is_some();
-    let failure_for_missing_identity = || {
-        if marker_is_present {
-            PostCompactRecoveryFailureClass::MalformedMarker
-        } else {
-            PostCompactRecoveryFailureClass::UnsupportedLegacy
-        }
-    };
+    let marker = compacted
+        .post_compact_recovery
+        .as_ref()
+        .ok_or(PostCompactRecoveryFailureClass::MalformedMarker)?;
     let compaction_window_id = compacted
         .window_id
         .as_deref()
         .filter(|window_id| is_uuid_v7(window_id))
-        .ok_or_else(failure_for_missing_identity)?;
+        .ok_or(PostCompactRecoveryFailureClass::MalformedMarker)?;
     let replacement_history = compacted
         .replacement_history
         .as_deref()
-        .ok_or_else(failure_for_missing_identity)?;
+        .ok_or(PostCompactRecoveryFailureClass::MalformedMarker)?;
     let boundary_item_id = replacement_history
         .last()
         .and_then(|item| item.id())
         .map(ToString::to_string)
         .filter(|boundary_item_id| !boundary_item_id.is_empty())
-        .ok_or_else(failure_for_missing_identity)?;
+        .ok_or(PostCompactRecoveryFailureClass::MalformedMarker)?;
     let boundary_occurrences = replacement_history
         .iter()
         .filter(|item| {
@@ -129,16 +137,14 @@ fn identity_from_compaction(
         })
         .count();
     if boundary_occurrences != 1 {
-        return Err(failure_for_missing_identity());
+        return Err(PostCompactRecoveryFailureClass::MalformedMarker);
     }
 
-    if let Some(marker) = &compacted.post_compact_recovery {
-        if marker.boundary_item_id.is_empty() {
-            return Err(PostCompactRecoveryFailureClass::MalformedMarker);
-        }
-        if marker.boundary_item_id != boundary_item_id {
-            return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
-        }
+    if marker.boundary_item_id.is_empty() {
+        return Err(PostCompactRecoveryFailureClass::MalformedMarker);
+    }
+    if marker.boundary_item_id != boundary_item_id {
+        return Err(PostCompactRecoveryFailureClass::BoundaryMismatch);
     }
 
     Ok(PostCompactRecoveryIdentity {

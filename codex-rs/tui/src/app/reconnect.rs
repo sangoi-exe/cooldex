@@ -191,13 +191,21 @@ impl App {
             return false;
         }
         if !self.reconnect.offline {
+            #[cfg(target_os = "windows")]
+            if self.windows_sandbox_setup_is_local()
+                && let Some(message) = self.chat_widget.initial_user_message.take()
+            {
+                self.chat_widget.restore_user_message_to_composer(message);
+            }
             self.reconnect.offline = true;
+            // Cached blank sessions are usable only while this connection owns a subscription.
+            self.agents_overview.blank_sessions.clear();
             self.reconnect.failed = false;
             if self.pending_server_version_notice.take().is_some() {
                 self.reconnect.seen_version_notice = None;
                 self.update_server_version_overview_notice(
                     CODEX_CLI_VERSION,
-                    /*older_server*/ None,
+                    /*server_version*/ None,
                 );
             }
             self.cancel_pending_key_chord();
@@ -210,6 +218,9 @@ impl App {
             self.agents_overview.request_id = None;
             self.agents_overview.refresh_pending = false;
             self.agents_overview.refresh_notifications.clear();
+            self.agents_overview.pending_usage = None;
+            self.agents_overview.usage_disabled = false;
+            self.agents_overview.usage.clear();
             self.agents_overview.activity.clear();
             self.agents_overview.last_messages.clear();
             self.reconnect.presentation = if self
@@ -222,8 +233,10 @@ impl App {
                 }
                 ReconnectPresentation::Overview
             } else {
-                self.chat_widget
-                    .handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+                self.chat_widget.handle_restricted_key(
+                    KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+                    RestrictedInputMode::Disconnected,
+                );
                 ReconnectPresentation::Conversation
             };
             self.chat_widget.pause_for_disconnect();
@@ -264,17 +277,43 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         self.app_event_tx = AppEventSender::new(tx);
         *app_event_rx = rx;
+        {
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.creating_worktree {
+                state.creating_worktree = false;
+                self.pending_managed_worktree_creation = false;
+            }
+        }
         self.agent_navigation.picker_refresh = None;
         self.last_subagent_backfill_attempt = None;
         self.rate_limit_refresh_state.invalidate_recovery();
         session.inherit_task_tool_capabilities(app_server);
         *app_server = session;
+        #[cfg(any(target_os = "windows", test))]
+        let interrupted_windows_setup = self.windows_sandbox.pending_setup.take().is_some();
+        #[cfg(any(target_os = "windows", test))]
+        {
+            if interrupted_windows_setup {
+                self.windows_sandbox.setup_started_at = None;
+                self.chat_widget.clear_windows_sandbox_setup_status();
+                self.chat_widget.windows_sandbox_elevated_setup_complete = false;
+            }
+        }
+        self.chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         self.chat_widget.set_local_worktree_operations(
             !crate::uses_remote_workspace_or_environment(
                 &self.app_server_target,
                 self.environment_manager.as_ref(),
             ),
         );
+        self.chat_widget.windows_sandbox_local_server =
+            !self.app_server_target.uses_remote_workspace()
+                && app_server.app_server_platform_os() == Some("windows");
+        self.chat_widget.windows_sandbox_host = WindowsSandboxHost::Unknown;
         self.chat_widget.cyber_policy_notice = Default::default();
         self.chat_widget.requires_openai_auth = bootstrap.requires_openai_auth;
         self.chat_widget.remote_connection =
@@ -307,7 +346,9 @@ impl App {
         self.pending_plugin_enabled_writes.clear();
         self.pending_hook_enabled_writes.clear();
         self.temporary_structured_requests.clear();
-        self.pending_thread_titles.clear();
+        for (_, cancellation) in self.pending_thread_titles.drain() {
+            cancellation.cancel();
+        }
         self.sync_thread_title_progress();
         self.agents_overview.dispatched_requests.clear();
         self.agents_overview.request_id = None;
@@ -428,6 +469,13 @@ impl App {
             self.chat_widget.show_bottom_pane_view(Box::new(view));
             self.refresh_agents_overview_threads(app_server);
         }
+        #[cfg(any(target_os = "windows", test))]
+        if interrupted_windows_setup {
+            self.chat_widget.add_error_message(
+                "Windows sandbox setup was interrupted. Restart Codex before using Agent mode."
+                    .to_string(),
+            );
+        }
         // Only accept fresh task-tool calls once this connection and its event queue are adopted.
         if let ThreadToolTransport::Mcp(server) = app_server.thread_tool_transport() {
             server.reconnect(app_server.request_handle(), self.app_event_tx.clone());
@@ -456,11 +504,17 @@ impl App {
             client_version,
             app_server.server_version(),
         );
-        if self.reconnect.seen_version_notice != connected_notice_key {
+        if !self.local_settings.tui.show_server_version_notice
+            || self.reconnect.seen_version_notice != connected_notice_key
+        {
             self.reconnect.seen_version_notice = None;
-            self.update_server_version_overview_notice(client_version, /*older_server*/ None);
+            self.update_server_version_overview_notice(
+                client_version,
+                /*server_version*/ None,
+            );
         }
         if let Some((notice, key)) = crate::status::remote_connection::pending_server_version_notice(
+            &self.local_settings.tui,
             &self.app_server_target,
             app_server.server_codex_home(),
             client_version,

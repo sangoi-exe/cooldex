@@ -143,6 +143,7 @@ impl SkillPopup {
                     _ => None,
                 };
                 GenericDisplayRow {
+                    selection_style: None,
                     name,
                     name_prefix_spans: Vec::new(),
                     match_indices: indices,
@@ -329,6 +330,33 @@ mod tests {
         }
 
         insta::assert_snapshot!("skill_popup_scrolled", render_popup(&popup, /*width*/ 72));
+    }
+
+    #[test]
+    fn lowercase_expansion_preserves_match_ranking_and_highlighting() {
+        let mut popup = SkillPopup::new(vec![
+            named_mention_item("İx", &[]),
+            named_mention_item("i\u{0307}x", &[]),
+            named_mention_item("aİx", &[]),
+            named_mention_item("ai\u{0307}x", &[]),
+        ]);
+        popup.set_query("\u{0307}x");
+
+        // Each pair lowercases identically. The dot starts a contiguous match,
+        // but not a prefix, even when it came from the expansion of 'İ'.
+        assert_eq!(
+            popup.filtered(),
+            vec![
+                (3, Some(vec![2, 3]), 0),
+                (2, Some(vec![1, 2]), 0),
+                (1, Some(vec![1, 2]), 0),
+                (0, Some(vec![0, 1]), 0),
+            ]
+        );
+        insta::assert_snapshot!(
+            "skill_popup_lowercase_expansion",
+            render_popup(&popup, /*width*/ 48)
+        );
     }
 
     #[test]

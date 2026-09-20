@@ -1,82 +1,64 @@
+use crate::agent::types::ResolvedMultiAgentV2UsageHints;
 use crate::config::MultiAgentV2Config;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::EffectiveMultiAgentMode;
+use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_features::MultiAgentV2Policy;
+use codex_prompts::ResolvedMessage;
+use codex_prompts::ResolvedModelMessages;
+use codex_prompts::ResolvedMultiAgentMessages;
 use codex_protocol::config_types::MultiAgentMode;
-use codex_protocol::openai_models::MultiAgentModeMessages;
-use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
-const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
-
-At the start of your turn, you are the active agent.
-You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents.
-All agents in the team, including the agents that you can assign tasks to, are equally intelligent and capable, and have access to the same set of tools.
-
-You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent without triggering a turn.
-Child agents can also spawn their own sub-agents.
-You can decide how much context you want to propagate to your sub-agents with the `fork_turns` parameter.
-
-You will receive messages in the analysis channel in the form:
-```
-Message Type: MESSAGE | FINAL_ANSWER
-Task name: <recipient>
-Sender: <author>
-Payload:
-<payload text>
-```
-They may be addressed as to=/root
-"#;
-const DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT: &str = r#"You are an agent in a team of agents collaborating to complete a task.
-
-You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents. All agents in the team, including the agents that you can assign tasks to, are equally intelligent and capable, and have access to the same set of tools.
-
-You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent.
-Child agents can also spawn their own sub-agents.
-
-When you provide a response in the final channel, that content is immediately delivered back to your parent agent.
-
-You will receive messages in the analysis channel in the form:
-```
-Message Type: NEW_TASK | MESSAGE | FINAL_ANSWER
-Task name: <recipient>
-Sender: <author>
-Payload:
-<payload text>
-```
-You may also see them addressed as to=/root/..., which indicates your identity is /root/...
-"#;
-const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-history forks (`fork_turns` omitted or `\"all\"`) inherit the parent model and reasoning effort and do not accept overrides. Only set `model` or `reasoning_effort` when explicitly requested by the user, applicable `AGENTS.md` instructions, or skill instructions; when doing so, set `fork_turns` to `\"none\"` or a positive integer string.";
-// Merge-safety anchor: V2 usage guidance keeps generic timed mailbox/steer waiting separate from
-// mailbox-aware, completion-body-redacted known-target conditions rather than recreating V1 polling.
-const DEFAULT_MULTI_AGENT_V2_WAIT_AGENT_USAGE_HINT_TEXT: &str = "When calling `wait_agent`, prefer longer waits (minutes) for generic mailbox/steer activity to avoid busy polling. Use `{ targets, return_when: \"all_final\", disable_timeout: true }` for self-contained known-target fan-in or `{ targets, return_when: \"any_final\", disable_timeout: true }` for incremental completion. Targeted condition waits return for actual pending agent communication before their requested final-state condition is reached. Pending user steer remains authoritative; target errors win over requested final-state success, and both win over mailbox activity. The queued communication is not embedded in the wait result and is processed through the next parent sampling step. Generic timed mailbox/steer behavior, target resolution, compact statuses, completion-body redaction, and list behavior remain unchanged.";
-const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Note that collaboration tools cannot be called from inside `functions.exec`. Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` only as direct tool calls using the recipient shown in their tool definitions, such as `to=functions.collaboration.spawn_agent`, since they are intentionally absent from the `functions.exec` `tools.*` namespace. Available tools in `functions.exec` are explicitly described with a `tools` namespace in the developer message.
-
-All agents share the same directory. In detail:
-- All agents have access to the same container and filesystem as you.
-- All agents use the same current working directory.
-- As a result, edits made by one agent are immediately visible to all other agents.
-"#;
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ResolvedMultiAgentV2UsageHints {
-    pub(crate) root: Option<MultiAgentRoleInstructions>,
-    pub(crate) subagent: Option<MultiAgentRoleInstructions>,
+/// Uses the step's captured model messages for model-context assembly.
+pub(super) fn usage_hint_text(step_context: &StepContext) -> Option<MultiAgentRoleInstructions> {
+    let turn_context = step_context.turn.as_ref();
+    usage_hint_text_for_source(
+        turn_context,
+        &turn_context.session_source,
+        ResolvedModelMessages::from_model(&step_context.settings.model_info).multi_agent(),
+    )
 }
 
-// Merge-safety anchor: V2 usage hints retain captured-binding, configured, then catalog/bundled
-// precedence and omit operator-facing text for internal or non-thread-spawn subagent sources.
-pub(crate) fn usage_hint_text(
+/// Uses the turn's frozen model identity only for full-history identity capture.
+///
+/// This is intentionally distinct from `usage_hint_text`, whose step-scoped input serves
+/// `session/world_state.rs`; callers must not overload one API with two temporal meanings.
+pub(crate) fn usage_hint_text_for_turn(
+    turn_context: &TurnContext,
+) -> Option<MultiAgentRoleInstructions> {
+    usage_hint_text_for_source(
+        turn_context,
+        &turn_context.session_source,
+        ResolvedModelMessages::from_model(turn_context.model_info()).multi_agent(),
+    )
+}
+
+// Merge-safety anchor: V2 usage hints retain source filtering and captured-binding precedence;
+// inherited text/marker state is never re-resolved through mutable config or catalog data.
+fn usage_hint_text_for_source(
     turn_context: &TurnContext,
     session_source: &SessionSource,
+    multi_agent_messages: ResolvedMultiAgentMessages<'_>,
 ) -> Option<MultiAgentRoleInstructions> {
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
+
+    let subagent = match session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => true,
+        SessionSource::Cli
+        | SessionSource::VSCode
+        | SessionSource::Exec
+        | SessionSource::Mcp
+        | SessionSource::Custom(_)
+        | SessionSource::Unknown => false,
+        SessionSource::Internal(_) | SessionSource::SubAgent(_) => return None,
+    };
 
     if let AgentUsageHintBinding::Inherited { instructions } =
         &turn_context.config.agent_usage_hint_binding
@@ -86,26 +68,15 @@ pub(crate) fn usage_hint_text(
             .map(MultiAgentRoleInstructions::from_agent_usage_hint_instructions);
     }
 
-    let catalog = turn_context
-        .model_info()
-        .model_messages
-        .as_ref()
-        .and_then(|messages| messages.multi_agent.as_ref())
-        .and_then(|messages| messages.role.as_ref());
     let snapshot = resolve_usage_hints(
         &turn_context.config.multi_agent_v2,
-        catalog,
+        multi_agent_messages,
         !turn_context.config.update_plan_enabled && turn_context.config.model_catalog.is_none(),
     );
-    match session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => snapshot.subagent,
-        SessionSource::Cli
-        | SessionSource::VSCode
-        | SessionSource::Exec
-        | SessionSource::Mcp
-        | SessionSource::Custom(_)
-        | SessionSource::Unknown => snapshot.root,
-        SessionSource::Internal(_) | SessionSource::SubAgent(_) => None,
+    if subagent {
+        snapshot.subagent
+    } else {
+        snapshot.root
     }
 }
 
@@ -113,73 +84,55 @@ pub(crate) fn usage_hint_text(
 // later child turns must use this binding rather than resolve current config or model catalog data.
 pub(crate) fn full_history_usage_hint_binding(turn_context: &TurnContext) -> AgentUsageHintBinding {
     AgentUsageHintBinding::Inherited {
-        instructions: usage_hint_text(turn_context, &turn_context.session_source)
+        instructions: usage_hint_text_for_turn(turn_context)
             .map(MultiAgentRoleInstructions::into_agent_usage_hint_instructions),
     }
 }
 
 pub(crate) fn resolve_usage_hints(
     config: &MultiAgentV2Config,
-    catalog: Option<&MultiAgentRoleMessages>,
+    multi_agent_messages: ResolvedMultiAgentMessages<'_>,
     omit_update_plan_instructions: bool,
 ) -> ResolvedMultiAgentV2UsageHints {
-    let resolve_role = |configured: Option<&str>, catalog: Option<&str>, bundled: &str| {
+    let resolve_role = |configured: Option<&str>, message: ResolvedMessage<'_>| {
         // Configured roles take precedence; empty configured or catalog roles suppress fallback.
         if let Some(configured) = configured {
             return (!configured.is_empty())
-                .then(|| MultiAgentRoleInstructions::unmarked(configured));
+                .then(|| MultiAgentRoleInstructions::Configured(configured.to_owned()));
         }
 
-        let base = catalog.unwrap_or(bundled);
+        let base = message.text();
         if base.is_empty() {
             return None;
         }
-        let base = if omit_update_plan_instructions {
-            crate::context::without_update_plan_instructions(base)
-        } else {
-            base.to_string()
-        };
-
-        let max_concurrency = config.max_concurrent_threads_per_session;
-        let wait_agent_guidance = if config.wait_agent_enabled {
-            format!("{DEFAULT_MULTI_AGENT_V2_WAIT_AGENT_USAGE_HINT_TEXT}\n\n")
-        } else {
-            String::new()
-        };
-        let mut text = format!(
-            "{base}\n{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{wait_agent_guidance}There are {max_concurrency} available concurrency slots, meaning that up to {max_concurrency} agents can be active at once, including you."
-        );
-        if config.expose_spawn_agent_model_overrides {
-            text.push_str("\n\n");
-            text.push_str(DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT);
-        }
-
-        Some(if catalog.is_some() {
-            MultiAgentRoleInstructions::catalog(text)
-        } else {
-            MultiAgentRoleInstructions::unmarked(text)
+        Some(MultiAgentRoleInstructions::Composed {
+            base: base.to_owned(),
+            marked: message.catalog_override().is_some(),
+            omit_update_plan_instructions,
+            max_concurrency: config.max_concurrent_threads_per_session,
+            wait_agent_enabled: config.wait_agent_enabled,
+            expose_model_overrides: config.expose_spawn_agent_model_overrides,
         })
     };
 
     ResolvedMultiAgentV2UsageHints {
         root: resolve_role(
             config.root_agent_usage_hint_text.as_deref(),
-            catalog.and_then(|messages| messages.root.as_deref()),
-            DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+            multi_agent_messages.root,
         ),
         subagent: resolve_role(
             config.subagent_usage_hint_text.as_deref(),
-            catalog.and_then(|messages| messages.subagent.as_deref()),
-            DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+            multi_agent_messages.subagent,
         ),
     }
 }
 
-// Merge-safety anchor: effective V2 mode follows config policy and remains absent for internal or
-// non-thread-spawn subagent sources.
+// Merge-safety anchor: effective V2 mode follows explicit config policy, never reasoning effort,
+// and remains absent for internal or non-thread-spawn subagent sources.
 pub(crate) fn effective_multi_agent_mode(
-    turn_context: &TurnContext,
+    step_context: &StepContext,
 ) -> Option<EffectiveMultiAgentMode> {
+    let turn_context = step_context.turn.as_ref();
     if turn_context.multi_agent_version != MultiAgentVersion::V2 {
         return None;
     }
@@ -195,32 +148,24 @@ pub(crate) fn effective_multi_agent_mode(
         SessionSource::Internal(_) | SessionSource::SubAgent(_) => return None,
     }
 
-    let catalog_mode = turn_context
-        .model_info()
-        .model_messages
-        .as_ref()
-        .and_then(|messages| messages.multi_agent.as_ref())
-        .and_then(|messages| messages.mode.as_ref());
-    let explanation = effective_mode_explanation(&turn_context.config.multi_agent_v2, catalog_mode);
-    let mode = match turn_context.config.multi_agent_v2.policy {
+    let messages =
+        ResolvedModelMessages::from_model(&step_context.settings.model_info).multi_agent();
+    let config = &turn_context.config.multi_agent_v2;
+    let explanation = config
+        .multi_agent_mode_hint_text
+        .clone()
+        .or_else(|| messages.hint.map(str::to_owned))
+        .or_else(|| match config.policy {
+            MultiAgentV2Policy::ExplicitRequestOnly => {
+                messages.explicit.catalog_override().map(str::to_owned)
+            }
+            MultiAgentV2Policy::Proactive => {
+                messages.proactive.catalog_override().map(str::to_owned)
+            }
+        });
+    let mode = match config.policy {
         MultiAgentV2Policy::ExplicitRequestOnly => MultiAgentMode::ExplicitRequestOnly,
         MultiAgentV2Policy::Proactive => MultiAgentMode::Proactive,
     };
     Some(EffectiveMultiAgentMode::new(mode, explanation))
-}
-
-fn effective_mode_explanation(
-    config: &MultiAgentV2Config,
-    catalog: Option<&MultiAgentModeMessages>,
-) -> Option<String> {
-    config
-        .multi_agent_mode_hint_text
-        .clone()
-        .or_else(|| catalog.and_then(|mode| mode.hint_text.clone()))
-        .or_else(|| match config.policy {
-            MultiAgentV2Policy::ExplicitRequestOnly => {
-                catalog.and_then(|mode| mode.explicit.clone())
-            }
-            MultiAgentV2Policy::Proactive => catalog.and_then(|mode| mode.proactive.clone()),
-        })
 }

@@ -1,5 +1,6 @@
 use crate::AppServerTarget;
 use crate::RemoteAppServerEndpoint;
+use crate::update_versions::ServerVersionNoticeKind;
 use sha2::Digest;
 use sha2::Sha256;
 use url::Url;
@@ -24,7 +25,7 @@ pub(crate) fn remote_connection_status_value(
 ) -> Option<RemoteConnectionStatus> {
     let endpoint = match app_server_target {
         AppServerTarget::Embedded | AppServerTarget::InstanceChild => return None,
-        AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
+        AppServerTarget::LocalDaemon { endpoint, .. } | AppServerTarget::Remote { endpoint } => {
             endpoint
         }
     };
@@ -46,11 +47,25 @@ pub(crate) fn remote_connection_status_value(
 
 pub(crate) fn server_version_notice(client: &str, server: Option<&str>) -> Option<String> {
     let server = server?;
-    crate::update_versions::is_official_server_older(client, server).then(|| {
-        format!(
-            "A background Codex service is running v{server}, older than your Codex CLI v{client}."
-        )
-    })
+    let comparison = match crate::update_versions::server_version_notice_kind(client, server)? {
+        ServerVersionNoticeKind::Older => "older than",
+        ServerVersionNoticeKind::Different => "different from",
+    };
+    Some(format!(
+        "A background Codex service is running v{server}, {comparison} your Codex CLI v{client}."
+    ))
+}
+
+pub(crate) fn server_version_notice_for_tui(
+    settings: &codex_config::types::Tui,
+    client: &str,
+    server: Option<&str>,
+) -> Option<String> {
+    if settings.show_server_version_notice {
+        server_version_notice(client, server)
+    } else {
+        None
+    }
 }
 
 fn hash_identity_part(hasher: &mut Sha256, tag: &[u8], value: &[u8]) {
@@ -72,7 +87,7 @@ pub(crate) fn server_version_notice_key(
     // remote endpoint to hash.
     let endpoint = match target {
         AppServerTarget::Embedded | AppServerTarget::InstanceChild => None,
-        AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
+        AppServerTarget::LocalDaemon { endpoint, .. } | AppServerTarget::Remote { endpoint } => {
             Some(endpoint)
         }
     };
@@ -127,13 +142,14 @@ pub(crate) fn server_version_notice_key(
 }
 
 pub(crate) fn pending_server_version_notice(
+    settings: &codex_config::types::Tui,
     target: &AppServerTarget,
     server_home: Option<&str>,
     client: &str,
     server: Option<&str>,
     last_shown: Option<&str>,
 ) -> Option<(ServerVersionNotice, String)> {
-    let message = server_version_notice(client, server)?;
+    let message = server_version_notice_for_tui(settings, client, server)?;
     let notice = ServerVersionNotice {
         message,
         offer_update: matches!(target, AppServerTarget::LocalDaemon { .. }),
@@ -185,6 +201,7 @@ mod tests {
 
         let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
         let daemon_target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: socket_path.clone(),
             },
@@ -200,14 +217,31 @@ mod tests {
     }
 
     #[test]
-    fn server_version_notice_only_for_older_official_server() {
+    fn server_version_notice_uses_client_release_policy() {
         assert_eq!(
             server_version_notice("0.153.0", Some("0.152.1")),
             Some("A background Codex service is running v0.152.1, older than your Codex CLI v0.153.0.".to_string())
         );
         assert_eq!(server_version_notice("0.153.0", Some("0.153.0")), None);
-        assert_eq!(server_version_notice("0.0.0", Some("0.152.1")), None);
+        assert_eq!(
+            server_version_notice("0.0.0", Some("0.152.1")),
+            Some("A background Codex service is running v0.152.1, different from your Codex CLI v0.0.0.".to_string())
+        );
         assert_eq!(server_version_notice("0.153.0", /*server*/ None), None);
+        assert_eq!(
+            server_version_notice("0.153.0-alpha.10", Some("0.153.0-alpha.9")),
+            Some("A background Codex service is running v0.153.0-alpha.9, older than your Codex CLI v0.153.0-alpha.10.".to_string())
+        );
+        for server in ["0.153.0-alpha.10", "0.153.0-alpha.11", "0.153.0"] {
+            assert_eq!(
+                server_version_notice("0.153.0-alpha.10", Some(server)),
+                None
+            );
+        }
+        assert_eq!(
+            server_version_notice("0.155.0-alpha.12", Some("0.156.0")),
+            Some("A background Codex service is running v0.156.0, different from your Codex CLI v0.155.0-alpha.12.".to_string())
+        );
     }
 
     #[test]
@@ -216,20 +250,27 @@ mod tests {
             socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
         };
         let local = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: endpoint.clone(),
         };
         let remote = AppServerTarget::Remote { endpoint };
+        let settings = codex_config::types::Tui {
+            show_server_version_notice: true,
+            ..Default::default()
+        };
         let notice = |target| {
             pending_server_version_notice(
+                &settings,
                 target,
                 /*server_home*/ None,
-                "0.153.0",
-                Some("0.152.1"),
+                "0.153.0-alpha.10.1",
+                Some("0.153.0-alpha.9.2"),
                 /*last_shown*/ None,
             )
             .map(|(notice, _)| notice)
         };
-        let remote_notice = server_version_notice("0.153.0", Some("0.152.1")).unwrap();
+        let remote_notice =
+            server_version_notice("0.153.0-alpha.10.1", Some("0.153.0-alpha.9.2")).unwrap();
         assert_eq!(
             notice(&remote),
             Some(ServerVersionNotice {
@@ -256,6 +297,7 @@ mod tests {
             })
         };
         let local = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: socket("/c")?,
         };
         let remote = AppServerTarget::Remote {

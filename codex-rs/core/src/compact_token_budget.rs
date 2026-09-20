@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::compact::InitialContextInjection;
-use crate::compact_handoff::PreCompactHandoffSettings;
 use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::context::world_state::WorldState;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -30,6 +29,8 @@ pub(crate) async fn run_manual_compact_task(
     turn_context: Arc<TurnContext>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    sess.emit_turn_started(&turn_context).await;
+
     // Manual compaction runs outside run_turn, so it captures its own current step.
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), cancellation_token)
@@ -85,14 +86,8 @@ async fn run_compact_task_inner(
         PreCompactHookOutcome::Continue => {}
         PreCompactHookOutcome::Stopped => return Err(CodexErr::TurnAborted),
     }
-    let prepared_handoff = prepare_pre_compact_handoff(
-        sess,
-        turn_context,
-        PreCompactHandoffSettings::from_step_context(step_context),
-        &step_context.session_telemetry,
-        cancellation_token,
-    )
-    .await?;
+    let prepared_handoff =
+        prepare_pre_compact_handoff(sess, step_context.as_ref(), cancellation_token).await?;
 
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(turn_context, &compaction_item)

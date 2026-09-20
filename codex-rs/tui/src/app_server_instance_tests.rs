@@ -179,6 +179,7 @@ async fn app_server_child_helper() -> Result<()> {
     )
     .await
     .map_err(color_eyre::Report::new)
+    .map(|_| ())
 }
 
 fn endpoint_socket(endpoint: &RemoteAppServerEndpoint) -> &AbsolutePathBuf {

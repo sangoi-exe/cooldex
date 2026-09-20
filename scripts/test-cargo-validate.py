@@ -51,6 +51,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-app-server-transport": "app-server-transport",
             "codex-async-utils": "async-utils",
             "codex-attachment-store": "attachment-store",
+            "codex-aws-auth": "aws-auth",
             "codex-backend-client": "backend-client",
             "codex-build-info": "build-info",
             "codex-chatgpt": "chatgpt",
@@ -73,6 +74,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-file-system": "file-system",
             "codex-git-utils": "git-utils",
             "codex-guardian-context": "guardian-context",
+            "codex-guardian-reviewer": "ext/guardian-reviewer",
             "codex-guardian-v2": "ext/guardian-v2",
             "codex-history": "history",
             "codex-history-notes-extension": "ext/history-notes",
@@ -82,30 +84,40 @@ class CargoValidateTests(unittest.TestCase):
             "codex-linux-sandbox": "linux-sandbox",
             "codex-login": "login",
             "codex-mcp": "codex-mcp",
+            "codex-memories-read": "memories/read",
+            "codex-mermaid": "mermaid",
             "codex-model-provider": "model-provider",
             "codex-models-manager": "models-manager",
             "codex-mxc-sandbox": "mxc-sandbox",
             "codex-otel-trace-websocket": "otel-trace-websocket",
             "codex-protocol": "protocol",
+            "codex-queue-extension": "ext/queue",
             "codex-realtime-webrtc": "realtime-webrtc",
             "codex-rmcp-client": "rmcp-client",
             "codex-sandboxing": "sandboxing",
+            "codex-secrets": "secrets",
+            "codex-shell-escalation": "shell-escalation",
             "codex-skills": "skills",
             "codex-test-binary-support": "test-binary-support",
             "codex-terminal-detection": "terminal-detection",
+            "codex-tcp-tunnel": "tcp-tunnel",
             "codex-thread-manager-sample": "thread-manager-sample",
             "codex-tools": "tools",
             "codex-tui": "tui",
             "codex-unmapped-fixture": "unmapped-fixture",
             "codex-uds": "uds",
             "codex-user-verification": "user-verification",
+            "codex-utils-absolute-path": "utils/absolute-path",
             "codex-utils-audio": "utils/audio",
             "codex-utils-cache": "utils/cache",
+            "codex-utils-fuzzy-match": "utils/fuzzy-match",
             "codex-utils-git-discovery": "utils/git-discovery",
             "codex-utils-image": "utils/image",
             "codex-utils-path": "utils/path-utils",
             "codex-utils-process": "utils/process",
             "codex-utils-pty": "utils/pty",
+            "codex-utils-sandbox-summary": "utils/sandbox-summary",
+            "codex-utils-string": "utils/string",
             "codex-voice-host": "voice-host",
             "codex-websocket-client": "websocket-client",
             "codex-windows-sandbox": "windows-sandbox-rs",
@@ -1686,6 +1698,7 @@ class CargoValidateTests(unittest.TestCase):
     def test_known_cli_fallback_roots_have_explicit_strict_rule(self) -> None:
         cases = (
             ("codex-attachment-store", "codex-rs/attachment-store/Cargo.toml"),
+            ("codex-aws-auth", "codex-rs/aws-auth/Cargo.toml"),
             ("codex-build-info", "codex-rs/build-info/Cargo.toml"),
             ("codex-code-mode-protocol", "codex-rs/code-mode-protocol/Cargo.toml"),
             (
@@ -1707,18 +1720,36 @@ class CargoValidateTests(unittest.TestCase):
                 "codex-rs/ext/history-notes/Cargo.toml",
             ),
             ("codex-guardian-context", "codex-rs/guardian-context/Cargo.toml"),
+            (
+                "codex-guardian-reviewer",
+                "codex-rs/ext/guardian-reviewer/Cargo.toml",
+            ),
             ("codex-history", "codex-rs/history/Cargo.toml"),
             (
                 "codex-otel-trace-websocket",
                 "codex-rs/otel-trace-websocket/Cargo.toml",
             ),
             ("codex-realtime-webrtc", "codex-rs/realtime-webrtc/Cargo.toml"),
+            ("codex-queue-extension", "codex-rs/ext/queue/Cargo.toml"),
+            ("codex-memories-read", "codex-rs/memories/read/Cargo.toml"),
+            ("codex-mermaid", "codex-rs/mermaid/Cargo.toml"),
+            ("codex-secrets", "codex-rs/secrets/Cargo.toml"),
+            ("codex-shell-escalation", "codex-rs/shell-escalation/Cargo.toml"),
             ("codex-skills", "codex-rs/skills/Cargo.toml"),
             (
                 "codex-terminal-detection",
                 "codex-rs/terminal-detection/Cargo.toml",
             ),
+            ("codex-tcp-tunnel", "codex-rs/tcp-tunnel/Cargo.toml"),
+            (
+                "codex-utils-absolute-path",
+                "codex-rs/utils/absolute-path/Cargo.toml",
+            ),
             ("codex-utils-audio", "codex-rs/utils/audio/Cargo.toml"),
+            (
+                "codex-utils-fuzzy-match",
+                "codex-rs/utils/fuzzy-match/Cargo.toml",
+            ),
             (
                 "codex-utils-git-discovery",
                 "codex-rs/utils/git-discovery/Cargo.toml",
@@ -1730,6 +1761,11 @@ class CargoValidateTests(unittest.TestCase):
             ("codex-uds", "codex-rs/uds/Cargo.toml"),
             ("codex-utils-path", "codex-rs/utils/path-utils/Cargo.toml"),
             ("codex-utils-pty", "codex-rs/utils/pty/Cargo.toml"),
+            (
+                "codex-utils-sandbox-summary",
+                "codex-rs/utils/sandbox-summary/Cargo.toml",
+            ),
+            ("codex-utils-string", "codex-rs/utils/string/Cargo.toml"),
             ("codex-worktree", "codex-rs/worktree/Cargo.toml"),
         )
 
@@ -3510,6 +3546,46 @@ class CargoValidateTests(unittest.TestCase):
         ):
             self.assertNotIn(neutral_prefix, filter_expression)
 
+    def test_native_aggregate_excludes_proven_elevated_windows_sandbox_tests(
+        self,
+    ) -> None:
+        command = tomllib.loads(PRODUCTION_CONFIG.read_text(encoding="utf-8"))[
+            "commands"
+        ]["windows-nextest-workspace"]
+        argv = command["argv"]
+        self.assertIsInstance(argv, list)
+        self.assertTrue(all(isinstance(argument, str) for argument in argv))
+        filter_expression = argv[argv.index("-E") + 1]
+        self.assertIsInstance(filter_expression, str)
+
+        expected_tests = {
+            "codex-core": (
+                "windows_sandbox_cli_preserves_managed_deny_reads_across_launches",
+            ),
+            "codex-exec-server": (
+                "file_system_elevated_relative_read_denial_uses_policy_cwd",
+            ),
+        }
+        package_filters = {}
+        for package, test_names in expected_tests.items():
+            prefix = f"(package({package}) & test(/(?:^|::)(?:"
+            suffix = ")(?:$|::)/))"
+            start = filter_expression.index(prefix) + len(prefix)
+            end = filter_expression.index(suffix, start)
+            package_filter = filter_expression[start:end]
+            package_filters[package] = package_filter
+            for test_name in test_names:
+                with self.subTest(package=package, test_name=test_name):
+                    self.assertEqual(1, package_filter.split("|").count(test_name))
+
+        for variant in ("local", "remote"):
+            with self.subTest(variant=variant):
+                self.assertRegex(
+                    "file_system_elevated_relative_read_denial_uses_policy_cwd"
+                    f"::{variant}",
+                    "(?:^|::)(?:" + package_filters["codex-exec-server"] + ")(?:$|::)",
+                )
+
     def test_windows_sandbox_owner_selects_native_aggregate(self) -> None:
         plan = self.plan_json(
             "--file", "codex-rs/windows-sandbox-rs/src/lib.rs", "--mode", "full"
@@ -3536,7 +3612,14 @@ class CargoValidateTests(unittest.TestCase):
 
         self.assertEqual(1, commands.count(windows_argv))
         self.assertNotIn(["just", "test"], commands)
-        windows_command = self.command_for_argv(plan, windows_argv)
+        windows_commands = [
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-workspace"
+        ]
+        self.assertEqual(1, len(windows_commands))
+        windows_command = windows_commands[0]
+        self.assertEqual(windows_argv, windows_command["argv"])
         windows_index = commands.index(windows_argv)
         self.assertEqual("windows-nextest-workspace", windows_command["kind"])
         self.assertEqual(
@@ -3612,15 +3695,23 @@ class CargoValidateTests(unittest.TestCase):
     def test_full_mode_scopes_wsl_test_preparation_and_runtime_to_explicit_linux_unix_packages(
         self,
     ) -> None:
-        files = ("codex-rs/core/Cargo.toml", "codex-rs/uds/Cargo.toml")
+        files = (
+            "codex-rs/core/Cargo.toml",
+            "codex-rs/uds/Cargo.toml",
+            "codex-rs/shell-escalation/Cargo.toml",
+        )
+        file_args = tuple(
+            argument for file_path in files for argument in ("--file", file_path)
+        )
         plans = {
-            mode: self.plan_json("--file", files[0], "--file", files[1], "--mode", mode)
+            mode: self.plan_json(*file_args, "--mode", mode)
             for mode in ("quick", "standard", "strict", "full")
         }
         commands_by_mode = {
             mode: self.command_lines(plan) for mode, plan in plans.items()
         }
-        packages = ("codex-core", "codex-uds")
+        packages = ("codex-core", "codex-uds", "codex-shell-escalation")
+        wsl_runtime_packages = {"codex-uds", "codex-shell-escalation"}
 
         for plan in plans.values():
             self.assertNotIn("wsl_runtime_packages", plan)
@@ -3661,18 +3752,23 @@ class CargoValidateTests(unittest.TestCase):
             for argv in test_preparation:
                 with self.subTest(mode="full", package=package, argv=argv):
                     assertion = (
-                        self.assertIn if package == "codex-uds" else self.assertNotIn
+                        self.assertIn
+                        if package in wsl_runtime_packages
+                        else self.assertNotIn
                     )
                     assertion(argv, full_commands)
 
-        self.assertIn(
-            ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-uds"],
-            full_commands,
-        )
-        self.assertNotIn(
-            ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-core"],
-            full_commands,
-        )
+        for package in packages:
+            with self.subTest(mode="full", package=package, rung="runtime"):
+                assertion = (
+                    self.assertIn
+                    if package in wsl_runtime_packages
+                    else self.assertNotIn
+                )
+                assertion(
+                    ["./scripts/cargo-guard.sh", "cargo", "test", "-p", package],
+                    full_commands,
+                )
 
         for mode in ("standard", "strict"):
             commands = commands_by_mode[mode]

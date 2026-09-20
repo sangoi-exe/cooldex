@@ -11,17 +11,19 @@ use super::disconnect::serve_reconnect_requests;
 
 #[tokio::test]
 async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> Result<()> {
-    for (recovered_queue, edit_offline, resume_error_code, deferred_notice) in [
-        (true, false, -32603, false),
-        (false, false, -32603, false),
-        (true, true, -32603, false),
-        (true, false, -32600, false),
-        (false, false, -32600, false),
-        (true, true, -32600, false),
-        (true, false, -32603, true),
+    for (recovered_queue, edit_offline, resume_error_code, deferred_notice, notice_enabled) in [
+        (true, false, -32603, false, false),
+        (true, false, -32603, false, true),
+        (false, false, -32603, false, false),
+        (true, true, -32603, false, false),
+        (true, false, -32600, false, false),
+        (false, false, -32600, false, false),
+        (true, true, -32600, false, false),
+        (true, false, -32603, true, true),
     ] {
         let pending_profile = !recovered_queue && resume_error_code == -32600;
         let (mut app, mut events, mut ops) = make_test_app_with_channels().await;
+        app.local_settings.tui.show_server_version_notice = notice_enabled;
         let id = ThreadId::new();
         let cwd = app.config.cwd.clone();
         app.config.model = Some("gpt-test".into());
@@ -49,11 +51,20 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         app.chat_widget.set_collaboration_mask(
             crate::collaboration_modes::plan_mask(app.model_catalog.as_ref()).unwrap(),
         );
-        let expected_mode = app.chat_widget.effective_collaboration_mode().with_updates(
+        let cached_mode = app.chat_widget.effective_collaboration_mode().with_updates(
             Some("gpt-test".into()),
             Some(None),
             /*developer_instructions*/ None,
         );
+        // A newer server can report a mode changed by another client while disconnected.
+        let server_mode = (!recovered_queue).then(|| CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                developer_instructions: Some("Updated by another client".into()),
+                ..cached_mode.settings.clone()
+            },
+        });
+        let expected_mode = server_mode.clone().unwrap_or(cached_mode);
         let expected_submitted_mode = expected_mode.clone();
         assert!(!app.model_catalog.collaboration_modes.is_empty());
         if edit_offline {
@@ -76,18 +87,21 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
         app.app_server_target = AppServerTarget::Remote { endpoint };
-        let (notice, key) = crate::status::remote_connection::pending_server_version_notice(
-            &app.app_server_target,
-            /*server_home*/ None,
-            "2.1.0",
-            Some("2.0.0"),
-            /*last_shown*/ None,
-        )
-        .expect("older server should have a pending notice");
-        app.reconnect.seen_version_notice = Some(key);
-        if deferred_notice {
-            app.pending_server_version_notice = Some(notice);
-            app.update_server_version_overview_notice("2.1.0", Some("2.0.0"));
+        if notice_enabled {
+            let (notice, key) = crate::status::remote_connection::pending_server_version_notice(
+                &app.local_settings.tui,
+                &app.app_server_target,
+                /*server_home*/ None,
+                "2.1.0",
+                Some("2.0.0"),
+                /*last_shown*/ None,
+            )
+            .expect("older server should have a pending notice");
+            app.reconnect.seen_version_notice = Some(key);
+            if deferred_notice {
+                app.pending_server_version_notice = Some(notice);
+                app.update_server_version_overview_notice("2.1.0", Some("2.0.0"));
+            }
         }
         let thread = json!({
             "id": id, "sessionId": id, "preview": "only once", "ephemeral": false,
@@ -113,8 +127,12 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
                         let params = request.params.as_ref().unwrap();
                         assert_eq!(params["threadId"], id.to_string());
                         assert!(params["model"].is_null());
-                        Some(json!({"result": {"thread": thread, "model": "gpt-test", "modelProvider": "test-provider", "cwd": cwd,
-                            "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"}, "reasoningEffort": null}}))
+                        let mut result = json!({"thread": thread, "model": "gpt-test", "modelProvider": "test-provider", "cwd": cwd,
+                            "approvalPolicy": "never", "approvalsReviewer": "user", "sandbox": {"type": "dangerFullAccess"}, "reasoningEffort": null});
+                        if let Some(mode) = &server_mode {
+                            result["collaborationMode"] = json!(mode);
+                        }
+                        Some(json!({"result": result}))
                     }
                     "thread/read" => Some(json!({"result": {"thread": thread}})),
                     "thread/list" | "thread/loaded/list" => Some(json!({"result": {"data": [], "nextCursor": null}})),
@@ -226,13 +244,19 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
                 &mut app.rate_limit_hard_stop_generation,
             )
             .unwrap();
-        let before_disconnect = Instant::now() - Duration::from_secs(/*secs*/ 300);
+        let before_disconnect = Instant::now();
         app.recap.note_focus_lost(before_disconnect);
         for _ in 0..3 {
             app.recap
                 .note_turn_finished(&TurnStatus::Completed, before_disconnect);
         }
         app.schedule_recap_check(id, Instant::now());
+        app.pending_managed_worktree_creation = true;
+        app.agents_overview
+            .view_state
+            .lock()
+            .unwrap()
+            .creating_worktree = true;
         let old_sender = app.app_event_tx.clone();
         let connected = reconnect(
             app.app_server_target.clone(),
@@ -252,6 +276,14 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
         app.finish_reconnect(&mut tui, &mut session, &mut events, connected, "2.1.0")
             .await?;
         assert!(app.pending_server_profiles.is_empty());
+        assert!(!app.pending_managed_worktree_creation);
+        assert!(
+            !app.agents_overview
+                .view_state
+                .lock()
+                .unwrap()
+                .creating_worktree
+        );
         assert!(!app.reconnect.offline);
         assert!(!app.thread_unavailable(id));
         assert_eq!(app.last_subagent_backfill_attempt, None);
@@ -268,6 +300,10 @@ async fn reconnect_restores_history_permissions_and_keeps_old_input_paused() -> 
             !app.agent_navigation
                 .finish_picker_refresh(id, stale_picker_refresh)
         );
+        // Let the rebound timer become due without depending on machine uptime.
+        tokio::time::pause();
+        tokio::time::advance(recap::RECAP_DELAY).await;
+        tokio::time::resume();
         let mut deferred = Vec::new();
         tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
             loop {

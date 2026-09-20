@@ -17,6 +17,7 @@ fn rendered_text(markdown: &str, cwd: Option<&Path>) -> String {
 fn file_citation_paths_preserve_markdown_significant_characters() {
     for path in [
         "/tmp/a*b*.txt",
+        "/tmp/$x$/report.md",
         "/tmp/a`b`.txt",
         "/tmp/a<b>.txt",
         "/tmp/report#L10",
@@ -137,10 +138,11 @@ fn file_citations_preserve_escaped_nested_and_reference_directives() {
 #[test]
 fn multiple_file_citations_render_without_interpreting_encoded_source() {
     let cwd = std::env::temp_dir();
-    let second = cwd.join("second.xlsx");
+    // Merge-safety anchor: file-citation rendering accepts native paths serialized as file URLs and still presents the temporary artifact's portable leaf name.
+    let second = url::Url::from_file_path(cwd.join("second.xlsx")).unwrap();
     let markdown = format!(
         r#"&#58;codex-file-citation{{path="ignored.xlsx"}} :codex-file-citation{{artifact_kind="workbook" path="reports/final%20report.xlsx" purpose="output" sheet="Dashboard" range="A1:D8"}} and ::codex-file-citation{{path="{}"}}"#,
-        second.display(),
+        second.as_str(),
     );
 
     assert_eq!(
@@ -158,6 +160,13 @@ fn multiple_file_citations_render_without_interpreting_encoded_source() {
 
 #[test]
 fn file_citations_preserve_adjacent_entities_and_escaped_punctuation() {
+    assert_eq!(
+        rendered_text(
+            r"$\alpha$:codex-file-citation{path=/tmp/$x$/report.md}$\beta$",
+            /*cwd*/ None
+        ),
+        "α/tmp/$x$/report.mdβ",
+    );
     let cwd = std::env::temp_dir();
     for (markdown, expected) in [
         (

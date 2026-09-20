@@ -33,6 +33,7 @@ use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
+use core_test_support::context_snapshot::SnapshotEntry;
 use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
@@ -330,6 +331,17 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
     vec![
         chunk(ev_response_created(response_id)),
         chunk(ev_completed(response_id)),
+    ]
+}
+
+// Merge-safety anchor: direct streaming compaction fixtures reserve the operation-local handoff response before each compaction response so later streams retain their asserted request roles.
+fn pre_compact_handoff_chunks() -> Vec<StreamingSseChunk> {
+    vec![
+        chunk(ev_message_item_done(
+            "pre-compact-handoff",
+            "continue after compaction",
+        )),
+        chunk(ev_completed("pre-compact-handoff")),
     ]
 }
 
@@ -1037,22 +1049,14 @@ async fn any_new_input_interrupts_sleep() {
 
 fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]) {
     assert_eq!(requests.len(), 2);
-    let options = ContextSnapshotOptions::default().strip_capability_instructions();
+    let options = ContextSnapshotOptions::default().rewrite_known_segments();
     let first: Value = from_slice(&requests[0]).expect("parse first request");
     let second: Value = from_slice(&requests[1]).expect("parse second request");
-    let first_items = first["input"]
-        .as_array()
-        .expect("first request input")
-        .clone();
-    let second_items = second["input"]
-        .as_array()
-        .expect("second request input")
-        .clone();
-    let snapshot = context_snapshot::format_labeled_items_snapshot(
-        "/responses POST bodies (input only, redacted like other suite snapshots)",
+    let snapshot = context_snapshot::format_context_snapshot(
+        "/responses POST bodies with pending input",
         &[
-            ("First request", first_items.as_slice()),
-            ("Second request", second_items.as_slice()),
+            SnapshotEntry::body(&first).labeled("First request"),
+            SnapshotEntry::body(&second).labeled("Second request"),
         ],
         &options,
     );
@@ -1495,6 +1499,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
                 "initial", /*total_tokens*/ 500_000,
             )),
         ],
+        pre_compact_handoff_chunks(),
         vec![StreamingSseChunk {
             gate: Some(failure_gate),
             body: failure.clone(),
@@ -1503,15 +1508,19 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
     // Mail arriving during a failed turn may start one fresh turn. That turn must also
     // stop on the terminal error, persist its mail, and not start another turn for it.
     let failed_turns = if pending_input == PendingInputAfterFailure::TriggeringMail {
-        streams.push(vec![StreamingSseChunk {
-            gate: None,
-            body: failure,
-        }]);
+        streams.extend([
+            pre_compact_handoff_chunks(),
+            vec![StreamingSseChunk {
+                gate: None,
+                body: failure,
+            }],
+        ]);
         2
     } else {
         1
     };
     streams.extend([
+        pre_compact_handoff_chunks(),
         vec![
             chunk(json!({
                 "type": "response.output_item.done",
@@ -1542,7 +1551,6 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
         .with_config(move |config| {
             config.model_provider.base_url = Some(base_url);
             config.model_auto_compact_token_limit = Some(100_000);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
             // The streaming fixture records raw request bodies for JSON assertions.
             let _ = config.features.disable(Feature::EnableRequestCompression);
         })
@@ -1560,7 +1568,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
     submit_user_input(codex, "prompt that needs compaction").await;
     tokio::time::timeout(
         std::time::Duration::from_secs(/*secs*/ 10),
-        server.wait_for_request_count(/*count*/ 2),
+        server.wait_for_request_count(/*count*/ 3),
     )
     .await?;
     match pending_input {
@@ -1611,9 +1619,9 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
     .await;
     assert_eq!(errors.len(), failed_turns);
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 1 + failed_turns);
-    for request in &requests[1..] {
-        let body: Value = from_slice(request)?;
+    assert_eq!(requests.len(), 1 + 2 * failed_turns);
+    for request_pair in requests[1..].chunks_exact(2) {
+        let body: Value = from_slice(&request_pair[1])?;
         assert!(
             body["input"]
                 .as_array()
@@ -1663,7 +1671,7 @@ async fn terminal_compaction_error_does_not_retry_pending_input(
         unreachable!("expected turn completion");
     };
     assert_eq!(completed.error, None);
-    assert_eq!(server.requests().await.len(), 3 + failed_turns);
+    assert_eq!(server.requests().await.len(), 4 + 2 * failed_turns);
     server.shutdown().await;
     Ok(())
 }
@@ -1712,6 +1720,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
 
     let (server, _completions) = start_streaming_sse_server(vec![
         first_chunks,
+        pre_compact_handoff_chunks(),
         compact_chunks,
         post_compact_continuation_chunks,
         steered_follow_up_chunks,
@@ -1737,10 +1746,10 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
 
-    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
-    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
+    let post_compact_body: Value = from_slice(&requests[3]).expect("parse post-compact request");
+    let steered_body: Value = from_slice(&requests[4]).expect("parse steered request");
 
     let post_compact_user_texts = message_input_texts(&post_compact_body, "user");
     assert!(
@@ -1799,9 +1808,13 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         )),
     ];
 
-    let (server, _completions) =
-        start_streaming_sse_server(vec![first_chunks, compact_chunks, steered_follow_up_chunks])
-            .await;
+    let (server, _completions) = start_streaming_sse_server(vec![
+        first_chunks,
+        pre_compact_handoff_chunks(),
+        compact_chunks,
+        steered_follow_up_chunks,
+    ])
+    .await;
 
     let codex = test_codex()
         .with_model("gpt-5.4")
@@ -1824,10 +1837,10 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
 
-    let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
-    let steered_body: Value = from_slice(&requests[2]).expect("parse steered request");
+    let compact_body: Value = from_slice(&requests[2]).expect("parse compact request");
+    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(
@@ -1914,6 +1927,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
 
     let (server, _completions) = start_streaming_sse_server(vec![
         first_chunks,
+        pre_compact_handoff_chunks(),
         compact_chunks,
         post_compact_continuation_chunks,
         steered_follow_up_chunks,
@@ -1940,11 +1954,11 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     wait_for_turn_complete(&codex).await;
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
 
-    let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
-    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
-    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
+    let compact_body: Value = from_slice(&requests[2]).expect("parse compact request");
+    let post_compact_body: Value = from_slice(&requests[3]).expect("parse post-compact request");
+    let steered_body: Value = from_slice(&requests[4]).expect("parse steered request");
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(

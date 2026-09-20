@@ -39,6 +39,11 @@ impl SessionTask for BlockingTurnStartedTask {
                     ctx.as_ref(),
                     EventMsg::TurnStarted(TurnStartedEvent {
                         turn_id: ctx.sub_id.clone(),
+                        root_turn_id: Some(
+                            ctx.turn_metadata_state
+                                .root_turn_id()
+                                .unwrap_or_else(|| ctx.sub_id.clone()),
+                        ),
                         trace_id: ctx.trace_id.clone(),
                         started_at: ctx.turn_timing_state.started_at_unix_secs().await,
                         model_context_window: ctx.model_context_window(),

@@ -299,6 +299,7 @@ fn settings_snapshot(
         permission_profile: PermissionProfile::read_only(),
         active_permission_profile: None,
         cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
+        runtime_workspace_roots: None,
         reasoning_effort: None,
         reasoning_summary: None,
         personality: None,
@@ -310,6 +311,7 @@ fn settings_snapshot(
                 developer_instructions: None,
             },
         },
+        disabled_plugin_ids: Vec::new(),
         shell_tool_enabled,
     }
 }

@@ -10,7 +10,6 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::step_settings::ResolvedStepSettings;
-use crate::session::turn_context::TurnContext;
 use codex_async_utils::OrCancelExt;
 use codex_history::HandoffPreparation;
 use codex_otel::SessionTelemetry;
@@ -201,19 +200,19 @@ impl PreparedPreCompactHandoff {
 /// Prepares one hidden, tool-free handoff request without publishing generated text.
 pub(crate) async fn prepare_pre_compact_handoff(
     sess: &Session,
-    turn_context: &TurnContext,
-    settings: PreCompactHandoffSettings,
-    session_telemetry: &SessionTelemetry,
+    step_context: &StepContext,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PreparedPreCompactHandoff> {
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
     }
+    let settings = PreCompactHandoffSettings::from_step_context(step_context);
     let snapshot = sess
         .snapshot_pre_compact_handoff_input(&settings.model_info)
         .await?;
     let source = PreCompactHandoffSource::from_snapshot(snapshot, settings);
-    let recovery_instructions = turn_context
+    let recovery_instructions = step_context
+        .turn
         .config
         .post_compact_recovery_instructions
         .as_deref()
@@ -232,13 +231,13 @@ pub(crate) async fn prepare_pre_compact_handoff(
 
     let prompt = source.synthesis_prompt();
     let responses_metadata = sess
-        .responses_metadata(turn_context, CodexResponsesRequestKind::PreCompactHandoff)
+        .responses_metadata(step_context, CodexResponsesRequestKind::PreCompactHandoff)
         .await;
     let outcome = match synthesize_pre_compact_handoff(
         sess,
         &source,
         &prompt,
-        session_telemetry,
+        &step_context.session_telemetry,
         &responses_metadata,
         cancellation_token,
     )

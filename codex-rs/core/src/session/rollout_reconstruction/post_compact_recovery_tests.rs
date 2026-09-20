@@ -239,57 +239,37 @@ fn duplicate_matching_application_is_idempotent_but_mismatch_blocks() {
 }
 
 #[test]
-fn stable_pre_feature_compaction_is_repairable_but_ambiguous_legacy_is_not() {
-    let repairable = reconstruct(&[compaction(
+fn markerless_compactions_have_no_recovery_obligation() {
+    let stable = reconstruct(&[compaction(
         Some(WINDOW_ID),
         None,
         Some(vec![boundary_item(BOUNDARY_ID)]),
     )]);
-    assert_eq!(
-        repairable
-            .pending_identity()
-            .expect("stable pre-feature identity should be repairable"),
-        &PostCompactRecoveryIdentity {
-            compaction_window_id: WINDOW_ID.to_string(),
-            boundary_item_id: BOUNDARY_ID.to_string(),
-        }
-    );
+    assert_eq!(stable, PostCompactRecoveryRuntimeState::Absent);
 
     let missing_window = reconstruct(&[compaction(
         None,
         None,
         Some(vec![boundary_item(BOUNDARY_ID)]),
     )]);
-    assert_eq!(
-        missing_window.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::UnsupportedLegacy)
-    );
+    assert_eq!(missing_window, PostCompactRecoveryRuntimeState::Absent);
 
     let missing_boundary = reconstruct(&[compaction(Some(WINDOW_ID), None, Some(Vec::new()))]);
-    assert_eq!(
-        missing_boundary.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::UnsupportedLegacy)
-    );
+    assert_eq!(missing_boundary, PostCompactRecoveryRuntimeState::Absent);
 
     let duplicate_boundary = reconstruct(&[compaction(
         Some(WINDOW_ID),
         None,
         Some(vec![boundary_item(BOUNDARY_ID), boundary_item(BOUNDARY_ID)]),
     )]);
-    assert_eq!(
-        duplicate_boundary.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::UnsupportedLegacy)
-    );
+    assert_eq!(duplicate_boundary, PostCompactRecoveryRuntimeState::Absent);
 
     let wrong_uuid_version = reconstruct(&[compaction(
         Some(UUID_V4_WINDOW_ID),
         None,
         Some(vec![boundary_item(BOUNDARY_ID)]),
     )]);
-    assert_eq!(
-        wrong_uuid_version.blocked_failure(),
-        Some(PostCompactRecoveryFailureClass::UnsupportedLegacy)
-    );
+    assert_eq!(wrong_uuid_version, PostCompactRecoveryRuntimeState::Absent);
 }
 
 #[test]
@@ -298,6 +278,19 @@ fn malformed_marker_or_out_of_order_application_blocks() {
         reconstruct(&[application(WINDOW_ID, BOUNDARY_ID, TURN_ID)]);
     assert_eq!(
         application_without_compaction.blocked_failure(),
+        Some(PostCompactRecoveryFailureClass::MalformedApplicationProof)
+    );
+
+    let application_after_markerless_compaction = reconstruct(&[
+        compaction(
+            Some(WINDOW_ID),
+            None,
+            Some(vec![boundary_item(BOUNDARY_ID)]),
+        ),
+        application(WINDOW_ID, BOUNDARY_ID, TURN_ID),
+    ]);
+    assert_eq!(
+        application_after_markerless_compaction.blocked_failure(),
         Some(PostCompactRecoveryFailureClass::MalformedApplicationProof)
     );
 

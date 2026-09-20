@@ -251,7 +251,7 @@ build-for-release:
 write-config-schema:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo run -p codex-config-schema --bin codex-write-config-schema
 
-# Regenerate vendored app-server protocol schema artifacts.
+# Regenerate app-server protocol schemas and the Python SDK derived from them.
 write-app-server-schema *args:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" {{ python }} app-server-protocol/scripts/write_schema_fixtures.py {args}
 

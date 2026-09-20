@@ -29,8 +29,6 @@ pub(crate) enum PostCompactRecoveryFailureClass {
     Serialization,
     #[error("packet_cap")]
     PacketCap,
-    #[error("unsupported_legacy_recovery")]
-    UnsupportedLegacy,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

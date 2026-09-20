@@ -371,7 +371,7 @@ fn existing_cross_context_keymaps_load_without_misleading_submit_hints() {
         let mut editor = editor();
         editor.navigate(/*forward*/ true);
         editor.set_keymap(&keymap);
-        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"ctrl + ] skip   ⌥ + ↓ prev question"); }
+        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"ctrl+] skip   ⌥+↓ prev question"); }
         editor.handle_key_event(KeyEvent::from(KeyCode::F(12)));
         assert!(editor.submission.is_none());
     }
@@ -391,4 +391,45 @@ fn question_navigation_resets_history_recall() {
     editor.navigate(/*forward*/ false);
     editor.handle_key_event(KeyCode::Up.into());
     assert_eq!(editor.composer.current_text(), "newer");
+}
+
+#[test]
+fn answered_questions_do_not_reopen_when_history_precedes_local_drafts() {
+    let mut original = editor();
+    let saved = original.capture();
+    original.resolve_answers(&["unknown".into()]);
+    assert_eq!(original.state.pending, saved.pending);
+    let mut restored = editor();
+    restored.state = QuestionState::default();
+    restored.resolve_answers(&[r#"["request_user_input_async","message",0]"#.into()]);
+    restored.append(
+        "message",
+        &[
+            question("First", /*options*/ None),
+            question("Second", /*options*/ None),
+        ],
+    );
+    assert_eq!(restored.unanswered_count(), 1);
+    restored.restore(saved);
+    assert_eq!(restored.state.pending, original.state.pending[1..]);
+    // Legacy desktop replies refer to the entire source message.
+    restored.resolve_answers(&["message".into()]);
+    assert_eq!(restored.unanswered_count(), 0);
+    assert!(restored.composer.is_empty());
+}
+
+#[test]
+fn oversized_question_ids_keep_questions_answerable_without_echoing_the_id() {
+    let mut editor = editor();
+    editor.clear_pending();
+    editor.append(&"x".repeat(1024), &[question("Question", /*options*/ None)]);
+    assert_eq!(editor.unanswered_count(), 1);
+    editor.set_expanded(/*expanded*/ true);
+    editor.handle_paste("Answer".into());
+    render_editor(&editor, /*width*/ 80, /*height*/ 20);
+    editor.go_next_or_submit();
+    let Some(QuestionSubmission::Submit(reply)) = editor.submission else {
+        panic!("submitted answer");
+    };
+    assert_eq!(reply, "> Question\n\nAnswer");
 }

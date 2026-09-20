@@ -20,7 +20,6 @@ use crate::legacy_core::config::edit::ConfigEditsBuilder;
 use crate::markdown_render::render_streaming_markdown_lines_with_width_and_cwd as render_assistant;
 use crate::pager_overlay::Overlay;
 use crate::status::format_directory_display;
-use crate::style::footer_hint_key_style;
 use crate::style::footer_hint_label_style;
 use crate::terminal_palette::best_color;
 use crate::terminal_palette::default_bg;
@@ -77,6 +76,10 @@ use uuid::Uuid;
 
 mod archive;
 mod page_loading;
+
+#[cfg(test)]
+#[path = "resume_picker_color_tests.rs"]
+mod color_tests;
 
 use page_loading::PageCwdFilter;
 use page_loading::PageLoadMode;
@@ -333,6 +336,7 @@ struct SessionPickerViewPersistence {
 }
 
 struct SessionPickerRunOptions {
+    use_theme_colors: bool,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     local_filter_cwd: Option<PathBuf>,
@@ -444,6 +448,7 @@ async fn run_resume_picker_with_launch_context(
     let provider_filter = picker_provider_filter(config, uses_remote_workspace);
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
+        use_theme_colors: local_settings.tui.status_line_use_colors,
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -504,6 +509,7 @@ pub async fn run_fork_picker_with_app_server(
     let provider_filter = picker_provider_filter(config, uses_remote_workspace);
     let runtime_keymap = picker_runtime_keymap(local_settings)?;
     let options = SessionPickerRunOptions {
+        use_theme_colors: local_settings.tui.status_line_use_colors,
         show_all,
         filter_cwd: cwd_filter,
         local_filter_cwd,
@@ -559,6 +565,7 @@ async fn run_session_picker_with_loader(
         options.action,
     );
     state.local_filter_cwd = options.local_filter_cwd;
+    state.use_theme_colors = options.use_theme_colors;
     state.worktrees_enabled = options.worktrees_enabled;
     state.density = options.initial_density;
     state.view_persistence = options.view_persistence;
@@ -828,6 +835,7 @@ impl Drop for AltScreenGuard<'_> {
 }
 
 struct PickerState {
+    use_theme_colors: bool,
     // Resolve local filesystem membership once per cwd for each page-loading cycle.
     local_cwd_matches: HashMap<PathBuf, bool>,
     requester: FrameRequester,
@@ -1028,6 +1036,7 @@ impl PickerState {
         action: SessionPickerAction,
     ) -> Self {
         Self {
+            use_theme_colors: true,
             requester,
             relative_time_reference: None,
             pagination: PaginationState::new(),
@@ -2681,7 +2690,7 @@ fn fit_footer_hint_refs(
         if idx > 0 {
             spans.push(" ".repeat(gap_width).set_style(footer_hint_label_style()));
         }
-        spans.push(hint.key.clone().set_style(footer_hint_key_style()));
+        spans.extend(crate::key_hint::key_label_spans(&hint.key));
         let label = match mode {
             FooterHintLabelMode::Wide => Some(hint.wide_label.as_str()),
             FooterHintLabelMode::Compact => Some(hint.compact_label.as_str()),
@@ -2836,11 +2845,7 @@ fn render_comfortable_session_lines(
 ) -> Vec<Line<'static>> {
     let marker = selection_marker(is_selected, is_expanded);
     let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
-    let title = if is_selected {
-        selected_session_title_span(title)
-    } else {
-        title.into()
-    };
+    let title = session_title_span(title, row.thread_id, state.use_theme_colors, is_selected);
     let title_line = Line::from(vec![marker, title]);
     let mut lines = vec![title_line];
     let row_style = if is_selected {
@@ -2908,7 +2913,8 @@ fn apply_line_background(mut line: Line<'static>, style: Style, width: u16) -> L
     }
     line.style = line.style.patch(style);
     for span in &mut line.spans {
-        span.style = span.style.patch(style);
+        // Keep identity accents while inheriting the selected row's background.
+        span.style = style.patch(span.style);
     }
     line
 }
@@ -2935,6 +2941,8 @@ fn render_dense_session_lines(
         marker,
         date: &date,
         title: row.display_preview(),
+        thread_id: row.thread_id,
+        use_theme_colors: state.use_theme_colors,
         is_selected,
         is_zebra,
         width,
@@ -2946,6 +2954,8 @@ fn render_dense_session_lines(
 }
 
 struct DenseSummaryInput<'a> {
+    thread_id: Option<ThreadId>,
+    use_theme_colors: bool,
     marker: Span<'static>,
     date: &'a str,
     title: &'a str,
@@ -2958,11 +2968,12 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
     let marker_width = input.marker.width();
     let available = (input.width as usize).saturating_sub(marker_width);
     let columns = dense_columns(available);
-    let title = if input.is_selected {
-        selected_session_title_span(dense_column_text(input.title, columns.title_width))
-    } else {
-        dense_column_text(input.title, columns.title_width).into()
-    };
+    let title = session_title_span(
+        dense_column_text(input.title, columns.title_width),
+        input.thread_id,
+        input.use_theme_colors,
+        input.is_selected,
+    );
 
     let spans = vec![
         input.marker,
@@ -3043,8 +3054,19 @@ fn selected_session_style() -> Style {
     }
 }
 
-fn selected_session_title_span(title: String) -> Span<'static> {
-    title.set_style(selected_session_style())
+fn session_title_span(
+    title: String,
+    thread_id: Option<ThreadId>,
+    use_theme_colors: bool,
+    is_selected: bool,
+) -> Span<'static> {
+    if use_theme_colors && let Some(thread_id) = thread_id {
+        title.fg(crate::thread_color::thread_color(thread_id))
+    } else if is_selected {
+        title.set_style(selected_session_style())
+    } else {
+        title.into()
+    }
 }
 
 fn render_footer_lines(
@@ -4524,7 +4546,7 @@ mod tests {
         state.list_keymap.move_right = vec![crate::key_hint::ctrl(KeyCode::Char('l'))];
         let remapped_footer = footer_lines_text(&state, /*width*/ 220);
         assert!(
-            remapped_footer.contains("ctrl + h/ctrl + l change option"),
+            remapped_footer.contains("ctrl+h/ctrl+l change option"),
             "{remapped_footer}"
         );
         state.list_keymap.move_left.clear();
@@ -5595,6 +5617,8 @@ session_picker_view = "dense"
             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
             date: "15m ago",
             title: "Selected dense row",
+            thread_id: None,
+            use_theme_colors: true,
             is_selected: true,
             is_zebra: false,
             width: 80,
@@ -5611,6 +5635,8 @@ session_picker_view = "dense"
             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
             date: "15m ago",
             title: "Zebra dense row",
+            thread_id: None,
+            use_theme_colors: true,
             is_selected: false,
             is_zebra: true,
             width: 80,

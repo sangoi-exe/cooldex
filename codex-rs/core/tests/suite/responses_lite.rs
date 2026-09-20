@@ -14,6 +14,7 @@ use codex_login::auth::BedrockApiKeyAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
@@ -278,11 +279,15 @@ async fn responses_lite_prepares_images() -> Result<()> {
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![
             UserInput::Image {
-                image_url: image_url.to_string(),
+                image: ImageReference::Inline {
+                    image_url: image_url.to_string(),
+                },
                 detail: Some(ImageDetail::Original),
             },
             UserInput::Image {
-                image_url: remote_image_url.to_string(),
+                image: ImageReference::Inline {
+                    image_url: remote_image_url.to_string(),
+                },
                 detail: Some(ImageDetail::High),
             },
         ]))
@@ -547,24 +552,30 @@ async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let response_mock = responses::mount_sse_once(
+    let response_mock = responses::mount_sse_sequence(
         &server,
-        responses::sse(vec![
-            responses::ev_response_created("resp-1"),
-            responses::ev_completed("resp-1"),
-        ]),
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "RESPONSES_LITE_COMPACT_SUMMARY",
+                    }
+                }),
+                responses::ev_completed("resp-compact"),
+            ]),
+        ],
     )
     .await;
-    let compact_mock =
-        responses::mount_compact_json_once(&server, serde_json::json!({ "output": [] })).await;
 
-    let mut builder = test_codex()
-        .with_model_info_override("gpt-5.4", |model_info| {
-            model_info.use_responses_lite = true;
-        })
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
-        });
+    let mut builder = test_codex().with_model_info_override("gpt-5.4", |model_info| {
+        model_info.use_responses_lite = true;
+    });
     let test = builder.build(&server).await?;
 
     test.submit_turn("Compact this conversation").await?;
@@ -574,8 +585,14 @@ async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result
     })
     .await;
 
-    response_mock.single_request();
-    let compact_request = compact_mock.single_request();
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let compact_request = &requests[1];
+    assert_eq!(compact_request.path(), "/v1/responses");
+    assert_eq!(
+        compact_request.inputs_of_type("compaction_trigger").len(),
+        1
+    );
     assert_eq!(
         compact_request.header(RESPONSES_LITE_HEADER).as_deref(),
         Some("true")
@@ -602,16 +619,26 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
 
     for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         let server = responses::start_mock_server().await;
-        let response_mock = responses::mount_sse_once(
+        let response_mock = responses::mount_sse_sequence(
             &server,
-            responses::sse(vec![
-                responses::ev_response_created("resp-1"),
-                responses::ev_completed("resp-1"),
-            ]),
+            vec![
+                responses::sse(vec![
+                    responses::ev_response_created("resp-1"),
+                    responses::ev_completed("resp-1"),
+                ]),
+                responses::sse(vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "compaction",
+                            "encrypted_content": "GPT_5_6_COMPACT_SUMMARY",
+                        }
+                    }),
+                    responses::ev_completed("resp-compact"),
+                ]),
+            ],
         )
         .await;
-        let compact_mock =
-            responses::mount_compact_json_once(&server, serde_json::json!({ "output": [] })).await;
 
         let mut builder = test_codex()
             .with_model_info_override(model, |model_info| {
@@ -619,7 +646,6 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
             })
             .with_config(|config| {
                 config.base_instructions = Some("test instructions".to_string());
-                let _ = config.features.disable(Feature::RemoteCompactionV2);
             });
         let test = builder.build(&server).await?;
 
@@ -631,9 +657,11 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
         })
         .await;
 
-        let turn_request = response_mock.single_request();
-        let compact_request = compact_mock.single_request();
-        let actual = [&turn_request, &compact_request].map(|request| {
+        let requests = response_mock.requests();
+        assert_eq!(requests.len(), 2);
+        let turn_request = &requests[0];
+        let compact_request = &requests[1];
+        let actual = [turn_request, compact_request].map(|request| {
             let body = request.body_json();
             serde_json::json!({
                 "lite_header": request.header(RESPONSES_LITE_HEADER),

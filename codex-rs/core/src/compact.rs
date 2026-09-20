@@ -5,7 +5,6 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
-use crate::compact_handoff::PreCompactHandoffSettings;
 use crate::compact_handoff::PreparedPreCompactHandoff;
 use crate::compact_handoff::prepare_pre_compact_handoff;
 use crate::context::CompactionSummary;
@@ -16,10 +15,8 @@ use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
 use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
-use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
-#[cfg(test)]
-use crate::session::PreviousTurnSettings;
+use crate::session::RequestEffortUsage;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn::get_last_assistant_message_from_turn;
@@ -96,6 +93,7 @@ pub(crate) struct CompactedHistoryMetadata {
     pub(crate) window_ids: AutoCompactWindowIds,
     pub(crate) compaction_response_id: Option<String>,
     pub(crate) compaction_model_hash: Option<String>,
+    pub(crate) reviewer_compaction_hash: Option<String>,
 }
 
 /// Operation-local inputs that must be installed with one compacted checkpoint.
@@ -142,7 +140,7 @@ pub(crate) async fn build_compaction_initial_context(
         } => {
             let items = sess
                 .build_initial_context_with_world_state_for_window(
-                    step_context.turn.as_ref(),
+                    step_context,
                     world_state.as_ref(),
                     window_ids,
                 )
@@ -200,6 +198,7 @@ pub(crate) async fn run_compact_task(
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
+    sess.emit_turn_started(&turn_context).await;
     run_compact_task_inner(
         sess,
         step_context,
@@ -252,14 +251,8 @@ async fn run_compact_task_inner(
             return Err(error);
         }
     }
-    let prepared_handoff = prepare_pre_compact_handoff(
-        &sess,
-        &turn_context,
-        PreCompactHandoffSettings::from_step_context(&step_context),
-        &step_context.session_telemetry,
-        cancellation_token,
-    )
-    .await?;
+    let prepared_handoff =
+        prepare_pre_compact_handoff(&sess, step_context.as_ref(), cancellation_token).await?;
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         step_context,
@@ -293,6 +286,20 @@ async fn run_compact_task_inner(
             CompactionAnalyticsDetails::default(),
         )
         .await;
+    if let Err(err) = &result
+        && !matches!(phase, CompactionPhase::PostTurn)
+        && !matches!(
+            err.details(),
+            CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+        )
+    {
+        sess.track_turn_codex_error(turn_context.as_ref(), err);
+        // Pre-turn failures are reported after preserving the incoming prompt.
+        if !matches!(phase, CompactionPhase::PreTurn) {
+            let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+            sess.send_event(&turn_context, event).await;
+        }
+    }
     result.map(|_| ())
 }
 
@@ -324,17 +331,17 @@ async fn run_compact_task_inner_impl(
     // request tracking)
     // survives retries within this compact turn.
     let responses_metadata = sess
-        .responses_metadata(
-            turn_context.as_ref(),
-            CodexResponsesRequestKind::Compaction(compaction_metadata),
-        )
+        .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
         .await;
 
-    let compaction_output = loop {
+    let compaction_response = loop {
         // Clone is required because of the loop
-        let turn_input = history
+        let mut turn_input = history
             .clone()
             .for_prompt(&turn_context.model_info().input_modalities);
+        sess.services
+            .executed_tool_calls
+            .attach_to_compaction_prompt(&mut turn_input);
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -351,8 +358,8 @@ async fn run_compact_task_inner_impl(
         .await;
 
         match attempt_result {
-            Ok(output) => {
-                break output;
+            Ok(response) => {
+                break response;
             }
             Err(err)
                 if matches!(
@@ -363,9 +370,6 @@ async fn run_compact_task_inner_impl(
                 return Err(err);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
@@ -379,9 +383,6 @@ async fn run_compact_task_inner_impl(
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(turn_context, event).await;
                 return Err(e);
             }
             Err(e) => {
@@ -397,9 +398,6 @@ async fn run_compact_task_inner_impl(
                     tokio::time::sleep(delay).await;
                     continue;
                 } else {
-                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(turn_context, event).await;
                     return Err(e);
                 }
             }
@@ -410,20 +408,29 @@ async fn run_compact_task_inner_impl(
     // operation-local collector until the route accounts them before the shared installer.
     sess.record_observed_response_completed(
         turn_context.as_ref(),
-        &compaction_output.response_id,
-        compaction_output.token_usage.as_ref(),
-        compaction_output.usage_metadata.as_ref(),
+        &compaction_response.response_id,
+        compaction_response.token_usage.as_ref(),
+        compaction_response.usage_metadata.as_ref(),
     )
     .await;
     sess.update_token_usage_info(
         turn_context.as_ref(),
-        compaction_output.token_usage.as_ref(),
+        compaction_response.token_usage.as_ref(),
     )
     .await?;
 
     let history_items = frozen_history.annotated_items();
-    let summary_suffix =
-        get_last_assistant_message_from_turn(compaction_output.items.iter()).unwrap_or_default();
+    let summary_suffix = if matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
+        get_last_assistant_message_from_turn(compaction_response.items.iter())
+            .filter(|summary| !summary.trim().is_empty())
+            .ok_or_else(|| {
+                CodexErr::Stream(
+                    "Post-turn compaction completed without an assistant summary".to_string(),
+                )
+            })?
+    } else {
+        get_last_assistant_message_from_turn(compaction_response.items.iter()).unwrap_or_default()
+    };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let identity = if sess.guardian_context_mode == GuardianContextMode::ThreadOwned {
         CompactedMessageIdentity::Preserve
@@ -449,8 +456,8 @@ async fn run_compact_task_inner_impl(
     }
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage { .. } => {
-            Some(turn_context.to_turn_context_item())
+        InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+            Some(step_context.to_turn_context_item())
         }
     };
     sess.replace_compacted_history(
@@ -461,8 +468,9 @@ async fn run_compact_task_inner_impl(
             message: summary_text,
             window_number,
             window_ids,
-            compaction_response_id: Some(compaction_output.response_id),
+            compaction_response_id: Some(compaction_response.response_id),
             compaction_model_hash: turn_context.model_info().comp_hash.clone(),
+            reviewer_compaction_hash: None,
         }
         .with_prepared_handoff(prepared_handoff),
     )
@@ -850,7 +858,7 @@ fn build_compacted_history_with_limit(
     history
 }
 
-struct LocalCompactionOutput {
+struct CompactionResponse {
     response_id: String,
     items: Vec<ResponseItem>,
     token_usage: Option<TokenUsage>,
@@ -863,13 +871,17 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<LocalCompactionOutput> {
+) -> CodexResult<CompactionResponse> {
     let mut stream = client_session
         .stream(
             prompt,
             turn_context.model_info(),
             &turn_context.session_telemetry,
-            turn_context.reasoning_effort().cloned(),
+            sess.reasoning_effort_for_request(
+                &turn_context.initial_settings,
+                RequestEffortUsage::Compaction,
+            )
+            .await,
             turn_context.reasoning_summary(),
             turn_context.config.service_tier.clone(),
             responses_metadata,
@@ -902,7 +914,7 @@ async fn drain_to_completed(
                 usage_metadata,
                 ..
             }) => {
-                return Ok(LocalCompactionOutput {
+                return Ok(CompactionResponse {
                     response_id,
                     items,
                     token_usage,

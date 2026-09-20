@@ -23,6 +23,7 @@ fn insert_splash(app: &mut App, tui: &mut tui::Tui) {
             &app.config,
             &app.local_settings,
             "gpt-test",
+            &session.model,
             &session,
             /*is_first_event*/ false,
             /*tooltip_override*/ None,
@@ -53,6 +54,7 @@ async fn startup_warnings_preserve_stream_repair_and_backtrack_selection() -> Re
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
         remote_image_urls: Vec::new(),
+        spoken: false,
     })];
     app.transcript_reflow.mark_resize_requested_during_stream();
     insert_warnings(&mut app, &mut tui, &["First warning"]);
@@ -140,7 +142,7 @@ async fn startup_warnings_wait_for_splash_and_coalesce_with_full_details() -> Re
     let transcript = app.transcript_cells[1].transcript_lines(/*width*/ 80);
     insta::assert_snapshot!(format!("display:\n{}\n\ntranscript:\n{}", lines_to_single_string(&display), lines_to_single_string(&transcript)), @"
     display:
-    ⚠ 2 startup issues · ctrl + t for details
+    ⚠ 2 startup issues · ctrl+t for details
 
     transcript:
     ⚠ Skill manifest is invalid.

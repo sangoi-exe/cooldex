@@ -77,6 +77,8 @@ mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
 mod title_setup;
+pub(crate) mod user_verification;
+mod voice_strip;
 pub(crate) use action_required_title::ACTION_REQUIRED_PREVIEW_PREFIX;
 pub(crate) use action_required_title::build_action_required_title_text;
 pub(crate) use actionable_banner::ActionableBanner;
@@ -99,6 +101,8 @@ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 pub(crate) use status_line_style::status_line_from_segments;
+pub(crate) use voice_strip::VoiceStripPhase;
+pub(crate) use voice_strip::VoiceStripState;
 mod bottom_pane_view;
 mod effort_ignition;
 
@@ -139,6 +143,8 @@ pub(crate) use footer::goal_status_indicator_line;
 pub(crate) use list_selection_view::ColumnWidthMode;
 pub(crate) use list_selection_view::ListSelectionView;
 pub(crate) use list_selection_view::OnSelectionChangedCallback;
+pub(crate) use list_selection_view::PickerSurface;
+pub(crate) use list_selection_view::SelectionAppearance;
 pub(crate) use list_selection_view::SelectionDescriptionLayout;
 pub(crate) use list_selection_view::SelectionRowDisplay;
 pub(crate) use list_selection_view::SelectionToggle;
@@ -170,8 +176,10 @@ pub(crate) use title_setup::preview_line_for_title_items;
 mod paste_burst;
 mod pending_input_preview;
 mod pending_thread_approvals;
+mod picker_style;
 pub(crate) mod popup_consts;
 mod scroll_state;
+mod selection_picker_layout;
 mod selection_popup_common;
 mod selection_row_layout;
 mod selection_tabs;
@@ -217,7 +225,9 @@ pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
+pub(crate) use chat_composer::RestrictedInputMode;
 pub(crate) use chat_composer_history::HistoryEntry;
+pub(crate) use textarea::KillBufferSnapshot;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
@@ -228,6 +238,7 @@ pub(crate) use list_selection_view::SELECTION_TOGGLE_BLOCKED_PREFIX;
 pub(crate) use list_selection_view::SELECTION_TOGGLE_UNAVAILABLE_PREFIX;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
+pub(crate) use list_selection_view::SelectionSecondaryAction;
 
 struct DelayedApprovalRequest {
     request: ApprovalRequest,
@@ -526,11 +537,6 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub fn set_personality_command_enabled(&mut self, enabled: bool) {
-        self.composer.set_personality_command_enabled(enabled);
-        self.request_redraw();
-    }
-
     pub fn set_service_tier_commands_enabled(&mut self, enabled: bool) {
         self.composer.set_service_tier_commands_enabled(enabled);
         self.request_redraw();
@@ -585,6 +591,14 @@ impl BottomPane {
             questions.set_vim_enabled(enabled);
         }
         self.request_redraw();
+    }
+
+    pub(crate) fn take_kill_buffer_snapshot(&mut self) -> KillBufferSnapshot {
+        self.composer.take_kill_buffer_snapshot()
+    }
+
+    pub(crate) fn restore_kill_buffer_snapshot(&mut self, snapshot: KillBufferSnapshot) {
+        self.composer.restore_kill_buffer_snapshot(snapshot);
     }
 
     pub(crate) fn toggle_vim_enabled(&mut self) -> bool {
@@ -718,14 +732,19 @@ impl BottomPane {
         self.push_view(Box::new(modal));
     }
 
-    /// Edit the draft without invoking popups, submissions, or remote actions.
-    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+    /// Preserve restricted drafts, allowing recovery commands only for connected unavailable threads.
+    pub(crate) fn handle_restricted_key(
+        &mut self,
+        key: KeyEvent,
+        mode: RestrictedInputMode,
+    ) -> InputResult {
         self.view_stack.clear();
         self.delayed_approval_requests.clear();
         self.composer
             .set_input_enabled(/*enabled*/ true, /*placeholder*/ None);
-        self.composer.handle_disconnected_key(key);
+        let result = self.composer.handle_restricted_key(key, mode);
         self.request_redraw();
+        result
     }
 
     /// Forward a key event to the active view or the composer.
@@ -1078,6 +1097,12 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_voice_strip(&mut self, state: Option<VoiceStripState>) {
+        self.composer
+            .set_voice_strip(state, self.frame_requester.clone());
+        self.request_redraw();
+    }
+
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
         self.composer.set_remote_image_urls(urls);
         self.request_redraw();
@@ -1287,6 +1312,18 @@ impl BottomPane {
     }
 
     fn apply_standard_popup_hint(&self, params: &mut list_selection_view::SelectionViewParams) {
+        // Configured list actions take precedence over optional row shortcuts.
+        for item in &mut params.items {
+            if item.secondary_action.as_ref().is_some_and(|secondary| {
+                let (code, modifiers) = secondary.key.parts();
+                self.keymap
+                    .list
+                    .action_for(KeyEvent::new(code, modifiers))
+                    .is_some()
+            }) {
+                item.secondary_action = None;
+            }
+        }
         if !params.allow_cancel {
             if params.footer_hint.is_none()
                 || params.footer_hint.as_ref() == Some(&popup_consts::standard_popup_hint_line())
@@ -2605,7 +2642,10 @@ mod tests {
         assert_eq!(pane.composer_text(), "ya");
         assert!(pane.view_stack.is_empty());
         assert_eq!(pane.delayed_approval_requests.len(), 1);
-        pane.handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+        pane.handle_restricted_key(
+            KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+            RestrictedInputMode::Disconnected,
+        );
         pane.pre_draw_tick_at(Instant::now() + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
         pane.handle_paste(" kept".into());
         assert_eq!(pane.composer_text(), "ya kept");

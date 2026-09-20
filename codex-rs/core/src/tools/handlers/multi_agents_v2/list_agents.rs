@@ -1,6 +1,5 @@
 use super::analytics::ToolCallAnalytics;
 use super::*;
-use crate::agent::control::ListedAgent;
 use crate::tools::handlers::multi_agents_spec::create_list_agents_tool;
 use codex_protocol::protocol::AgentStatus;
 use codex_tools::ToolSpec;
@@ -54,23 +53,22 @@ impl Handler {
             .map_err(collab_spawn_error)?;
 
         // Merge-safety anchor: V2 list presentation omits completed final-response bodies while
-        // AgentControl keeps canonical statuses intact for internal lifecycle consumers.
+        // LocalAgentControl retains canonical statuses intact for internal lifecycle consumers.
         let agents = agents
             .into_iter()
-            .map(
-                |ListedAgent {
-                     agent_name,
-                     agent_status,
-                 }| ListedAgent {
-                    agent_name,
-                    agent_status: match agent_status {
-                        AgentStatus::Completed(Some(_)) => AgentStatus::Completed(None),
-                        status => status,
-                    },
+            .map(|agent| ListedAgent {
+                agent_name: agent
+                    .metadata
+                    .agent_path
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| agent.thread_id.to_string()),
+                agent_status: match agent.status {
+                    AgentStatus::Completed(Some(_)) => AgentStatus::Completed(None),
+                    status => status,
                 },
-            )
+            })
             .collect();
-
         Ok(boxed_tool_output(ListAgentsResult { agents }))
     }
 }
@@ -85,6 +83,12 @@ impl CoreToolRuntime for Handler {
 #[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListedAgent {
+    agent_name: String,
+    agent_status: AgentStatus,
 }
 
 #[derive(Debug, Serialize)]

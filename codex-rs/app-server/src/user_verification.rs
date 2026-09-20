@@ -48,8 +48,7 @@ impl Service {
             auth_manager,
             provider: Arc::new(native::platform_provider),
             platform_supported: native::platform_supported(),
-            // Host activation follows the bundled TUI integration.
-            device_supported: || false,
+            device_supported: native::device_supported,
             worker: Arc::new(Semaphore::new(/*permits*/ 1)),
         }
     }
@@ -182,10 +181,12 @@ async fn run(
                     }
                     NativeOperation::Enroll => {
                         let key = provider.ensure_key(&guard).map_err(native_error)?;
-                        // TODO: start enrollment, sign proof of possession, then finish registration.
-                        // This implementation establishes the local key only.
+                        // The trusted caller owns backend registration and can use verify
+                        // to sign the enrollment challenge with this local credential.
                         rpc::UserVerificationEnrollResponse {
                             credential_id: key.credential.credential_id,
+                            algorithm: Some(key.credential.algorithm),
+                            public_key: Some(key.credential.public_key),
                         }
                         .into()
                     }
@@ -255,5 +256,17 @@ mod tests;
 mod rpc_tests;
 
 #[cfg(test)]
+#[path = "user_verification_cancel_tests.rs"]
+mod cancel_tests;
+
+#[cfg(test)]
 #[path = "user_verification_test_support.rs"]
 mod test_support;
+
+#[cfg(test)]
+#[path = "user_verification_activation_tests.rs"]
+mod activation_tests;
+
+#[cfg(test)]
+#[path = "user_verification_connection_tests.rs"]
+mod connection_tests;

@@ -102,7 +102,13 @@ fn incremental_render_keeps_final_block_mutable_and_matches_full_render() {
         "| --- | --- |\n",
         "| alpha | beta |\n",
     ];
-    let (source, render) = assert_rich_stream_matches_full_render(&chunks, Some(48));
+    let (source, render) = crate::terminal_palette::with_test_default_colors(
+        crate::terminal_probe::DefaultColors {
+            fg: (220, 220, 220),
+            bg: (20, 20, 20),
+        },
+        || assert_rich_stream_matches_full_render(&chunks, /*width*/ Some(48)),
+    );
 
     assert!(render.stable_source_len > 0);
     assert!(render.stable_source_len < source.len());
@@ -122,7 +128,13 @@ fn incremental_file_citations_preserve_metadata_unicode_and_markdown() {
     .map(|(filename, prefix)| {
         let tail = format!("path=\"{}\"}}\n", cwd.join(filename).display());
         let chunks = ["# Output\n\n", prefix, &tail, "\n", "Continue.\n"];
-        let (_, render) = assert_rich_stream_matches_full_render(&chunks, Some(80));
+        let (_, render) = crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (220, 220, 220),
+                bg: (20, 20, 20),
+            },
+            || assert_rich_stream_matches_full_render(&chunks, /*width*/ Some(80)),
+        );
 
         render.lines
     });
@@ -445,5 +457,55 @@ fn paragraphs_after_unwrapped_table_fence_advance_stable_source() {
         append_rich_and_assert_matches_full(&mut render, &mut source, block, width, &cwd);
         assert!(render.stable_source_len > previous_stable_source_len);
         previous_stable_source_len = render.stable_source_len;
+    }
+}
+
+#[test]
+fn shell_pid_preserves_following_equations() {
+    for shell in [
+        "Shell examples: $HOME and echo $$.",
+        "Shell examples: $HOME.",
+    ] {
+        let source = format!("{shell}\n\nAfter rejected equations: $\\alpha$.\n\n$$\\beta$$");
+        for width in [80, 24] {
+            let (_, render) = assert_rich_stream_matches_full_render(
+                &source.split_inclusive('$').collect::<Vec<_>>(),
+                Some(width),
+            );
+            let expected = format!("{shell}\n\nAfter rejected equations: α.\n\nβ");
+            assert_eq!(
+                render.lines,
+                render_source(
+                    &expected,
+                    Some(width),
+                    &test_cwd(),
+                    HistoryRenderMode::Rich,
+                    /*inline_visualization_context*/ None,
+                )
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_math_openers_allow_bounded_incremental_rendering() {
+    let cwd = test_cwd();
+    for (open, close) in [
+        ("echo $$", "$$"),
+        ("Equation: \\[", "\\]"),
+        (r"\[label\]\*", "\\]"),
+    ] {
+        let (mut source, mut render) =
+            assert_rich_stream_matches_full_render(&[&format!("{open}\n\n")], Some(80));
+        let distant_closer = format!("{close}\n\nAfter $\\alpha$.\n\n");
+        for chunk in std::iter::repeat_n(
+            "An ordinary paragraph that must not retain the entire response.\n\n",
+            /*count*/ 160,
+        )
+        .chain(std::iter::once(distant_closer.as_str()))
+        {
+            append_rich_and_assert_matches_full(&mut render, &mut source, chunk, Some(80), &cwd);
+            assert!(source.len() - render.stable_source_len < 4200);
+        }
     }
 }

@@ -52,6 +52,7 @@ use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use ratatui::prelude::*;
@@ -244,6 +245,10 @@ fn reset_at_from(captured_at: &chrono::DateTime<chrono::Local>, seconds: i64) ->
 }
 
 fn permissions_text_for(config: &Config) -> Option<String> {
+    permissions_text_for_width(config, /*width*/ 80)
+}
+
+fn permissions_text_for_width(config: &Config, width: u16) -> Option<String> {
     let usage = TokenUsage::default();
     let captured_at = chrono::Local
         .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
@@ -265,7 +270,7 @@ fn permissions_text_for(config: &Config) -> Option<String> {
         /*collaboration_mode*/ None,
         /*reasoning_effort_override*/ None,
     );
-    render_lines(&composite.display_lines(/*width*/ 80))
+    render_lines(&composite.display_lines(width))
         .iter()
         .find(|line| line.contains("Permissions:"))
         .and_then(|line| {
@@ -358,7 +363,6 @@ async fn status_snapshot_includes_reasoning_details() {
 #[tokio::test]
 async fn status_snapshot_shows_chatgpt_plan_without_email() {
     let temp_home = TempDir::new().expect("temp home");
-    write_models_cache(temp_home.path()).expect("write models cache");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
@@ -371,6 +375,9 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
+    write_models_cache(temp_home.path())
+        .await
+        .expect("write models cache");
     let mut app_server = crate::start_embedded_app_server_for_picker(&config)
         .await
         .expect("start embedded app server");
@@ -624,7 +631,7 @@ async fn status_permissions_workspace_roots_include_profile_defined_directories(
                     /*exclude_slash_tmp*/ false,
                 ),
                 ActivePermissionProfile::new(":workspace"),
-                vec![profile_root.clone()],
+                vec![profile_root.clone().into()],
             ),
         )
         .expect("set permission profile");
@@ -742,6 +749,7 @@ async fn status_uses_server_provider_id_and_auth_requirement() {
         ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("eu-west-1".to_string()),
+            credential_export: None,
             auth_refresh: None,
         }));
     config.model_provider.base_url =
@@ -2225,5 +2233,38 @@ async fn status_context_window_uses_last_usage() {
     assert!(
         !context_line.contains("102K"),
         "context line should not use total aggregated tokens, got: {context_line}"
+    );
+}
+
+#[tokio::test]
+async fn status_permissions_include_executor_profile_root() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/repo").abs());
+    config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest.to_core())
+        .expect("set approval policy");
+    let root = PathUri::parse("file://server/share/foreign").expect("executor URI");
+    config
+        .permissions
+        .set_permission_profile_from_session_snapshot(
+            PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                PermissionProfile::workspace_write_with_path_uris(
+                    std::slice::from_ref(&root),
+                    NetworkSandboxPolicy::Restricted,
+                    /*exclude_tmpdir_env_var*/ true,
+                    /*exclude_slash_tmp*/ true,
+                ),
+                ActivePermissionProfile::new("executor"),
+                vec![root.into()],
+            ),
+        )
+        .expect("set permission snapshot");
+
+    assert_snapshot!(
+        permissions_text_for_width(&config, /*width*/ 160).expect("permissions line"),
+        @r"Profile executor (workspace [\\server\share\foreign], Ask for approval)"
     );
 }

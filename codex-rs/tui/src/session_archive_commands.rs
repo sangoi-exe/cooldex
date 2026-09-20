@@ -228,6 +228,9 @@ pub(super) async fn start_app_server_for_session_command(
         arg0_paths,
         explicit_remote_endpoint,
     } = options;
+    if cli.no_daemon && explicit_remote_endpoint.is_some() {
+        return Err(eyre!("--no-daemon cannot be used with --remote."));
+    }
     let loader_overrides = LoaderOverrides::default();
     let strict_config = cli.strict_config;
     let raw_config_overrides = cli.config_overrides.raw_overrides.clone();
@@ -247,13 +250,15 @@ pub(super) async fn start_app_server_for_session_command(
     }
 
     let workload_identity_selected = codex_login::is_workload_identity_selected();
-    let reuse_implicit_local_daemon = !workload_identity_selected
-        && super::can_reuse_implicit_local_daemon(
+    let reuse_implicit_local_daemon = !cli.no_daemon
+        && !workload_identity_selected
+        && super::daemon_startup::config_exclusion(
             &cli_kv_overrides,
             &launch_loader_overrides,
             strict_config,
             cli.bypass_hook_trust,
-        );
+        )
+        .is_none();
     // Merge-safety anchor: archive commands load their effective mode before any daemon choice,
     // then reject InstanceChild because they have no owning interactive TUI supervisor.
     let provisional_app_server_target =

@@ -488,6 +488,5 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
         .with_model(REQUESTED_MODEL)
         .disable_feature(Feature::ComputerUse)
         .disable_feature(Feature::RemoteModels)
-        .enable_feature(Feature::Personality)
         .write(codex_home)
 }

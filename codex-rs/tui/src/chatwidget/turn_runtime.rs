@@ -74,6 +74,7 @@ impl ChatWidget {
     // Raw reasoning uses the same flow as summarized reasoning
 
     pub(super) fn on_task_started(&mut self) {
+        self.bottom_pane.dismiss_composer_sparkle();
         self.clear_context_compaction();
         self.input_queue.user_turn_pending_start = false;
         self.reset_safety_buffering_for_turn_start();
@@ -103,6 +104,8 @@ impl ChatWidget {
         self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
         self.reasoning_header = None;
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
             /*body*/ None,
@@ -116,6 +119,9 @@ impl ChatWidget {
         completion: Option<history_cell::FinalMessageSeparator>,
         from_replay: bool,
     ) {
+        if self.status_state.reasoning_resume_turn_id.is_some() {
+            self.on_agent_reasoning_final();
+        }
         self.input_queue.submit_pending_steers_after_interrupt = false;
         let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
             parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
@@ -136,21 +142,7 @@ impl ChatWidget {
             .unwrap_or_default();
         self.transcript.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
-        self.flush_answer_stream_with_separator();
-        if let Some(mut controller) = self.plan_stream_controller.take() {
-            let had_live_tail = controller.has_live_tail();
-            self.clear_active_stream_tail();
-            let (cell, source) = controller.finalize();
-            if !had_live_tail && let Some(cell) = cell {
-                self.add_boxed_history(cell);
-            }
-            if let Some(source) = source {
-                self.note_stream_consolidation_queued();
-                self.app_event_tx
-                    .send(AppEvent::ConsolidateProposedPlan(source));
-            }
-            self.request_pending_usage_output_insertion_after_stream_shutdown();
-        }
+        self.flush_answer_and_plan_streams();
         self.flush_unified_exec_wait_streak();
         if !from_replay {
             self.collect_runtime_metrics_delta();
@@ -174,6 +166,9 @@ impl ChatWidget {
         // Mark task stopped and request redraw now that all content is in history.
         self.clear_context_compaction();
         self.status_state.pending_status_indicator_restore = false;
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
+        self.reasoning_header = None;
         self.input_queue.user_turn_pending_start = false;
         self.clear_active_hook_cell();
         self.clear_guardian_review_status();
@@ -314,6 +309,13 @@ impl ChatWidget {
     /// This does not clear MCP startup tracking, because MCP startup can overlap with turn cleanup
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
+        self.flush_answer_and_plan_streams();
+        if self.status_state.reasoning_resume_turn_id.is_some() {
+            self.on_agent_reasoning_final();
+        }
+        self.status_state.reasoning_item_id = None;
+        self.status_state.reasoning_resume_turn_id = None;
+        self.reasoning_header = None;
         self.clear_context_compaction();
         self.clear_safety_buffering();
         // Drop preview-only stream tail content on any termination path before
@@ -363,7 +365,6 @@ impl ChatWidget {
 
     fn on_error(&mut self, message: String) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        self.flush_answer_stream_with_separator();
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
         self.set_ambient_pet_notification(

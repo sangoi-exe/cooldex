@@ -46,7 +46,12 @@ fn connected_server_version_notice_snapshot() {
             .expect("absolute socket path"),
         },
     };
+    let settings = codex_config::types::Tui {
+        show_server_version_notice: true,
+        ..Default::default()
+    };
     let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
+        &settings,
         &target,
         /*server_home*/ None,
         "0.153.0",
@@ -61,6 +66,7 @@ fn connected_server_version_notice_snapshot() {
 #[test]
 fn local_daemon_version_notice_snapshot() {
     let target = crate::AppServerTarget::LocalDaemon {
+        allow_embedded_fallback: true,
         endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
             socket_path: AbsolutePathBuf::from_absolute_path(
                 std::env::temp_dir().join("codex.sock"),
@@ -68,16 +74,30 @@ fn local_daemon_version_notice_snapshot() {
             .expect("absolute socket path"),
         },
     };
-    let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
-        &target,
-        /*server_home*/ None,
-        "0.153.0",
-        Some("0.152.1"),
-        /*last_shown*/ None,
-    )
-    .expect("older local service should have a notice");
-    let cell = new_server_version_warning(notice);
-    insta::assert_snapshot!(render_lines(&cell.display_lines(/*width*/ 100)).join("\n"));
+    let settings = codex_config::types::Tui {
+        show_server_version_notice: true,
+        ..Default::default()
+    };
+    for (client, server, snapshot) in [
+        ("0.153.0", "0.152.1", "local_daemon_version_notice_snapshot"),
+        ("0.155.0-alpha.12", "0.156.0", "local_daemon_alpha_mismatch"),
+        ("0.0.0", "0.156.0", "local_daemon_source_mismatch"),
+    ] {
+        let (notice, _) = crate::status::remote_connection::pending_server_version_notice(
+            &settings,
+            &target,
+            /*server_home*/ None,
+            client,
+            Some(server),
+            /*last_shown*/ None,
+        )
+        .expect("local service should have a notice");
+        let cell = new_server_version_warning(notice);
+        insta::assert_snapshot!(
+            snapshot,
+            render_lines(&cell.display_lines(/*width*/ 100)).join("\n")
+        );
+    }
 }
 
 async fn test_config() -> Config {
@@ -487,10 +507,7 @@ fn structured_tool_cell_renders_raw_plain_text_without_prefix_or_style() {
         invocation,
         /*animations_enabled*/ false,
     );
-    assert!(
-        cell.complete(Duration::from_millis(1), Ok(result))
-            .is_none()
-    );
+    cell.complete(Duration::from_millis(1), Ok(result));
 
     let lines = cell.raw_lines();
     let rendered = render_lines(&lines);
@@ -510,18 +527,14 @@ fn raw_mode_toggle_transcript_snapshot() {
         },
         /*animations_enabled*/ false,
     );
-    assert!(
-        tool_cell
-            .complete(
-                Duration::from_millis(5),
-                Ok(CallToolResult {
-                    content: vec![text_block("structured output\nsecond line")],
-                    is_error: None,
-                    structured_content: None,
-                    meta: None,
-                }),
-            )
-            .is_none()
+    tool_cell.complete(
+        Duration::from_millis(5),
+        Ok(CallToolResult {
+            content: vec![text_block("structured output\nsecond line")],
+            is_error: None,
+            structured_content: None,
+            meta: None,
+        }),
     );
     let cells: Vec<Box<dyn HistoryCell>> = vec![
             Box::new(new_user_prompt(
@@ -586,6 +599,7 @@ fn image_generation_call_renders_saved_path() {
 
 fn session_configured_event(model: &str) -> ThreadSessionState {
     ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -725,6 +739,7 @@ async fn session_info_uses_availability_nux_tooltip_override() {
         &config,
         &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
+        "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
         Some("Model just became available".to_string()),
@@ -748,6 +763,7 @@ async fn session_info_availability_nux_tooltip_snapshot() {
         &config,
         &crate::local_settings::LocalSettings::from(&config),
         "gpt-5",
+        "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
         Some("Model just became available".to_string()),
@@ -765,6 +781,7 @@ async fn session_info_first_event_suppresses_tooltips_and_nux() {
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
+        "gpt-5",
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ true,
@@ -785,6 +802,7 @@ async fn session_info_hides_tooltips_when_disabled() {
     let cell = new_session_info(
         &config,
         &crate::local_settings::LocalSettings::from(&config),
+        "gpt-5",
         "gpt-5",
         &session_configured_event("gpt-5"),
         /*is_first_event*/ false,
@@ -1040,6 +1058,7 @@ async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_status_only_servers() {
     let statuses = vec![McpServerStatus {
+        server_capabilities: None,
         tools_error: None,
         name: "plugin_docs".to_string(),
         runtime_status: None,
@@ -1073,6 +1092,7 @@ fn mcp_tools_output_from_statuses_renders_status_only_servers() {
 #[test]
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
+        server_capabilities: None,
         tools_error: None,
         name: "plugin_docs".to_string(),
         runtime_status: None,
@@ -1317,7 +1337,7 @@ fn web_search_history_cell_without_detail_snapshot() {
 }
 
 #[test]
-fn web_search_history_cell_wraps_with_indented_continuation() {
+fn web_search_history_cell_truncates() {
     let query = "example search query with several generic words to exercise wrapping".to_string();
     let cell = new_web_search_call(
         "call-1".to_string(),
@@ -1331,10 +1351,7 @@ fn web_search_history_cell_wraps_with_indented_continuation() {
 
     assert_eq!(
         rendered,
-        vec![
-            "• Searched the web for example search query with several generic".to_string(),
-            "  words to exercise wrapping".to_string(),
-        ]
+        vec!["• Searched the web for example search query with several generi…".to_string(),]
     );
 }
 
@@ -1428,13 +1445,11 @@ fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
     let transcript = render_lines(&cell.transcript_lines(/*width*/ 180)).join("\n");
     insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
     history:
-    • Called Inspect Spotify workspace
+    • Inspect Spotify workspace
       └ 012345678901234567890123456789012345
-            67890123456789012345678901234567
-            89012345678901234567890123456789
-            01234567890123456789012345678901
-            23456789012345678901234567890123
-            45678901...
+        678901234567890123456789012345678901
+        234567890123456789012345678901234567
+        +1 line (ctrl + t to view transcrip…
 
     transcript:
     • Called node_repl.js({"title":"Inspect Spotify workspace","code":"await tools.exec_command({ cmd: 'git status' })"})
@@ -1472,7 +1487,7 @@ fn code_mode_tool_call_preserves_failure_details() {
     let transcript = render_lines(&cell.transcript_lines(/*width*/ 120)).join("\n");
     insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
     history:
-    • Called Inspect workspace
+    • Inspect workspace
       └ Script failed
         Output:
         permission denied
@@ -1534,10 +1549,7 @@ fn completed_mcp_tool_call_success_snapshot() {
         invocation,
         /*animations_enabled*/ true,
     );
-    assert!(
-        cell.complete(Duration::from_millis(1420), Ok(result))
-            .is_none()
-    );
+    cell.complete(Duration::from_millis(1420), Ok(result));
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
 
@@ -1545,7 +1557,7 @@ fn completed_mcp_tool_call_success_snapshot() {
 }
 
 #[test]
-fn completed_mcp_tool_call_image_after_text_returns_extra_cell() {
+fn completed_mcp_tool_call_image_after_text_snapshot() {
     let invocation = McpInvocation {
         server: "image".into(),
         tool: "generate".into(),
@@ -1569,12 +1581,10 @@ fn completed_mcp_tool_call_image_after_text_returns_extra_cell() {
         invocation,
         /*animations_enabled*/ true,
     );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
+    cell.complete(Duration::from_millis(25), Ok(result));
 
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
 }
 
 #[test]
@@ -1600,16 +1610,14 @@ fn completed_mcp_tool_call_accepts_data_url_image_blocks() {
         invocation,
         /*animations_enabled*/ true,
     );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
+    cell.complete(Duration::from_millis(25), Ok(result));
 
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
 }
 
 #[test]
-fn completed_mcp_tool_call_skips_invalid_image_blocks() {
+fn completed_mcp_tool_call_multiple_image_blocks_snapshot() {
     let invocation = McpInvocation {
         server: "image".into(),
         tool: "generate".into(),
@@ -1630,12 +1638,10 @@ fn completed_mcp_tool_call_skips_invalid_image_blocks() {
         invocation,
         /*animations_enabled*/ true,
     );
-    let extra_cell = cell
-        .complete(Duration::from_millis(25), Ok(result))
-        .expect("expected image cell");
+    cell.complete(Duration::from_millis(25), Ok(result));
 
-    let rendered = render_lines(&extra_cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered, vec!["tool result (image output)"]);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
 }
 
 #[test]
@@ -1654,10 +1660,7 @@ fn completed_mcp_tool_call_error_snapshot() {
         invocation,
         /*animations_enabled*/ true,
     );
-    assert!(
-        cell.complete(Duration::from_secs(2), Err("network timeout".into()))
-            .is_none()
-    );
+    cell.complete(Duration::from_secs(2), Err("network timeout".into()));
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
 
@@ -1697,10 +1700,7 @@ fn completed_mcp_tool_call_multiple_outputs_snapshot() {
         invocation,
         /*animations_enabled*/ true,
     );
-    assert!(
-        cell.complete(Duration::from_millis(640), Ok(result))
-            .is_none()
-    );
+    cell.complete(Duration::from_millis(640), Ok(result));
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 48)).join("\n");
 
@@ -1732,10 +1732,7 @@ fn completed_mcp_tool_call_wrapped_outputs_snapshot() {
         invocation,
         /*animations_enabled*/ true,
     );
-    assert!(
-        cell.complete(Duration::from_millis(1280), Ok(result))
-            .is_none()
-    );
+    cell.complete(Duration::from_millis(1280), Ok(result));
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
 
@@ -1768,10 +1765,7 @@ fn completed_mcp_tool_call_multiple_outputs_inline_snapshot() {
         invocation,
         /*animations_enabled*/ true,
     );
-    assert!(
-        cell.complete(Duration::from_millis(320), Ok(result))
-            .is_none()
-    );
+    cell.complete(Duration::from_millis(320), Ok(result));
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 120)).join("\n");
 
@@ -2222,7 +2216,7 @@ fn multiline_command_both_lines_wrap_with_correct_prefixes() {
 #[test]
 fn stderr_tail_more_than_five_lines_snapshot() {
     // Build an exec cell with a non-zero exit and 10 lines on stderr to exercise
-    // the head/tail rendering and gutter prefixes.
+    // the three-line preview, hidden-line count, and gutter prefixes.
     let call_id = "c_err".to_string();
     let mut cell = ExecCell::new(
         ExecCall {
@@ -2310,6 +2304,7 @@ fn ran_cell_multiline_with_stderr_snapshot() {
 fn user_history_cell_wraps_and_prefixes_each_line_snapshot() {
     let msg = "_count_r\x1b[13;2:3uows";
     let cell = UserHistoryCell {
+        spoken: false,
         message: msg.to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2333,6 +2328,7 @@ fn user_history_cell_wraps_long_urls_inside_the_message_gutter() {
     );
     let image_start = message.find("[Image #1]").unwrap();
     let cell = UserHistoryCell {
+        spoken: false,
         message,
         text_elements: vec![TextElement::new(
             (image_start..image_start + "[Image #1]".len()).into(),
@@ -2383,6 +2379,7 @@ fn user_history_cell_wraps_long_urls_inside_the_message_gutter() {
 #[test]
 fn user_history_cell_renders_remote_image_urls() {
     let cell = UserHistoryCell {
+        spoken: false,
         message: "describe these".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2397,8 +2394,49 @@ fn user_history_cell_renders_remote_image_urls() {
 }
 
 #[test]
-fn user_history_cell_summarizes_inline_data_urls() {
+fn user_image_labels_follow_the_painted_prompt_surface() {
+    use ratatui::widgets::Paragraph;
+    use ratatui::widgets::Widget;
+
+    let placeholder = "[Image #1]";
     let cell = UserHistoryCell {
+        spoken: false,
+        message: format!("{placeholder} describe these"),
+        text_elements: vec![TextElement::new(
+            (0..placeholder.len()).into(),
+            Some(placeholder.to_owned()),
+        )],
+        local_image_paths: Vec::new(),
+        remote_image_urls: vec![
+            "https://example.com/one.png".to_string(),
+            "https://example.com/two.png".to_string(),
+        ],
+    };
+    let mut snapshots = Vec::new();
+    for (fg, bg) in [
+        ((30, 30, 30), (255, 255, 255)),
+        ((235, 235, 235), (18, 20, 30)),
+        ((150, 150, 150), (95, 95, 95)),
+    ] {
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors { fg, bg },
+            || {
+                let area = Rect::new(
+                    /*x*/ 0, /*y*/ 0, /*width*/ 32, /*height*/ 5,
+                );
+                let mut buffer = Buffer::empty(area);
+                Paragraph::new(cell.display_lines(area.width)).render(area, &mut buffer);
+                snapshots.push(format!("{bg:?}: {buffer:?}"));
+            },
+        );
+    }
+    insta::assert_snapshot!(snapshots.join("\n"));
+}
+
+#[test]
+fn user_history_cell_summarizes_inline_data_urls() {
+    let mut cell = UserHistoryCell {
+        spoken: false,
         message: "describe inline image".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2409,11 +2447,22 @@ fn user_history_cell_summarizes_inline_data_urls() {
 
     assert!(rendered.contains("[Image #1]"));
     assert!(rendered.contains("describe inline image"));
+    let placeholder = "[Image #1]";
+    cell.message = format!("{placeholder} describe inline image");
+    cell.text_elements = vec![TextElement::new(
+        (0..placeholder.len()).into(),
+        Some(placeholder.to_string()),
+    )];
+    insta::assert_snapshot!(
+        "portable_image_raw_output",
+        render_lines(&cell.raw_lines()).join("\n")
+    );
 }
 
 #[test]
 fn user_history_cell_numbers_multiple_remote_images() {
     let cell = UserHistoryCell {
+        spoken: false,
         message: "describe both".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2433,6 +2482,7 @@ fn user_history_cell_numbers_multiple_remote_images() {
 #[test]
 fn user_history_cell_height_matches_rendered_lines_with_remote_images() {
     let cell = UserHistoryCell {
+        spoken: false,
         message: "line one\nline two".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2455,6 +2505,7 @@ fn user_history_cell_height_matches_rendered_lines_with_remote_images() {
 #[test]
 fn user_history_cell_trims_trailing_blank_message_lines() {
     let cell = UserHistoryCell {
+        spoken: false,
         message: "line one\n\n   \n\t \n".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2475,6 +2526,7 @@ fn user_history_cell_trims_trailing_blank_message_lines() {
 fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
     let message = "tokenized\n\n\n".to_string();
     let cell = UserHistoryCell {
+        spoken: false,
         message,
         text_elements: vec![TextElement::new(
             (0..8).into(),
@@ -2498,6 +2550,7 @@ fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
 fn render_uses_wrapping_for_long_url_like_line() {
     let url = "https://example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890/artifacts/reports/performance/summary/detail/with/a/very/long/path/that/keeps/going/for/testing/purposes-only-and-does/not/need/to/resolve/index.html?session_id=abc123def456ghi789jkl012mno345pqr678stu901vwx234yz";
     let cell: Box<dyn HistoryCell> = Box::new(UserHistoryCell {
+        spoken: false,
         message: url.to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -2651,7 +2704,7 @@ fn reasoning_summary_block() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• Detailed reasoning goes here."]);
@@ -2723,7 +2776,7 @@ async fn reasoning_summary_block_respects_config_overrides() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
+    assert_eq!(rendered_display, Vec::<String>::new());
 }
 
 #[test]
@@ -2757,17 +2810,14 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
 }
 
 #[test]
-fn reasoning_summary_block_displays_title_only_summary() {
+fn reasoning_summary_block_keeps_title_only_summary_in_expanded_transcript() {
     let cell = new_reasoning_summary_block(
         vec!["**Confirming backend JSONL source**".to_string()],
         &test_cwd(),
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(
-        rendered_display.join("\n"),
-        @"• Confirming backend JSONL source"
-    );
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(
@@ -2784,7 +2834,7 @@ fn reasoning_summary_block_splits_header_and_summary_when_present() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    assert_eq!(rendered_display, vec!["• We should fix the bug next."]);
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• We should fix the bug next."]);
@@ -2801,7 +2851,7 @@ fn reasoning_summary_block_hides_empty_html_comment_parts() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(rendered_display.join("\n"), @"");
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, Vec::<String>::new());
@@ -2819,7 +2869,7 @@ fn reasoning_summary_block_preserves_bold_content_after_empty_html_comment_part(
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(rendered_display.join("\n"), @"• Important conclusion");
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• Important conclusion"]);
@@ -2847,7 +2897,7 @@ fn reasoning_summary_block_strips_header_after_leading_empty_part() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(rendered_display.join("\n"), @"• Tests passed");
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• Tests passed"]);
@@ -2864,7 +2914,7 @@ fn reasoning_summary_block_drops_empty_part_after_real_content() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(rendered_display.join("\n"), @"• done");
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• done"]);
@@ -2878,7 +2928,7 @@ fn reasoning_summary_block_preserves_literal_html_comment() {
     );
 
     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
-    insta::assert_snapshot!(rendered_display.join("\n"), @"• Use <!-- --> in JSX.");
+    assert_eq!(rendered_display, Vec::<String>::new());
 
     let rendered_transcript = render_transcript(cell.as_ref());
     assert_eq!(rendered_transcript, vec!["• Use <!-- --> in JSX."]);
@@ -2973,6 +3023,7 @@ fn agent_markdown_cell_narrow_width_shows_prefix_only() {
 #[test]
 fn wrapped_and_prefixed_cells_handle_tiny_widths() {
     let user_cell = UserHistoryCell {
+        spoken: false,
         message: "tiny width coverage for wrapped user history".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
@@ -3079,6 +3130,7 @@ fn consolidation_walker_replaces_agent_message_cells() {
 
     // Build a transcript with: [UserCell, AgentMsg(head), AgentMsg(cont), AgentMsg(cont)]
     let user = Arc::new(UserHistoryCell {
+        spoken: false,
         message: "hello".to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),

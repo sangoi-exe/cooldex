@@ -1,8 +1,12 @@
 use super::*;
-use crate::agent::control::SpawnAgentForkMode;
-use crate::agent::control::SpawnAgentOptions;
+use crate::agent::child_config::SpawnConfigOptions;
+use crate::agent::child_config::SpawnConfigVersion;
+use crate::agent::child_config::prepare_agent_spawn_config_with_service_tier;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::types::MessageDeliveryMode;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::agent::types::SpawnAgentOptions;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -13,16 +17,24 @@ use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use crate::turn_timing::now_unix_timestamp_ms;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_tools::ToolSpec;
 
 #[derive(Default)]
 pub(crate) struct Handler {
     options: SpawnAgentToolOptions,
+    description_override: Option<String>,
 }
 
 impl Handler {
-    pub(crate) fn new(options: SpawnAgentToolOptions) -> Self {
-        Self { options }
+    pub(crate) fn new(
+        options: SpawnAgentToolOptions,
+        description_override: Option<String>,
+    ) -> Self {
+        Self {
+            options,
+            description_override,
+        }
     }
 }
 
@@ -32,7 +44,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_spawn_agent_tool_v2(self.options.clone())
+        create_spawn_agent_tool_v2(self.options.clone(), self.description_override.as_deref())
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -88,6 +100,33 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 }
 
+// Merge-safety anchor: V2 full-history forks preserve one captured parent identity and
+// must reject every public identity override before child configuration is prepared.
+fn reject_v2_full_history_identity_overrides(
+    agent_type: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&ReasoningEffort>,
+    service_tier: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    let overrides = [
+        agent_type.map(|_| "agent_type"),
+        model.map(|_| "model"),
+        reasoning_effort.map(|_| "reasoning_effort"),
+        service_tier.map(|_| "service_tier"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if overrides.is_empty() {
+        return Ok(());
+    }
+
+    Err(FunctionCallError::RespondToModel(format!(
+        "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({}) or set fork_turns to none or a positive integer",
+        overrides.join(", ")
+    )))
+}
+
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
 ) -> Result<
@@ -126,6 +165,7 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+
     let expected_identity = if is_full_history_fork {
         Some(session.full_history_agent_identity_snapshot(turn).await)
     } else {
@@ -134,49 +174,26 @@ async fn handle_spawn_agent(
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
-    let mut config =
-        build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
-    if !is_full_history_fork {
-        if turn
-            .config
-            .multi_agent_v2
-            .subagent_developer_instructions
-            .is_none()
-        {
-            // Non-full-history V2 spawns rebuild child identity from explicit subagent
-            // instructions and role defaults. When no subagent-specific override is configured,
-            // do not let the parent turn's developer instructions leak through as the child's
-            // starting point.
-            config.developer_instructions = None;
-        }
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort.clone(),
-        )
-        .await?;
-        apply_spawn_agent_role(&session, &mut config, role_name).await?;
-        apply_spawn_agent_service_tier(&session, &mut config, args.service_tier.as_deref()).await?;
-        apply_spawn_agent_base_instructions(&session, &mut config).await?;
-    }
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
-
-    // Remember an applied configured default so cold reload reapplies its restrictions.
-    let persisted_role_name = role_name.or_else(|| {
-        (!is_full_history_fork
-            && config
-                .agent_roles
-                .get(DEFAULT_ROLE_NAME)
-                .is_some_and(|role| role.config_file.is_some()))
-        .then_some(DEFAULT_ROLE_NAME)
-    });
+    let prepared = prepare_agent_spawn_config_with_service_tier(
+        &session,
+        step_context.as_ref(),
+        SpawnConfigOptions {
+            version: SpawnConfigVersion::V2,
+            full_history_fork: is_full_history_fork,
+            role_name,
+            model: args.model.as_deref(),
+            reasoning_effort: args.reasoning_effort.clone(),
+        },
+        args.service_tier.as_deref(),
+    )
+    .await
+    .map_err(FunctionCallError::RespondToModel)?;
+    let mut config = prepared.config;
     let mut spawn_source = thread_spawn_source(
         session.thread_id,
         &turn.session_source,
         child_depth,
-        persisted_role_name,
+        prepared.role_name.as_deref(),
         Some(args.task_name.clone()),
     )?;
     if let Some(identity) = expected_identity.as_ref() {
@@ -193,16 +210,15 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = communication_from_tool_message(
+    let communication = agent_message_from_tool(message, &source).into_communication(
         author,
         new_agent_path.clone(),
-        message,
-        &source,
-        /*trigger_turn*/ true,
+        MessageDeliveryMode::TriggerTurn,
     );
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
-    // Merge-safety anchor: Full-history V2 forks use the parent's captured identity and
-    // instruction context; no child-specific usage hint crosses this spawn boundary.
+    // Merge-safety anchor: full-history V2 forks carry the captured parent binding in their
+    // identity snapshot; this handler must not resolve or append a fresh child usage hint.
+    let multi_agent_v2_usage_hints = None;
     let spawned_agent = Box::pin(
         session
             .services
@@ -218,7 +234,9 @@ async fn handle_spawn_agent(
                     parent_thread_id: Some(session.thread_id),
                     parent_turn_id: Some(turn.sub_id.clone()),
                     root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                    turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                     environments: Some(step_context.environments.to_selections()),
+                    multi_agent_v2_usage_hints,
                     cyber_access_program: turn.cyber_access_program,
                 },
             ),

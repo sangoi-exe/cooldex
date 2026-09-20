@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use codex_async_utils::OrCancelExt;
+use codex_extension_api::TurnStartPhase;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
@@ -56,6 +58,32 @@ impl SessionTask for RegularTask {
     ) -> SessionTaskResult {
         let run_turn_span = trace_span!("run_turn");
         let prewarmed_client_session = async {
+            // Regular-start contributors run once, after the task is visible and interruptible.
+            let prepares_mcp = sess
+                .services
+                .extensions
+                .turn_lifecycle_contributors()
+                .iter()
+                .any(|contributor| {
+                    contributor.turn_start_phase(&sess.services.thread_extension_data)
+                        == TurnStartPhase::RegularTaskStart
+                        && contributor.requires_mcp_runtime(&sess.services.thread_extension_data)
+                });
+            let preparation = sess
+                .emit_turn_start_lifecycle(
+                    &ctx,
+                    /*token_usage_at_turn_start*/ None,
+                    TurnStartPhase::RegularTaskStart,
+                )
+                .or_cancel(&cancellation_token)
+                .await;
+            // Even cancelled discovery may have cleared the previous account's catalog.
+            if prepares_mcp {
+                sess.request_mcp_runtime_reprojection();
+            }
+            if preparation.is_err() {
+                return SessionStartupPrewarmResolution::Cancelled;
+            }
             sess.set_server_reasoning_included(/*included*/ false).await;
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
                 .await
@@ -64,7 +92,14 @@ impl SessionTask for RegularTask {
         .await;
         let prewarmed_client_session = match prewarmed_client_session {
             SessionStartupPrewarmResolution::Cancelled => {
-                run_hooks_and_record_inputs(&sess, &ctx, &input, PersistContext::Standard).await;
+                run_hooks_and_record_inputs(
+                    &sess,
+                    &ctx,
+                    &ctx.capture_current_model_info(),
+                    &input,
+                    PersistContext::Standard,
+                )
+                .await;
                 return Ok(SessionTaskOutput::default());
             }
             SessionStartupPrewarmResolution::Unavailable { .. } => None,
