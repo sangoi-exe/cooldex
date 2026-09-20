@@ -22,6 +22,7 @@ use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
@@ -596,6 +597,83 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
         "a recovery persistence failure must not be followed by TurnAborted"
     );
     test.codex.submit(Op::CleanBackgroundTerminals).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_turn_compaction_installation_failure_fails_the_completed_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (release_compaction_tx, release_compaction_rx) = oneshot::channel();
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("completed-turn", "completed answer"),
+                ev_completed_with_tokens("completed-turn", /*total_tokens*/ 10_000),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: sse(vec![
+                ev_assistant_message("post-turn-handoff", "continue after compaction"),
+                ev_completed("post-turn-handoff"),
+            ]),
+        }],
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: sse(vec![ev_response_created("post-turn-compact")]),
+            },
+            StreamingSseChunk {
+                gate: Some(release_compaction_rx),
+                body: sse(vec![
+                    ev_assistant_message("post-turn-summary", SUMMARY),
+                    ev_completed("post-turn-compact"),
+                ]),
+            },
+        ],
+    ])
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.name = "OpenAI-compatible test provider".to_string();
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.model_context_window = Some(10_000);
+            config.model_post_turn_compact_threshold_percent = 100;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_streaming_server(&server)
+        .await?;
+
+    test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
+    server.wait_for_request_count(3).await;
+    test.thread_store
+        .shutdown_thread(test.session_configured.thread_id)
+        .await?;
+    release_compaction_tx
+        .send(())
+        .expect("release the post-turn compaction response");
+
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees a terminal error event");
+    };
+    assert!(
+        error
+            .message
+            .starts_with("Fatal error: failed to durably install compacted history:"),
+        "canonical post-turn compaction installation failure must terminate the completed turn: {error:?}"
+    );
+    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error.as_ref(), Some(&error));
     Ok(())
 }
 

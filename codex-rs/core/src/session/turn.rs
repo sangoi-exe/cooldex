@@ -716,6 +716,9 @@ pub(crate) async fn run_turn(
                     }
                     // Token-budget resets do not summarize, so preserve their existing rollover
                     // policy. Keep summarizing compaction in this task to serialize history updates.
+                    // Merge-safety anchor: post-turn compaction preserves completed answers for
+                    // ordinary failures, but fatal compacted-history installation/recovery errors
+                    // must enter the same turn's terminal-error lifecycle.
                     let config = &turn_context.config;
                     if config.model_post_turn_compact_threshold_percent > 0
                         && !config.features.enabled(Feature::TokenBudget)
@@ -741,7 +744,9 @@ pub(crate) async fn run_turn(
                     {
                         if matches!(
                             err.details(),
-                            CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+                            CodexErrorDetails::Fatal(_)
+                                | CodexErrorDetails::Interrupted
+                                | CodexErrorDetails::TurnAborted
                         ) {
                             return Err(err);
                         }
