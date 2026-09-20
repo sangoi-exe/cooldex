@@ -161,10 +161,10 @@ for companion command, package, host, and Computer Use surfaces. -->
 do not reconstruct it from mutable configuration, hashes, thread settings, events, or rendered context. -->
 - `SessionMeta.agent_usage_hint_binding` is the canonical birth binding for durable
   MultiAgentV2 usage-hint identity. `AgentIdentitySnapshot` and runtime `Config` carry
-  it; the runtime field is not a `ConfigToml` key. The PRD owns state, inheritance, and
-  legacy-restoration limits.
-- `.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` owns planned
-  requirements, architecture boundaries, and shipped-status interpretation.
+  it; the runtime field is not a `ConfigToml` key. Its state, inheritance, and
+  legacy-restoration limits are owned by `codex-rs/protocol/src/protocol.rs`,
+  `codex-rs/core/src/config/mod.rs`, `codex-rs/core/src/agent/identity.rs`, and
+  `codex-rs/core/src/session/multi_agents.rs`.
 
 ## Voice Support Boundary
 
@@ -716,8 +716,6 @@ Codex supports running connected app-server and exec-server on different operati
   `/home/lucas/.codex/orch.config.toml`.
 - `/home/lucas/.codex/agents/` — registered specialist role behavior and verdict
   owners.
-- `/home/lucas/work/codex/.sangoi/reference/areas/master-refactor-v2-prd-rfc.md` —
-  product requirements, architecture boundaries, and shipped-status interpretation.
 - `/home/lucas/work/codex/.sangoi/reference/areas/cooldex-fork-feature-inventory.md` —
   detailed current fork-feature inventory, operator-support layout, and evidence limits.
 <!-- Merge-safety anchor: pre-compaction handoff synthesis stays operation-local, while
@@ -725,11 +723,12 @@ the existing compaction installer and recovery owner atomically bind and consume
 - `/home/lucas/work/codex/codex-rs/core/src/compact_handoff.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/session/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/session/turn.rs`,
+  `/home/lucas/work/codex/codex-rs/core/src/session/rollout_reconstruction/post_compact_recovery.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/tasks/mod.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/context/post_compact_recovery.rs`, and
   `/home/lucas/work/codex/codex-rs/core/src/state/post_compact_recovery.rs` — bounded
-  pre-compaction prompt-to-self synthesis, atomic recovery binding, typed context,
-  pending state, first-accepted-response consumption, and fatal recovery-error
+  pre-compaction prompt-to-self synthesis, atomic recovery binding, current reconstruction,
+  typed context, pending state, first-accepted-response consumption, and fatal recovery-error
   propagation through task-abort cleanup owners.
 - `/home/lucas/work/codex/codex-rs/protocol/src/protocol.rs`,
   `/home/lucas/work/codex/codex-rs/core/src/config/mod.rs`,
@@ -737,11 +736,11 @@ the existing compaction installer and recovery owner atomically bind and consume
   `/home/lucas/work/codex/codex-rs/core/src/session/multi_agents.rs` — MultiAgentV2
   usage-hint binding, full-history identity, and contextual-rendering owners.
 <!-- Merge-safety anchor: V2 fan-in and list presentation remain bounded to existing
-handler owners; the PRD owns their behavior boundary and canonical statuses stay full. -->
+handler owners; canonical statuses stay full. -->
 - `/home/lucas/work/codex/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs` and
   `/home/lucas/work/codex/codex-rs/core/src/tools/handlers/multi_agents_v2/list_agents.rs`
-  — token-efficient V2 fan-in and body-free list-presentation owners; the
-  `master-refactor-v2` PRD / RFC owns their behavior boundary.
+  — current owners for token-efficient V2 fan-in, body-free list presentation, and full
+  canonical statuses.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`,
   `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
   `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust
