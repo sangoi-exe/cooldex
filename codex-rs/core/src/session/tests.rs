@@ -3703,10 +3703,7 @@ async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_stat
     )
     .await;
     let cancellation_token = CancellationToken::new();
-    let step_context = session
-        .capture_step_context(Arc::clone(&turn_context), &cancellation_token)
-        .await
-        .expect("a fresh cancellation token cannot be cancelled");
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
     let world_state = Arc::new(
         session
             .build_world_state_for_step(&step_context)

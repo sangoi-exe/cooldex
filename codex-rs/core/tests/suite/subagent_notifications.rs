@@ -2378,9 +2378,9 @@ async fn spawned_agent_uses_summary_support_for_final_model(
     };
     assert_eq!(child_body["model"], json!(REQUESTED_MODEL));
     let expected_reasoning = if child_supports_summary {
-        json!({"effort": "medium", "summary": "detailed", "context": "all_turns"})
+        json!({"effort": "medium", "summary": "detailed"})
     } else {
-        json!({"effort": "medium", "context": "all_turns"})
+        json!({"effort": "medium"})
     };
     assert_eq!(child_body["reasoning"], expected_reasoning);
     assert_eq!(

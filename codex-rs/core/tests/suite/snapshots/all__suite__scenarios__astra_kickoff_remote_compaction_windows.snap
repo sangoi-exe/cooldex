@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/scenarios.rs
+assertion_line: 417
 expression: "context_snapshot::format_request_history_snapshot(\"Astra plans a kickoff with local and plugin skills, remotely compacts, and checks an image brief.\",\n&requests, &ContextSnapshotOptions::default().include_request_settings(),)"
 ---
 Scenario: Astra plans a kickoff with local and plugin skills, remotely compacts, and checks an image brief.
@@ -16,15 +17,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=9e8e744a3a55a2dd):
-        - namespace/functions; hash=e7db0a45c4ec3157
+00:additional_tools/developer (3; hash=83cec4f4306928a1):
+        - namespace/functions; hash=9f66f29f7cd6bc4b
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=91f6de0e2773854f
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=45e25db751c72fbf
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -190,15 +191,15 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 02)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (3; hash=9e8e744a3a55a2dd):
-        - namespace/functions; hash=e7db0a45c4ec3157
+00:additional_tools/developer (3; hash=83cec4f4306928a1):
+        - namespace/functions; hash=9f66f29f7cd6bc4b
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=91f6de0e2773854f
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=45e25db751c72fbf
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -228,7 +229,15 @@ Settings: same as window 1
 03:message/user:
     Summarize the kickoff notes with $notes:summarize.
 04:compaction:encrypted=true; chars=26; hash=ec5e2724e6f5f641
-05:message/developer[3]:
+05:message/assistant:
+    <post_compact_handoff>
+    resume from the compacted state
+    </post_compact_handoff>
+06:message/developer:
+    <post_compact_recovery>
+    {"compaction_window_id":"<UUID 1>","boundary_item_id":"cmp_<UUID 2>","directive":"A context compaction j...","mid_turn_continuation":"resume_interrupted_turn"}} [hash=389eb8ff6bc1b51a]
+    </post_compact_recovery>
+07:message/developer[3]:
     [01] <skills_instructions>
         ## Skills
         A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list ...ed into an absolute path using the skill roots table. [hash=ca27c3957f42502b]
@@ -277,7 +286,7 @@ Settings: same as window 1
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
 
         If explicit user input is required for another reason before progress can safely continue, do not use th... as a textual assistant message.</collaboration_mode> [hash=8213052bde4a62b2]
-06:message/developer:
+08:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -295,9 +304,9 @@ Settings: same as window 1
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...ne"` or a positive integer string.</multi_agent_role> [hash=c7f52e90688299ce]
-07:message/developer:
+09:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-08:message/user[2]:
+10:message/user[2]:
     [01] # AGENTS.md instructions for <AGENTS_DIRECTORY>
 
         <INSTRUCTIONS>
@@ -310,10 +319,10 @@ Settings: same as window 1
           <timezone><HOST_TIMEZONE></timezone>
           <filesystem><workspace_roots><root><WORKSPACE_ROOT 1></root></workspace_roots><permission_profile type...ntry></file_system></permission_profile></filesystem> [hash=911722cc43b4c3b8]
         </environment_context>
-09:message/user[2]:
+11:message/user[2]:
     [01] Check the final kickoff brief and attached sketch with $final-check and $calendar:agenda.
     [02] <input_image:image_url>
-10:message/user:
+12:message/user:
     <skill>
     <name>final-check</name>
     <path><SKILLS_ROOT>/final-check/SKILL.md</path>
@@ -325,7 +334,7 @@ Settings: same as window 1
     Check that the brief has an owner for every action.
 
     </skill>
-11:message/user:
+13:message/user:
     <skill>
     <name>calendar:agenda</name>
     <path><PLUGINS_CACHE>/test/calendar/local/skills/agenda/SKILL.md</path>
@@ -337,7 +346,7 @@ Settings: same as window 1
     List meetings with dates and attendees.
 
     </skill>
-12:message/developer:
+14:message/developer:
     Capabilities from the `calendar` plugin:
     - Skills from this plugin are prefixed with `calendar:`.
     Use these plugin-associated capabilities to help solve the task.

@@ -185,9 +185,10 @@ fn file_citations_preserve_adjacent_entities_and_escaped_punctuation() {
 #[test]
 fn file_citation_after_local_link_soft_break_starts_a_new_line_snapshot() {
     let cwd = std::env::temp_dir();
+    let first = url::Url::from_file_path(cwd.join("first.txt")).unwrap();
     let markdown = format!(
         "[first](<{}>)\n:codex-file-citation{{path=\"second.txt\"}}",
-        cwd.join("first.txt").display(),
+        first.as_str(),
     );
     let rendered = rendered_text(&markdown, Some(&cwd));
 

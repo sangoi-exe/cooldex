@@ -120,7 +120,7 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
         };
         assert_eq!(
             (prompts.get(), archived_path.exists(), active_path.exists()),
-            (7, false, true)
+            (9, false, true)
         );
         match action {
             SessionStartAction::Resume(_) => {

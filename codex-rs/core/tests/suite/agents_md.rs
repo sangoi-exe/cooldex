@@ -95,6 +95,34 @@ const SPAWN_PARENT_PROMPT: &str = "spawn a child with the parent context";
 const SPAWN_SEED_PROMPT: &str = "seed parent history";
 const PROVIDER_WARNING: &str = "global instruction source unavailable; using fallback";
 
+// Merge-safety anchor: create intentional unreadable symlink loops before Wiremock expectations and skip only unprivileged Windows.
+#[cfg(unix)]
+fn create_symlink_loop_if_supported(path: &Path) -> bool {
+    std::os::unix::fs::symlink(
+        path.file_name().expect("symlink path should have a name"),
+        path,
+    )
+    .expect("create symlink loop");
+    true
+}
+
+#[cfg(windows)]
+fn create_symlink_loop_if_supported(path: &Path) -> bool {
+    let linked = std::os::windows::fs::symlink_file(
+        path.file_name().expect("symlink path should have a name"),
+        path,
+    );
+    if linked
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(1314))
+    {
+        eprintln!("Skipping symlink test: Windows symlink privilege unavailable");
+        return false;
+    }
+    linked.expect("create symlink loop");
+    true
+}
+
 struct WarningInstructionsProvider {
     inner: CodexHomeUserInstructionsProvider,
     warning_active: AtomicBool,
@@ -2105,6 +2133,17 @@ async fn multi_environment_thread_refreshes_global_and_keeps_repository_snapshot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn global_instruction_warnings_reappear_only_after_recovery() -> Result<()> {
+    let home = Arc::new(TempDir::new()?);
+    write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
+    let override_path = home.path().join(GLOBAL_AGENTS_OVERRIDE_FILENAME);
+    if !create_symlink_loop_if_supported(&override_path) {
+        return Ok(());
+    }
+    let read_error = std::fs::read(&override_path).expect_err("symlink loop must be unreadable");
+    let expected_warning = format!(
+        "Failed to read global AGENTS.md instructions from `{}`: {read_error}",
+        override_path.display()
+    );
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_sequence(
         &server,
@@ -2118,25 +2157,6 @@ async fn global_instruction_warnings_reappear_only_after_recovery() -> Result<()
             .collect(),
     )
     .await;
-    let home = Arc::new(TempDir::new()?);
-    write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
-    let override_path = home.path().join(GLOBAL_AGENTS_OVERRIDE_FILENAME);
-    let create_unreadable_override = || {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(GLOBAL_AGENTS_OVERRIDE_FILENAME, &override_path)
-        }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_file(GLOBAL_AGENTS_OVERRIDE_FILENAME, &override_path)
-        }
-    };
-    create_unreadable_override()?;
-    let read_error = std::fs::read(&override_path).expect_err("symlink loop must be unreadable");
-    let expected_warning = format!(
-        "Failed to read global AGENTS.md instructions from `{}`: {read_error}",
-        override_path.display()
-    );
     let mut builder = test_codex().with_home(Arc::clone(&home));
     let test = builder.build_with_auto_env(&server).await?;
     wait_for_event(
@@ -2153,7 +2173,10 @@ async fn global_instruction_warnings_reappear_only_after_recovery() -> Result<()
     ] {
         std::fs::remove_file(&override_path)?;
         if warning_active {
-            create_unreadable_override()?;
+            assert!(
+                create_symlink_loop_if_supported(&override_path),
+                "symlink support became unavailable after setup"
+            );
         } else {
             std::fs::write(&override_path, "")?;
         }

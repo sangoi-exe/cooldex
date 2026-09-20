@@ -9,6 +9,13 @@ use tokio::sync::Notify;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_global_read_keeps_instructions_until_recovery() -> Result<()> {
+    let home = Arc::new(TempDir::new()?);
+    let source = home.path().join(GLOBAL_AGENTS_FILENAME);
+    if !create_symlink_loop_if_supported(&source) {
+        return Ok(());
+    }
+    std::fs::remove_file(&source)?;
+    let source = write_global_file(&home, GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
     let server = start_mock_server().await;
     let requests = responses::mount_sse_sequence(
         &server,
@@ -17,17 +24,15 @@ async fn failed_global_read_keeps_instructions_until_recovery() -> Result<()> {
             .to_vec(),
     )
     .await;
-    let home = Arc::new(TempDir::new()?);
-    let source = write_global_file(&home, GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
     let mut builder = test_codex().with_home(Arc::clone(&home));
     let test = builder.build_with_auto_env(&server).await?;
     test.submit_turn("initial instructions").await?;
 
     std::fs::remove_file(&source)?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(GLOBAL_AGENTS_FILENAME, &source)?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(GLOBAL_AGENTS_FILENAME, &source)?;
+    assert!(
+        create_symlink_loop_if_supported(&source),
+        "symlink support became unavailable after setup"
+    );
     test.submit_turn("keep instructions through the read failure")
         .await?;
     assert_eq!(
