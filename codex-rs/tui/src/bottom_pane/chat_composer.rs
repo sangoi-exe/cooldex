@@ -391,6 +391,8 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -615,6 +617,8 @@ pub(crate) struct ChatComposer {
     // host-independent while non-test rendering keeps runtime WSL detection.
     #[cfg(test)]
     shortcut_overlay_wsl_override: Option<bool>,
+    #[cfg(test)]
+    shortcut_overlay_wsl_override_reads: Cell<usize>,
 }
 
 /// A resolved legacy `$` target plus any catalog built while disambiguating shell syntax.
@@ -786,6 +790,8 @@ impl ChatComposer {
             vim_normal_keymap: default_vim_normal_keymap,
             #[cfg(test)]
             shortcut_overlay_wsl_override: None,
+            #[cfg(test)]
+            shortcut_overlay_wsl_override_reads: Cell::new(0),
         };
         this.draft.textarea.set_keymap_bindings(&default_keymap);
         // Apply configuration via the setter to keep side-effects centralized.
@@ -3880,26 +3886,29 @@ impl ChatComposer {
 
     fn footer_props(&self) -> FooterProps {
         let mode = self.footer_mode();
-        let is_wsl = {
+        let is_wsl = if mode == FooterMode::ShortcutOverlay {
             #[cfg(target_os = "linux")]
             {
-                let detected_wsl = {
-                    #[cfg(test)]
-                    {
-                        self.shortcut_overlay_wsl_override
-                            .unwrap_or_else(crate::clipboard_paste::is_probably_wsl)
-                    }
-                    #[cfg(not(test))]
-                    {
-                        crate::clipboard_paste::is_probably_wsl()
-                    }
-                };
-                mode == FooterMode::ShortcutOverlay && detected_wsl
+                #[cfg(test)]
+                if let Some(is_wsl) = self.shortcut_overlay_wsl_override {
+                    self.shortcut_overlay_wsl_override_reads.set(
+                        self.shortcut_overlay_wsl_override_reads
+                            .get()
+                            .saturating_add(1),
+                    );
+                    is_wsl
+                } else {
+                    crate::clipboard_paste::is_probably_wsl()
+                }
+                #[cfg(not(test))]
+                crate::clipboard_paste::is_probably_wsl()
             }
             #[cfg(not(target_os = "linux"))]
             {
                 false
             }
+        } else {
+            false
         };
 
         FooterProps {
@@ -5388,6 +5397,21 @@ mod tests {
         {
             let _ = composer;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn footer_props_reads_wsl_override_only_for_shortcut_overlay() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.shortcut_overlay_wsl_override = Some(true);
+
+        assert!(!composer.footer_props().is_wsl);
+        assert_eq!(composer.shortcut_overlay_wsl_override_reads.get(), 0);
+
+        composer.footer.mode = FooterMode::ShortcutOverlay;
+
+        assert!(composer.footer_props().is_wsl);
+        assert_eq!(composer.shortcut_overlay_wsl_override_reads.get(), 1);
     }
 
     #[test]
