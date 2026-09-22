@@ -779,7 +779,7 @@ async fn guardian_requests_record_only_their_own_tool_calls(thread_owned: bool) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(CodexAuth::from_api_key("test-api-key"), true, "gpt-5.6-luna"; "api_key_uses_luna_with_responses_lite")]
+#[test_case(CodexAuth::from_api_key("test-api-key"), true, "gpt-5.6-luna"; "api_key_uses_luna_with_full_responses")]
 #[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), true, "codex-auto-review"; "chatgpt_uses_codex_auto_review")]
 #[test_case(CodexAuth::create_dummy_chatgpt_auth_for_testing(), false, "codex-auto-review"; "chatgpt_without_free_guardian")]
 async fn guardian_session_prewarms_and_is_reused_for_first_review(
@@ -812,10 +812,15 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         .into_iter()
         .find(|model| model.slug == expected_model)
         .expect("bundled Guardian review model");
-    let use_responses_lite = review_model.use_responses_lite;
-    if expected_model == "gpt-5.6-luna" {
-        assert!(use_responses_lite, "Luna must use Responses Lite");
-    }
+    let use_responses_lite = if expected_model == "gpt-5.6-luna" {
+        assert!(
+            review_model.use_responses_lite,
+            "Luna's bundled catalog must retain its Responses Lite metadata"
+        );
+        false
+    } else {
+        review_model.use_responses_lite
+    };
 
     let tool_args = json!({
         "cmd": "true",
@@ -948,6 +953,24 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
             .as_str()
             .expect("Responses Lite Guardian developer instructions")
     } else {
+        assert_eq!(
+            guardian_prewarm["client_metadata"]
+                ["ws_request_header_x_openai_internal_codex_responses_lite"]
+                .as_str(),
+            None
+        );
+        assert!(
+            guardian_prewarm.get("tools").is_some(),
+            "full Responses Guardian request should expose top-level tools"
+        );
+        assert!(
+            !guardian_prewarm["input"].as_array().is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|item| item["type"].as_str() == Some("additional_tools"))
+            }),
+            "full Responses Guardian request should not inject Responses Lite additional tools"
+        );
         guardian_prewarm["instructions"]
             .as_str()
             .expect("Guardian instructions")
