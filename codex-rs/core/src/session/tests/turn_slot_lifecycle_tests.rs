@@ -1,4 +1,5 @@
 use super::*;
+use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
@@ -452,6 +453,99 @@ async fn fresh_handler_input_joins_intended_replacement_after_caller_cancellatio
             }) if turn_id == fresh_request_id
         ),
         "fresh input must not create a third task"
+    );
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held state lock is the explicit pre-drain startup barrier under test"
+)]
+async fn stale_pending_work_startup_cannot_drain_successor_mailbox_input() {
+    let (session, stale_context, rx) = make_session_and_context_with_rx().await;
+    let _startup_prewarm_release = install_blocked_startup_prewarm(session.as_ref()).await;
+    let expected_mail = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root(),
+        Vec::new(),
+        "mail owned by the successor startup".to_string(),
+        /*trigger_turn*/ true,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(expected_mail.clone(), Default::default())
+        .await;
+
+    let stale_claim = {
+        let mut slot = session.active_turn.lock().await;
+        slot.claim_start(stale_context.sub_id.clone())
+            .expect("idle slot should admit the stale startup")
+    };
+    let state_guard = session.state.lock().await;
+    let stale_startup = tokio::spawn({
+        let session = Arc::clone(&session);
+        let stale_context = Arc::clone(&stale_context);
+        async move {
+            session
+                .start_claimed_regular_task_with_options(
+                    stale_claim,
+                    stale_context,
+                    Vec::new(),
+                    /*input_persisted*/ None,
+                    MailboxParentProvenance::Attribute,
+                )
+                .await
+        }
+    });
+    wait_for_starting_turn(session.as_ref(), &stale_context.sub_id).await;
+    assert!(
+        session
+            .abort_turn_if_active(&stale_context.sub_id, TurnAbortReason::Replaced)
+            .await,
+        "targeted abort should retire the stale startup claim"
+    );
+
+    drop(state_guard);
+    assert!(
+        timeout(Duration::from_secs(2), stale_startup)
+            .await
+            .expect("stale startup should return")
+            .expect("stale startup should not panic")
+            .is_err(),
+        "stale startup must fail before consuming mailbox input"
+    );
+    assert!(
+        session.input_queue.has_pending_mailbox_items().await,
+        "stale startup must leave successor mailbox input intact"
+    );
+
+    let successor_turn_id = "successor-after-stale-startup".to_string();
+    session
+        .maybe_start_turn_for_pending_work_with_sub_id(successor_turn_id.clone())
+        .await;
+    recv_turn_started(&rx, &successor_turn_id).await;
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0,
+        vec![TurnInput::InterAgentCommunication(expected_mail)]
+    );
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0,
+        Vec::<TurnInput>::new(),
+        "successor must receive mailbox input exactly once"
+    );
+    assert!(
+        !session.input_queue.has_pending_mailbox_items().await,
+        "successor should drain the mailbox once it owns the claim"
     );
 
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;

@@ -563,6 +563,13 @@ impl Session {
         let (start_tx, start_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
 
+        // Merge-safety anchor: a claimed startup revalidates its generation before draining
+        // mailbox input so a stale task cannot consume its successor's work.
+        {
+            let slot = self.active_turn.lock().await;
+            slot.validate_running_install(&claim)
+                .map_err(turn_slot_codex_error)?;
+        }
         let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
         if let MailboxParentProvenance::Attribute = mailbox_parent_provenance {
             if let Some(id) = start_options.parent_turn_id.as_ref() {
@@ -1160,6 +1167,10 @@ impl Session {
             task, turn_state, ..
         } = retired_turn;
         let turn_context = Arc::clone(&task.turn_context);
+        // Merge-safety anchor: terminal abort retirement settles admitted persisted-message
+        // waiters before task cleanup so no unrecorded admission leaks.
+        self.pending_user_message_admissions
+            .complete_task_end(&turn_context.sub_id);
         let completed_with_error = self
             .handle_task_abort(task, reason.clone(), turn_state.as_ref())
             .await;
