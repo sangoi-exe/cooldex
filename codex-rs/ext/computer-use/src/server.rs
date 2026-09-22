@@ -336,10 +336,23 @@ pub async fn dispatch_tool_call<Runtime>(
 where
     Runtime: ComputerUseRuntime,
 {
-    dispatch_tool_call_with(runtime, request, |runtime, request| {
-        runtime.execute(request)
-    })
-    .await
+    let parsed_request = match parse_call_tool_request(request) {
+        Ok(parsed_request) => parsed_request,
+        Err(ParseToolRequestError::UnknownTool(name)) => {
+            return Err(ErrorData::invalid_params(
+                format!("unknown tool: {name}"),
+                None,
+            ));
+        }
+        Err(ParseToolRequestError::InvalidArguments(error)) => {
+            return Ok(error_call_tool_result(error));
+        }
+    };
+
+    match runtime.execute(parsed_request).await {
+        Ok(output) => success_call_tool_result(output),
+        Err(error) => Ok(error_call_tool_result(error)),
+    }
 }
 
 async fn dispatch_tool_call_with_context<Runtime>(
@@ -349,22 +362,6 @@ async fn dispatch_tool_call_with_context<Runtime>(
 ) -> Result<CallToolResult, ErrorData>
 where
     Runtime: ComputerUseRuntime,
-{
-    dispatch_tool_call_with(runtime, request, move |runtime, request| {
-        runtime.execute_cancellable(request, context)
-    })
-    .await
-}
-
-async fn dispatch_tool_call_with<Runtime, Execute, Execution>(
-    runtime: &Runtime,
-    request: CallToolRequestParams,
-    execute: Execute,
-) -> Result<CallToolResult, ErrorData>
-where
-    Runtime: ComputerUseRuntime,
-    Execute: FnOnce(&Runtime, ComputerUseRequest) -> Execution,
-    Execution: Future<Output = Result<ComputerUseOutput, ComputerUseError>>,
 {
     let parsed_request = match parse_call_tool_request(request) {
         Ok(parsed_request) => parsed_request,
@@ -379,7 +376,7 @@ where
         }
     };
 
-    match execute(runtime, parsed_request).await {
+    match runtime.execute_cancellable(parsed_request, context).await {
         Ok(output) => success_call_tool_result(output),
         Err(error) => Ok(error_call_tool_result(error)),
     }
