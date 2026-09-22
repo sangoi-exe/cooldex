@@ -966,14 +966,13 @@ async fn projects_validate_filters_cursors_and_sqlite_less_assignment() -> Resul
     assert_eq!(unchanged.thread.git_info, None);
 
     let unsupported_projects_home = TempDir::new()?;
+    let store_id = Uuid::now_v7();
     MockResponsesConfig::new(&responses.uri())
         .disable_feature(Feature::ComputerUse)
+        .with_root_config(&format!(
+            "experimental_thread_store = {{ type = \"in_memory\", id = \"{store_id}\" }}"
+        ))
         .write(unsupported_projects_home.path())?;
-    let store_id = Uuid::now_v7();
-    std::fs::write(
-        unsupported_projects_home.path().join("config.toml"),
-        format!("experimental_thread_store = {{ type = \"in_memory\", id = \"{store_id}\" }}"),
-    )?;
     let mut unsupported_projects = TestAppServer::builder()
         .with_codex_home(unsupported_projects_home.path())
         .build_initialized()

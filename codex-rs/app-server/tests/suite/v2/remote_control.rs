@@ -19,8 +19,13 @@ use codex_app_server::AppServerWebsocketAuthSettings;
 use codex_app_server::PluginStartupTasks;
 use codex_app_server::RemoteControlStartupMode;
 use codex_app_server::run_main_with_transport_options;
+use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::InitializeCapabilities;
+use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCNotification;
+use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
 use codex_app_server_protocol::RemoteControlClientsListOrder;
@@ -47,6 +52,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
 use codex_utils_cli::CliConfigOverrides;
+use codex_uds::UnixStream;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -62,6 +68,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::accept_async;
+use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -611,6 +618,140 @@ async fn stdio_eof_releases_thread_writer_with_pending_remote_control_enable() -
         })
         .await?;
     assert_eq!(resumed.thread.id, thread_id);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn final_instance_child_disconnect_cancels_pending_remote_control_enable() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut backend = BlockingRemoteControlBackend::start(codex_home.path()).await?;
+    let config_path = codex_home.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[tui]\napp_server_mode = \"instance_child\"\n",
+            std::fs::read_to_string(&config_path)?
+        ),
+    )?;
+    let socket_path = codex_home.path().join("app-server.sock");
+    let transport =
+        AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
+    let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
+    let app_server = tokio::spawn(run_main_with_transport_options(
+        Arg0DispatchPaths {
+            codex_self_exe: Some(std::env::current_exe()?),
+            codex_linux_sandbox_exe: None,
+            main_execve_wrapper_exe: None,
+        },
+        CliConfigOverrides::default(),
+        LoaderOverrides::default(),
+        /*strict_config*/ false,
+        /*default_analytics_enabled*/ false,
+        transport,
+        SessionSource::Cli,
+        AppServerWebsocketAuthSettings::default(),
+        AppServerRuntimeOptions {
+            plugin_startup_tasks: PluginStartupTasks::Skip,
+            remote_control_startup_mode: RemoteControlStartupMode::DisabledEphemeral,
+            install_shutdown_signal_handler: false,
+            launch_mode: codex_app_server::AppServerLaunchMode::InstanceChild,
+            ..Default::default()
+        },
+    ));
+    let stream = timeout(STARTUP_TIMEOUT, async {
+        loop {
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => break Ok(stream),
+                Err(err)
+                    if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => break Err(err),
+            }
+        }
+    })
+    .await
+    .context("instance child did not listen on its control socket")??;
+    let (mut websocket, _) = client_async("ws://localhost/rpc", stream).await?;
+
+    let initialize_request_id = RequestId::Integer(1);
+    let initialize_request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(
+        ClientRequest::Initialize {
+            request_id: initialize_request_id.clone(),
+            params: InitializeParams {
+                client_info: ClientInfo {
+                    name: DEFAULT_CLIENT_NAME.to_string(),
+                    title: None,
+                    version: "0.1.0".to_string(),
+                },
+                capabilities: Some(InitializeCapabilities {
+                    experimental_api: true,
+                    ..Default::default()
+                }),
+            },
+        },
+    )?)?;
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&JSONRPCMessage::Request(initialize_request))?.into(),
+        ))
+        .await?;
+    timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            let frame = websocket
+                .next()
+                .await
+                .context("instance child closed during initialization")??;
+            let Message::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<JSONRPCMessage>(&text)? {
+                JSONRPCMessage::Response(response) if response.id == initialize_request_id => {
+                    break Ok(());
+                }
+                JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
+                    anyhow::bail!("instance child rejected initialize: {}", error.error.message);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("instance child did not initialize")??;
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&JSONRPCMessage::Notification(JSONRPCNotification {
+                method: "initialized".to_string(),
+                params: None,
+            }))?
+            .into(),
+        ))
+        .await?;
+
+    let enable_request = serde_json::from_value::<JSONRPCRequest>(serde_json::to_value(
+        ClientRequest::RemoteControlEnable {
+            request_id: RequestId::Integer(2),
+            params: None,
+        },
+    )?)?;
+    websocket
+        .send(Message::Text(
+            serde_json::to_string(&JSONRPCMessage::Request(enable_request))?.into(),
+        ))
+        .await?;
+    assert_eq!(
+        timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??,
+        "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
+    );
+
+    websocket.close(None).await?;
+    drop(websocket);
+    let exit = timeout(DEFAULT_TIMEOUT, app_server)
+        .await
+        .context("final instance child did not shut down while enrollment was pending")??;
+    assert_eq!(exit, codex_app_server::AppServerExit::Graceful);
     Ok(())
 }
 

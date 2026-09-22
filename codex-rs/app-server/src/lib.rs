@@ -1221,6 +1221,8 @@ pub async fn run_main_with_transport_options(
                                     break "stdio_connection_closed";
                                 }
                                 if shutdown_when_no_connections && connections.is_empty() {
+                                    // Pending remote enrollment must stop before RPCs drain.
+                                    remote_control_shutdown_token.cancel();
                                     break "last_connection_closed";
                                 }
                             }
