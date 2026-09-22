@@ -180,11 +180,13 @@ async fn manual_compaction_emits_turn_started_before_cancellable_step_capture() 
         block_next_read: AtomicBool::new(/*v*/ true),
         read_started: Notify::new(),
     });
-    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
         user_provider: Some(provider.clone()),
         ..Default::default()
     }));
-    let session = Arc::new(session);
 
     session
         .spawn_task(
