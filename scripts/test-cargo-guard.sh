@@ -60,6 +60,17 @@ case "${subcommand}" in
         fi
         ;;
     clean)
+        if [[ -n "${FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE:-}" ]]; then
+            descendant_status="quiescent"
+            if [[ -s "${FAKE_CARGO_DESCENDANT_FILE:-}" ]]; then
+                descendant_pid="$(cat "${FAKE_CARGO_DESCENDANT_FILE}")"
+                descendant_state="$(/usr/bin/ps -o stat= -p "${descendant_pid}" 2>/dev/null | tr -d '[:space:]')"
+                if kill -0 "${descendant_pid}" 2>/dev/null && [[ "${descendant_state}" != Z* ]]; then
+                    descendant_status="alive"
+                fi
+            fi
+            printf '%s\n' "${descendant_status}" >"${FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE}"
+        fi
         exit "${FAKE_CARGO_CLEAN_STATUS:-0}"
         ;;
     *)
@@ -224,7 +235,7 @@ begin_case() {
     export CARGO_GUARD_HISTORY_PATH="${CURRENT_HISTORY}"
     export CARGO_GUARD_TEST_WORKSPACE_TARGET_DIR="${CURRENT_WORKSPACE_TARGET_DIR}"
     export CARGO_GUARD_TEST_SHARED_TARGET_DIR="${CURRENT_SHARED_TARGET_DIR}"
-    unset FAKE_CARGO_COMMAND_STATUS FAKE_CARGO_COMMAND_SLEEP FAKE_CARGO_CLEAN_STATUS FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE FAKE_CARGO_BREAK_TELEMETRY_AFTER_START
+    unset FAKE_CARGO_COMMAND_STATUS FAKE_CARGO_COMMAND_SLEEP FAKE_CARGO_CLEAN_STATUS FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE FAKE_CARGO_BREAK_TELEMETRY_AFTER_START
     unset FAKE_PS_FORCE_BAD_PGID FAKE_PS_FAIL_PROCESS_LIST
     unset FAKE_CARGO_DESCENDANT_FILE FAKE_PS_PGID_SEQUENCE_FILE FAKE_PS_PROCESS_LIST_FILE
     unset RUST_MIN_STACK RUST_TEST_THREADS NEXTEST_TEST_THREADS CARGO_BUILD_JOBS CARGO_TARGET_DIR CARGO_GUARD_RESOURCE_PROFILE NEXTEST_PROFILE
@@ -1421,6 +1432,39 @@ assert entry["disk_emergency"] is True
 assert entry["status"] == 70
 assert entry["observed_growth_gib"] > 0
 PY
+
+begin_case
+descendant_file="${TMP_ROOT}/disk-emergency-descendant.pid"
+clean_descendant_status_file="${TMP_ROOT}/disk-emergency-clean-descendant-status"
+export FAKE_CARGO_DESCENDANT_FILE="${descendant_file}"
+export FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE="${clean_descendant_status_file}"
+export CARGO_GUARD_MONITOR=1
+export CARGO_GUARD_MONITOR_INTERVAL_SECS=1
+export CARGO_GUARD_TERM_GRACE_SECS=1
+set_df_sequence 99 99 99 99 99 1 99 99 99 99 99 99
+./scripts/cargo-guard.sh cargo check -p codex-core >"${CURRENT_OUT}" 2>&1 &
+guard_pid="$!"
+EXTRA_PIDS+=("${guard_pid}")
+wait_for_file "${descendant_file}"
+descendant_pid="$(cat "${descendant_file}")"
+EXTRA_PIDS+=("${descendant_pid}")
+set +e
+wait "${guard_pid}"
+guard_status=$?
+set -e
+if [[ "${guard_status}" == "0" ]]; then
+    fail "expected disk-emergency guard to fail"
+fi
+assert_clean_count 1
+if [[ ! -s "${clean_descendant_status_file}" ]]; then
+    fail "expected disk-emergency cleanup to record descendant status"
+fi
+if [[ "$(cat "${clean_descendant_status_file}")" != "quiescent" ]]; then
+    fail "disk-emergency cleanup started while TERM-resistant descendant was alive"
+fi
+if kill -0 "${descendant_pid}" 2>/dev/null && [[ "$(/usr/bin/ps -o stat= -p "${descendant_pid}" 2>/dev/null | tr -d '[:space:]')" != Z* ]]; then
+    fail "expected TERM-resistant descendant to be killed during disk emergency"
+fi
 
 begin_case
 export CARGO_GUARD_MONITOR=1

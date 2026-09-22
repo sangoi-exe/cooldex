@@ -1859,8 +1859,15 @@ run_guarded_cargo() {
     set +e
     wait "${guard_child_pid}"
     status=$?
+    if [[ -f "${monitor_file}" && -s "${monitor_file}" ]]; then
+        if [[ -n "${monitor_pid}" ]]; then
+            wait "${monitor_pid}" 2>/dev/null || true
+            monitor_pid=""
+        fi
+    else
+        stop_monitor
+    fi
     guard_child_live=0
-    stop_monitor
     trap - INT TERM
 
     if [[ -f "${monitor_file}" && -s "${monitor_file}" ]]; then
