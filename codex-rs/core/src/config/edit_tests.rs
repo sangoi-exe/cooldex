@@ -137,6 +137,29 @@ fn multi_agent_v2_feature_toggle_preserves_nested_configuration() {
 }
 
 #[test]
+fn disabling_multi_agent_v2_rejects_subagent_instruction_file_without_writing() {
+    let tmp = tempdir().expect("tmpdir");
+    let codex_home = tmp.path();
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let original = "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = \"child.md\"\n";
+    std::fs::write(&config_path, original).expect("write config");
+
+    let error = ConfigEditsBuilder::new(codex_home)
+        .set_feature_enabled("multi_agent_v2", /*enabled*/ false)
+        .apply_blocking()
+        .expect_err("disabling MultiAgentV2 with subagent instructions must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "cannot disable features.multi_agent_v2 while features.multi_agent_v2.subagent_instructions_file is configured"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read unchanged config"),
+        original
+    );
+}
+
+#[test]
 fn sleep_tool_feature_toggle_preserves_mode() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();

@@ -428,6 +428,28 @@ impl ConfigDocument {
         self.remove(segments)
     }
 
+    fn reject_incompatible_multi_agent_v2_configuration(&self) -> anyhow::Result<()> {
+        let Some(multi_agent_v2) = self
+            .doc
+            .get("features")
+            .and_then(TomlItem::as_table_like)
+            .and_then(|features| features.get("multi_agent_v2"))
+            .and_then(TomlItem::as_table_like)
+        else {
+            return Ok(());
+        };
+
+        if multi_agent_v2.get("enabled").and_then(TomlItem::as_bool) == Some(false)
+            && multi_agent_v2.contains_key("subagent_instructions_file")
+        {
+            anyhow::bail!(
+                "cannot disable features.multi_agent_v2 while features.multi_agent_v2.subagent_instructions_file is configured"
+            );
+        }
+
+        Ok(())
+    }
+
     fn replace_mcp_servers(
         &mut self,
         servers: &BTreeMap<String, McpServerConfig>,
@@ -765,6 +787,10 @@ fn apply_blocking_to_resolved_file(
         mutated |= document.apply(edit)?;
     }
 
+    if mutated {
+        document.reject_incompatible_multi_agent_v2_configuration()?;
+    }
+
     if !mutated {
         return Ok(());
     }
@@ -871,13 +897,14 @@ impl ConfigEditsBuilder {
     }
 
     // Merge-safety anchor: structured feature toggles preserve nested settings; network_proxy
-    // retains its credential-broker exception when disabled.
+    // retains its credential-broker exception when disabled, while MultiAgentV2 rejects a
+    // disabled configuration that retains its instruction-file setting.
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
     /// graduates to globally enabled. Structured feature-table settings can
-    /// preserve nested options by writing `enabled = false` when needed.
+    /// preserve compatible nested options by writing `enabled = false` when needed.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
         let mut segments = vec!["features".to_string(), key.to_string()];
         if !enabled && key != "network_proxy" && is_structured_feature_path(&segments) {

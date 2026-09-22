@@ -12123,6 +12123,42 @@ max_concurrent_threads_per_session = 9
 }
 
 #[tokio::test]
+async fn disabling_multi_agent_v2_with_supported_settings_persists_loadable_config(
+) -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+    )?;
+
+    ConfigEditsBuilder::new(codex_home.path())
+        .set_feature_enabled("multi_agent_v2", /*enabled*/ false)
+        .apply_blocking()
+        .expect("disable MultiAgentV2");
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(!config.features.enabled(Feature::MultiAgentV2));
+    assert_eq!(
+        config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+        Some("Delegate carefully.")
+    );
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join(CONFIG_TOML_FILE))?,
+        "[features.multi_agent_v2]\nenabled = false\nsubagent_usage_hint_text = \"Delegate carefully.\"\n"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn multi_agent_v2_default_session_thread_cap_counts_root() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
