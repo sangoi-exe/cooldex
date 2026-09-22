@@ -6,6 +6,7 @@ import ntpath
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -29,6 +30,22 @@ def find_pwsh() -> str | None:
 
 
 PWSH = find_pwsh()
+
+
+class HarnessPrerequisiteTests(unittest.TestCase):
+    def test_direct_harness_fails_without_powershell(self) -> None:
+        environment = os.environ.copy()
+        environment["PATH"] = ""
+        process = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve())],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("pwsh.exe or pwsh must be on PATH", process.stderr)
 
 
 class CleanupTests(unittest.TestCase):
@@ -536,4 +553,7 @@ if (-not (Test-Path -LiteralPath $env:CWC_PATH)) { exit 14 }
 
 
 if __name__ == "__main__":
+    if PWSH is None:
+        print("pwsh.exe or pwsh must be on PATH", file=sys.stderr)
+        raise SystemExit(1)
     unittest.main(verbosity=2)

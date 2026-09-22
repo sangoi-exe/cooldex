@@ -7,9 +7,11 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -66,6 +68,22 @@ BOOTSTRAP_FIXTURE_FIELDS = (
     "CARGO_VALIDATE_WINDOWS_TEST_BOOTSTRAP_V8_BINDING",
     "CARGO_VALIDATE_WINDOWS_TEST_BOOTSTRAP_FINAL_HOST",
 )
+
+
+class HarnessPrerequisiteTests(unittest.TestCase):
+    def test_direct_harness_fails_without_powershell(self) -> None:
+        environment = os.environ.copy()
+        environment["PATH"] = ""
+        process = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve())],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("pwsh.exe or pwsh must be on PATH", process.stderr)
 
 
 class CargoValidateWindowsTests(unittest.TestCase):
@@ -1699,15 +1717,15 @@ class CargoValidateWindowsTests(unittest.TestCase):
                     msg="preflight failure must occur before fake-cargo creation",
                 )
 
-        process, summary, result = self.invoke(
+        process = self.invoke_raw(
             self.manifest([self.command(env=self.fixture_env())]),
             fixture_opt_in=True,
             preflight_fixture=DEFAULT_PREFLIGHT_FIXTURE,
             preflight_fixture_opt_in=False,
         )
         self.assertEqual(process.returncode, 1)
-        self.assertEqual(summary["status"], "preflight-failed")
-        self.assertIn("preflight fixture data requires", str(result["error"]))
+        self.assertEqual(process.stdout.strip(), "")
+        self.assertIn("preflight fixture data requires", process.stderr)
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
@@ -1794,6 +1812,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
     def test_native_mutex_busy_and_abandoned_fail_closed(self) -> None:
+        namespace = f"mutex-{uuid.uuid4().hex}"
+        manifest = self.manifest([self.command(env=self.fixture_env())])
+        manifest["windows_runtime"]["workflow_namespace"] = namespace
+        expected_run_root = self.unix_path(rf"F:\.cache\{namespace}")
+        self.assertFalse(expected_run_root.exists())
         mutex_env = os.environ.copy()
         mutex_entries = [
             entry for entry in mutex_env.get("WSLENV", "").split(":") if entry
@@ -1828,19 +1851,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
-            process, summary, result = self.invoke(
-                self.manifest([self.command(env=self.fixture_env())]),
-                fixture_opt_in=True,
-            )
+            process = self.invoke_raw(manifest, fixture_opt_in=True)
             self.assertEqual(process.returncode, 1)
-            self.assertEqual(summary["status"], "preflight-failed")
-            self.assertIn("mutex is busy", str(result["error"]))
-            self.assertFalse(
-                self.unix_path(result["paths"]["tool_staging"])
-                .joinpath("command-1", "cargo.exe")
-                .exists(),
-                msg="mutex failure must occur before fake-cargo creation",
-            )
+            self.assertEqual(process.stdout.strip(), "")
+            self.assertIn("mutex is busy", process.stderr)
+            self.assertFalse(expected_run_root.exists())
         finally:
             if holder.stdin is not None:
                 holder.stdin.write("\n")
@@ -1852,8 +1867,13 @@ class CargoValidateWindowsTests(unittest.TestCase):
             if holder.stderr is not None:
                 holder.stderr.close()
 
-        process, summary, result = self.invoke(
-            self.manifest([self.command(env=self.fixture_env())]),
+        namespace = f"mutex-{uuid.uuid4().hex}"
+        manifest = self.manifest([self.command(env=self.fixture_env())])
+        manifest["windows_runtime"]["workflow_namespace"] = namespace
+        expected_run_root = self.unix_path(rf"F:\.cache\{namespace}")
+        self.assertFalse(expected_run_root.exists())
+        process = self.invoke_raw(
+            manifest,
             fixture_opt_in=True,
             preflight_fixture={
                 **DEFAULT_PREFLIGHT_FIXTURE,
@@ -1861,8 +1881,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
             },
         )
         self.assertEqual(process.returncode, 1)
-        self.assertEqual(summary["status"], "preflight-failed")
-        self.assertIn("mutex was abandoned", str(result["error"]))
+        self.assertEqual(process.stdout.strip(), "")
+        self.assertIn("mutex was abandoned", process.stderr)
+        self.assertFalse(expected_run_root.exists())
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
@@ -1913,4 +1934,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if PWSH is None:
+        print("pwsh.exe or pwsh must be on PATH", file=sys.stderr)
+        raise SystemExit(1)
     unittest.main()

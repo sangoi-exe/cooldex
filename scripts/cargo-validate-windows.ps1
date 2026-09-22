@@ -3196,6 +3196,8 @@ try {
     $yolo = (Assert-StringArray $manifestData["flags"] "manifest.flags") -contains "yolo"
     $script:Runtime = $runtime
     $script:CacheRoot = $runtime.cache_root
+    $testFixture = Get-TestOnlyPreflightFixture
+    $nativeMutex = Enter-NativeExecutionMutex $testFixture
     $script:RunPaths = New-RunPaths $runtime.workflow_namespace $runtime.reuse_run_root
     $script:Preflight = [ordered]@{
         schema = 2
@@ -3214,7 +3216,7 @@ try {
             rust_toolchain = $runtime.rust_toolchain
             source_materialization = $runtime.source_materialization
         }
-        native_mutex = [ordered]@{ name = $script:NativeMutexName; status = "not-required" }
+        native_mutex = $nativeMutex
         native_git = $null
         direct_toolchain = $null
         bootstrap = [ordered]@{
@@ -3236,7 +3238,6 @@ try {
     }
     Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
 
-    $testFixture = Get-TestOnlyPreflightFixture
     $bootstrapFixture = Get-TestOnlyBootstrapFixture
     $planId = Get-RequiredSha256 $manifestData["plan_id"] "plan_id"
     $toolingDigest = Get-RequiredSha256 $manifestData["validation_tooling_digest"] "validation_tooling_digest"
@@ -3299,7 +3300,6 @@ try {
 
     $materialization = $null
     if ($approved.Count -ne 0) {
-        $script:Preflight.native_mutex = Enter-NativeExecutionMutex $testFixture
         $null = Invoke-ExecutionPreflight $runtime $script:RunPaths $testFixture "before-materialization-or-command" $yolo
         Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
         if ($candidate.is_bound) {
