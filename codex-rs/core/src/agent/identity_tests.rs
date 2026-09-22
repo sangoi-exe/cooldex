@@ -2,6 +2,8 @@ use super::*;
 use crate::context::MultiAgentRoleInstructions;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::AgentUsageHintInstructions;
 use pretty_assertions::assert_eq;
@@ -22,7 +24,12 @@ fn snapshot() -> AgentIdentitySnapshot {
         "gpt-5.4".to_string(),
         Some(ReasoningEffort::High),
         Some(ReasoningSummary::Detailed),
-        BASE_SECRET.to_string(),
+        BaseInstructions {
+            text: BASE_SECRET.to_string(),
+            provenance: Some(BaseInstructionsProvenance::Model {
+                model: "gpt-5.4".to_string(),
+            }),
+        },
         Some(DEVELOPER_SECRET.to_string()),
         Some("priority".to_string()),
         Some(false),
@@ -62,7 +69,10 @@ fn identity_equality_covers_every_field() {
     let mut different_summary = expected.clone();
     different_summary.model_reasoning_summary = Some(ReasoningSummary::Concise);
     let mut different_base = expected.clone();
-    different_base.base_instructions = Arc::from("different base");
+    different_base.base_instructions.text = "different base".to_string();
+    let mut different_base_provenance = expected.clone();
+    different_base_provenance.base_instructions.provenance =
+        Some(BaseInstructionsProvenance::Custom);
     let mut different_developer = expected.clone();
     different_developer.developer_instructions = Some(Arc::from("different developer"));
     let mut different_tier = expected.clone();
@@ -80,6 +90,7 @@ fn identity_equality_covers_every_field() {
         different_effort,
         different_summary,
         different_base,
+        different_base_provenance,
         different_developer,
         different_tier,
         different_shell_tool,
@@ -103,6 +114,13 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
         .expect("identity should apply");
 
     assert!(!config.features.enabled(Feature::ShellTool));
+    assert_eq!(config.base_instructions, Some(BASE_SECRET.to_string()));
+    assert_eq!(
+        config.base_instructions_provenance,
+        Some(BaseInstructionsProvenance::Model {
+            model: "gpt-5.4".to_string(),
+        })
+    );
     assert_eq!(
         config.agent_usage_hint_binding,
         AgentUsageHintBinding::Inherited {

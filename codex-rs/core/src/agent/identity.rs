@@ -5,6 +5,7 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::SessionSource;
@@ -28,7 +29,7 @@ pub(crate) struct AgentIdentitySnapshot {
     model: String,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
-    base_instructions: Arc<str>,
+    base_instructions: BaseInstructions,
     developer_instructions: Option<Arc<str>>,
     service_tier: Option<String>,
     shell_tool_enabled: Option<bool>,
@@ -44,7 +45,7 @@ impl AgentIdentitySnapshot {
         model: String,
         model_reasoning_effort: Option<ReasoningEffort>,
         model_reasoning_summary: Option<ReasoningSummary>,
-        base_instructions: String,
+        base_instructions: BaseInstructions,
         developer_instructions: Option<String>,
         service_tier: Option<String>,
         shell_tool_enabled: Option<bool>,
@@ -59,7 +60,7 @@ impl AgentIdentitySnapshot {
             model,
             model_reasoning_effort,
             model_reasoning_summary,
-            base_instructions: Arc::from(base_instructions),
+            base_instructions,
             developer_instructions: developer_instructions.map(Arc::from),
             service_tier,
             shell_tool_enabled,
@@ -99,7 +100,10 @@ impl AgentIdentitySnapshot {
             .model_reasoning_effort
             .clone_from(&self.model_reasoning_effort);
         config.model_reasoning_summary = self.model_reasoning_summary;
-        config.base_instructions = Some(self.base_instructions.to_string());
+        config.base_instructions = Some(self.base_instructions.text.clone());
+        config
+            .base_instructions_provenance
+            .clone_from(&self.base_instructions.provenance);
         config.developer_instructions = self
             .developer_instructions
             .as_ref()

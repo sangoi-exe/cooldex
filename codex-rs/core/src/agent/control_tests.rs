@@ -57,6 +57,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -899,6 +901,16 @@ async fn resumed_v2_root_rejects_missing_canonical_usage_hint_binding() {
     .await;
 }
 
+#[tokio::test]
+async fn resumed_v2_root_restores_compacted_developer_instructions_and_model_provenance() {
+    check_v2_agent_reload(
+        V2ReloadRoute::Sender,
+        V2ReloadExpectation::CompactedColdIdentity,
+        FullHistoryUsageHintSource::Configured,
+    )
+    .await;
+}
+
 #[derive(Clone, Copy)]
 enum V2ReloadRoute {
     Sender,
@@ -915,6 +927,7 @@ enum V2ReloadExpectation {
     MissingShellState,
     MissingUsageHintBinding,
     CompressedAncestor,
+    CompactedColdIdentity,
 }
 
 #[derive(Clone, Copy)]
@@ -922,6 +935,10 @@ enum FullHistoryUsageHintSource {
     Configured,
     CatalogMarked,
 }
+
+const COMPACTED_COLD_DEVELOPER_INSTRUCTIONS: &str =
+    "compacted cold developer instructions survive reload";
+const COMPACTED_COLD_BASE_INSTRUCTIONS: &str = "Before.\n\n## Planning\nYou have access to an `update_plan` tool which tracks steps.\n\n### Examples\nKeep steps current.\n\n## Work\nImplement.\n\n## `update_plan`\nUpdate the checklist.\n\n# Next\n## Planning\nDiscuss architecture and inspect update_plan before editing.\n";
 
 async fn spawn_v2_reload_test_child(
     control: &LocalAgentControl,
@@ -970,8 +987,14 @@ async fn check_v2_agent_reload(
         V2ReloadExpectation::FullHistoryUsageHint
             | V2ReloadExpectation::ResumedRootFullHistoryUsageHint
     );
+    let uses_compacted_cold_identity =
+        matches!(expectation, V2ReloadExpectation::CompactedColdIdentity);
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
+    if uses_compacted_cold_identity {
+        config.update_plan_enabled = false;
+        config.model_catalog = None;
+    }
     if matches!(
         expectation,
         V2ReloadExpectation::MissingShellState | V2ReloadExpectation::CompressedAncestor
@@ -1086,6 +1109,14 @@ async fn check_v2_agent_reload(
     };
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
+    if uses_compacted_cold_identity {
+        child_config.base_instructions = Some(COMPACTED_COLD_BASE_INSTRUCTIONS.to_string());
+        child_config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {
+            model: "gpt-5.6-luna".to_string(),
+        });
+        child_config.developer_instructions =
+            Some(COMPACTED_COLD_DEVELOPER_INSTRUCTIONS.to_string());
+    }
     child_config
         .features
         .disable(Feature::ShellTool)
@@ -1133,9 +1164,22 @@ async fn check_v2_agent_reload(
         )])
         .await
         .expect("child rollout should persist with v2 metadata");
-    if matches!(expectation, V2ReloadExpectation::BoundedModelContext) {
+    if matches!(
+        expectation,
+        V2ReloadExpectation::BoundedModelContext | V2ReloadExpectation::CompactedColdIdentity
+    ) {
         let bounded_turn_context = child_thread.session.new_default_turn().await;
         let bounded_turn_id = bounded_turn_context.sub_id.clone();
+        let replacement_history = if uses_compacted_cold_identity {
+            child_thread
+                .session
+                .clone_history()
+                .await
+                .annotated_items()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
         child_thread
             .session
             .persist_rollout_items(&[
@@ -1161,7 +1205,7 @@ async fn check_v2_agent_reload(
                 RolloutItem::TurnContext(bounded_turn_context.to_turn_context_item()),
                 RolloutItem::Compacted(CompactedItem {
                     message: "bounded child context".to_string(),
-                    replacement_history: Some(Vec::new()),
+                    replacement_history: Some(replacement_history),
                     guardian_history: None,
                     retained_context: None,
                     mcp_resource_origins: None,
@@ -1194,6 +1238,7 @@ async fn check_v2_agent_reload(
             | V2ReloadExpectation::MissingUsageHintBinding
             | V2ReloadExpectation::ResumedRootFullHistoryUsageHint
             | V2ReloadExpectation::CompressedAncestor
+            | V2ReloadExpectation::CompactedColdIdentity
     ) {
         assert!(matches!(route, V2ReloadRoute::Sender));
         let child_rollout_path = stored_child
@@ -1314,7 +1359,8 @@ async fn check_v2_agent_reload(
                     "child rollout should contain exactly one canonical usage-hint binding"
                 );
             }
-            V2ReloadExpectation::ResumedRootFullHistoryUsageHint => {}
+            V2ReloadExpectation::ResumedRootFullHistoryUsageHint
+            | V2ReloadExpectation::CompactedColdIdentity => {}
             V2ReloadExpectation::CompressedAncestor => {
                 let root_contents =
                     std::fs::read_to_string(&root_rollout_path).expect("read root rollout");
@@ -1496,6 +1542,62 @@ async fn check_v2_agent_reload(
                         .iter()
                         .any(|text| text == "full-history child reload subagent guidance"),
                     "paginated resumed-root child must not re-resolve its child hint"
+                );
+            }
+            V2ReloadExpectation::CompactedColdIdentity => {
+                let resumed_root =
+                    resume_result.expect("root resume should restore compacted child metadata");
+                let resumed_control = resumed_root.thread.session.services.agent_control.clone();
+                resumed_control
+                    .ensure_v2_agent_loaded(
+                        harness.config.clone(),
+                        spawned_agent.thread_id,
+                        /*parent*/ None,
+                    )
+                    .await
+                    .expect("restored compacted child should load");
+                let restored_child = resumed_manager
+                    .get_thread(spawned_agent.thread_id)
+                    .await
+                    .expect("restored compacted child should be loaded");
+                assert_eq!(
+                    restored_child.session.agent_identity_snapshot().await,
+                    expected_identity
+                );
+                let restored_turn = restored_child.session.new_default_turn().await;
+                assert_eq!(
+                    restored_turn.developer_instructions.as_deref(),
+                    Some(COMPACTED_COLD_DEVELOPER_INSTRUCTIONS),
+                    "cold identity restore must retain developer instructions from replacement history"
+                );
+                let restored_history = restored_child.session.clone_history().await;
+                assert!(
+                    history_contains_text(
+                        restored_history.raw_items(),
+                        COMPACTED_COLD_DEVELOPER_INSTRUCTIONS,
+                    ),
+                    "the rebuilt cold context must retain developer instructions from replacement history"
+                );
+                assert_eq!(
+                    restored_child.session.get_base_instructions().await,
+                    BaseInstructions {
+                        text: COMPACTED_COLD_BASE_INSTRUCTIONS.to_string(),
+                        provenance: Some(BaseInstructionsProvenance::Model {
+                            model: "gpt-5.6-luna".to_string(),
+                        }),
+                    }
+                );
+                assert_eq!(
+                    restored_child.session.get_prompt_base_instructions().await,
+                    BaseInstructions {
+                        text: codex_prompts::without_update_plan_instructions(
+                            COMPACTED_COLD_BASE_INSTRUCTIONS,
+                        ),
+                        provenance: Some(BaseInstructionsProvenance::Model {
+                            model: "gpt-5.6-luna".to_string(),
+                        }),
+                    },
+                    "model provenance must preserve update-plan stripping after cold reload"
                 );
             }
             V2ReloadExpectation::CompressedAncestor => {

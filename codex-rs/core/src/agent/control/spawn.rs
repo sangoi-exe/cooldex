@@ -26,6 +26,7 @@ use codex_extension_api::ExtensionDataInit;
 use codex_history::ResponseItemEnvelope;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::intersect_effective_permission_profiles;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_utils_path_uri::PathUri;
@@ -238,40 +239,46 @@ async fn load_agent_model_context(
 // be reclassified as developer instructions while resolving the persisted identity.
 fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
     for item in history {
-        let RolloutItem::ResponseItem(response_item) = item else {
-            continue;
+        let response_items = match item {
+            RolloutItem::ResponseItem(response_item) => std::slice::from_ref(response_item),
+            RolloutItem::Compacted(compacted) => {
+                compacted.replacement_history.as_deref().unwrap_or_default()
+            }
+            _ => continue,
         };
-        match &response_item.item {
-            ResponseItem::Message {
-                role,
-                content,
-                internal_chat_message_metadata_passthrough,
-                ..
-            } if role == "developer" => {
-                let content_item_kinds = internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|metadata| metadata.content_item_kinds.as_deref());
-                for (index, content_item) in content.iter().enumerate() {
-                    let is_usage_hint = content_item_kinds
-                        .and_then(|kinds| kinds.get(index))
-                        .is_some_and(|kind| kind.0.as_str() == "multi_agent.usage_hint");
-                    if !is_usage_hint
-                        && let Some(instructions) =
-                            crate::event_mapping::first_non_contextual_dev_message_text(
-                                std::slice::from_ref(content_item),
-                            )
-                    {
-                        return Some(instructions.to_string());
+        for response_item in response_items {
+            match &response_item.item {
+                ResponseItem::Message {
+                    role,
+                    content,
+                    internal_chat_message_metadata_passthrough,
+                    ..
+                } if role == "developer" => {
+                    let content_item_kinds = internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.content_item_kinds.as_deref());
+                    for (index, content_item) in content.iter().enumerate() {
+                        let is_usage_hint = content_item_kinds
+                            .and_then(|kinds| kinds.get(index))
+                            .is_some_and(|kind| kind.0.as_str() == "multi_agent.usage_hint");
+                        if !is_usage_hint
+                            && let Some(instructions) =
+                                crate::event_mapping::first_non_contextual_dev_message_text(
+                                    std::slice::from_ref(content_item),
+                                )
+                        {
+                            return Some(instructions.to_string());
+                        }
                     }
                 }
+                ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && !crate::event_mapping::is_contextual_user_message_content(content) =>
+                {
+                    return None;
+                }
+                _ => {}
             }
-            ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && !crate::event_mapping::is_contextual_user_message_content(content) =>
-            {
-                break;
-            }
-            _ => {}
         }
     }
     None
@@ -340,8 +347,15 @@ async fn restore_v2_identity_snapshot(
     let reasoning_summary = latest_thread_settings.reasoning_summary;
     let base_instructions = initial_history
         .get_base_instructions()
-        .map(|base_instructions| base_instructions.text)
-        .or_else(|| config.base_instructions.clone())
+        .or_else(|| {
+            config
+                .base_instructions
+                .as_ref()
+                .map(|text| BaseInstructions {
+                    text: text.clone(),
+                    provenance: config.base_instructions_provenance.clone(),
+                })
+        })
         .ok_or_else(|| {
             CodexErr::InvalidRequest(format!(
                 "agent {} is missing persisted base instructions required to restore its identity snapshot",

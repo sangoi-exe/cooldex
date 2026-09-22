@@ -2128,7 +2128,10 @@ impl Session {
                 .collaboration_mode
                 .reasoning_effort(),
             configuration.step_settings.reasoning_summary,
-            configuration.base_instructions.clone(),
+            BaseInstructions {
+                text: configuration.base_instructions.clone(),
+                provenance: state.base_instructions_provenance.clone(),
+            },
             configuration.developer_instructions.clone(),
             configuration.step_settings.service_tier.clone(),
             Some(
@@ -2159,7 +2162,7 @@ impl Session {
             step_context.settings.model_info.slug.clone(),
             step_context.settings.effective_reasoning_effort(),
             Some(step_context.settings.reasoning_summary),
-            base_instructions.text,
+            base_instructions,
             turn_context.developer_instructions.clone(),
             step_context.settings.service_tier.clone(),
             Some(turn_context.config.features.enabled(Feature::ShellTool)),
