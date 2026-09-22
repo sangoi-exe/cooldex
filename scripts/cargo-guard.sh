@@ -85,7 +85,6 @@ Runs Cargo with deterministic guardrails for build-like commands:
   - supervises every guarded Cargo child in a verified process group and aborts only that group on disk emergency
   - preserves successful package-targeted caches and runs package-scoped `cargo clean -p ...` only after package-targeted failures
   - runs broad `cargo clean` only when no package target is available, and never solely because a package-targeted command failed
-  - also clears stale known target-cache contents when Cargo's effective target/build directory is elsewhere
   - honors CARGO_GUARD_NO_CLEAN=1 by failing before any pre-run or post-run cargo clean
   - honors CARGO_GUARD_NO_POST_CLEAN=1 by allowing pre-run cleanup but failing before post-run cleanup
 
@@ -240,16 +239,6 @@ resolve_path() {
         realpath -m -- "${raw_path}"
     else
         realpath -m -- "${base_dir}/${raw_path}"
-    fi
-}
-
-resolve_path_no_symlinks() {
-    local raw_path="$1"
-    local base_dir="$2"
-    if [[ "${raw_path}" = /* ]]; then
-        realpath -m -s -- "${raw_path}"
-    else
-        realpath -m -s -- "${base_dir}/${raw_path}"
     fi
 }
 
@@ -488,118 +477,6 @@ path_is_same_or_inside() {
     [[ "${candidate}" == "${parent}" || "${candidate}" == "${parent}/"* ]]
 }
 
-append_stale_target_candidate() {
-    local label="$1"
-    local candidate="$2"
-    local existing
-    for existing in "${stale_target_candidate_paths[@]}"; do
-        if [[ "${existing}" == "${candidate}" ]]; then
-            return
-        fi
-    done
-    stale_target_candidate_labels+=("${label}")
-    stale_target_candidate_paths+=("${candidate}")
-}
-
-resolve_test_target_override() {
-    local env_name="$1"
-    local raw_path="$2"
-    local target_kind="$3"
-    local resolved_path tmp_root
-    resolved_path="$(resolve_path_no_symlinks "${raw_path}" "${CODEX_RS_DIR}")"
-    tmp_root="$(realpath -m -s -- "${TMPDIR:-/tmp}")"
-    if ! path_is_same_or_inside "${resolved_path}" "${tmp_root}"; then
-        log error "${env_name} must stay under ${tmp_root}; got ${resolved_path}"
-        exit 2
-    fi
-    case "${target_kind}" in
-        workspace)
-            if [[ "${resolved_path}" != */target ]]; then
-                log error "${env_name} must end with /target; got ${resolved_path}"
-                exit 2
-            fi
-            ;;
-        shared)
-            if [[ "${resolved_path}" != */cargo-target/codex-rs ]]; then
-                log error "${env_name} must end with /cargo-target/codex-rs; got ${resolved_path}"
-                exit 2
-            fi
-            ;;
-        *)
-            log error "unknown stale target override kind: ${target_kind}"
-            exit 2
-            ;;
-    esac
-    printf '%s\n' "${resolved_path}"
-}
-
-resolve_stale_target_candidates() {
-    stale_target_candidate_labels=()
-    stale_target_candidate_paths=()
-
-    local workspace_target_dir
-    if [[ -n "${CARGO_GUARD_TEST_WORKSPACE_TARGET_DIR:-}" ]]; then
-        workspace_target_dir="$(resolve_test_target_override CARGO_GUARD_TEST_WORKSPACE_TARGET_DIR "${CARGO_GUARD_TEST_WORKSPACE_TARGET_DIR}" workspace)"
-    else
-        workspace_target_dir="$(resolve_path_no_symlinks "${CODEX_RS_DIR}/target" "${CODEX_RS_DIR}")"
-    fi
-    append_stale_target_candidate "stale-target:workspace" "${workspace_target_dir}"
-
-    local shared_target_dir
-    if [[ -n "${CARGO_GUARD_TEST_SHARED_TARGET_DIR:-}" ]]; then
-        shared_target_dir="$(resolve_test_target_override CARGO_GUARD_TEST_SHARED_TARGET_DIR "${CARGO_GUARD_TEST_SHARED_TARGET_DIR}" shared)"
-    else
-        shared_target_dir="$(resolve_path_no_symlinks "${HOME}/.cache/cargo-target/codex-rs" "${CODEX_RS_DIR}")"
-    fi
-    append_stale_target_candidate "stale-target:shared" "${shared_target_dir}"
-}
-
-stale_target_candidate_shape_is_allowed() {
-    local label="$1"
-    local path="$2"
-    case "${label}" in
-        stale-target:workspace)
-            [[ "${path}" == */target ]]
-            ;;
-        stale-target:shared)
-            [[ "${path}" == */cargo-target/codex-rs ]]
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-stale_target_candidate_is_cleanable() {
-    local label="$1"
-    local path="$2"
-    [[ -d "${path}" && ! -L "${path}" ]] || return 1
-
-    local resolved_path candidate
-    resolved_path="$(realpath -m -s -- "${path}")"
-    stale_target_candidate_shape_is_allowed "${label}" "${resolved_path}" || return 1
-
-    local known_candidate=0
-    local index
-    for index in "${!stale_target_candidate_paths[@]}"; do
-        candidate="${stale_target_candidate_paths[$index]}"
-        if [[ "${label}" == "${stale_target_candidate_labels[$index]}" && "${resolved_path}" == "${candidate}" ]]; then
-            known_candidate=1
-            break
-        fi
-    done
-    (( known_candidate == 1 )) || return 1
-
-    if path_is_same_or_inside "${resolved_path}" "${resolved_target_dir}" \
-        || path_is_same_or_inside "${resolved_target_dir}" "${resolved_path}" \
-        || path_is_same_or_inside "${resolved_path}" "${resolved_build_dir}" \
-        || path_is_same_or_inside "${resolved_build_dir}" "${resolved_path}"; then
-        return 1
-    fi
-
-    return 0
-}
-
 monitored_path_is_cleanable() {
     local label="$1"
     local path="$2"
@@ -609,10 +486,6 @@ monitored_path_is_cleanable() {
             ;;
         build)
             path_is_same_or_inside "${path}" "${resolved_target_dir}"
-            return $?
-            ;;
-        stale-target:*)
-            stale_target_candidate_is_cleanable "${label}" "${path}"
             return $?
             ;;
         *)
@@ -1647,20 +1520,6 @@ has_package_clean_targets() {
     ((${#package_clean_args[@]} > 0))
 }
 
-clean_stale_target_caches() {
-    local reason="$1"
-    local index label path
-    for index in "${!stale_target_candidate_paths[@]}"; do
-        label="${stale_target_candidate_labels[$index]}"
-        path="${stale_target_candidate_paths[$index]}"
-        if ! stale_target_candidate_is_cleanable "${label}" "${path}"; then
-            continue
-        fi
-        log warning "cleaning stale target cache: ${label}=${path} (${reason})"
-        find "${path}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    done
-}
-
 run_cargo_clean_or_fail() {
     local reason="$1"
     local phase="$2"
@@ -1676,9 +1535,6 @@ run_cargo_clean_or_fail() {
     fi
     if ! run_cargo_clean "${reason}" "${clean_args[@]}"; then
         return 1
-    fi
-    if ((${#clean_args[@]} == 0)); then
-        clean_stale_target_caches "${reason}"
     fi
 }
 
@@ -2531,19 +2387,12 @@ fi
 EXPECTED_GROWTH_BYTES="$(bytes_from_gib "${EXPECTED_GROWTH_GIB}")"
 
 resolve_metadata_dirs
-resolve_stale_target_candidates
 
 monitored_paths=()
 monitored_labels=()
 append_unique_monitored_path workspace "${CODEX_RS_DIR}"
 append_unique_monitored_path target "${resolved_target_dir}"
 append_unique_monitored_path build "${resolved_build_dir}"
-for index in "${!stale_target_candidate_paths[@]}"; do
-    candidate_path="${stale_target_candidate_paths[$index]}"
-    if [[ -d "${candidate_path}" && ! -L "${candidate_path}" ]]; then
-        append_unique_monitored_path "${stale_target_candidate_labels[$index]}" "${candidate_path}"
-    fi
-done
 append_unique_monitored_path tmp "${TMPDIR:-/tmp}"
 append_unique_monitored_path cargo-home "${CARGO_HOME:-${HOME}/.cargo}"
 
@@ -2551,12 +2400,6 @@ log info "workspace: ${CODEX_RS_DIR}"
 log info "execution cwd: ${cargo_workdir}"
 log info "target-dir: ${resolved_target_dir}"
 log info "build-dir: ${resolved_build_dir}"
-for index in "${!stale_target_candidate_paths[@]}"; do
-    candidate_path="${stale_target_candidate_paths[$index]}"
-    if [[ -d "${candidate_path}" && ! -L "${candidate_path}" ]]; then
-        log info "${stale_target_candidate_labels[$index]}-dir: ${candidate_path}"
-    fi
-done
 log info "resource-profile: ${CARGO_GUARD_RESOURCE_PROFILE:-manual}"
 log info "disk-policy: min=${MIN_FREE_GIB}GiB reserve=${RESERVE_FREE_PCT}%/${RESERVE_FREE_GIB}GiB expected-growth=${EXPECTED_GROWTH_GIB}GiB source=${EXPECTED_GROWTH_SOURCE} abort=${ABORT_FREE_PCT}%/${ABORT_FREE_GIB}GiB monitor=${MONITOR_ENABLED}"
 

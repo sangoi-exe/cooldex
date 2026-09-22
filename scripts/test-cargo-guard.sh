@@ -185,8 +185,6 @@ CURRENT_LOG=""
 CURRENT_OUT=""
 CURRENT_TARGET_DIR=""
 CURRENT_BUILD_DIR=""
-CURRENT_WORKSPACE_TARGET_DIR=""
-CURRENT_SHARED_TARGET_DIR=""
 CURRENT_SEQUENCE_FILE=""
 CURRENT_MEMINFO=""
 CURRENT_HISTORY=""
@@ -213,8 +211,6 @@ begin_case() {
     CURRENT_OUT="${case_dir}/out.log"
     CURRENT_TARGET_DIR="${case_dir}/target"
     CURRENT_BUILD_DIR="${CURRENT_TARGET_DIR}"
-    CURRENT_WORKSPACE_TARGET_DIR="${case_dir}/codex-rs/target"
-    CURRENT_SHARED_TARGET_DIR="${case_dir}/shared/cargo-target/codex-rs"
     CURRENT_SEQUENCE_FILE="${case_dir}/df-sequence"
     CURRENT_MEMINFO="${case_dir}/meminfo"
     CURRENT_HISTORY="${case_dir}/history.jsonl"
@@ -233,8 +229,6 @@ begin_case() {
     export FAKE_NPROC_VALUE=28
     export CARGO_GUARD_MEMINFO_PATH="${CURRENT_MEMINFO}"
     export CARGO_GUARD_HISTORY_PATH="${CURRENT_HISTORY}"
-    export CARGO_GUARD_TEST_WORKSPACE_TARGET_DIR="${CURRENT_WORKSPACE_TARGET_DIR}"
-    export CARGO_GUARD_TEST_SHARED_TARGET_DIR="${CURRENT_SHARED_TARGET_DIR}"
     unset FAKE_CARGO_COMMAND_STATUS FAKE_CARGO_COMMAND_SLEEP FAKE_CARGO_CLEAN_STATUS FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE FAKE_CARGO_BREAK_TELEMETRY_AFTER_START
     unset FAKE_PS_FORCE_BAD_PGID FAKE_PS_FAIL_PROCESS_LIST
     unset FAKE_CARGO_DESCENDANT_FILE FAKE_PS_PGID_SEQUENCE_FILE FAKE_PS_PROCESS_LIST_FILE
@@ -1091,110 +1085,6 @@ set_df_sequence 99 1 99 99 99 99 99 99
 expect_ok cargo check --target-dir "${explicit_target}" --workspace
 assert_file_contains "${CURRENT_LOG}" "args=clean --target-dir ${explicit_target} "
 assert_file_not_contains "${CURRENT_LOG}" "args=clean .* -p "
-
-begin_case
-mkdir -p -- "${CURRENT_WORKSPACE_TARGET_DIR}/debug"
-printf 'stale artifact\n' >"${CURRENT_WORKSPACE_TARGET_DIR}/debug/stale-bin"
-set_df_sequence 99 99 1 99 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_contains "${CURRENT_OUT}" "guard-path: stale-target:workspace=${CURRENT_WORKSPACE_TARGET_DIR} .*clean-candidate=1"
-assert_file_contains "${CURRENT_OUT}" "cleaning stale target cache: stale-target:workspace=${CURRENT_WORKSPACE_TARGET_DIR}"
-if [[ -e "${CURRENT_WORKSPACE_TARGET_DIR}/debug/stale-bin" ]]; then
-    fail "expected stale workspace target contents to be removed"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_WORKSPACE_TARGET_DIR}/debug"
-printf 'active artifact\n' >"${CURRENT_WORKSPACE_TARGET_DIR}/debug/active-bin"
-CURRENT_TARGET_DIR="${CURRENT_WORKSPACE_TARGET_DIR}"
-CURRENT_BUILD_DIR="${CURRENT_TARGET_DIR}"
-export FAKE_CARGO_TARGET_DIR_JSON="${CURRENT_TARGET_DIR}"
-export FAKE_CARGO_BUILD_DIR_JSON="${CURRENT_BUILD_DIR}"
-export FAKE_STAT_TARGET_PATH="${CURRENT_TARGET_DIR}"
-set_df_sequence 99 1 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_not_contains "${CURRENT_OUT}" "cleaning stale target cache: stale-target:workspace=${CURRENT_WORKSPACE_TARGET_DIR}"
-if [[ ! -e "${CURRENT_WORKSPACE_TARGET_DIR}/debug/active-bin" ]]; then
-    fail "workspace target contents were removed while it was the effective target"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_SHARED_TARGET_DIR}/debug"
-printf 'stale artifact\n' >"${CURRENT_SHARED_TARGET_DIR}/debug/stale-bin"
-set_df_sequence 99 99 1 99 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_contains "${CURRENT_OUT}" "guard-path: stale-target:shared=${CURRENT_SHARED_TARGET_DIR} .*clean-candidate=1"
-assert_file_contains "${CURRENT_OUT}" "cleaning stale target cache: stale-target:shared=${CURRENT_SHARED_TARGET_DIR}"
-if [[ -e "${CURRENT_SHARED_TARGET_DIR}/debug/stale-bin" ]]; then
-    fail "expected stale shared target contents to be removed"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_SHARED_TARGET_DIR}/debug"
-printf 'stale artifact\n' >"${CURRENT_SHARED_TARGET_DIR}/debug/stale-bin"
-export CARGO_GUARD_NO_CLEAN=1
-set_df_sequence 99 99 1 99 99
-expect_fail cargo check --workspace
-assert_clean_count 0
-assert_file_contains "${CURRENT_OUT}" 'CARGO_GUARD_NO_CLEAN=1 forbids cargo clean \(pre-run cleanable filesystem below required start headroom\)'
-if [[ ! -e "${CURRENT_SHARED_TARGET_DIR}/debug/stale-bin" ]]; then
-    fail "stale shared target contents were removed despite no-clean mode"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_SHARED_TARGET_DIR}/debug"
-printf 'active artifact\n' >"${CURRENT_SHARED_TARGET_DIR}/debug/active-bin"
-CURRENT_TARGET_DIR="${CURRENT_SHARED_TARGET_DIR}"
-CURRENT_BUILD_DIR="${CURRENT_TARGET_DIR}"
-export FAKE_CARGO_TARGET_DIR_JSON="${CURRENT_TARGET_DIR}"
-export FAKE_CARGO_BUILD_DIR_JSON="${CURRENT_BUILD_DIR}"
-export FAKE_STAT_TARGET_PATH="${CURRENT_TARGET_DIR}"
-set_df_sequence 99 1 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_not_contains "${CURRENT_OUT}" "cleaning stale target cache: stale-target:shared=${CURRENT_SHARED_TARGET_DIR}"
-if [[ ! -e "${CURRENT_SHARED_TARGET_DIR}/debug/active-bin" ]]; then
-    fail "shared target contents were removed while it was the effective target"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_SHARED_TARGET_DIR%/*}" "${TMP_ROOT}/linked-shared-target/debug"
-printf 'linked artifact\n' >"${TMP_ROOT}/linked-shared-target/debug/linked-bin"
-ln -s "${TMP_ROOT}/linked-shared-target" "${CURRENT_SHARED_TARGET_DIR}"
-set_df_sequence 99 1 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_not_contains "${CURRENT_OUT}" "guard-path: stale-target:shared=${CURRENT_SHARED_TARGET_DIR}"
-if [[ ! -e "${TMP_ROOT}/linked-shared-target/debug/linked-bin" ]]; then
-    fail "symlinked shared target contents were removed"
-fi
-
-begin_case
-unknown_cache="${CURRENT_SHARED_TARGET_DIR%/*}/other-workspace"
-mkdir -p -- "${unknown_cache}/debug"
-printf 'unknown artifact\n' >"${unknown_cache}/debug/unknown-bin"
-set_df_sequence 99 1 99 99 99 99 99 99
-expect_ok cargo check --workspace
-assert_clean_count 1
-assert_file_not_contains "${CURRENT_OUT}" "other-workspace"
-if [[ ! -e "${unknown_cache}/debug/unknown-bin" ]]; then
-    fail "unknown cargo-target sibling was removed"
-fi
-
-begin_case
-mkdir -p -- "${CURRENT_SHARED_TARGET_DIR}/debug"
-printf 'broad artifact\n' >"${CURRENT_SHARED_TARGET_DIR}/debug/broad-bin"
-export CARGO_GUARD_TEST_SHARED_TARGET_DIR="${TMP_ROOT}"
-set_df_sequence 99 1 99 99 99 99 99 99
-expect_fail cargo check -p codex-core
-assert_clean_count 0
-assert_file_contains "${CURRENT_OUT}" 'CARGO_GUARD_TEST_SHARED_TARGET_DIR must end with /cargo-target/codex-rs'
-if [[ ! -e "${CURRENT_SHARED_TARGET_DIR}/debug/broad-bin" ]]; then
-    fail "shared target contents were removed through broad override"
-fi
 
 begin_case
 export CARGO_GUARD_TEST_THREADS_MAX=4
