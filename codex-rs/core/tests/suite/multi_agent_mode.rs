@@ -134,6 +134,7 @@ async fn submit_turn(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: the multi-agent policy remains configuration-owned, independent of Ultra reasoning.
 async fn ultra_reasoning_uses_highest_non_ultra_without_changing_the_default_policy() -> Result<()>
 {
     skip_if_no_network!(Ok(()));

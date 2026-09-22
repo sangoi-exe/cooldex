@@ -151,6 +151,7 @@ async fn mount_completed_child(
 #[test_case(Some("priority"), Some("default"); "explicit default preserves active and idle V2 child work")]
 #[test_case(None, Some("priority"); "enabling fast mode preserves active and idle V2 child work")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: existing V2 subagents retain their resolved service tier when the root tier changes.
 async fn root_service_tier_change_preserves_existing_v2_subagent(
     initial_service_tier: Option<&str>,
     updated_service_tier: Option<&str>,

@@ -69,6 +69,7 @@ def test_schema_refresh_only_updates_python_for_repository_schemas(monkeypatch, 
 
     runpy.run_path(str(script), run_name="__main__")
 
+    # Merge-safety anchor: schema generation must dispatch Cargo through cargo-guard.sh.
     assert [args[:2] for args, _kwargs in calls] == (
         [
             [str(ROOT.parents[1] / "scripts" / "cargo-guard.sh"), "cargo"],

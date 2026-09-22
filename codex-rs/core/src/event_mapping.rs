@@ -82,6 +82,7 @@ pub(crate) fn has_non_contextual_dev_message_content(message: &[ContentItem]) ->
         .any(|content_item| !is_contextual_dev_fragment(content_item))
 }
 
+// Merge-safety anchor: persisted developer identity restoration must exclude contextual fragments.
 pub(crate) fn first_non_contextual_dev_message_text(message: &[ContentItem]) -> Option<&str> {
     message.iter().find_map(|content_item| {
         let ContentItem::InputText { text } = content_item else {

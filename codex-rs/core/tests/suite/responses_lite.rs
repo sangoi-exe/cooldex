@@ -614,6 +614,7 @@ async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Merge-safety anchor: the GPT-5.6 family uses full Responses transport even when catalog metadata enables Lite.
 async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

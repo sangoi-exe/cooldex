@@ -215,6 +215,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     );
     assert!(parent_path.with_extension("jsonl.zst").exists());
 
+    // Merge-safety anchor: recall traverses compressed inherited history through the fork checkpoint.
     let recall_requests = mount_sse_sequence(
         &server,
         vec![
