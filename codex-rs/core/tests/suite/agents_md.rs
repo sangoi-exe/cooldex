@@ -1873,7 +1873,10 @@ async fn root_global_instruction_provider_is_bound_per_creation_boundary() -> Re
             history.clone(),
         )
         .await?;
-    assert_eq!(fork.thread.instruction_sources().await, Vec::<PathUri>::new());
+    assert_eq!(
+        fork.thread.instruction_sources().await,
+        Vec::<PathUri>::new()
+    );
     submit_thread_turn(&fork.thread, "continue fork without global instructions").await?;
 
     parent.thread.shutdown_and_wait().await?;
@@ -1890,8 +1893,15 @@ async fn root_global_instruction_provider_is_bound_per_creation_boundary() -> Re
         .await?;
     assert_eq!(resumed.thread_id, parent_id);
     assert!(!Arc::ptr_eq(&resumed.thread, &parent.thread));
-    assert_eq!(resumed.thread.instruction_sources().await, Vec::<PathUri>::new());
-    submit_thread_turn(&resumed.thread, "continue cold resume without global instructions").await?;
+    assert_eq!(
+        resumed.thread.instruction_sources().await,
+        Vec::<PathUri>::new()
+    );
+    submit_thread_turn(
+        &resumed.thread,
+        "continue cold resume without global instructions",
+    )
+    .await?;
 
     let global = expected_provider_only_instruction_fragment(GLOBAL_INSTRUCTIONS);
     let removal = expected_provider_only_instruction_fragment(

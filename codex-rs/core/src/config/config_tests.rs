@@ -12123,8 +12123,8 @@ max_concurrent_threads_per_session = 9
 }
 
 #[tokio::test]
-async fn disabling_multi_agent_v2_with_supported_settings_persists_loadable_config(
-) -> std::io::Result<()> {
+async fn disabling_multi_agent_v2_with_supported_settings_persists_loadable_config()
+-> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),

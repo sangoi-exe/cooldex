@@ -1826,8 +1826,7 @@ impl ThreadManagerState {
         } else {
             SessionInstructions {
                 user_provider: Some(
-                    user_provider
-                        .unwrap_or_else(|| Arc::clone(&self.user_instructions_provider)),
+                    user_provider.unwrap_or_else(|| Arc::clone(&self.user_instructions_provider)),
                 ),
                 thread_provider,
                 thread: inherited.thread,

@@ -623,7 +623,10 @@ impl CodexThread {
                 ),
             ));
         }
-        if matches!(&state, PendingUserMessageAdmissionState::WaitingForAdmission) {
+        if matches!(
+            &state,
+            PendingUserMessageAdmissionState::WaitingForAdmission
+        ) {
             self.session
                 .live_thread_for_persistence("admit persisted user message")
                 .map_err(|error| {

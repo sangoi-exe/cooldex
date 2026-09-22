@@ -823,7 +823,8 @@ async fn thread_start_binds_global_instructions_to_each_effective_config() -> Re
             ..Default::default()
         })
         .await?;
-    let excluded: ThreadStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    let excluded: ThreadStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(excluded.instruction_sources, Vec::new());
 
     let request_id = mcp
@@ -836,7 +837,8 @@ async fn thread_start_binds_global_instructions_to_each_effective_config() -> Re
             ..Default::default()
         })
         .await?;
-    let included: ThreadStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    let included: ThreadStartResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         included
             .instruction_sources

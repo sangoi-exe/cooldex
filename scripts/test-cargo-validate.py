@@ -6574,7 +6574,9 @@ class CargoValidateTests(unittest.TestCase):
 
         initial_input_digest = planner.plan_input_digest(plan, self.repo_root)
         self.assertEqual(0, planner.verify_plan(plan, self.repo_root, keep_going=False))
-        self.assertEqual(initial_input_digest, planner.plan_input_digest(plan, self.repo_root))
+        self.assertEqual(
+            initial_input_digest, planner.plan_input_digest(plan, self.repo_root)
+        )
 
         source_path.write_text("pub fn changed() {}\n")
         self.assertNotEqual(

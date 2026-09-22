@@ -141,7 +141,8 @@ fn disabling_multi_agent_v2_rejects_subagent_instruction_file_without_writing() 
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let original = "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = \"child.md\"\n";
+    let original =
+        "[features.multi_agent_v2]\nenabled = true\nsubagent_instructions_file = \"child.md\"\n";
     std::fs::write(&config_path, original).expect("write config");
 
     let error = ConfigEditsBuilder::new(codex_home)

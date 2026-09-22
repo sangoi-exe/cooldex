@@ -191,7 +191,8 @@ async fn user_message_admission_reports_steered_after_persistence() -> Result<()
 }
 
 #[tokio::test]
-async fn persisted_user_message_admission_rejects_ephemeral_sessions_before_routing() -> Result<()> {
+async fn persisted_user_message_admission_rejects_ephemeral_sessions_before_routing() -> Result<()>
+{
     let server = start_mock_server().await;
     let test = test_codex().build_with_auto_env(&server).await?;
     let mut config = test.config.clone();
