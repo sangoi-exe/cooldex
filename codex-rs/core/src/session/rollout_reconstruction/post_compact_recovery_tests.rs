@@ -6,10 +6,14 @@ use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnCompleteEvent;
 use pretty_assertions::assert_eq;
+
+use crate::context::PostCompactRecoveryContext;
+use crate::session::post_compact_recovery::insert_post_compact_recovery_packet;
 
 const WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
 const OTHER_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
@@ -107,6 +111,104 @@ fn marked_compaction() -> RolloutItem {
         Some(BOUNDARY_ID),
         Some(vec![boundary_item(BOUNDARY_ID)]),
     )
+}
+
+#[test]
+fn recovery_placement_precedes_an_interleaved_native_tool_batch() {
+    let identity = PostCompactRecoveryIdentity {
+        compaction_window_id: WINDOW_ID.to_string(),
+        boundary_item_id: BOUNDARY_ID.to_string(),
+    };
+    let mut input = vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            encrypted_function_args: None,
+            call_id: "call-1".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "interleaved response item".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: Some(ResponseItemId::from_server(BOUNDARY_ID.to_string())),
+            call_id: Some("call-1".to_string()),
+            name: Some("shell".to_string()),
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text("done".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let native_batch = input.clone();
+    let packet = PostCompactRecoveryContext::new(WINDOW_ID, BOUNDARY_ID, "continue", None)
+        .expect("recovery packet");
+
+    insert_post_compact_recovery_packet(&mut input, &identity, packet)
+        .expect("place recovery before the complete native batch");
+
+    assert!(matches!(
+        &input[0],
+        ResponseItem::Message { role, .. } if role == "developer"
+    ));
+    assert_eq!(&input[1..], native_batch.as_slice());
+}
+
+#[test]
+fn recovery_placement_keeps_standalone_and_server_outputs_as_boundaries() {
+    let identity = PostCompactRecoveryIdentity {
+        compaction_window_id: WINDOW_ID.to_string(),
+        boundary_item_id: BOUNDARY_ID.to_string(),
+    };
+    let standalone_output = ResponseItem::FunctionCallOutput {
+        id: Some(ResponseItemId::from_server(BOUNDARY_ID.to_string())),
+        call_id: None,
+        name: Some("send_message_to_thread".to_string()),
+        namespace: Some("codex_app".to_string()),
+        output: FunctionCallOutputPayload::from_text("delegated work".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut standalone_input = vec![standalone_output.clone()];
+    let standalone_packet =
+        PostCompactRecoveryContext::new(WINDOW_ID, BOUNDARY_ID, "continue", None)
+            .expect("recovery packet");
+
+    insert_post_compact_recovery_packet(&mut standalone_input, &identity, standalone_packet)
+        .expect("place recovery after the standalone output");
+
+    assert_eq!(standalone_input[0], standalone_output);
+    assert!(matches!(
+        &standalone_input[1],
+        ResponseItem::Message { role, .. } if role == "developer"
+    ));
+
+    let server_output = ResponseItem::ToolSearchOutput {
+        id: Some(ResponseItemId::from_server(BOUNDARY_ID.to_string())),
+        call_id: Some("server-search".to_string()),
+        status: "completed".to_string(),
+        execution: "server".to_string(),
+        tools: Vec::new(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut server_input = vec![server_output.clone()];
+    let server_packet = PostCompactRecoveryContext::new(WINDOW_ID, BOUNDARY_ID, "continue", None)
+        .expect("recovery packet");
+
+    insert_post_compact_recovery_packet(&mut server_input, &identity, server_packet)
+        .expect("place recovery after the server output");
+
+    assert_eq!(server_input[0], server_output);
+    assert!(matches!(
+        &server_input[1],
+        ResponseItem::Message { role, .. } if role == "developer"
+    ));
 }
 
 #[test]

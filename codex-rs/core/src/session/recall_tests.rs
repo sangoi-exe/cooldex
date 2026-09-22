@@ -199,7 +199,7 @@ async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
         id: None,
         call_id: Some("search-1".to_string()),
         status: Some("completed".to_string()),
-        execution: "server".to_string(),
+        execution: "client".to_string(),
         arguments: serde_json::json!({"query": "context"}),
         internal_chat_message_metadata_passthrough: None,
     };
@@ -207,7 +207,7 @@ async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
         id: None,
         call_id: Some("search-1".to_string()),
         status: "completed".to_string(),
-        execution: "server".to_string(),
+        execution: "client".to_string(),
         tools: vec![serde_json::json!({"name": "read_file"})],
         internal_chat_message_metadata_passthrough: None,
     };
@@ -284,6 +284,82 @@ async fn preserves_parallel_tool_batch_order_and_atomicity() {
             .collect::<Vec<_>>(),
         vec!["call-a", "call-b", "call-b", "call-a"]
     );
+    assert_eq!(value["omitted_groups"], 0);
+}
+
+#[tokio::test]
+async fn preserves_interleaved_native_tool_batch_order_and_atomicity() {
+    let (session, turn_context) = make_session_and_context().await;
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    rollout_response_item(function_call("call-1")),
+                    rollout_response_item(message("assistant", "interleaved response item")),
+                    rollout_response_item(function_output("call-1", "done")),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("build interleaved recall batch");
+    let value = parsed(&context);
+    let groups = value["groups"].as_array().expect("groups");
+    let items = groups[0]["items"].as_array().expect("batch items");
+
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item["type"].as_str().expect("item type"))
+            .collect::<Vec<_>>(),
+        vec!["function_call", "message", "function_call_output"]
+    );
+    assert_eq!(value["omitted_groups"], 0);
+}
+
+#[tokio::test]
+async fn preserves_standalone_and_server_tool_outputs_as_history_items() {
+    let (session, turn_context) = make_session_and_context().await;
+    let named_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("send_message_to_thread".to_string()),
+        namespace: Some("codex_app".to_string()),
+        output: FunctionCallOutputPayload::from_text("delegated work".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let server_output = ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: Some("server-search".to_string()),
+        status: "completed".to_string(),
+        execution: "server".to_string(),
+        tools: vec![serde_json::json!({"name": "read_file"})],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let context = session
+        .build_recall_context(
+            &turn_context,
+            tail(
+                session.thread_id,
+                vec![
+                    rollout_response_item(named_output),
+                    rollout_response_item(server_output),
+                    compacted("summary", Some(Vec::new())),
+                ],
+            ),
+        )
+        .await
+        .expect("build standalone output recall");
+    let value = parsed(&context);
+    let groups = value["groups"].as_array().expect("groups");
+
+    assert_eq!(value["availability"], "available");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["items"][0]["type"], "function_call_output");
+    assert_eq!(groups[1]["items"][0]["type"], "tool_search_output");
     assert_eq!(value["omitted_groups"], 0);
 }
 

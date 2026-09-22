@@ -26,7 +26,6 @@ pub(crate) enum ToolItemKind {
 
 pub(crate) struct CompleteToolBatch {
     pub(crate) range: Range<usize>,
-    pub(crate) output_start: usize,
 }
 
 pub(crate) struct IncompleteToolBatch {
@@ -42,42 +41,35 @@ pub(crate) enum ToolBatchMatch {
 pub(crate) fn complete_trailing_tool_batch(
     items: &[ResponseItem],
 ) -> Result<CompleteToolBatch, &'static str> {
-    let mut output_start = items.len();
-    while output_start > 0 {
-        match classified_identity(&items[output_start - 1]) {
-            ClassifiedToolItem::Output(_) => output_start -= 1,
-            ClassifiedToolItem::UnsupportedOutput => {
-                return Err("unsupported_trailing_tool_item");
-            }
-            ClassifiedToolItem::Call(_)
-            | ClassifiedToolItem::UnsupportedCall
-            | ClassifiedToolItem::NonTool => break,
-        }
-    }
-    if output_start == items.len() {
+    if !matches!(
+        items.last().map(classified_identity),
+        Some(ClassifiedToolItem::Output(_))
+    ) {
         return Err("no_trailing_tool_outputs");
     }
 
-    let mut call_start = output_start;
-    while call_start > 0 {
-        match classified_identity(&items[call_start - 1]) {
-            ClassifiedToolItem::Call(_) => call_start -= 1,
-            ClassifiedToolItem::UnsupportedCall => return Err("unsupported_call_item"),
+    let mut call_start = None;
+    for index in (0..items.len()).rev() {
+        match classified_identity(&items[index]) {
+            ClassifiedToolItem::Call(_) | ClassifiedToolItem::UnsupportedCall => {
+                call_start = Some(index);
+            }
+            ClassifiedToolItem::Output(_) | ClassifiedToolItem::UnsupportedOutput
+                if call_start.is_some() =>
+            {
+                break;
+            }
             ClassifiedToolItem::Output(_)
             | ClassifiedToolItem::UnsupportedOutput
-            | ClassifiedToolItem::NonTool => break,
+            | ClassifiedToolItem::NonTool => {}
         }
     }
-    if call_start == output_start {
+    let Some(call_start) = call_start else {
         return Err("no_matching_tool_calls");
-    }
+    };
 
     match tool_batch_at(items, call_start)? {
-        Some(ToolBatchMatch::Complete(batch))
-            if batch.output_start == output_start && batch.range.end == items.len() =>
-        {
-            Ok(batch)
-        }
+        Some(ToolBatchMatch::Complete(batch)) if batch.range.end == items.len() => Ok(batch),
         Some(ToolBatchMatch::Complete(_)) => Err("non_trailing_tool_batch"),
         Some(ToolBatchMatch::Incomplete(batch)) => Err(batch.reason),
         None => Err("no_matching_tool_calls"),
@@ -98,78 +90,74 @@ pub(crate) fn tool_batch_at(
         return Ok(None);
     }
 
-    let mut call_end = start;
     let mut call_identities = HashSet::new();
     let mut call_ids = HashSet::new();
+    let mut output_identities = HashSet::new();
+    let mut output_call_ids = HashSet::new();
     let mut incomplete_reason = None;
-    while call_end < items.len() {
-        match classified_identity(&items[call_end]) {
+    let mut saw_output = false;
+    let mut end = start;
+    while end < items.len() {
+        match classified_identity(&items[end]) {
             ClassifiedToolItem::Call(identity) => {
+                if saw_output {
+                    return Err("tool_call_follows_output");
+                }
                 if !call_ids.insert(identity.call_id.clone()) {
                     return Err("duplicate_call_id");
                 }
                 if !call_identities.insert(identity) {
                     return Err("duplicate_call_identity");
                 }
-                call_end += 1;
+                end += 1;
             }
             ClassifiedToolItem::UnsupportedCall => {
+                if saw_output {
+                    return Err("tool_call_follows_output");
+                }
                 incomplete_reason.get_or_insert("unsupported_call_item");
-                call_end += 1;
+                end += 1;
             }
-            ClassifiedToolItem::Output(_)
-            | ClassifiedToolItem::UnsupportedOutput
-            | ClassifiedToolItem::NonTool => break,
-        }
-    }
-
-    let output_start = call_end;
-    let mut output_end = output_start;
-    let mut output_identities = HashSet::new();
-    let mut output_call_ids = HashSet::new();
-    while output_end < items.len() {
-        match classified_identity(&items[output_end]) {
             ClassifiedToolItem::Output(identity) => {
+                saw_output = true;
                 if !output_call_ids.insert(identity.call_id.clone()) {
                     return Err("duplicate_output_call_id");
                 }
                 if !output_identities.insert(identity) {
                     return Err("duplicate_output_identity");
                 }
-                output_end += 1;
+                if !output_identities.is_subset(&call_identities) {
+                    return Err("output_without_matching_call");
+                }
+                end += 1;
+                if incomplete_reason.is_none() && output_identities == call_identities {
+                    return Ok(Some(ToolBatchMatch::Complete(CompleteToolBatch {
+                        range: start..end,
+                    })));
+                }
             }
             ClassifiedToolItem::UnsupportedOutput => {
-                incomplete_reason.get_or_insert("unsupported_output_item");
-                output_end += 1;
+                return Err("unsupported_output_item");
             }
-            ClassifiedToolItem::Call(_)
-            | ClassifiedToolItem::UnsupportedCall
-            | ClassifiedToolItem::NonTool => break,
+            ClassifiedToolItem::NonTool => end += 1,
         }
     }
 
-    if output_start == output_end {
+    if !saw_output {
         return Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-            end: call_end,
+            end,
             reason: "no_matching_tool_outputs",
         })));
     }
     if let Some(reason) = incomplete_reason {
         return Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-            end: output_end,
+            end,
             reason,
         })));
     }
-    if call_identities != output_identities {
-        return Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-            end: output_end,
-            reason: "incomplete_or_asymmetric_tool_batch",
-        })));
-    }
-
-    Ok(Some(ToolBatchMatch::Complete(CompleteToolBatch {
-        range: start..output_end,
-        output_start,
+    Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
+        end,
+        reason: "incomplete_or_asymmetric_tool_batch",
     })))
 }
 
@@ -208,6 +196,10 @@ fn classified_identity(item: &ResponseItem) -> ClassifiedToolItem {
             ClassifiedToolItem::UnsupportedCall,
             ClassifiedToolItem::Call,
         ),
+        ResponseItem::ToolSearchCall {
+            execution: server_execution,
+            ..
+        } if server_execution == "server" => ClassifiedToolItem::NonTool,
         ResponseItem::ToolSearchCall { call_id, .. } => call_id
             .as_deref()
             .and_then(|call_id| identity(call_id, PairKind::ToolSearch))
@@ -222,6 +214,11 @@ fn classified_identity(item: &ResponseItem) -> ClassifiedToolItem {
             ClassifiedToolItem::UnsupportedOutput,
             ClassifiedToolItem::Output,
         ),
+        ResponseItem::FunctionCallOutput {
+            call_id: None,
+            name: Some(name),
+            ..
+        } if !name.trim().is_empty() => ClassifiedToolItem::NonTool,
         ResponseItem::FunctionCallOutput { call_id: None, .. } => {
             ClassifiedToolItem::UnsupportedOutput
         }
@@ -230,6 +227,10 @@ fn classified_identity(item: &ResponseItem) -> ClassifiedToolItem {
                 ClassifiedToolItem::UnsupportedOutput,
                 ClassifiedToolItem::Output,
             ),
+        ResponseItem::ToolSearchOutput {
+            execution: server_execution,
+            ..
+        } if server_execution == "server" => ClassifiedToolItem::NonTool,
         ResponseItem::ToolSearchOutput { call_id, .. } => call_id
             .as_deref()
             .and_then(|call_id| identity(call_id, PairKind::ToolSearch))
