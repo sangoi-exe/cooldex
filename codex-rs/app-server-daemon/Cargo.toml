@@ -19,8 +19,6 @@ codex-app-server-transport = { workspace = true }
 codex-http-client = { workspace = true }
 codex-install-context = { workspace = true }
 codex-utils-home-dir = { workspace = true }
-# Merge-safety anchor: daemon-managed app-server lifecycle retains the fork-owned process utility dependency.
-codex-utils-process = { workspace = true }
 codex-uds = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }

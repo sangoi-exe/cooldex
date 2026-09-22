@@ -2315,7 +2315,6 @@ dependencies = [
  "codex-install-context",
  "codex-uds",
  "codex-utils-home-dir",
- "codex-utils-process",
  "futures",
  "libc",
  "pretty_assertions",
