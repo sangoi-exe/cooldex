@@ -401,7 +401,7 @@ impl CodexThread {
     }
 
     // Merge-safety anchor: paired immediate/persisted admission APIs keep typed outcomes;
-    // persisted admission requires client identity and awaits durable rollout acknowledgement.
+    // persisted admission requires client identity, a live persistence owner, and awaits durable rollout acknowledgement.
     /// Waits until Core has started a turn or steered the active turn.
     pub async fn submit_user_input_and_wait_for_admission(
         &self,
@@ -622,6 +622,13 @@ impl CodexThread {
                     "user message admission requires nonempty user input".to_string(),
                 ),
             ));
+        }
+        if matches!(&state, PendingUserMessageAdmissionState::WaitingForAdmission) {
+            self.session
+                .live_thread_for_persistence("admit persisted user message")
+                .map_err(|error| {
+                    UserMessageAdmissionError::Admission(CodexErr::Fatal(error.to_string()))
+                })?;
         }
 
         self.session

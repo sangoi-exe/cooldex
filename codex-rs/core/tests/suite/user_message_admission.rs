@@ -1,8 +1,10 @@
 use anyhow::Result;
+use codex_core::StartThreadOptions;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
 use codex_core::TurnInputSubmission;
 use codex_core::UserMessageAdmission;
+use codex_core::UserMessageAdmissionError;
 use codex_history::RolloutItem;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
@@ -185,6 +187,52 @@ async fn user_message_admission_reports_steered_after_persistence() -> Result<()
     assert!(second_request.contains("follow-up while running"));
 
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_user_message_admission_rejects_ephemeral_sessions_before_routing() -> Result<()> {
+    let server = start_mock_server().await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    let mut config = test.config.clone();
+    config.ephemeral = true;
+    let ephemeral = test
+        .thread_manager
+        .start_thread(StartThreadOptions::new(config))
+        .await?;
+    assert!(ephemeral.thread.rollout_path().is_none());
+
+    let error = timeout(
+        Duration::from_secs(5),
+        ephemeral
+            .thread
+            .submit_user_input_and_wait_for_persisted_admission(persisted_user_input_request(
+                "ephemeral message",
+                "ephemeral-client-message",
+            )),
+    )
+    .await
+    .expect("ephemeral persisted admission should reject before routing")
+    .expect_err("ephemeral sessions cannot durably admit user messages");
+    assert!(matches!(
+        error,
+        UserMessageAdmissionError::Admission(error)
+            if matches!(
+                error.details(),
+                CodexErrorDetails::Fatal(message)
+                    if message == "Session persistence is disabled; cannot admit persisted user message."
+            )
+    ));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/responses")),
+        "rejected persisted admission must not start a turn"
+    );
+
+    ephemeral.thread.shutdown_and_wait().await?;
     Ok(())
 }
 
