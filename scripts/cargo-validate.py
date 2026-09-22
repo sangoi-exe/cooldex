@@ -350,6 +350,7 @@ class Selection:
     feature_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     unknown_path_fallbacks: list[str] = field(default_factory=list)
+    unmapped_durable_paths: list[str] = field(default_factory=list)
 
     def add_package(self, package: str, reason: str) -> None:
         self.packages.setdefault(package, set()).add(reason)
@@ -1467,6 +1468,73 @@ def git_candidate_identity(repo_root: Path) -> dict[str, str | None]:
     return {"head": head, "merge_head": merge_head, "index_tree": index_tree}
 
 
+def git_worktree_input_digest(plan: Plan, repo_root: Path) -> str | None:
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--git-dir"],
+        cwd=repo_root,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if git_dir.returncode != 0:
+        return None
+
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "--no-ext-diff"],
+        cwd=repo_root,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if diff.returncode != 0:
+        raise PlannerError(
+            f"git diff --binary --no-ext-diff failed ({diff.returncode}): "
+            + diff.stderr.decode(errors="replace").strip()
+        )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=repo_root,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if untracked.returncode != 0:
+        raise PlannerError(
+            "git ls-files --others --exclude-standard -z failed "
+            f"({untracked.returncode}): {untracked.stderr.decode(errors='replace').strip()}"
+        )
+
+    excluded_receipt_path: str | None = None
+    if plan.receipt_dir is not None:
+        try:
+            excluded_receipt_path = (
+                plan.receipt_dir.resolve().relative_to(repo_root.resolve()).as_posix()
+            )
+        except ValueError:
+            pass
+
+    untracked_files = []
+    for path_bytes in untracked.stdout.split(b"\0"):
+        if not path_bytes:
+            continue
+        file_path = normalize_repo_path(os.fsdecode(path_bytes), repo_root)
+        if excluded_receipt_path is not None and (
+            file_path == excluded_receipt_path
+            or file_path.startswith(excluded_receipt_path + "/")
+        ):
+            continue
+        untracked_files.append(file_digest_record(repo_root, file_path))
+    untracked_files.sort(key=lambda record: record["path"])
+
+    return stable_digest(
+        {
+            "schema": 1,
+            "index_to_worktree_diff_sha256": hashlib.sha256(diff.stdout).hexdigest(),
+            "untracked_files": untracked_files,
+        }
+    )
+
+
 def validation_tooling_digest(repo_root: Path) -> str:
     return stable_digest(
         {
@@ -1537,8 +1605,9 @@ def plan_resume_id(plan: Plan, tooling_digest: str) -> str:
 
 def plan_input_digest(plan: Plan, repo_root: Path) -> str:
     payload: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "candidate_identity": plan.candidate_identity,
+        "worktree_input_digest": git_worktree_input_digest(plan, repo_root),
         "changed_files": [
             file_digest_record(repo_root, file_path)
             for file_path in sorted(set(plan.files))
@@ -2103,12 +2172,14 @@ def validate_config(
 
 def apply_path_rules(
     file_path: str, config: dict[str, Any], selection: Selection
-) -> bool:
+) -> tuple[bool, bool]:
     file_surface_matched = False
+    file_rule_matched = False
     for rule in config.get("path_rules", []):
         patterns = rule.get("patterns", [])
         if not any(fnmatch(file_path, pattern) for pattern in patterns):
             continue
+        file_rule_matched = True
         reason = f"matched validation rule {', '.join(patterns)} for {file_path}"
         for package in rule.get("packages", []):
             selection.add_package(package, reason)
@@ -2125,7 +2196,7 @@ def apply_path_rules(
             selection.add_prep_command_name(command_name, reason)
         for command_name in rule.get("commands", []):
             selection.add_command_name(command_name, reason)
-    return file_surface_matched
+    return file_surface_matched, file_rule_matched
 
 
 def classify_file(
@@ -2135,7 +2206,9 @@ def classify_file(
     packages: list[PackageInfo],
     selection: Selection,
 ) -> None:
-    file_surface_matched = apply_path_rules(file_path, config, selection)
+    file_surface_matched, file_rule_matched = apply_path_rules(
+        file_path, config, selection
+    )
 
     package = (
         package_for_file(file_path, repo_root, packages)
@@ -2151,6 +2224,9 @@ def classify_file(
         selection.flags.add("rust_source")
     if cargo_manifest:
         selection.flags.add("manifest_changed")
+
+    if not rust_source and not file_rule_matched:
+        selection.unmapped_durable_paths.append(file_path)
 
     if package and (rust_source or cargo_manifest):
         selection.add_package(package, f"{file_path} belongs to package {package}")
@@ -2462,6 +2538,11 @@ def build_plan(
 
     if selection.feature_errors:
         raise PlannerError("\n".join(selection.feature_errors))
+    if selection.unmapped_durable_paths:
+        raise PlannerError(
+            "changed durable paths do not map to validation rules:\n"
+            + "\n".join(selection.unmapped_durable_paths)
+        )
     if mode_at_least(mode, "strict") and selection.unknown_path_fallbacks:
         raise PlannerError(
             "strict mode requires explicit validation path rules:\n"

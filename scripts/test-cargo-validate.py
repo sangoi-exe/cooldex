@@ -4680,6 +4680,33 @@ class CargoValidateTests(unittest.TestCase):
         self.assertNotEqual(0, process.returncode)
         self.assertIn("not owned by a Cargo workspace package", process.stderr)
 
+    def test_unmapped_durable_paths_fail_loudly_for_plan_and_verify(self) -> None:
+        for file_path in ("scripts/test-remote-env.sh", "scripts/install/install.sh"):
+            for action in ("plan", "verify"):
+                with self.subTest(file_path=file_path, action=action):
+                    process = self.run_planner(
+                        action,
+                        "--file",
+                        file_path,
+                        "--mode",
+                        "standard",
+                        "--no-receipt",
+                        "--repo-root",
+                        str(self.repo_root),
+                        "--metadata-json",
+                        str(self.metadata_path),
+                        "--config",
+                        str(PRODUCTION_CONFIG),
+                        check=False,
+                    )
+
+                    self.assertEqual(2, process.returncode)
+                    self.assertIn(
+                        "changed durable paths do not map to validation rules",
+                        process.stderr,
+                    )
+                    self.assertIn(file_path, process.stderr)
+
     def test_resource_profile_env_includes_adaptive_job_contract(self) -> None:
         plan = self.plan_json(
             "--file", "codex-rs/core/src/config/mod.rs", "--mode", "standard"
@@ -4704,7 +4731,9 @@ class CargoValidateTests(unittest.TestCase):
         self,
     ) -> None:
         cases = {
-            "stale expected growth key": """
+            "stale expected growth key": (
+                "",
+                """
                 [resource_profiles.check]
                 reserve_free_pct = 15
                 reserve_free_gib = 12
@@ -4712,8 +4741,12 @@ class CargoValidateTests(unittest.TestCase):
                 abort_free_pct = 6
                 abort_free_gib = 6
                 monitor = false
-            """,
-            "stale profile key": """
+                """,
+                "uses a stale key name",
+            ),
+            "stale profile key": (
+                "",
+                """
                 [resource_profiles.check]
                 reserve_free_pct = 15
                 reserve_free_gib = 12
@@ -4721,17 +4754,21 @@ class CargoValidateTests(unittest.TestCase):
                 abort_free_gib = 6
                 monitor = false
                 jobs_max = 4
-            """,
-            "zero history sample limit": """
-                [defaults]
-                history_sample_limit = 0
-            """,
-            "stale history multiplier": """
-                [defaults]
-                history_growth_multiplier_pct = 125
-            """,
+                """,
+                "uses a stale key name",
+            ),
+            "zero history sample limit": (
+                "history_sample_limit = 0",
+                "",
+                "defaults.history_sample_limit must be positive",
+            ),
+            "stale history multiplier": (
+                "history_growth_multiplier_pct = 125",
+                "",
+                "defaults.history_growth_multiplier_pct uses a stale key name",
+            ),
         }
-        for label, extra_config in cases.items():
+        for label, (defaults_extra, extra_config, expected_error) in cases.items():
             with self.subTest(label=label):
                 config_path = self.repo_root / f"{label.replace(' ', '-')}.toml"
                 config_path.write_text(
@@ -4742,6 +4779,7 @@ class CargoValidateTests(unittest.TestCase):
                     standard_mode = "standard"
                     unknown_rust_path_policy = "package-plus-cli-strict"
                     workspace_features_policy = "deny-routine-all-features"
+                    {defaults_extra}
 
                     [receipts]
                     dir = "receipts"
@@ -4768,6 +4806,7 @@ class CargoValidateTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertNotEqual(0, process.returncode)
+                self.assertIn(expected_error, process.stderr)
 
     def write_direct_guard_fixture(
         self, *, metrics_kind: str = "valid"
@@ -6493,6 +6532,62 @@ class CargoValidateTests(unittest.TestCase):
             ["cmd-01", "cmd-02", "cmd-03", "cmd-01", "cmd-02", "cmd-03"],
             command_log.read_text().splitlines(),
         )
+
+    def test_verify_resume_reruns_surface_only_plan_after_unstaged_source_change(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        source_path = self.repo_root / "surface-only-source.rs"
+        stub_path = self.repo_root / "surface-only-stub.py"
+        receipt_dir = self.repo_root / "surface-only-receipts"
+        command_log = receipt_dir / "command-log.txt"
+        source_path.write_text("pub fn initial() {}\n")
+        stub_path.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True)\n"
+            "Path(sys.argv[1]).open('a').write('ran\\n')\n"
+        )
+        self.init_git_repo()
+        self.commit_all("surface-only initial")
+
+        plan = planner.Plan(
+            action="verify",
+            stage="validation",
+            mode="strict",
+            files=[],
+            selected_packages=[],
+            selected_surfaces=["cli"],
+            flags=[],
+            warnings=[],
+            commands=[
+                planner.CommandEntry(
+                    argv=(sys.executable, str(stub_path), str(command_log)),
+                    reason="surface-only resume fixture",
+                )
+            ],
+            manual=[],
+            receipt_dir=receipt_dir,
+            telemetry_level="full",
+            candidate_identity=planner.git_candidate_identity(self.repo_root),
+        )
+
+        initial_input_digest = planner.plan_input_digest(plan, self.repo_root)
+        self.assertEqual(0, planner.verify_plan(plan, self.repo_root, keep_going=False))
+        self.assertEqual(initial_input_digest, planner.plan_input_digest(plan, self.repo_root))
+
+        source_path.write_text("pub fn changed() {}\n")
+        self.assertNotEqual(
+            initial_input_digest, planner.plan_input_digest(plan, self.repo_root)
+        )
+        self.assertEqual(
+            0, planner.verify_plan(plan, self.repo_root, keep_going=False, resume=True)
+        )
+        self.assertEqual(["ran", "ran"], command_log.read_text().splitlines())
+        self.assertEqual(
+            0, planner.verify_plan(plan, self.repo_root, keep_going=False, resume=True)
+        )
+        self.assertEqual(["ran", "ran"], command_log.read_text().splitlines())
 
     def test_verify_resume_reruns_after_validation_tooling_digest_changes(self) -> None:
         config_path, metadata_path, command_log = self.write_resume_verify_fixture(
