@@ -64,7 +64,7 @@ case "${subcommand}" in
             descendant_status="quiescent"
             if [[ -s "${FAKE_CARGO_DESCENDANT_FILE:-}" ]]; then
                 descendant_pid="$(cat "${FAKE_CARGO_DESCENDANT_FILE}")"
-                descendant_state="$(/usr/bin/ps -o stat= -p "${descendant_pid}" 2>/dev/null | tr -d '[:space:]')"
+                descendant_state="$(/usr/bin/ps -o stat= -p "${descendant_pid}" 2>/dev/null | tr -d '[:space:]' || true)"
                 if kill -0 "${descendant_pid}" 2>/dev/null && [[ "${descendant_state}" != Z* ]]; then
                     descendant_status="alive"
                 fi
