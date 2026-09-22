@@ -16,6 +16,7 @@ use codex_rollout::SourceByteLimitedSeekableReader;
 use serde_json::Value;
 
 use super::LocalThreadStore;
+use super::rollout_lineage;
 use super::thread_rollout_resolver;
 use crate::LoadRolloutTailParams;
 use crate::RecallRolloutSourceIssue;
@@ -64,33 +65,51 @@ async fn load_rollout_tail_with_projection(
     params: LoadRolloutTailParams,
     projection: TailProjection,
 ) -> ThreadStoreResult<StoredRecallRolloutTail> {
-    let path = resolve_rollout_path(store, params.thread_id, params.include_archived)
-        .await?
-        .ok_or_else(|| ThreadStoreError::InvalidRequest {
-            message: format!("no rollout found for thread id {}", params.thread_id),
-        })?;
-    scan_rollout_tail(store, path, params, projection).await
+    let mut budget =
+        thread_rollout_resolver::RolloutReadBudget::new(params.max_bytes, params.max_records);
+    let initial_rollout = thread_rollout_resolver::resolve_current_with_read_budget(
+        store,
+        params.thread_id,
+        params.include_archived,
+        &mut budget,
+    )
+    .await?
+    .ok_or_else(|| ThreadStoreError::InvalidRequest {
+        message: format!("no rollout found for thread id {}", params.thread_id),
+    })?;
+    scan_rollout_tail(
+        store,
+        initial_rollout.rollout_id,
+        initial_rollout.path,
+        params,
+        projection,
+        budget,
+    )
+    .await
 }
 
 async fn scan_rollout_tail(
     store: &LocalThreadStore,
+    initial_rollout_id: ThreadId,
     initial_path: PathBuf,
     params: LoadRolloutTailParams,
     projection: TailProjection,
+    budget: thread_rollout_resolver::RolloutReadBudget,
 ) -> ThreadStoreResult<StoredRecallRolloutTail> {
     let mut items_newest_first = Vec::new();
-    let mut bytes_read = 0_u64;
-    let mut records_read = 0_usize;
+    let mut bytes_read = budget.bytes_read();
+    let mut records_read = budget.records_read();
     let mut segments_read = 0_usize;
     let mut reached_start = false;
     let mut source_issue = None;
     let mut seen = HashSet::new();
-    let mut segment_thread_id = params.thread_id;
+    let mut segment_rollout_id = initial_rollout_id;
     let mut segment_path = initial_path;
     let mut segment_end: Option<HistoryPosition> = None;
+    let mut initial_segment = true;
 
     loop {
-        if !seen.insert(segment_thread_id) {
+        if !seen.insert(segment_rollout_id) {
             return Err(invalid_lineage(params.thread_id, "cycle detected"));
         }
         if segment_end.is_some_and(|end| end.end_ordinal_exclusive == 0) {
@@ -149,7 +168,7 @@ async fn scan_rollout_tail(
                     segment_path.display()
                 ),
             })?;
-        if session_meta.meta.id != segment_thread_id {
+        if initial_segment && session_meta.meta.id != params.thread_id {
             return Err(invalid_lineage(
                 params.thread_id,
                 "source rollout belongs to another thread",
@@ -158,8 +177,7 @@ async fn scan_rollout_tail(
 
         match session_meta.meta.history_mode {
             ThreadHistoryMode::Legacy => {
-                if segment_thread_id != params.thread_id || session_meta.meta.history_base.is_some()
-                {
+                if !initial_segment || session_meta.meta.history_base.is_some() {
                     return Err(invalid_lineage(
                         params.thread_id,
                         "legacy rollout cannot be a paginated lineage segment",
@@ -173,14 +191,15 @@ async fn scan_rollout_tail(
                     reached_start = true;
                     break;
                 };
-                segment_thread_id = base.thread_id;
+                segment_rollout_id = base.thread_id;
                 segment_end = Some(base);
                 segment_path =
-                    resolve_rollout_path(store, segment_thread_id, /*include_archived*/ true)
+                    rollout_lineage::resolve_rollout_path_by_id(store, segment_rollout_id)
                         .await?
                         .ok_or_else(|| {
-                            invalid_lineage(segment_thread_id, "missing source rollout")
+                            invalid_lineage(segment_rollout_id, "missing source rollout")
                         })?;
+                initial_segment = false;
             }
         }
     }
@@ -195,19 +214,6 @@ async fn scan_rollout_tail(
         segments_read,
         source_issue,
     })
-}
-
-async fn resolve_rollout_path(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    include_archived: bool,
-) -> ThreadStoreResult<Option<PathBuf>> {
-    let resolved = if include_archived {
-        thread_rollout_resolver::resolve_current_including_archived(store, thread_id).await?
-    } else {
-        thread_rollout_resolver::resolve_current(store, thread_id).await?
-    };
-    Ok(resolved.map(|resolved| resolved.path))
 }
 
 #[derive(Clone, Copy)]

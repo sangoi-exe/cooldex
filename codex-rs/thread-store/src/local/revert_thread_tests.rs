@@ -19,6 +19,7 @@ use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListTurnsParams;
+use crate::LoadRolloutTailParams;
 use crate::RevertThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
@@ -100,6 +101,33 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         Some(vec![home.path().join("workspace")])
     );
     assert_eq!(turn_ids(&store, thread_id).await, vec!["turn-1"]);
+    let first_revert_tail = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: 1024 * 1024,
+        max_records: 128,
+    };
+    let first_revert_strict = store
+        .load_rollout_tail(first_revert_tail.clone())
+        .await
+        .expect("strict tail follows the original immutable rollout after the first revert");
+    let first_revert_recall = store
+        .load_recall_rollout_tail(first_revert_tail)
+        .await
+        .expect("recall tail follows the original immutable rollout after the first revert");
+    let expected_first_revert_items =
+        serde_json::to_value(vec![turn_started("turn-1"), turn_completed("turn-1")])
+            .expect("serialize first-revert expected tail");
+    assert_eq!(
+        serde_json::to_value(&first_revert_strict.items).expect("serialize strict tail"),
+        expected_first_revert_items
+    );
+    assert_eq!(
+        serde_json::to_value(&first_revert_recall.items).expect("serialize recall tail"),
+        expected_first_revert_items
+    );
+    assert!(first_revert_strict.reached_start);
+    assert!(first_revert_recall.reached_start);
 
     store
         .revert_thread(RevertThreadParams {
@@ -110,6 +138,24 @@ async fn revert_keeps_thread_id_and_hides_suffix_across_repeated_reverts() {
         .await
         .expect("revert before first turn");
     assert_eq!(turn_ids(&store, thread_id).await, Vec::<String>::new());
+    let repeated_revert_tail = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: 1024 * 1024,
+        max_records: 128,
+    };
+    let repeated_revert_strict = store
+        .load_rollout_tail(repeated_revert_tail.clone())
+        .await
+        .expect("strict tail follows immutable ancestry after repeated reverts");
+    let repeated_revert_recall = store
+        .load_recall_rollout_tail(repeated_revert_tail)
+        .await
+        .expect("recall tail follows immutable ancestry after repeated reverts");
+    assert!(repeated_revert_strict.items.is_empty());
+    assert!(repeated_revert_recall.items.is_empty());
+    assert!(repeated_revert_strict.reached_start);
+    assert!(repeated_revert_recall.reached_start);
 
     store
         .archive_thread(ArchiveThreadParams { thread_id })

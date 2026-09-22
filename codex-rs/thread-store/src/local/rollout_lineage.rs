@@ -189,7 +189,11 @@ impl LocalThreadStore {
     }
 }
 
-async fn resolve_rollout_path_by_id(
+/// Resolves the immutable rollout ID stored in a paginated `HistoryPosition`.
+///
+/// This deliberately bypasses logical-thread selection, which can point to a newer replacement
+/// rollout after `thread/revert`.
+pub(super) async fn resolve_rollout_path_by_id(
     store: &LocalThreadStore,
     rollout_id: ThreadId,
 ) -> ThreadStoreResult<Option<PathBuf>> {

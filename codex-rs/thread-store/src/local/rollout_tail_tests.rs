@@ -380,6 +380,239 @@ async fn loads_plain_child_with_compressed_parent_lineage() {
 }
 
 #[tokio::test]
+async fn sqlite_resolution_counts_source_reads_against_zero_and_exact_tail_limits() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("initialize state database");
+    let uuid = Uuid::from_u128(/*v*/ 3025);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-05",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    codex_rollout::state_db::reconcile_rollout(
+        Some(state_db.as_ref()),
+        path.as_path(),
+        &config.default_model_provider_id,
+        /*builder*/ None,
+        &[],
+        /*archived_only*/ Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    let source_bytes = fs::metadata(path.as_path())
+        .expect("rollout metadata")
+        .len();
+    let store = LocalThreadStore::new(config, Some(state_db));
+
+    let zero = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: 0,
+        max_records: 1,
+    };
+    let zero_strict = store
+        .load_rollout_tail(zero.clone())
+        .await
+        .expect("zero-budget strict tail");
+    let zero_recall = store
+        .load_recall_rollout_tail(zero)
+        .await
+        .expect("zero-budget recall tail");
+    assert!(!zero_strict.reached_start);
+    assert!(!zero_recall.reached_start);
+    assert_eq!(zero_strict.bytes_read, 0);
+    assert_eq!(zero_recall.bytes_read, 0);
+    assert_eq!(zero_strict.records_read, 0);
+    assert_eq!(zero_recall.records_read, 0);
+
+    let exact = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: source_bytes,
+        max_records: 1,
+    };
+    let exact_strict = store
+        .load_rollout_tail(exact.clone())
+        .await
+        .expect("exact-budget strict tail");
+    let exact_recall = store
+        .load_recall_rollout_tail(exact)
+        .await
+        .expect("exact-budget recall tail");
+    assert!(!exact_strict.reached_start);
+    assert!(!exact_recall.reached_start);
+    assert_eq!(exact_strict.bytes_read, source_bytes);
+    assert_eq!(exact_recall.bytes_read, source_bytes);
+    assert_eq!(exact_strict.records_read, 1);
+    assert_eq!(exact_recall.records_read, 1);
+}
+
+#[tokio::test]
+async fn legacy_resolution_counts_each_metadata_read_against_tail_limits() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("initialize state database");
+    let uuid = Uuid::from_u128(/*v*/ 3026);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let canonical_path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-06",
+        uuid,
+        ThreadHistoryMode::Legacy,
+    )
+    .expect("write rollout");
+    let legacy_path = canonical_path.with_file_name("legacy-rollout.jsonl");
+    fs::rename(canonical_path.as_path(), legacy_path.as_path()).expect("rename legacy rollout");
+    let mut metadata = codex_state::ThreadMetadataBuilder::new(
+        thread_id,
+        legacy_path.clone(),
+        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("fixed creation time"),
+        codex_protocol::protocol::SessionSource::Cli,
+    )
+    .build(&config.default_model_provider_id);
+    metadata.history_mode = ThreadHistoryMode::Legacy;
+    state_db
+        .upsert_thread(&metadata)
+        .await
+        .expect("select legacy rollout in database");
+    let source_bytes = fs::metadata(legacy_path.as_path())
+        .expect("rollout metadata")
+        .len();
+    let store = LocalThreadStore::new(config, Some(state_db));
+
+    let zero = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: 0,
+        max_records: 2,
+    };
+    let zero_strict = store
+        .load_rollout_tail(zero.clone())
+        .await
+        .expect("zero-budget legacy strict tail");
+    let zero_recall = store
+        .load_recall_rollout_tail(zero)
+        .await
+        .expect("zero-budget legacy recall tail");
+    assert!(!zero_strict.reached_start);
+    assert!(!zero_recall.reached_start);
+    assert_eq!(zero_strict.bytes_read, 0);
+    assert_eq!(zero_recall.bytes_read, 0);
+    assert_eq!(zero_strict.records_read, 0);
+    assert_eq!(zero_recall.records_read, 0);
+
+    let exact = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: source_bytes * 2,
+        max_records: 2,
+    };
+    let exact_strict = store
+        .load_rollout_tail(exact.clone())
+        .await
+        .expect("exact-budget legacy strict tail");
+    let exact_recall = store
+        .load_recall_rollout_tail(exact)
+        .await
+        .expect("exact-budget legacy recall tail");
+    assert!(!exact_strict.reached_start);
+    assert!(!exact_recall.reached_start);
+    assert_eq!(exact_strict.bytes_read, source_bytes * 2);
+    assert_eq!(exact_recall.bytes_read, source_bytes * 2);
+    assert_eq!(exact_strict.records_read, 2);
+    assert_eq!(exact_recall.records_read, 2);
+}
+
+#[tokio::test]
+async fn compressed_sqlite_resolution_counts_full_physical_source_against_tail_limits() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite.clone(),
+        config.default_model_provider_id.clone(),
+    )
+    .await
+    .expect("initialize state database");
+    let uuid = Uuid::from_u128(/*v*/ 3027);
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let path = write_session_file_with_history_mode(
+        home.path(),
+        "2025-01-03T13-04-07",
+        uuid,
+        ThreadHistoryMode::Paginated,
+    )
+    .expect("write rollout");
+    codex_rollout::state_db::reconcile_rollout(
+        Some(state_db.as_ref()),
+        path.as_path(),
+        &config.default_model_provider_id,
+        /*builder*/ None,
+        &[],
+        /*archived_only*/ Some(false),
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    let source_bytes = compress_rollout(path.as_path());
+    let store = LocalThreadStore::new(config, Some(state_db));
+
+    let zero = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: 0,
+        max_records: 1,
+    };
+    let zero_strict = store
+        .load_rollout_tail(zero.clone())
+        .await
+        .expect("zero-budget compressed strict tail");
+    let zero_recall = store
+        .load_recall_rollout_tail(zero)
+        .await
+        .expect("zero-budget compressed recall tail");
+    assert!(!zero_strict.reached_start);
+    assert!(!zero_recall.reached_start);
+    assert_eq!(zero_strict.bytes_read, 0);
+    assert_eq!(zero_recall.bytes_read, 0);
+    assert_eq!(zero_strict.records_read, 0);
+    assert_eq!(zero_recall.records_read, 0);
+
+    let exact = LoadRolloutTailParams {
+        thread_id,
+        include_archived: false,
+        max_bytes: source_bytes,
+        max_records: 1,
+    };
+    let exact_strict = store
+        .load_rollout_tail(exact.clone())
+        .await
+        .expect("exact-budget compressed strict tail");
+    let exact_recall = store
+        .load_recall_rollout_tail(exact)
+        .await
+        .expect("exact-budget compressed recall tail");
+    assert!(!exact_strict.reached_start);
+    assert!(!exact_recall.reached_start);
+    assert_eq!(exact_strict.bytes_read, source_bytes);
+    assert_eq!(exact_recall.bytes_read, source_bytes);
+    assert_eq!(exact_strict.records_read, 1);
+    assert_eq!(exact_recall.records_read, 1);
+}
+
+#[tokio::test]
 async fn reports_byte_limited_incomplete_source_without_parsing_a_partial_record() {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::from_u128(/*v*/ 3002);
