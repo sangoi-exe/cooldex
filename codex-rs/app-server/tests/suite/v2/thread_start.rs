@@ -49,6 +49,7 @@ use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -795,6 +796,102 @@ async fn thread_start_response_includes_loaded_instruction_sources() -> Result<(
     .collect::<Vec<_>>();
 
     assert_eq!(instruction_sources, expected_instruction_sources);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_binds_global_instructions_to_each_effective_config() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+    let global_agents_path = codex_home.path().join("AGENTS.md");
+    std::fs::write(&global_agents_path, "global instructions")?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            config: Some(HashMap::from([(
+                "include_global_agents_md".to_string(),
+                json!(false),
+            )])),
+            environments: Some(Vec::new()),
+            ..Default::default()
+        })
+        .await?;
+    let excluded: ThreadStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(excluded.instruction_sources, Vec::new());
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            config: Some(HashMap::from([(
+                "include_global_agents_md".to_string(),
+                json!(true),
+            )])),
+            environments: Some(Vec::new()),
+            ..Default::default()
+        })
+        .await?;
+    let included: ThreadStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        included
+            .instruction_sources
+            .iter()
+            .map(|path| normalize_path_for_comparison(path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![normalize_path_for_comparison(std::fs::canonicalize(
+            global_agents_path,
+        )?)]
+    );
+
+    for (thread_id, prompt, expected_global_instructions) in [
+        (excluded.thread.id, "excluded root", false),
+        (included.thread.id, "included root", true),
+    ] {
+        let request_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id,
+                input: vec![V2UserInput::Text {
+                    text: prompt.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("failed to fetch received requests")?;
+        let model_request = requests
+            .iter()
+            .rev()
+            .find(|request| request.url.path().ends_with("/responses"))
+            .context("expected model request")?;
+        let model_request_body = model_request
+            .body_json::<Value>()
+            .context("model request body should be JSON")?
+            .to_string();
+        assert_eq!(
+            model_request_body.contains("global instructions"),
+            expected_global_instructions,
+            "{prompt} model context should match its effective global-instructions setting"
+        );
+    }
 
     Ok(())
 }

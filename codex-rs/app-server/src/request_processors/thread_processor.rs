@@ -24,6 +24,8 @@ use codex_app_server_protocol::ThreadSectionMoveResponse;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
+use codex_extension_api::UserInstructionsProvider;
+use codex_home::CodexHomeUserInstructionsProvider;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErrorDetails;
@@ -31,6 +33,7 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::PersistContext;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -102,6 +105,15 @@ struct ThreadRevertRuntimeSnapshot {
     config: Config,
     settings: CodexThreadSettingsOverrides,
     client_mcp_extensions: ClientMcpExtensions,
+}
+
+fn global_user_instructions_provider(config: &Config) -> Arc<dyn UserInstructionsProvider> {
+    Arc::new(CodexHomeUserInstructionsProvider::new(
+        config.codex_home.clone(),
+        codex_home::GlobalInstructionsMode::from_include_global_agents_md(
+            config.include_global_agents_md,
+        ),
+    ))
 }
 
 fn collect_resume_override_mismatches(
@@ -1465,6 +1477,7 @@ impl ThreadRequestProcessor {
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }
+        let user_instructions_provider = global_user_instructions_provider(&config);
         let mut start_options = StartThreadOptions::new(config);
         let reserved_thread_id = if start_options.config.ephemeral {
             None
@@ -1487,6 +1500,7 @@ impl ThreadRequestProcessor {
             .thread_manager
             .start_thread(StartThreadOptions {
                 allow_provider_model_fallback,
+                user_instructions_provider: Some(user_instructions_provider),
                 initial_history: match session_start_source
                     .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
                 {
@@ -2249,6 +2263,7 @@ impl ThreadRequestProcessor {
             .load_resume_initial_history_from_stored_thread(stored_thread)
             .await?;
         let response_history = thread_history.clone();
+        let user_instructions_provider = global_user_instructions_provider(&config);
         let NewThread {
             thread_id: resumed_thread_id,
             thread: codex_thread,
@@ -2256,12 +2271,13 @@ impl ThreadRequestProcessor {
             ..
         } = self
             .thread_manager
-            .resume_thread_with_history(
+            .resume_thread_with_history_and_user_instructions_provider(
                 config,
                 thread_history,
                 self.auth_manager.clone(),
                 self.request_trace_context(request_id).await,
                 client_mcp_extensions,
+                Some(user_instructions_provider),
             )
             .await
             .map_err(|err| internal_error(format!("error reloading thread after revert: {err}")))?;
@@ -3917,9 +3933,10 @@ impl ThreadRequestProcessor {
 
         let response_history = thread_history.clone();
 
+        let user_instructions_provider = global_user_instructions_provider(&config);
         match self
             .thread_manager
-            .resume_thread_with_history(
+            .resume_thread_with_history_and_user_instructions_provider(
                 config,
                 thread_history,
                 self.auth_manager.clone(),
@@ -3930,6 +3947,7 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
+                Some(user_instructions_provider),
             )
             .await
         {
@@ -5122,11 +5140,13 @@ impl ThreadRequestProcessor {
             .await?
         };
 
+        let user_instructions_provider = global_user_instructions_provider(&config);
         let fork_options = StartThreadOptions {
             thread_source,
             parent_trace,
             client_mcp_extensions,
             reserved_thread_id,
+            user_instructions_provider: Some(user_instructions_provider),
             ..StartThreadOptions::new(config)
         };
         let new_thread = if let Some(prepared_fork) = prepared_fork {

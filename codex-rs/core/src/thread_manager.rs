@@ -249,6 +249,10 @@ pub struct InternalSessionParent {
 
 pub struct StartThreadOptions {
     pub config: Config,
+    /// Provider for this root thread's global instructions.
+    ///
+    /// Hosts that resolve a per-request Config must bind a provider derived from that Config so global instruction inclusion is fixed for this root session. Non-root sessions ignore this provider and inherit the parent's applied snapshot. When omitted, ThreadManager uses its host-wide default.
+    pub user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
     /// Host-owned provider for this root thread's additional instructions.
     ///
     /// Core composes these after the global [`UserInstructionsProvider`]
@@ -289,6 +293,7 @@ impl StartThreadOptions {
     pub fn new(config: Config) -> Self {
         Self {
             config,
+            user_instructions_provider: None,
             thread_instructions_provider: None,
             allow_provider_model_fallback: false,
             initial_history: InitialHistory::New,
@@ -1235,6 +1240,27 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
+        self.resume_thread_with_history_and_user_instructions_provider(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            client_mcp_extensions,
+            /*user_instructions_provider*/ None,
+        )
+        .await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    pub async fn resume_thread_with_history_and_user_instructions_provider(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        client_mcp_extensions: ClientMcpExtensions,
+        user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
+    ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
@@ -1245,6 +1271,7 @@ impl ThreadManager {
             thread_source,
             parent_trace,
             client_mcp_extensions,
+            user_instructions_provider,
             ..StartThreadOptions::new(config)
         };
         Box::pin(self.state.spawn_thread(ThreadSpawnRequest::new(
@@ -1509,6 +1536,7 @@ impl ThreadManager {
                     .unwrap_or(&self.state.session_source),
                 /*parent_thread_id*/ None,
                 source_thread_id,
+                options.user_instructions_provider.clone(),
                 options.thread_instructions_provider.clone(),
             )
             .await;
@@ -1777,6 +1805,7 @@ impl ThreadManagerState {
         session_source: &SessionSource,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
+        user_provider: Option<Arc<dyn UserInstructionsProvider>>,
         thread_provider: Option<Arc<dyn ThreadInstructionsProvider>>,
     ) -> SessionInstructions {
         let inherited_thread_id = match session_source {
@@ -1796,7 +1825,10 @@ impl ThreadManagerState {
             inherited
         } else {
             SessionInstructions {
-                user_provider: Some(Arc::clone(&self.user_instructions_provider)),
+                user_provider: Some(
+                    user_provider
+                        .unwrap_or_else(|| Arc::clone(&self.user_instructions_provider)),
+                ),
                 thread_provider,
                 thread: inherited.thread,
                 ..Default::default()
@@ -2029,6 +2061,7 @@ impl ThreadManagerState {
         } = request;
         let StartThreadOptions {
             mut config,
+            user_instructions_provider,
             thread_instructions_provider,
             allow_provider_model_fallback,
             initial_history,
@@ -2137,6 +2170,7 @@ impl ThreadManagerState {
                                 &session_source,
                                 parent_thread_id,
                                 forked_from_thread_id,
+                                user_instructions_provider,
                                 thread_instructions_provider,
                             )
                             .await

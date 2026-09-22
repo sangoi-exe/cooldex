@@ -21,6 +21,7 @@ use codex_home::GlobalInstructionsMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -1803,6 +1804,112 @@ async fn thread_provider_lives_with_its_session_across_resume() -> Result<()> {
             "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\ncold session instructions",
         )),
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_global_instruction_provider_is_bound_per_creation_boundary() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        ["parent", "fork", "cold-resume"]
+            .map(|id| sse(vec![ev_response_created(id), ev_completed(id)]))
+            .to_vec(),
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let source = write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
+    let mut builder = test_codex().with_home(Arc::clone(&home));
+    let test = builder.build_with_auto_env(&server).await?;
+    let included = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
+        CodexHomeUserInstructionsProvider::new(
+            AbsolutePathBuf::try_from(home.path().to_path_buf())?,
+            GlobalInstructionsMode::Include,
+        ),
+    )));
+    let excluded = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
+        CodexHomeUserInstructionsProvider::new(
+            AbsolutePathBuf::try_from(home.path().to_path_buf())?,
+            GlobalInstructionsMode::Exclude,
+        ),
+    )));
+    let parent = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(Vec::new()),
+            user_instructions_provider: Some(included.clone()),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    assert_eq!(
+        parent.thread.instruction_sources().await,
+        vec![PathUri::from_abs_path(&source)]
+    );
+    assert_eq!(included.load_count(), 1);
+    let (_, warm_history) = persisted_resume_history(&parent.thread).await?;
+
+    let warm = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            initial_history: warm_history,
+            user_instructions_provider: Some(excluded.clone()),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    assert!(Arc::ptr_eq(&warm.thread, &parent.thread));
+    assert_eq!(excluded.load_count(), 0);
+
+    submit_thread_turn(&parent.thread, "persist global instructions").await?;
+    let (parent_id, history) = persisted_resume_history(&parent.thread).await?;
+    let fork = test
+        .thread_manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            StartThreadOptions {
+                environments: Some(Vec::new()),
+                user_instructions_provider: Some(excluded.clone()),
+                ..StartThreadOptions::new(test.config.clone())
+            },
+            history.clone(),
+        )
+        .await?;
+    assert_eq!(fork.thread.instruction_sources().await, Vec::<PathUri>::new());
+    submit_thread_turn(&fork.thread, "continue fork without global instructions").await?;
+
+    parent.thread.shutdown_and_wait().await?;
+    let resumed = test
+        .thread_manager
+        .resume_thread_with_history_and_user_instructions_provider(
+            test.config.clone(),
+            history,
+            test.thread_manager.auth_manager(),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+            Some(excluded.clone()),
+        )
+        .await?;
+    assert_eq!(resumed.thread_id, parent_id);
+    assert!(!Arc::ptr_eq(&resumed.thread, &parent.thread));
+    assert_eq!(resumed.thread.instruction_sources().await, Vec::<PathUri>::new());
+    submit_thread_turn(&resumed.thread, "continue cold resume without global instructions").await?;
+
+    let global = expected_provider_only_instruction_fragment(GLOBAL_INSTRUCTIONS);
+    let removal = expected_provider_only_instruction_fragment(
+        "The previously provided AGENTS.md instructions no longer apply.",
+    );
+    assert_eq!(
+        response_mock
+            .requests()
+            .iter()
+            .map(instruction_fragments)
+            .collect::<Vec<_>>(),
+        vec![
+            vec![global.clone()],
+            vec![global.clone(), removal.clone()],
+            vec![global, removal],
+        ]
+    );
+
     Ok(())
 }
 

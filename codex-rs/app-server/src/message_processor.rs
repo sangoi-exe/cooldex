@@ -350,7 +350,7 @@ impl MessageProcessor {
                 }),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
-                    // Merge-safety anchor: app-server threads derive global AGENTS.md inclusion from include_global_agents_md.
+                    // Merge-safety anchor: app-server request roots bind global AGENTS.md inclusion from their effective Config; this startup provider is only the direct-manager fallback.
                     codex_home::GlobalInstructionsMode::from_include_global_agents_md(
                         config.include_global_agents_md,
                     ),
