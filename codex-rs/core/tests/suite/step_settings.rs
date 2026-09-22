@@ -86,6 +86,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
+use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
@@ -270,6 +271,22 @@ fn request_settings(request: &ResponsesRequest) -> Value {
         "reasoning": body["reasoning"],
         "service_tier": body.get("service_tier"),
     })
+}
+
+fn request_body(request: &wiremock::Request) -> Option<Value> {
+    let body = request
+        .headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+        })
+        .then(|| zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok())
+        .flatten()
+        .unwrap_or_else(|| request.body.clone());
+    serde_json::from_slice(&body).ok()
 }
 
 fn request_turn_id(request: &ResponsesRequest) -> String {
@@ -2226,6 +2243,194 @@ async fn model_activation_uses_destination_metadata_defaults(
         requests.iter().map(request_turn_id).collect::<Vec<_>>(),
         vec![request.turn_id; 3],
     );
+
+    Ok(())
+}
+
+// Merge-safety anchor: full-history V2 spawn captures the invoking step's complete effective identity,
+// including the catalog-composed typed usage hint, without rewriting future thread settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_history_spawn_inherits_active_step_identity() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const SPAWN_CALL_ID: &str = "active-step-spawn";
+    const CHILD_TASK: &str = "child: inherit active step identity";
+    let active_root_hint = format!("{MODEL_B} catalog root usage hint.");
+    let active_child_hint = format!("{MODEL_B} catalog child usage hint.");
+
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_TASK,
+        "task_name": "worker",
+    }))?;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body(request).is_some_and(|body| body["model"].as_str() == Some(MODEL_A))
+        },
+        paused_response("resp-before-active-spawn", "pause-before-active-spawn"),
+    )
+    .await;
+    let mut spawn_event =
+        ev_function_call_with_namespace(SPAWN_CALL_ID, "collaboration", "spawn_agent", &spawn_args);
+    spawn_event["item"]["encrypted_function_args"] = json!([]);
+    let active_parent_request = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body(request).is_some_and(|body| {
+                body["model"].as_str() == Some(MODEL_B)
+                    && body["input"].as_array().is_some_and(|items| {
+                        !items
+                            .iter()
+                            .any(|item| item["type"].as_str() == Some("agent_message"))
+                    })
+                    && !body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"].as_str() == Some("function_call_output")
+                                && item["call_id"].as_str() == Some(SPAWN_CALL_ID)
+                        })
+                    })
+            })
+        },
+        sse(vec![
+            ev_response_created("resp-active-parent"),
+            spawn_event,
+            ev_completed("resp-active-parent"),
+        ]),
+    )
+    .await;
+    let child_request = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body(request).is_some_and(|body| {
+                body["model"].as_str() == Some(MODEL_B)
+                    && body["input"].as_array().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(|item| item["type"].as_str() == Some("agent_message"))
+                    })
+            })
+        },
+        sse(vec![
+            ev_response_created("resp-active-child"),
+            ev_completed("resp-active-child"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_body(request).is_some_and(|body| {
+                body["model"].as_str() == Some(MODEL_B)
+                    && body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"].as_str() == Some("function_call_output")
+                                && item["call_id"].as_str() == Some(SPAWN_CALL_ID)
+                        })
+                    })
+            })
+        },
+        sse(vec![
+            ev_response_created("resp-active-parent-followup"),
+            ev_completed("resp-active-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = step_settings_test()
+        .with_config(|config| {
+            for feature in [Feature::Collab, Feature::MultiAgentV2] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("test config should allow feature update");
+            }
+            for model in &mut config
+                .model_catalog
+                .as_mut()
+                .expect("controlled model catalog")
+                .models
+            {
+                let multi_agent = model
+                    .model_messages
+                    .as_mut()
+                    .expect("model instruction metadata")
+                    .multi_agent
+                    .get_or_insert_with(MultiAgentMessages::default);
+                multi_agent.role = Some(MultiAgentRoleMessages {
+                    root: Some(format!("{} catalog root usage hint.", model.slug)),
+                    subagent: Some(format!("{} catalog child usage hint.", model.slug)),
+                });
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let future_settings = test.codex.thread_settings_snapshot().await;
+    let paused = start_paused_turn(&test.codex).await?;
+    apply_turn_settings(
+        &test.codex,
+        &paused.turn_id,
+        TurnSettingsUpdate {
+            model: Some(MODEL_B.to_string()),
+            effort: Some(Some(ReasoningEffort::High)),
+            summary: Some(ReasoningSummary::Detailed),
+            service_tier: Some(Some(ServiceTier::Fast.request_value().to_string())),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(test.codex.thread_settings_snapshot().await, future_settings);
+    answer_paused_turn(&test.codex, &paused.turn_id).await?;
+    wait_for_event(&test.codex, |event| match event {
+        EventMsg::Error(error) => panic!("active step spawn failed: {}", error.message),
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let parent_request = active_parent_request
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body_json()["model"].as_str() == Some(MODEL_B)
+                && request.inputs_of_type("agent_message").is_empty()
+                && request
+                    .inputs_of_type("function_call_output")
+                    .iter()
+                    .all(|item| item["call_id"].as_str() != Some(SPAWN_CALL_ID))
+        })
+        .expect("active parent spawn request");
+    let child_request = child_request
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body_json()["model"].as_str() == Some(MODEL_B)
+                && !request.inputs_of_type("agent_message").is_empty()
+        })
+        .expect("active child request");
+    assert_eq!(
+        request_settings(&child_request),
+        json!({
+            "model": MODEL_B,
+            "reasoning": { "effort": "high", "summary": "detailed" },
+            "service_tier": "priority",
+        })
+    );
+    for (request_role, request) in [("parent", &parent_request), ("child", &child_request)] {
+        let developer_messages = request.message_input_texts("developer");
+        assert!(
+            developer_messages
+                .iter()
+                .any(|message| message.contains(&active_root_hint)),
+            "{request_role} request should retain the active step's catalog root hint"
+        );
+        assert!(
+            developer_messages
+                .iter()
+                .all(|message| !message.contains(&active_child_hint)),
+            "{request_role} request must not freshly resolve child-only guidance"
+        );
+    }
 
     Ok(())
 }

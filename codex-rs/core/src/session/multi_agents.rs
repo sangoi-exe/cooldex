@@ -14,6 +14,8 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 
+// Merge-safety anchor: full-history V2 identity capture consumes this exact step snapshot so
+// active-only settings cannot be replaced by future thread defaults or a later catalog lookup.
 /// Uses the step's captured model messages for model-context assembly.
 pub(super) fn usage_hint_text(step_context: &StepContext) -> Option<MultiAgentRoleInstructions> {
     let turn_context = step_context.turn.as_ref();
@@ -24,10 +26,8 @@ pub(super) fn usage_hint_text(step_context: &StepContext) -> Option<MultiAgentRo
     )
 }
 
-/// Uses the turn's frozen model identity only for full-history identity capture.
-///
-/// This is intentionally distinct from `usage_hint_text`, whose step-scoped input serves
-/// `session/world_state.rs`; callers must not overload one API with two temporal meanings.
+/// Uses the turn's frozen model identity only when a direct AgentControl caller has no invoking
+/// step context. Public V2 spawn uses `usage_hint_text` above.
 pub(crate) fn usage_hint_text_for_turn(
     turn_context: &TurnContext,
 ) -> Option<MultiAgentRoleInstructions> {

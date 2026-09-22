@@ -2144,15 +2144,28 @@ impl Session {
         )
     }
 
-    // Merge-safety anchor: public full-history V2 spawn derives its child identity from the
-    // parent turn's effective typed hint, while ordinary snapshots retain their live binding.
+    // Merge-safety anchor: public full-history V2 spawn captures the invoking step's complete
+    // identity, including its typed hint, while ordinary snapshots retain live future settings.
     pub(crate) async fn full_history_agent_identity_snapshot(
         &self,
-        turn_context: &crate::session::turn_context::TurnContext,
+        step_context: &StepContext,
     ) -> AgentIdentitySnapshot {
-        self.agent_identity_snapshot()
-            .await
-            .for_full_history(multi_agents::usage_hint_text_for_turn(turn_context))
+        let turn_context = step_context.turn.as_ref();
+        let base_instructions = self.get_base_instructions().await;
+        AgentIdentitySnapshot::capture(
+            turn_context.session_source.get_agent_role(),
+            turn_context.config.model_provider_id.clone(),
+            turn_context.config.model_provider.clone(),
+            step_context.settings.model_info.slug.clone(),
+            step_context.settings.effective_reasoning_effort(),
+            Some(step_context.settings.reasoning_summary),
+            base_instructions.text,
+            turn_context.developer_instructions.clone(),
+            step_context.settings.service_tier.clone(),
+            Some(turn_context.config.features.enabled(Feature::ShellTool)),
+            turn_context.config.agent_usage_hint_binding.clone(),
+        )
+        .for_full_history(multi_agents::usage_hint_text(step_context))
     }
 
     pub(crate) async fn set_app_server_client_info(

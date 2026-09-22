@@ -167,7 +167,11 @@ async fn handle_spawn_agent(
         .filter(|role| !role.is_empty());
 
     let expected_identity = if is_full_history_fork {
-        Some(session.full_history_agent_identity_snapshot(turn).await)
+        Some(
+            session
+                .full_history_agent_identity_snapshot(step_context.as_ref())
+                .await,
+        )
     } else {
         None
     };

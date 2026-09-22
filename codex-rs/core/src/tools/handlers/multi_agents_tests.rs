@@ -653,8 +653,8 @@ async fn multi_agent_v2_full_history_rejects_every_identity_override_before_spaw
 }
 
 #[tokio::test]
-// Merge-safety anchor: public V2 full-history spawn compares the frozen parent hint identity,
-// not an ordinary Resolve snapshot that would hide a child-side hint re-resolution.
+// Merge-safety anchor: public V2 full-history spawn compares the invoking step's captured hint
+// identity, not an ordinary Resolve snapshot that would hide a child-side hint re-resolution.
 async fn multi_agent_v2_full_history_child_matches_parent_identity() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
@@ -681,8 +681,11 @@ async fn multi_agent_v2_full_history_child_matches_parent_identity() {
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
-    let expected_identity = session.full_history_agent_identity_snapshot(&turn).await;
     let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let expected_identity = session
+        .full_history_agent_identity_snapshot(step_context.as_ref())
+        .await;
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -745,8 +748,11 @@ async fn multi_agent_v2_full_history_bypasses_unresolvable_child_defaults() {
     session.services.agent_control = manager.agent_control();
     session.thread_id = root.thread_id;
     let session = Arc::new(session);
-    let expected_identity = session.full_history_agent_identity_snapshot(&turn).await;
     let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let expected_identity = session
+        .full_history_agent_identity_snapshot(step_context.as_ref())
+        .await;
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
