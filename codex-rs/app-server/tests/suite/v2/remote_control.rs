@@ -24,6 +24,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -51,8 +52,8 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::protocol::SessionSource;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
-use codex_utils_cli::CliConfigOverrides;
 use codex_uds::UnixStream;
+use codex_utils_cli::CliConfigOverrides;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -664,7 +665,10 @@ async fn final_instance_child_disconnect_cancels_pending_remote_control_enable()
             match UnixStream::connect(&socket_path).await {
                 Ok(stream) => break Ok(stream),
                 Err(err)
-                    if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) =>
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                    ) =>
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -712,7 +716,10 @@ async fn final_instance_child_disconnect_cancels_pending_remote_control_enable()
                     break Ok(());
                 }
                 JSONRPCMessage::Error(error) if error.id == initialize_request_id => {
-                    anyhow::bail!("instance child rejected initialize: {}", error.error.message);
+                    anyhow::bail!(
+                        "instance child rejected initialize: {}",
+                        error.error.message
+                    );
                 }
                 _ => {}
             }
@@ -750,7 +757,7 @@ async fn final_instance_child_disconnect_cancels_pending_remote_control_enable()
     drop(websocket);
     let exit = timeout(DEFAULT_TIMEOUT, app_server)
         .await
-        .context("final instance child did not shut down while enrollment was pending")??;
+        .context("final instance child did not shut down while enrollment was pending")???;
     assert_eq!(exit, codex_app_server::AppServerExit::Graceful);
     Ok(())
 }
