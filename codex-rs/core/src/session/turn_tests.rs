@@ -6,7 +6,6 @@ use codex_protocol::items::AgentMessageContent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
-use tracing_test::internal::MockWriter;
 
 struct RewriteAgentMessageContributor;
 
@@ -40,37 +39,25 @@ fn assistant_output_text(text: &str) -> ResponseItem {
     }
 }
 
-// Merge-safety anchor: log-db keeps ordinary traces but filters post-sampling token estimates.
+// Merge-safety anchor: always-on feedback and log-db sinks must suppress post-sampling token
+// estimation before it clones and traverses session history.
 #[test]
 fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
     let feedback = codex_feedback::CodexFeedback::new();
-    let buffer: &'static std::sync::Mutex<Vec<u8>> =
-        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
-    let _guard = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+    let subscriber = tracing_subscriber::registry()
         .with(feedback.logger_layer())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(MockWriter::new(buffer))
-                .with_filter(codex_state::log_db::default_filter()),
-        )
-        .set_default();
+        .with(tracing_subscriber::fmt::layer().with_filter(codex_state::log_db::default_filter()));
 
-    tracing::trace!(target: "codex_core::turn_tests", "control trace");
-    tracing::trace!(
-        target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
-        turn_id = "turn-id",
-        estimated_token_count = 42_u32,
-        message = "synthetic message",
-        "post sampling token estimate"
-    );
-
-    let log_db_logs = String::from_utf8(buffer.lock().expect("buffer lock").clone())
-        .expect("log-db logs should be UTF-8");
-
-    assert!(log_db_logs.contains("control trace"));
-    assert!(!log_db_logs.contains("post sampling token estimate"));
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        assert!(!tracing::event_enabled!(
+            target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
+            tracing::Level::TRACE,
+            turn_id,
+            estimated_token_count,
+            message
+        ));
+    });
 }
 
 #[tokio::test]

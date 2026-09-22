@@ -50,21 +50,31 @@ fn sampling_success_builds_application_for_the_exact_cached_packet_without_clear
 #[test]
 fn sampling_success_rejects_mismatched_identity_or_empty_turn() {
     let identity = identity();
-    let state = PostCompactRecoveryRuntimeState::pending(identity.clone());
+    let packet = PostCompactRecoveryContext::new(
+        &identity.compaction_window_id,
+        &identity.boundary_item_id,
+        "fixed boundary",
+        None,
+    )
+    .expect("recovery packet");
+    let state = PostCompactRecoveryRuntimeState::pending_with_packet(identity.clone(), packet);
     let different_identity = PostCompactRecoveryIdentity {
         compaction_window_id: identity.compaction_window_id.clone(),
         boundary_item_id: "different-boundary".to_string(),
     };
 
-    for result in [
-        state.application_for_sampling_success(&different_identity, "turn_with_response"),
-        state.application_for_sampling_success(&identity, ""),
-    ] {
-        assert_eq!(
-            result.expect_err("invalid sampling identity must fail"),
-            PostCompactRecoveryFailureClass::BoundaryMismatch
-        );
-    }
+    assert_eq!(
+        state
+            .application_for_sampling_success(&different_identity, "turn_with_response")
+            .expect_err("mismatched sampling identity must fail"),
+        PostCompactRecoveryFailureClass::BoundaryMismatch
+    );
+    assert_eq!(
+        state
+            .application_for_sampling_success(&identity, "")
+            .expect_err("empty sampling turn must fail"),
+        PostCompactRecoveryFailureClass::BoundaryMismatch
+    );
 }
 
 #[test]
