@@ -119,7 +119,6 @@ pub(crate) async fn run_remote_compact_task(
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
-    sess.emit_turn_started(&turn_context).await;
 
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Manual,

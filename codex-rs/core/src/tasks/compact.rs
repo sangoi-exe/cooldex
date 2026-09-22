@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use super::SessionTask;
+use super::SessionTaskContext;
 use super::SessionTaskResult;
 use super::emit_compact_metric;
+use super::emit_standard_turn_started;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -25,6 +27,14 @@ impl SessionTask for CompactTask {
 
     fn span_name(&self) -> &'static str {
         "session_task.compact"
+    }
+
+    fn emit_turn_started(
+        &self,
+        session: Arc<SessionTaskContext>,
+        ctx: Arc<TurnContext>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        emit_standard_turn_started(session, ctx)
     }
 
     async fn run(

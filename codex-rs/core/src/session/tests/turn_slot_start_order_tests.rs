@@ -1,7 +1,15 @@
 use super::*;
+use crate::agents_md_manager::AgentsMdManager;
+use crate::agents_md_manager::SessionInstructions;
 use crate::tasks::SessionTaskContext;
+use codex_extension_api::LoadInstructionsFuture;
+use codex_extension_api::LoadedUserInstructions;
+use codex_extension_api::UserInstructionsProvider;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use pretty_assertions::assert_eq;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::sync::Notify;
 
 struct BlockingTurnStartedTask {
     start_event_entered_tx: async_channel::Sender<()>,
@@ -66,6 +74,27 @@ impl SessionTask for BlockingTurnStartedTask {
     }
 }
 
+struct BlockingUserInstructionsProvider {
+    block_next_read: AtomicBool,
+    read_started: Notify,
+}
+
+impl UserInstructionsProvider for BlockingUserInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        let should_block = self.block_next_read.swap(/*val*/ false, Ordering::SeqCst);
+        Box::pin(async move {
+            if should_block {
+                self.read_started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            LoadedUserInstructions {
+                instructions: None,
+                warnings: Vec::new(),
+            }
+        })
+    }
+}
+
 fn user_input(text: &str) -> Vec<UserInput> {
     vec![UserInput::Text {
         text: text.to_string(),
@@ -113,6 +142,69 @@ async fn recv_turn_aborted(
     })
     .await
     .expect("expected TurnAborted")
+}
+
+async fn recv_turn_aborted_without_second_turn_started(
+    rx: &async_channel::Receiver<Event>,
+    expected_turn_id: &str,
+    expected_reason: TurnAbortReason,
+) -> Event {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("event channel should remain open");
+            match &event.msg {
+                EventMsg::TurnStarted(TurnStartedEvent { turn_id, .. })
+                    if turn_id == expected_turn_id =>
+                {
+                    panic!("manual compaction must emit TurnStarted exactly once");
+                }
+                EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id,
+                    reason,
+                    ..
+                }) if turn_id.as_deref() == Some(expected_turn_id) && reason == &expected_reason => {
+                    return event;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("expected TurnAborted")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compaction_emits_turn_started_before_cancellable_step_capture() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let provider = Arc::new(BlockingUserInstructionsProvider {
+        block_next_read: AtomicBool::new(/*v*/ true),
+        read_started: Notify::new(),
+    });
+    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+        user_provider: Some(Arc::clone(&provider)),
+        ..Default::default()
+    }));
+    let session = Arc::new(session);
+
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            crate::tasks::CompactTask,
+        )
+        .await;
+    timeout(Duration::from_secs(2), provider.read_started.notified())
+        .await
+        .expect("manual compaction should enter cancellable step capture");
+    recv_turn_started(&rx, &turn_context.sub_id).await;
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    recv_turn_aborted_without_second_turn_started(
+        &rx,
+        &turn_context.sub_id,
+        TurnAbortReason::Interrupted,
+    )
+    .await;
 }
 
 // Merge-safety anchor: generation waiters remain blocked until the successor emits TurnStarted
