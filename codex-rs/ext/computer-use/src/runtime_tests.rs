@@ -27,6 +27,7 @@ use crate::protocol::InputOperation;
 use crate::protocol::StartArgs;
 use crate::protocol::StopArgs;
 use crate::protocol::TypeTextArgs;
+use crate::server::RequestCancellation;
 
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_requires_start_before_get_environment() {
@@ -193,6 +194,136 @@ async fn runtime_screenshot_rejects_absolute_path_outside_invocation_dir() {
     assert!(error.message.contains("outside the invocation directory"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_queued_cancellation_does_not_start_sky() {
+    let harness = RuntimeHarness::with_blocking_sky();
+    let runtime = harness.runtime();
+
+    runtime
+        .execute(ComputerUseRequest::Start(StartArgs {}))
+        .await
+        .expect("start session");
+
+    let running_runtime = runtime.clone();
+    let running = tokio::spawn(async move {
+        running_runtime
+            .execute(ComputerUseRequest::TypeText(TypeTextArgs {
+                text: "first request".to_string(),
+            }))
+            .await
+    });
+    assert_eq!(
+        wait_for_file_contents(&harness.sky_started_log)
+            .await
+            .expect("first Sky request started"),
+        "started\n"
+    );
+
+    let (cancellation, canceller) = RequestCancellation::test_pair();
+    let queued_runtime = runtime.clone();
+    let queued = tokio::spawn(async move {
+        queued_runtime
+            .execute_with_cancellation(
+                ComputerUseRequest::TypeText(TypeTextArgs {
+                    text: "cancelled request".to_string(),
+                }),
+                cancellation,
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    canceller.cancel();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), queued)
+        .await
+        .expect("queued cancellation completed")
+        .expect("queued task did not panic")
+        .expect_err("queued request must be cancelled");
+    assert_eq!(error.code, crate::ComputerUseErrorCode::SkyCancelled);
+
+    fs::write(&harness.sky_release_file, []).expect("release first Sky request");
+    running
+        .await
+        .expect("running task did not panic")
+        .expect("first request completed");
+    assert_eq!(
+        fs::read_to_string(&harness.sky_started_log).expect("read Sky starts"),
+        "started\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&harness.sky_mutation_log).expect("read Sky mutations"),
+        "mutated\n"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_running_cancellation_terminates_sky_before_later_mutation() {
+    let harness = RuntimeHarness::with_blocking_sky();
+    let runtime = harness.runtime();
+
+    let started = runtime
+        .execute(ComputerUseRequest::Start(StartArgs {}))
+        .await
+        .expect("start session");
+    let session_id = running_session_id(&started);
+    let (cancellation, canceller) = RequestCancellation::test_pair();
+    let running_runtime = runtime.clone();
+    let running = tokio::spawn(async move {
+        running_runtime
+            .execute_with_cancellation(
+                ComputerUseRequest::TypeText(TypeTextArgs {
+                    text: "cancel running request".to_string(),
+                }),
+                cancellation,
+            )
+            .await
+    });
+    assert_eq!(
+        wait_for_file_contents(&harness.sky_started_log)
+            .await
+            .expect("Sky request started"),
+        "started\n"
+    );
+    let sky_pid = wait_for_file_contents(&harness.sky_pid_log)
+        .await
+        .expect("read Sky pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse Sky pid");
+
+    canceller.cancel();
+
+    let error = tokio::time::timeout(Duration::from_secs(3), running)
+        .await
+        .expect("running cancellation completed")
+        .expect("running task did not panic")
+        .expect_err("running request must be cancelled");
+    assert_eq!(error.code, crate::ComputerUseErrorCode::SkyCancelled);
+    assert!(
+        !Path::new(&format!("/proc/{sky_pid}")).exists(),
+        "Sky process must be reaped before cancellation returns"
+    );
+    let sky_output_dir = harness.temp_root.join(session_id).join("sky-output");
+    assert!(
+        fs::read_dir(sky_output_dir)
+            .expect("read Sky output directory")
+            .next()
+            .is_none(),
+        "Sky invocation directory must be cleaned before cancellation returns"
+    );
+
+    fs::write(&harness.sky_release_file, []).expect("release cancelled Sky request");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_file_contents(&harness.sky_mutation_log),
+        )
+        .await
+        .is_err(),
+        "terminated Sky process must not mutate after cancellation"
+    );
+}
+
 struct RuntimeHarness {
     _tempdir: TempDir,
     temp_root: PathBuf,
@@ -201,6 +332,10 @@ struct RuntimeHarness {
     sky_script: PathBuf,
     sky_env_log: PathBuf,
     sky_stdin_log: PathBuf,
+    sky_started_log: PathBuf,
+    sky_mutation_log: PathBuf,
+    sky_pid_log: PathBuf,
+    sky_release_file: PathBuf,
     fixture_jpeg: PathBuf,
 }
 
@@ -221,6 +356,10 @@ impl RuntimeHarness {
         Self::new(SkyScriptMode::OutsideAbsoluteScreenshot)
     }
 
+    fn with_blocking_sky() -> Self {
+        Self::new(SkyScriptMode::Blocking)
+    }
+
     fn new(mode: SkyScriptMode) -> Self {
         let tempdir = TempDir::new().expect("create tempdir");
         let temp_root = tempdir.path().join("sessions");
@@ -229,6 +368,10 @@ impl RuntimeHarness {
         let sky_script = tempdir.path().join("fake-sky.sh");
         let sky_env_log = tempdir.path().join("sky-env.log");
         let sky_stdin_log = tempdir.path().join("sky-stdin.log");
+        let sky_started_log = tempdir.path().join("sky-started.log");
+        let sky_mutation_log = tempdir.path().join("sky-mutation.log");
+        let sky_pid_log = tempdir.path().join("sky.pid");
+        let sky_release_file = tempdir.path().join("sky-release");
         let fixture_jpeg = tempdir.path().join("fixture.jpg");
         let outside_screenshot = tempdir.path().join("outside-shot.jpg");
 
@@ -289,6 +432,19 @@ cp {fixture_jpeg:?} "$outside_path"
 printf '[{{"filepath":"%s"}}]' "$outside_path"
 "#,
             ),
+            SkyScriptMode::Blocking => format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' TERM
+printf '%s\n' "$$" > {sky_pid_log:?}
+printf 'started\n' >> {sky_started_log:?}
+cat > {sky_stdin_log:?}
+while [[ ! -e {sky_release_file:?} ]]; do
+  sleep 0.01
+done
+printf 'mutated\n' >> {sky_mutation_log:?}
+"#,
+            ),
         };
         write_executable(&sky_script, &sky_script_contents);
 
@@ -300,6 +456,10 @@ printf '[{{"filepath":"%s"}}]' "$outside_path"
             sky_script,
             sky_env_log,
             sky_stdin_log,
+            sky_started_log,
+            sky_mutation_log,
+            sky_pid_log,
+            sky_release_file,
             fixture_jpeg,
         }
     }
@@ -325,6 +485,7 @@ enum SkyScriptMode {
     RelativeScreenshot,
     AbsoluteScreenshot,
     OutsideAbsoluteScreenshot,
+    Blocking,
 }
 
 fn running_session_id(output: &ComputerUseOutput) -> &str {

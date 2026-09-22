@@ -1,6 +1,11 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use base64::Engine as _;
+use codex_protocol::mcp::CallToolResult as ProtocolCallToolResult;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
@@ -293,17 +298,7 @@ async fn dispatch_returns_original_detail_image_for_screenshot() {
         runtime.requests(),
         vec![ComputerUseRequest::GetScreenshot(GetScreenshotArgs {})]
     );
-    assert_eq!(
-        result.structured_content,
-        Some(json!({
-            "ok": true,
-            "state": "running",
-            "session_id": "session-456",
-            "width": crate::SCREENSHOT_VIEWPORT_WIDTH,
-            "height": crate::SCREENSHOT_VIEWPORT_HEIGHT,
-            "mime_type": SCREENSHOT_MIME_TYPE,
-        }))
-    );
+    assert_eq!(result.structured_content, None);
     assert_eq!(result.is_error, Some(false));
     assert_eq!(result.content.len(), 1);
     let image = result.content[0].as_image().expect("image content");
@@ -314,6 +309,33 @@ async fn dispatch_returns_original_detail_image_for_screenshot() {
             .as_ref()
             .and_then(|meta| meta.0.get(crate::IMAGE_DETAIL_META_KEY)),
         Some(&json!(crate::IMAGE_DETAIL_ORIGINAL))
+    );
+
+    let model_result = ProtocolCallToolResult {
+        content: result
+            .content
+            .into_iter()
+            .map(|content| serde_json::to_value(content).expect("serialize MCP content"))
+            .collect(),
+        structured_content: result.structured_content,
+        is_error: result.is_error,
+        meta: result.meta.and_then(|meta| serde_json::to_value(meta).ok()),
+    };
+    let payload = model_result.into_function_call_output_payload();
+    assert_eq!(
+        payload.content_items(),
+        Some(
+            [FunctionCallOutputContentItem::InputImage {
+                image: ImageReference::Inline {
+                    image_url: format!(
+                        "data:{SCREENSHOT_MIME_TYPE};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&screenshot_payload.bytes),
+                    ),
+                },
+                detail: Some(ImageDetail::Original),
+            }]
+            .as_slice()
+        )
     );
 }
 

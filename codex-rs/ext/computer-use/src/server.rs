@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use rmcp::ErrorData;
@@ -17,6 +18,12 @@ use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use crate::protocol::CLICK_TOOL_NAME;
 use crate::protocol::ClickArgs;
@@ -69,16 +76,104 @@ then refresh your observation after typing.";
 const STOP_TOOL_DESCRIPTION: &str =
     "Stop and clean up the owned Computer Use desktop session when you are done.";
 
+type CancellationFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Immutable view of RMCP's original per-request cancellation token.
+///
+/// This wrapper deliberately keeps protocol request parsing out of the runtime
+/// while preserving the token's cancellation state and notification future.
+#[derive(Clone)]
+pub(crate) struct RequestCancellation {
+    is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    cancelled: Arc<dyn Fn() -> CancellationFuture + Send + Sync>,
+}
+
+impl RequestCancellation {
+    pub(crate) fn uncancellable() -> Self {
+        Self {
+            is_cancelled: Arc::new(|| false),
+            cancelled: Arc::new(|| Box::pin(std::future::pending())),
+        }
+    }
+
+    pub(crate) fn from_request_context(context: &RequestContext<RoleServer>) -> Self {
+        let cancellation_token = context.ct.clone();
+        let wait_token = cancellation_token.clone();
+        Self {
+            is_cancelled: Arc::new(move || cancellation_token.is_cancelled()),
+            cancelled: Arc::new(move || Box::pin(wait_token.clone().cancelled_owned())),
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        (self.is_cancelled)()
+    }
+
+    pub(crate) fn cancelled(&self) -> CancellationFuture {
+        (self.cancelled)()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, TestRequestCancellation) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let notified = Arc::new(Notify::new());
+        let is_cancelled = cancelled.clone();
+        let wait_cancelled = cancelled.clone();
+        let wait_notified = notified.clone();
+        let cancellation = Self {
+            is_cancelled: Arc::new(move || is_cancelled.load(Ordering::Acquire)),
+            cancelled: Arc::new(move || {
+                let cancelled = wait_cancelled.clone();
+                let notified = wait_notified.clone();
+                Box::pin(async move {
+                    while !cancelled.load(Ordering::Acquire) {
+                        notified.notified().await;
+                    }
+                })
+            }),
+        };
+        (
+            cancellation,
+            TestRequestCancellation {
+                cancelled,
+                notified,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestRequestCancellation {
+    cancelled: Arc<AtomicBool>,
+    notified: Arc<Notify>,
+}
+
+#[cfg(test)]
+impl TestRequestCancellation {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notified.notify_waiters();
+    }
+}
+
 /// Runtime owner for the Computer Use MCP surface.
 ///
-/// Implementations receive already-parsed tool requests and return stable
-/// domain outputs or stable domain failures. They must not depend on RMCP
-/// request parsing details.
+/// Implementations receive already-parsed tool requests and return stable domain
+/// outputs or stable domain failures. The cancellable entrypoint receives the
+/// original RMCP request context only to preserve cancellation.
 pub trait ComputerUseRuntime: Send + Sync + 'static {
     fn execute(
         &self,
         request: ComputerUseRequest,
     ) -> impl Future<Output = Result<ComputerUseOutput, ComputerUseError>> + Send;
+
+    fn execute_cancellable(
+        &self,
+        request: ComputerUseRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ComputerUseOutput, ComputerUseError>> + Send {
+        self.execute(request)
+    }
 }
 
 #[derive(Clone)]
@@ -129,9 +224,13 @@ where
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
-        Ok(self.dispatch(request).await?.into())
+        Ok(
+            dispatch_tool_call_with_context(&self.runtime, request, context)
+                .await?
+                .into(),
+        )
     }
 }
 
@@ -237,6 +336,36 @@ pub async fn dispatch_tool_call<Runtime>(
 where
     Runtime: ComputerUseRuntime,
 {
+    dispatch_tool_call_with(runtime, request, |runtime, request| {
+        runtime.execute(request)
+    })
+    .await
+}
+
+async fn dispatch_tool_call_with_context<Runtime>(
+    runtime: &Runtime,
+    request: CallToolRequestParams,
+    context: RequestContext<RoleServer>,
+) -> Result<CallToolResult, ErrorData>
+where
+    Runtime: ComputerUseRuntime,
+{
+    dispatch_tool_call_with(runtime, request, move |runtime, request| {
+        runtime.execute_cancellable(request, context)
+    })
+    .await
+}
+
+async fn dispatch_tool_call_with<Runtime, Execute, Execution>(
+    runtime: &Runtime,
+    request: CallToolRequestParams,
+    execute: Execute,
+) -> Result<CallToolResult, ErrorData>
+where
+    Runtime: ComputerUseRuntime,
+    Execute: FnOnce(&Runtime, ComputerUseRequest) -> Execution,
+    Execution: Future<Output = Result<ComputerUseOutput, ComputerUseError>>,
+{
     let parsed_request = match parse_call_tool_request(request) {
         Ok(parsed_request) => parsed_request,
         Err(ParseToolRequestError::UnknownTool(name)) => {
@@ -250,7 +379,7 @@ where
         }
     };
 
-    match runtime.execute(parsed_request).await {
+    match execute(runtime, parsed_request).await {
         Ok(output) => success_call_tool_result(output),
         Err(error) => Ok(error_call_tool_result(error)),
     }
@@ -338,7 +467,9 @@ fn success_call_tool_result(output: ComputerUseOutput) -> Result<CallToolResult,
     };
 
     let mut result = CallToolResult::success(content);
-    result.structured_content = Some(output.structured_content());
+    if !matches!(&output, ComputerUseOutput::Screenshot { .. }) {
+        result.structured_content = Some(output.structured_content());
+    }
     Ok(result)
 }
 

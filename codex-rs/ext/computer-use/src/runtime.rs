@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::RngCore as _;
+use rmcp::service::RequestContext;
+use rmcp::service::RoleServer;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -26,6 +28,7 @@ use crate::protocol::ComputerUseOutput;
 use crate::protocol::ComputerUseRequest;
 use crate::protocol::DesktopEnvironment;
 use crate::protocol::InputOperation;
+use crate::server::RequestCancellation;
 use crate::session::DesktopSession;
 use crate::session::DesktopSessionConfig;
 use crate::sky::SkyInvocation;
@@ -68,19 +71,45 @@ impl LocalComputerUseRuntime {
             state: Arc::new(Mutex::new(RuntimeState::default())),
         }
     }
-}
 
-impl ComputerUseRuntime for LocalComputerUseRuntime {
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Computer Use session state transitions must remain serialized"
     )]
+    pub(crate) async fn execute_with_cancellation(
+        &self,
+        request: ComputerUseRequest,
+        cancellation: RequestCancellation,
+    ) -> Result<ComputerUseOutput, ComputerUseError> {
+        let mut state = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(sky_cancelled_error()),
+            state = self.state.lock() => state,
+        };
+        if cancellation.is_cancelled() {
+            return Err(sky_cancelled_error());
+        }
+
+        state.execute(&self.config, request, cancellation).await
+    }
+}
+
+impl ComputerUseRuntime for LocalComputerUseRuntime {
     async fn execute(
         &self,
         request: ComputerUseRequest,
     ) -> Result<ComputerUseOutput, ComputerUseError> {
-        let mut state = self.state.lock().await;
-        state.execute(&self.config, request).await
+        self.execute_with_cancellation(request, RequestCancellation::uncancellable())
+            .await
+    }
+
+    async fn execute_cancellable(
+        &self,
+        request: ComputerUseRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ComputerUseOutput, ComputerUseError> {
+        self.execute_with_cancellation(request, RequestCancellation::from_request_context(&context))
+            .await
     }
 }
 
@@ -95,12 +124,13 @@ impl RuntimeState {
         &mut self,
         config: &LocalComputerUseRuntimeConfig,
         request: ComputerUseRequest,
+        cancellation: RequestCancellation,
     ) -> Result<ComputerUseOutput, ComputerUseError> {
         match request {
             ComputerUseRequest::Start(_) => self.start_or_reuse_session(config).await,
             ComputerUseRequest::GetEnvironment(_) => self.current_environment().await,
             ComputerUseRequest::Stop(_) => self.stop_session().await,
-            tool_request => self.run_sky_tool(config, tool_request).await,
+            tool_request => self.run_sky_tool(config, tool_request, cancellation).await,
         }
     }
 
@@ -171,7 +201,11 @@ impl RuntimeState {
         &mut self,
         config: &LocalComputerUseRuntimeConfig,
         request: ComputerUseRequest,
+        cancellation: RequestCancellation,
     ) -> Result<ComputerUseOutput, ComputerUseError> {
+        if cancellation.is_cancelled() {
+            return Err(sky_cancelled_error());
+        }
         let Some(session) = self.session.as_mut() else {
             return Err(session_not_started_error());
         };
@@ -201,6 +235,7 @@ impl RuntimeState {
             &sky_output_root,
             request,
             sky_invocation,
+            &cancellation,
         )
         .await
     }
@@ -220,6 +255,7 @@ async fn run_sky_invocation(
     sky_output_root: &Path,
     request: ComputerUseRequest,
     sky_invocation: SkyInvocation,
+    cancellation: &RequestCancellation,
 ) -> Result<ComputerUseOutput, ComputerUseError> {
     let invocation_dir = create_private_invocation_dir(sky_output_root).map_err(internal_error)?;
     let result = run_sky_invocation_inner(
@@ -228,6 +264,7 @@ async fn run_sky_invocation(
         &invocation_dir,
         request,
         sky_invocation,
+        cancellation,
     )
     .await;
 
@@ -245,6 +282,7 @@ async fn run_sky_invocation_inner(
     invocation_dir: &Path,
     request: ComputerUseRequest,
     sky_invocation: SkyInvocation,
+    cancellation: &RequestCancellation,
 ) -> Result<ComputerUseOutput, ComputerUseError> {
     let stdin_bytes = serde_json::to_vec(&sky_invocation.stdin_json).map_err(|error| {
         ComputerUseError::new(
@@ -254,6 +292,9 @@ async fn run_sky_invocation_inner(
         )
     })?;
     let operation = input_operation(&request);
+    if cancellation.is_cancelled() {
+        return Err(sky_cancelled_error());
+    }
     let mut child = spawn_sky_child(environment, invocation_dir, &sky_invocation)?;
     let process_group_id = child.id().ok_or_else(|| {
         ComputerUseError::new(
@@ -292,22 +333,61 @@ async fn run_sky_invocation_inner(
     let stdout_task = tokio::spawn(read_bounded_stream(stdout, SKY_STDOUT_LIMIT_BYTES));
     let stderr_task = tokio::spawn(read_bounded_stream(stderr, SKY_STDERR_CAPTURE_LIMIT_BYTES));
 
-    let status = match timeout(SKY_OUTER_TIMEOUT, child.wait()).await {
-        Ok(wait_result) => wait_result.map_err(|error| {
-            ComputerUseError::new(
-                ComputerUseErrorCode::SkyFailed,
-                format!("failed to wait for the Sky process: {error}"),
-                /*retryable*/ true,
+    enum SkyWaitResult {
+        Completed(std::process::ExitStatus),
+        Cancelled,
+        TimedOut,
+        WaitFailed(io::Error),
+    }
+
+    let status = match tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => SkyWaitResult::Cancelled,
+        wait_result = timeout(SKY_OUTER_TIMEOUT, child.wait()) => match wait_result {
+            Ok(Ok(status)) => SkyWaitResult::Completed(status),
+            Ok(Err(error)) => SkyWaitResult::WaitFailed(error),
+            Err(_) => SkyWaitResult::TimedOut,
+        },
+    } {
+        SkyWaitResult::Completed(status) => status,
+        SkyWaitResult::Cancelled => {
+            terminate_sky_process(
+                &mut child,
+                process_group_id,
+                stdin_task,
+                stdout_task,
+                stderr_task,
             )
-        })?,
-        Err(_) => {
-            let _ = terminate_process_group(&mut child, process_group_id).await;
-            let _ = stdin_task.await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            .await?;
+            return Err(sky_cancelled_error());
+        }
+        SkyWaitResult::TimedOut => {
+            terminate_sky_process(
+                &mut child,
+                process_group_id,
+                stdin_task,
+                stdout_task,
+                stderr_task,
+            )
+            .await?;
             return Err(ComputerUseError::new(
                 ComputerUseErrorCode::SkyTimeout,
                 "Sky exceeded the 32-second outer deadline",
+                /*retryable*/ true,
+            ));
+        }
+        SkyWaitResult::WaitFailed(error) => {
+            terminate_sky_process(
+                &mut child,
+                process_group_id,
+                stdin_task,
+                stdout_task,
+                stderr_task,
+            )
+            .await?;
+            return Err(ComputerUseError::new(
+                ComputerUseErrorCode::SkyFailed,
+                format!("failed to wait for the Sky process: {error}"),
                 /*retryable*/ true,
             ));
         }
@@ -351,7 +431,11 @@ async fn run_sky_invocation_inner(
     }
 
     if let Some(post_action_sleep) = sky_invocation.post_action_sleep {
-        sleep(post_action_sleep).await;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(sky_cancelled_error()),
+            _ = sleep(post_action_sleep) => {}
+        }
     }
 
     match operation {
@@ -419,15 +503,60 @@ fn spawn_sky_child(
 async fn terminate_process_group(child: &mut Child, process_group_id: u32) -> io::Result<()> {
     let _ = codex_utils_pty::process_group::terminate_process_group(process_group_id);
     match timeout(SKY_TERM_GRACE_PERIOD, child.wait()).await {
-        Ok(wait_result) => wait_result.map(|_| ()),
-        Err(_) => {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) | Err(_) => {
             let _ = codex_utils_pty::process_group::kill_process_group(process_group_id);
             match timeout(SKY_TERM_GRACE_PERIOD, child.wait()).await {
-                Ok(wait_result) => wait_result.map(|_| ()),
-                Err(_) => Ok(()),
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Sky process group did not exit after SIGKILL",
+                )),
             }
         }
     }
+}
+
+async fn terminate_sky_process(
+    child: &mut Child,
+    process_group_id: u32,
+    mut stdin_task: tokio::task::JoinHandle<io::Result<()>>,
+    mut stdout_task: tokio::task::JoinHandle<io::Result<CollectedStream>>,
+    mut stderr_task: tokio::task::JoinHandle<io::Result<CollectedStream>>,
+) -> Result<(), ComputerUseError> {
+    if let Err(error) = terminate_process_group(child, process_group_id).await {
+        stdin_task.abort();
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = stdin_task.await;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+        return Err(internal_error(error));
+    }
+
+    tokio::select! {
+        _ = reap_sky_io(&mut stdin_task, &mut stdout_task, &mut stderr_task) => {}
+        _ = sleep(SKY_TERM_GRACE_PERIOD) => {
+            stdin_task.abort();
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdin_task.await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+        }
+    }
+    Ok(())
+}
+
+async fn reap_sky_io(
+    stdin_task: &mut tokio::task::JoinHandle<io::Result<()>>,
+    stdout_task: &mut tokio::task::JoinHandle<io::Result<CollectedStream>>,
+    stderr_task: &mut tokio::task::JoinHandle<io::Result<CollectedStream>>,
+) {
+    let _ = stdin_task.await;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
 }
 
 async fn read_bounded_stream<R>(
@@ -639,6 +768,14 @@ fn internal_error(error: io::Error) -> ComputerUseError {
         ComputerUseErrorCode::InternalError,
         format!("internal Computer Use cleanup failed: {error}"),
         /*retryable*/ true,
+    )
+}
+
+fn sky_cancelled_error() -> ComputerUseError {
+    ComputerUseError::new(
+        ComputerUseErrorCode::SkyCancelled,
+        "Sky request was cancelled",
+        /*retryable*/ false,
     )
 }
 
