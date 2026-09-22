@@ -10,6 +10,7 @@ use codex_features::Feature;
 use codex_history::HandoffPreparation;
 use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::RolloutItem;
+use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -25,6 +26,7 @@ use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_pre_compact_handoff_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -180,6 +182,30 @@ fn assert_pending_marker_without_application(items: &[RolloutItem]) {
     );
 }
 
+fn block_post_compact_recovery_in_rollout(path: &Path) -> Result<()> {
+    let mut compacted_count = 0;
+    let lines = fs::read_to_string(path)?
+        .lines()
+        .map(|line| {
+            let mut rollout_line: serde_json::Value = serde_json::from_str(line)?;
+            if rollout_line["type"] == "compacted" {
+                let marker = rollout_line
+                    .pointer_mut("/payload/post_compact_recovery")
+                    .expect("compacted rollout line should retain a recovery marker");
+                marker["boundary_item_id"] = json!("mismatched-post-compact-recovery-boundary");
+                compacted_count += 1;
+            }
+            serde_json::to_string(&rollout_line)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(
+        compacted_count, 1,
+        "expected exactly one compacted rollout line"
+    );
+    fs::write(path, format!("{}\n", lines.join("\n")))?;
+    Ok(())
+}
+
 async fn wait_for_successful_turn_complete(codex: &codex_core::CodexThread) {
     let EventMsg::TurnComplete(completed) =
         wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
@@ -195,6 +221,24 @@ async fn wait_for_failed_turn_complete(codex: &codex_core::CodexThread) {
     else {
         unreachable!("predicate guarantees an error event");
     };
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error.as_ref(), Some(&error));
+}
+
+async fn wait_for_blocked_recovery_terminal_error(codex: &codex_core::CodexThread) {
+    let EventMsg::Error(error) =
+        wait_for_event(codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees an error event");
+    };
+    assert_eq!(
+        error.message,
+        "Fatal error: post-compact recovery is blocked: boundary_mismatch"
+    );
     let EventMsg::TurnComplete(completed) =
         wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
     else {
@@ -219,6 +263,132 @@ async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_successful_turn_complete(codex).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_recovery_fails_local_manual_compaction_terminally() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("first", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+            sse(vec![
+                ev_assistant_message("compact", SUMMARY),
+                ev_completed("compact"),
+            ]),
+        ],
+    )
+    .await;
+    let handoff_mock = mount_pre_compact_handoff_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("pre-compact-handoff", "continue after compaction"),
+            ev_completed("pre-compact-handoff"),
+        ]),
+    )
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::RemoteCompactionV2)
+            .expect("disable remote compaction v2");
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    let initial = builder.build(&server).await?;
+    let home = initial.home.clone();
+    let rollout_path = test_rollout_path(&initial);
+
+    seed_and_compact(&initial.codex).await?;
+    initial.codex.shutdown_and_wait().await?;
+    block_post_compact_recovery_in_rollout(&rollout_path)?;
+
+    let mut resumed_builder = test_codex().with_config(|config| {
+        config
+            .features
+            .disable(Feature::RemoteCompactionV2)
+            .expect("disable remote compaction v2");
+        config.model_provider.name = "OpenAI-compatible test provider".to_string();
+        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(0);
+    });
+    let resumed = resumed_builder.resume(&server, home, rollout_path).await?;
+    resumed.codex.submit(Op::Compact).await?;
+    wait_for_blocked_recovery_terminal_error(&resumed.codex).await;
+    handoff_mock.single_request();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_recovery_fails_remote_v2_manual_compaction_terminally() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("first", FIRST_REPLY),
+                ev_completed("first"),
+            ]),
+            sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": SUMMARY,
+                    }
+                }),
+                ev_completed("compact"),
+            ]),
+        ],
+    )
+    .await;
+    let handoff_mock = mount_pre_compact_handoff_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("pre-compact-handoff", "continue after compaction"),
+            ev_completed("pre-compact-handoff"),
+        ]),
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let initial = builder.build(&server).await?;
+    let home = initial.home.clone();
+    let rollout_path = test_rollout_path(&initial);
+
+    initial
+        .codex
+        .start_or_steer_turn(user_turn(FIRST_USER))
+        .await?;
+    wait_for_successful_turn_complete(&initial.codex).await;
+    initial.codex.submit(Op::Compact).await?;
+    wait_for_successful_turn_complete(&initial.codex).await;
+    initial.codex.shutdown_and_wait().await?;
+    block_post_compact_recovery_in_rollout(&rollout_path)?;
+
+    let mut resumed_builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        });
+    let resumed = resumed_builder.resume(&server, home, rollout_path).await?;
+    resumed.codex.submit(Op::Compact).await?;
+    wait_for_blocked_recovery_terminal_error(&resumed.codex).await;
+    handoff_mock.single_request();
     Ok(())
 }
 

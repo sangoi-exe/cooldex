@@ -86,7 +86,10 @@ impl SessionTask for CompactTask {
             }
         };
         if let Err(err) = result
-            && matches!(err.details(), CodexErrorDetails::TurnAborted)
+            && matches!(
+                err.details(),
+                CodexErrorDetails::TurnAborted | CodexErrorDetails::Fatal(_)
+            )
         {
             return Err(err);
         }
