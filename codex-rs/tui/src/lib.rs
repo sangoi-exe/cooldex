@@ -537,6 +537,7 @@ async fn start_app_server(
                 app_server_instance::InstanceChildLaunch {
                     codex_exe,
                     codex_home: config.codex_home.clone(),
+                    cwd: config.cwd.clone(),
                     raw_config_overrides,
                     profile: loader_overrides.user_config_profile.clone(),
                     strict_config,
@@ -1083,6 +1084,20 @@ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
     loader_overrides_are_default
 }
 
+fn loader_overrides_are_replayable_by_instance_child(
+    loader_overrides: &LoaderOverrides,
+    profile_v2_selected: bool,
+) -> bool {
+    if !profile_v2_selected {
+        return loader_overrides_are_default(loader_overrides);
+    }
+
+    let mut loader_overrides = loader_overrides.clone();
+    loader_overrides.user_config_path = None;
+    loader_overrides.user_config_profile = None;
+    loader_overrides_are_default(&loader_overrides)
+}
+
 /// Restore terminal modes before a fatal startup exit bypasses destructor cleanup.
 fn restore_terminal_before_fatal_exit() {
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
@@ -1141,7 +1156,13 @@ async fn run_ratatui_app(
     startup_draft: startup_draft::StartupDraft,
 ) -> color_eyre::Result<AppExitInfo> {
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
-    let raw_config_overrides = cli.config_overrides.raw_overrides.clone();
+    let mut raw_config_overrides = cli.config_overrides.raw_overrides.clone();
+    if let Some(model_provider) = &overrides.model_provider {
+        raw_config_overrides.push(format!(
+            "model_provider={}",
+            toml::Value::String(model_provider.clone())
+        ));
+    }
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
 
@@ -3101,6 +3122,34 @@ requires_openai_auth = {requires_openai_auth}
         );
         assert!(target.uses_remote_workspace());
         assert_eq!(target.thread_params_mode(), ThreadParamsMode::Remote);
+        Ok(())
+    }
+
+    #[test]
+    fn instance_child_replays_selected_profile_loader_overrides() -> color_eyre::Result<()> {
+        let profile = "work".parse()?;
+        let mut loader_overrides = LoaderOverrides {
+            user_config_path: Some(AbsolutePathBuf::from_absolute_path(
+                std::env::current_dir()?.join("work.config.toml"),
+            )?),
+            user_config_profile: Some(profile),
+            ..Default::default()
+        };
+
+        assert!(loader_overrides_are_replayable_by_instance_child(
+            &loader_overrides,
+            /*profile_v2_selected*/ true,
+        ));
+        assert!(!loader_overrides_are_replayable_by_instance_child(
+            &loader_overrides,
+            /*profile_v2_selected*/ false,
+        ));
+
+        loader_overrides.ignore_user_config = true;
+        assert!(!loader_overrides_are_replayable_by_instance_child(
+            &loader_overrides,
+            /*profile_v2_selected*/ true,
+        ));
         Ok(())
     }
 

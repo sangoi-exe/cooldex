@@ -283,7 +283,10 @@ pub(super) async fn run_main_inner(
             std::io::ErrorKind::Unsupported,
             "`tui.app_server_mode = \"instance_child\"` is supported only on Linux/WSL",
         ));
-        if !loader_overrides_are_default(&loader_overrides) {
+        if !loader_overrides_are_replayable_by_instance_child(
+            &loader_overrides,
+            cli.config_profile_v2.is_some(),
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "`tui.app_server_mode = \"instance_child\"` cannot replay this invocation's config loader overrides",

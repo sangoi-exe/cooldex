@@ -66,6 +66,65 @@ fn missing_profile_v2_fails_closed_for_non_strict_instance_child_app_server() ->
 }
 
 #[test]
+fn selected_profile_v2_reaches_instance_child_mode_validation() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[tui]\napp_server_mode = \"upstream\"\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("work.config.toml"),
+        "[tui]\napp_server_mode = \"instance_child\"\n",
+    )?;
+
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.args([
+        "--profile",
+        "work",
+        "app-server",
+        "--instance-child",
+        "--listen",
+        "off",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains(
+        "internal instance-child launch requires a Unix socket transport",
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn instance_child_mode_uses_the_child_working_directory_for_startup_config() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let child_cwd = codex_home.path().join("child-cwd");
+    std::fs::create_dir_all(child_cwd.join(".codex"))?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "[tui]\napp_server_mode = \"upstream\"\n\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&child_cwd)?
+        ),
+    )?;
+    std::fs::write(
+        child_cwd.join(".codex/config.toml"),
+        "[tui]\napp_server_mode = \"instance_child\"\n",
+    )?;
+
+    let mut cmd = codex_command(codex_home.path())?;
+    cmd.current_dir(&child_cwd)
+        .args(["app-server", "--instance-child", "--listen", "off"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "internal instance-child launch requires a Unix socket transport",
+        ));
+
+    Ok(())
+}
+
+#[test]
 fn agents_accept_interactive_configuration_overrides() -> Result<()> {
     let codex_home = TempDir::new()?;
 

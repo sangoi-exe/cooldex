@@ -2946,7 +2946,7 @@ async fn run_interactive_tui(
     }
 
     #[cfg(any(unix, windows))]
-    if interactive.agents_overview && remote.is_none() {
+    let started_agents_daemon_endpoint = if interactive.agents_overview && remote.is_none() {
         if !std::io::stdin().is_terminal() {
             return Ok(AppExitInfo::fatal("stdin is not a terminal"));
         }
@@ -2956,19 +2956,27 @@ async fn run_interactive_tui(
         cloud_config::load_config(&interactive.config_overrides, LoaderOverrides::default())
             .await
             .map_err(std::io::Error::other)?;
-        codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
+        let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
             .await
             .map_err(|err| std::io::Error::other(format!(
                 "{err:#}\nThe agents overview requires a shared server. Use codex --no-daemon to work without it."
             )))?;
-    }
+        Some(agents_daemon_endpoint(output.socket_path)?)
+    } else {
+        None
+    };
+    #[cfg(not(any(unix, windows)))]
+    let started_agents_daemon_endpoint = None;
 
-    let remote_endpoint = match resolve_remote_endpoint(remote, remote_auth_token_env.clone()) {
-        Ok(remote_endpoint) => remote_endpoint,
-        Err(err) if is_remote_auth_usage_error(&err) => {
-            return Ok(AppExitInfo::fatal(err.to_string()));
-        }
-        Err(err) => return Err(err),
+    let remote_endpoint = match started_agents_daemon_endpoint {
+        Some(endpoint) => Some(endpoint),
+        None => match resolve_remote_endpoint(remote, remote_auth_token_env.clone()) {
+            Ok(remote_endpoint) => remote_endpoint,
+            Err(err) if is_remote_auth_usage_error(&err) => {
+                return Ok(AppExitInfo::fatal(err.to_string()));
+            }
+            Err(err) => return Err(err),
+        },
     };
     let start_tui = || {
         codex_tui::run_main(
@@ -2979,6 +2987,14 @@ async fn run_interactive_tui(
         )
     };
     run_tui_with_recovery(start_tui, remote_auth_token_env.as_deref()).await
+}
+
+fn agents_daemon_endpoint(
+    socket_path: PathBuf,
+) -> std::io::Result<codex_tui::RemoteAppServerEndpoint> {
+    Ok(codex_tui::RemoteAppServerEndpoint::UnixSocket {
+        socket_path: AbsolutePathBuf::from_absolute_path_checked(socket_path)?,
+    })
 }
 
 async fn run_tui_with_recovery<F, Fut>(
@@ -3244,6 +3260,19 @@ mod tests {
         let size = std::mem::size_of_val(&future);
 
         assert!(size < 64 * 1024, "interactive TUI future is {size} bytes");
+    }
+
+    #[test]
+    fn agents_overview_uses_the_socket_returned_by_shared_daemon_startup() -> std::io::Result<()> {
+        let socket_path = std::env::current_dir()?.join("shared-agents.sock");
+
+        assert_eq!(
+            agents_daemon_endpoint(socket_path.clone())?,
+            codex_tui::RemoteAppServerEndpoint::UnixSocket {
+                socket_path: AbsolutePathBuf::from_absolute_path(socket_path)?,
+            }
+        );
+        Ok(())
     }
 
     #[cfg(windows)]

@@ -48,6 +48,7 @@ const OWNER_SUFFIX: &str = ".owner.json";
 pub(crate) struct InstanceChildLaunch {
     pub(crate) codex_exe: PathBuf,
     pub(crate) codex_home: AbsolutePathBuf,
+    pub(crate) cwd: AbsolutePathBuf,
     pub(crate) raw_config_overrides: Vec<String>,
     pub(crate) profile: Option<ProfileV2Name>,
     pub(crate) strict_config: bool,
@@ -102,6 +103,7 @@ impl AppServerInstance {
         }
         command
             .env("CODEX_HOME", launch.codex_home.as_path())
+            .current_dir(launch.cwd.as_path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file));

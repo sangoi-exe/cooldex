@@ -118,6 +118,7 @@ fn instance_launch_for_exe(home: &Path, codex_exe: PathBuf) -> Result<InstanceCh
     Ok(InstanceChildLaunch {
         codex_exe,
         codex_home: absolute(home)?,
+        cwd: absolute(home)?,
         raw_config_overrides: Vec::new(),
         profile: None,
         strict_config: false,
@@ -127,12 +128,15 @@ fn instance_launch_for_exe(home: &Path, codex_exe: PathBuf) -> Result<InstanceCh
 fn instance_launch_with_argv_capture(
     home: &Path,
     capture_path: &Path,
+    cwd_capture_path: &Path,
 ) -> Result<InstanceChildLaunch> {
     let test_exe = std::env::current_exe()?;
     let test_exe = test_exe.to_string_lossy();
     let capture_path = capture_path.to_string_lossy();
+    let cwd_capture_path = cwd_capture_path.to_string_lossy();
     let quoted_test_exe = shlex::try_quote(test_exe.as_ref())?;
     let quoted_capture_path = shlex::try_quote(capture_path.as_ref())?;
+    let quoted_cwd_capture_path = shlex::try_quote(cwd_capture_path.as_ref())?;
     let wrapper = home.join(format!("codex-argv-wrapper-{}.sh", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -141,7 +145,7 @@ fn instance_launch_with_argv_capture(
         .open(&wrapper)?;
     writeln!(
         file,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {quoted_capture_path}\nexec {quoted_test_exe} --exact app_server_instance::tests::app_server_child_helper --ignored --nocapture"
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {quoted_capture_path}\npwd > {quoted_cwd_capture_path}\nexec {quoted_test_exe} --exact app_server_instance::tests::app_server_child_helper --ignored --nocapture"
     )?;
     file.sync_all()?;
     instance_launch_for_exe(home, wrapper)
@@ -488,7 +492,9 @@ async fn instance_child_propagates_psp_feature_override_to_child_argv() -> Resul
     let home = TempDir::new()?;
     write_instance_config(home.path())?;
     let capture_path = home.path().join("instance-child-argv.txt");
-    let mut launch = instance_launch_with_argv_capture(home.path(), &capture_path)?;
+    let cwd_capture_path = home.path().join("instance-child-cwd.txt");
+    let mut launch =
+        instance_launch_with_argv_capture(home.path(), &capture_path, &cwd_capture_path)?;
     launch
         .raw_config_overrides
         .push("features.psp=true".to_string());
@@ -521,6 +527,58 @@ async fn instance_child_propagates_psp_feature_override_to_child_argv() -> Resul
 
 #[tokio::test]
 #[serial(app_server_instance)]
+async fn instance_child_replays_parent_cwd_profile_and_resolved_oss_provider_before_startup()
+-> Result<()> {
+    let home = TempDir::new()?;
+    write_instance_config(home.path())?;
+    let cwd = home.path().join("project");
+    std::fs::create_dir(&cwd)?;
+    let capture_path = home.path().join("instance-child-argv.txt");
+    let cwd_capture_path = home.path().join("instance-child-cwd.txt");
+    let mut launch =
+        instance_launch_with_argv_capture(home.path(), &capture_path, &cwd_capture_path)?;
+    launch.cwd = absolute(&cwd)?;
+    launch
+        .raw_config_overrides
+        .push("model_provider=\"ollama\"".to_string());
+    launch.profile = Some("work".parse()?);
+
+    let started = AppServerInstance::start(launch).await?;
+    let args = std::fs::read_to_string(&capture_path)?
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let app_server_index = args
+        .iter()
+        .position(|arg| arg == "app-server")
+        .expect("instance child subcommand");
+    let provider_override_index = args
+        .windows(2)
+        .position(|window| window == ["-c", "model_provider=\"ollama\""])
+        .expect("resolved OSS provider should be forwarded to the child");
+    let profile_index = args
+        .windows(2)
+        .position(|window| window == ["-p", "work"])
+        .expect("selected Profile V2 should be forwarded to the child");
+
+    assert!(provider_override_index + 1 < app_server_index);
+    assert!(profile_index + 1 < app_server_index);
+    assert_eq!(
+        std::fs::canonicalize(std::fs::read_to_string(&cwd_capture_path)?.trim())?,
+        std::fs::canonicalize(&cwd)?
+    );
+
+    crate::app_server_session::AppServerSession::new_instance_child(
+        started.client,
+        started.supervisor,
+    )
+    .shutdown()
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(app_server_instance)]
 async fn spawn_failure_and_early_exit_leave_no_owned_state() -> Result<()> {
     for codex_exe in [
         PathBuf::from("/definitely/missing/codex"),
@@ -530,6 +588,7 @@ async fn spawn_failure_and_early_exit_leave_no_owned_state() -> Result<()> {
         let launch = InstanceChildLaunch {
             codex_exe,
             codex_home: absolute(home.path())?,
+            cwd: absolute(home.path())?,
             raw_config_overrides: Vec::new(),
             profile: None,
             strict_config: false,
