@@ -159,10 +159,10 @@ async fn recv_turn_aborted_without_second_turn_started(
                     panic!("manual compaction must emit TurnStarted exactly once");
                 }
                 EventMsg::TurnAborted(TurnAbortedEvent {
-                    turn_id,
-                    reason,
-                    ..
-                }) if turn_id.as_deref() == Some(expected_turn_id) && reason == &expected_reason => {
+                    turn_id, reason, ..
+                }) if turn_id.as_deref() == Some(expected_turn_id)
+                    && reason == &expected_reason =>
+                {
                     return event;
                 }
                 _ => {}
@@ -181,7 +181,7 @@ async fn manual_compaction_emits_turn_started_before_cancellable_step_capture() 
         read_started: Notify::new(),
     });
     session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
-        user_provider: Some(Arc::clone(&provider)),
+        user_provider: Some(provider.clone()),
         ..Default::default()
     }));
     let session = Arc::new(session);
