@@ -4,4 +4,5 @@ codex_rust_crate(
     name = "computer-use",
     compile_data = glob(["vendor/openai/**"]),
     crate_name = "codex_computer_use_extension",
+    test_data_extra = glob(["vendor/openai/**"]),
 )

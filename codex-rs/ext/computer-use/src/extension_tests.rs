@@ -31,9 +31,11 @@ const VENDORED_SKY_LINUX_X64: &str = "sky/0.6.2/bin/linux/sky_linux_x64";
 async fn valid_override_pair_contributes_required_stdio_server() -> TestResult {
     let config = test_config().await?;
     let tempdir = tempfile::tempdir()?;
-    let sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let vendored_sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let sky_bin = tempdir.path().join("sky");
     let mcp_bin = tempdir.path().join("codex-computer-use-mcp");
-    copy_executable(&sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &sky_bin)?;
 
     let contributions = contribute_global(
         &config,
@@ -77,9 +79,11 @@ async fn valid_override_pair_contributes_required_stdio_server() -> TestResult {
 #[tokio::test]
 async fn config_pair_contributes_required_stdio_server_with_runtime_args() -> TestResult {
     let tempdir = tempfile::tempdir()?;
-    let sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let vendored_sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let sky_bin = tempdir.path().join("sky");
     let mcp_bin = tempdir.path().join("codex-computer-use-mcp");
-    copy_executable(&sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &sky_bin)?;
     let config = test_config_with_contents(&format!(
         r#"[features.computer_use]
 enabled = true
@@ -286,9 +290,11 @@ async fn incomplete_override_emits_one_warning_per_thread() -> TestResult {
 #[tokio::test]
 async fn invalid_xvfb_override_emits_generic_warning() -> TestResult {
     let tempdir = tempfile::tempdir()?;
-    let sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let vendored_sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let sky_bin = tempdir.path().join("sky");
     let mcp_bin = tempdir.path().join("codex-computer-use-mcp");
-    copy_executable(&sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &mcp_bin)?;
+    copy_executable(&vendored_sky_bin, &sky_bin)?;
     let config = test_config_with_contents(&format!(
         r#"[features.computer_use]
 enabled = true
