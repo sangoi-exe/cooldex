@@ -475,6 +475,7 @@ fn compacted_resume_metadata_presence_round_trips_empty_values() -> Result<()> {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        post_compact_recovery: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: Some(resume_metadata.clone()),
