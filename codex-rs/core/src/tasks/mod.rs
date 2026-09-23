@@ -410,8 +410,9 @@ impl Session {
         }
     }
 
-    // Merge-safety anchor: start/replacement shares generation-bound retirement with abort before
-    // installing a successor task.
+    // Merge-safety anchor: start/replacement acquires the shared persistence-publication permit
+    // before generation-bound retirement, cancels the retired task before releasing it, and keeps
+    // abort hooks and successor start outside the permit.
     async fn replace_or_start_task(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -430,6 +431,7 @@ impl Session {
 
         loop {
             let action = {
+                let _persistence_guard = self.acquire_thread_settings_persistence().await;
                 let mut slot = self.active_turn.lock().await;
                 if slot.is_idle() {
                     StartAction::Start(
@@ -443,13 +445,14 @@ impl Session {
                 {
                     StartAction::Wait(slot.subscribe_generation())
                 } else {
-                    StartAction::Replace(
-                        slot.begin_transition(
+                    let retired_turn = slot
+                        .begin_transition(
                             TerminalTransitionKind::Replacing,
                             Some(turn_context.sub_id.clone()),
                         )
-                        .map_err(turn_slot_codex_error)?,
-                    )
+                        .map_err(turn_slot_codex_error)?;
+                    retired_turn.task.cancellation_token.cancel();
+                    StartAction::Replace(retired_turn)
                 }
             };
 
@@ -987,6 +990,7 @@ impl Session {
     async fn abort_active_turn_owned(self: &Arc<Self>, reason: TurnAbortReason) {
         loop {
             let action = {
+                let _persistence_guard = self.acquire_thread_settings_persistence().await;
                 let mut slot = self.active_turn.lock().await;
                 if slot.is_idle() {
                     AbortSlotAction::Noop
@@ -1006,7 +1010,10 @@ impl Session {
                     AbortSlotAction::Wait(slot.subscribe_generation())
                 } else {
                     match slot.begin_transition(terminal_transition_kind(&reason), None) {
-                        Ok(retired_turn) => AbortSlotAction::Retire(retired_turn),
+                        Ok(retired_turn) => {
+                            retired_turn.task.cancellation_token.cancel();
+                            AbortSlotAction::Retire(retired_turn)
+                        }
                         Err(err) => {
                             warn!(%err, "failed to begin turn abort transition");
                             return;
@@ -1070,6 +1077,7 @@ impl Session {
     ) -> bool {
         loop {
             let action = {
+                let _persistence_guard = self.acquire_thread_settings_persistence().await;
                 let mut slot = self.active_turn.lock().await;
                 if slot.is_idle() {
                     AbortSlotAction::Noop
@@ -1101,7 +1109,10 @@ impl Session {
                     AbortSlotAction::Wait(slot.subscribe_generation())
                 } else {
                     match slot.begin_transition(terminal_transition_kind(&reason), None) {
-                        Ok(retired_turn) => AbortSlotAction::Retire(retired_turn),
+                        Ok(retired_turn) => {
+                            retired_turn.task.cancellation_token.cancel();
+                            AbortSlotAction::Retire(retired_turn)
+                        }
                         Err(err) => {
                             warn!(%err, "failed to begin targeted turn abort transition");
                             return false;
@@ -1497,12 +1508,10 @@ impl Session {
         turn_state: &Mutex<TurnState>,
     ) -> bool {
         let sub_id = task.turn_context.sub_id.clone();
-        if task.cancellation_token.is_cancelled() {
-            return false;
+        if !task.cancellation_token.is_cancelled() {
+            trace!(task_kind = ?task.kind, sub_id, "aborting running task");
+            task.cancellation_token.cancel();
         }
-
-        trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-        task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
             && task
                 .turn_context

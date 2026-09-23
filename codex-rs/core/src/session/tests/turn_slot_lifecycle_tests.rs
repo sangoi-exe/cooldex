@@ -1,6 +1,7 @@
 use super::*;
 use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
+use codex_protocol::turn_input::SuspendTurnOutcome;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
@@ -178,8 +179,625 @@ fn count_user_message_text(
         .count()
 }
 
+async fn start_gated_compaction_publication(
+    session: &Arc<Session>,
+    store: &GatedInMemoryThreadStore,
+) -> (
+    PostFlushGate,
+    tokio::task::JoinHandle<codex_protocol::error::Result<()>>,
+) {
+    let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+    let gate = store.gate_next_flush();
+    let compaction = tokio::spawn({
+        let session = Arc::clone(session);
+        async move {
+            session
+                .replace_compacted_history(
+                    vec![ResponseItemEnvelope::new(user_message(
+                        "gated compaction publication",
+                    ))],
+                    /*reference_context_item*/ None,
+                    /*world_state_baseline*/ None,
+                    CompactedHistoryMetadata {
+                        message: "gated compaction publication".to_string(),
+                        window_number,
+                        window_ids,
+                        compaction_response_id: None,
+                        compaction_model_hash: None,
+                        reviewer_compaction_hash: None,
+                    },
+                )
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), gate.wait_until_flushed())
+        .await
+        .expect("compaction should reach the post-flush test gate");
+    (gate, compaction)
+}
+
+async fn finish_gated_compaction_publication(
+    gate: &PostFlushGate,
+    compaction: tokio::task::JoinHandle<codex_protocol::error::Result<()>>,
+) {
+    gate.release().await;
+    timeout(Duration::from_secs(2), compaction)
+        .await
+        .expect("compaction should resume after publication gate release")
+        .expect("compaction task should not panic")
+        .expect("compaction should publish its durable checkpoint");
+}
+
+async fn start_regular_never_ending_task(session: &Arc<Session>, turn_context: &Arc<TurnContext>) {
+    session
+        .spawn_task(
+            Arc::clone(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    wait_for_running_turn(session.as_ref(), &turn_context.sub_id).await;
+}
+
+async fn wait_for_lifecycle_competitor_start(started: tokio::sync::oneshot::Receiver<()>) {
+    timeout(Duration::from_secs(2), started)
+        .await
+        .expect("lifecycle competitor should start")
+        .expect("lifecycle competitor start observer should remain open");
+}
+
+async fn wait_for_lifecycle_retirement(session: &Session) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if session.active_turn.lock().await.is_transitioning() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lifecycle should retire the active task before its deferred publication starts");
+}
+
+struct DeferredCompactionPublicationTask {
+    cancelled_tx: async_channel::Sender<()>,
+    start_rx: async_channel::Receiver<()>,
+    rejected_tx: async_channel::Sender<bool>,
+}
+
+impl SessionTask for DeferredCompactionPublicationTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Compact
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.deferred_compaction_publication"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        self.cancelled_tx
+            .send(())
+            .await
+            .expect("test should observe deferred compaction task cancellation");
+        self.start_rx
+            .recv()
+            .await
+            .expect("test should release deferred compaction publication");
+        let (window_number, window_ids) = session.prepare_auto_compact_window().await;
+        let result = session
+            .replace_compacted_history_for_task(
+                &cancellation_token,
+                vec![ResponseItemEnvelope::new(user_message(
+                    "cancelled task compaction publication",
+                ))],
+                /*reference_context_item*/ None,
+                /*world_state_baseline*/ None,
+                CompactedHistoryMetadata {
+                    message: "cancelled task compaction publication".to_string(),
+                    window_number,
+                    window_ids,
+                    compaction_response_id: None,
+                    compaction_model_hash: None,
+                    reviewer_compaction_hash: None,
+                },
+            )
+            .await;
+        self.rejected_tx
+            .send(result.is_err())
+            .await
+            .expect("test should observe deferred compaction publication admission");
+        result?;
+        Ok(Default::default())
+    }
+}
+
+struct DeferredRecoveryPublicationTask {
+    cancelled_tx: async_channel::Sender<()>,
+    start_rx: async_channel::Receiver<()>,
+    rejected_tx: async_channel::Sender<bool>,
+    identity: PostCompactRecoveryIdentity,
+}
+
+impl SessionTask for DeferredRecoveryPublicationTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.deferred_recovery_publication"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        session: Arc<Session>,
+        ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        self.cancelled_tx
+            .send(())
+            .await
+            .expect("test should observe deferred recovery task cancellation");
+        self.start_rx
+            .recv()
+            .await
+            .expect("test should release deferred recovery publication");
+        let result = session
+            .record_post_compact_recovery_sampling_success_for_task(
+                &self.identity,
+                &ctx.sub_id,
+                &cancellation_token,
+            )
+            .await;
+        self.rejected_tx
+            .send(result.is_err())
+            .await
+            .expect("test should observe deferred recovery publication admission");
+        result?;
+        Ok(Default::default())
+    }
+}
+
 // Merge-safety anchor: lifecycle tests exercise direct TurnSlot admission so exact rejection
-// payloads and independently owned transitions stay covered without retired adapters.
+// payloads, post-flush publication boundaries, and independently owned transitions stay covered
+// without retired adapters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retirement_rejects_cancelled_task_compaction_publication_before_durable_append() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("session should be unique"))
+        .await;
+    let (cancelled_tx, cancelled_rx) = async_channel::bounded(1);
+    let (start_tx, start_rx) = async_channel::bounded(1);
+    let (rejected_tx, rejected_rx) = async_channel::bounded(1);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            DeferredCompactionPublicationTask {
+                cancelled_tx,
+                start_rx,
+                rejected_tx,
+            },
+        )
+        .await;
+    wait_for_running_turn(session.as_ref(), &turn_context.sub_id).await;
+
+    let interrupt = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    wait_for_lifecycle_retirement(session.as_ref()).await;
+    timeout(Duration::from_secs(2), cancelled_rx.recv())
+        .await
+        .expect("retired compaction task should observe cancellation")
+        .expect("retired compaction task cancellation observer should remain open");
+    start_tx
+        .send(())
+        .await
+        .expect("deferred task should remain available during lifecycle retirement");
+    assert!(
+        timeout(Duration::from_secs(2), rejected_rx.recv())
+            .await
+            .expect("deferred compaction publication should report its admission result")
+            .expect("deferred compaction publication observer should remain open"),
+        "a retired task must reject compaction publication before its durable append"
+    );
+    timeout(Duration::from_secs(2), interrupt)
+        .await
+        .expect("interruption should finish after rejected publication")
+        .expect("interruption task should not panic");
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+
+    let durable_items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("durable thread history should be readable")
+        .items;
+    assert!(
+        !durable_items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::Compacted(_))),
+        "a cancelled task must not append a compacted checkpoint after lifecycle retirement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retirement_rejects_cancelled_task_recovery_publication_before_durable_proof() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    attach_in_memory_thread_store(Arc::get_mut(&mut session).expect("session should be unique"))
+        .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let (cancelled_tx, cancelled_rx) = async_channel::bounded(1);
+    let (start_tx, start_rx) = async_channel::bounded(1);
+    let (rejected_tx, rejected_rx) = async_channel::bounded(1);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            DeferredRecoveryPublicationTask {
+                cancelled_tx,
+                start_rx,
+                rejected_tx,
+                identity: identity.clone(),
+            },
+        )
+        .await;
+    wait_for_running_turn(session.as_ref(), &turn_context.sub_id).await;
+
+    let interrupt = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    wait_for_lifecycle_retirement(session.as_ref()).await;
+    timeout(Duration::from_secs(2), cancelled_rx.recv())
+        .await
+        .expect("retired recovery task should observe cancellation")
+        .expect("retired recovery task cancellation observer should remain open");
+    start_tx
+        .send(())
+        .await
+        .expect("deferred task should remain available during lifecycle retirement");
+    assert!(
+        timeout(Duration::from_secs(2), rejected_rx.recv())
+            .await
+            .expect("deferred recovery publication should report its admission result")
+            .expect("deferred recovery publication observer should remain open"),
+        "a retired task must reject recovery publication before its durable proof"
+    );
+    timeout(Duration::from_secs(2), interrupt)
+        .await
+        .expect("interruption should finish after rejected publication")
+        .expect("interruption task should not panic");
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+
+    let durable_items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("durable thread history should be readable")
+        .items;
+    assert!(
+        !durable_items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::PostCompactRecoveryApplied(applied)
+                    if applied.compaction_window_id == identity.compaction_window_id
+                        && applied.boundary_item_id == identity.boundary_item_id
+                        && applied.turn_id == turn_context.sub_id
+            )
+        }),
+        "a cancelled task must not append a recovery proof after lifecycle retirement"
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity),
+        "a rejected recovery publication must not clear live recovery state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interruption_waits_for_compaction_live_publication() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_gated_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+
+    let (gate, compaction) = start_gated_compaction_publication(&session, store.as_ref()).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let interrupt = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            started_tx
+                .send(())
+                .expect("interruption start observer should remain open");
+            session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    wait_for_lifecycle_competitor_start(started_rx).await;
+    assert!(
+        !interrupt.is_finished(),
+        "interruption must wait for durable compaction publication"
+    );
+    assert_eq!(
+        session.active_turn.lock().await.running_turn_id(),
+        Some(turn_context.sub_id.as_str())
+    );
+
+    finish_gated_compaction_publication(&gate, compaction).await;
+    timeout(Duration::from_secs(2), interrupt)
+        .await
+        .expect("interruption should finish after compaction publication")
+        .expect("interruption task should not panic");
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+    assert!(session.active_turn.lock().await.is_idle());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn targeted_abort_waits_for_compaction_live_publication() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_gated_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+
+    let (gate, compaction) = start_gated_compaction_publication(&session, store.as_ref()).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let targeted_abort = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_id = turn_context.sub_id.clone();
+        async move {
+            started_tx
+                .send(())
+                .expect("targeted-abort start observer should remain open");
+            session
+                .abort_turn_if_active(&turn_id, TurnAbortReason::Interrupted)
+                .await
+        }
+    });
+    wait_for_lifecycle_competitor_start(started_rx).await;
+    assert!(
+        !targeted_abort.is_finished(),
+        "targeted abort must wait for durable compaction publication"
+    );
+    assert_eq!(
+        session.active_turn.lock().await.running_turn_id(),
+        Some(turn_context.sub_id.as_str())
+    );
+
+    finish_gated_compaction_publication(&gate, compaction).await;
+    assert!(
+        timeout(Duration::from_secs(2), targeted_abort)
+            .await
+            .expect("targeted abort should finish after compaction publication")
+            .expect("targeted abort task should not panic")
+    );
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Interrupted).await;
+    assert!(session.active_turn.lock().await.is_idle());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_waits_for_compaction_live_publication_before_successor_admission() {
+    let (mut session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let store = attach_gated_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    let successor_id = "successor-after-compaction-publication".to_string();
+    let successor = session
+        .new_turn_with_default_settings(successor_id.clone(), Default::default())
+        .await;
+
+    let (gate, compaction) = start_gated_compaction_publication(&session, store.as_ref()).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let replacement = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            started_tx
+                .send(())
+                .expect("replacement start observer should remain open");
+            session
+                .spawn_task(
+                    successor,
+                    Vec::new(),
+                    NeverEndingTask {
+                        kind: TaskKind::Regular,
+                        listen_to_cancellation_token: true,
+                    },
+                )
+                .await;
+        }
+    });
+    wait_for_lifecycle_competitor_start(started_rx).await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement must wait for durable compaction publication"
+    );
+    assert_eq!(
+        session.active_turn.lock().await.running_turn_id(),
+        Some(turn_context.sub_id.as_str())
+    );
+
+    finish_gated_compaction_publication(&gate, compaction).await;
+    timeout(Duration::from_secs(2), replacement)
+        .await
+        .expect("replacement should finish after compaction publication")
+        .expect("replacement task should not panic");
+    recv_turn_aborted(&rx, &turn_context.sub_id, TurnAbortReason::Replaced).await;
+    wait_for_running_turn(session.as_ref(), &successor_id).await;
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    recv_turn_aborted(&rx, &successor_id, TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suspension_waits_for_compaction_live_publication() {
+    let thread_manager = crate::ThreadManager::with_models_provider_for_tests(
+        CodexAuth::from_api_key("test"),
+        built_in_model_providers(/*openai_base_url*/ None)["openai"].clone(),
+    );
+    let (mut session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = thread_manager.agent_control();
+    let store = attach_gated_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+
+    let (gate, compaction) = start_gated_compaction_publication(&session, store.as_ref()).await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let suspension = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            started_tx
+                .send(())
+                .expect("suspension start observer should remain open");
+            super::super::turn_suspension::suspend_turn_and_shutdown(
+                &session,
+                "suspend-after-compaction-publication".to_string(),
+            )
+            .await
+        }
+    });
+    wait_for_lifecycle_competitor_start(started_rx).await;
+    assert!(
+        !suspension.is_finished(),
+        "suspension must wait for durable compaction publication"
+    );
+    assert_eq!(
+        session.active_turn.lock().await.running_turn_id(),
+        Some(turn_context.sub_id.as_str())
+    );
+
+    finish_gated_compaction_publication(&gate, compaction).await;
+    assert_eq!(
+        timeout(Duration::from_secs(2), suspension)
+            .await
+            .expect("suspension should finish after compaction publication")
+            .expect("suspension task should not panic")
+            .expect("suspension should succeed"),
+        SuspendTurnOutcome::Suspended {
+            turn_id: turn_context.sub_id.clone(),
+        }
+    );
+    assert!(session.active_turn.lock().await.is_idle());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_application_retains_live_recovery_until_durable_proof_returns() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let store = attach_gated_in_memory_thread_store(
+        Arc::get_mut(&mut session).expect("session should be uniquely owned"),
+    )
+    .await;
+    let identity = install_test_post_compact_recovery(session.as_ref()).await;
+    let recovery_packet = crate::context::PostCompactRecoveryContext::new(
+        &identity.compaction_window_id,
+        &identity.boundary_item_id,
+        "test recovery instructions",
+        None,
+    )
+    .expect("recovery packet");
+    session
+        .state
+        .lock()
+        .await
+        .post_compact_recovery
+        .cache_packet(&identity, recovery_packet)
+        .expect("cache recovery packet");
+    let gate = store.gate_next_flush();
+    let application = tokio::spawn({
+        let session = Arc::clone(&session);
+        let identity = identity.clone();
+        async move {
+            session
+                .record_post_compact_recovery_sampling_success(&identity, "sampling-turn")
+                .await
+        }
+    });
+    timeout(Duration::from_secs(2), gate.wait_until_flushed())
+        .await
+        .expect("recovery application should reach the post-flush test gate");
+    let durable_items = session
+        .live_thread()
+        .expect("test live thread")
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("durable recovery proof should be readable after its flush")
+        .items;
+    assert!(durable_items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::PostCompactRecoveryApplied(applied)
+                if applied.compaction_window_id == identity.compaction_window_id
+                    && applied.boundary_item_id == identity.boundary_item_id
+                    && applied.turn_id == "sampling-turn"
+        )
+    }));
+    assert!(
+        !application.is_finished(),
+        "recovery application must not clear live state before its durable proof returns"
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        Some(&identity)
+    );
+    assert!(
+        session.thread_settings_persistence.try_acquire().is_err(),
+        "recovery application must retain the shared publication permit through its live clear"
+    );
+
+    gate.release().await;
+    timeout(Duration::from_secs(2), application)
+        .await
+        .expect("recovery application should finish after durable proof release")
+        .expect("recovery application task should not panic")
+        .expect("recovery application should clear matching live state");
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity(),
+        None
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_handler_input_waits_for_completion_terminal_flush() {
     let (mut session, old_turn_context, rx) = make_session_and_context_with_rx().await;

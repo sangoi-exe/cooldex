@@ -2934,9 +2934,10 @@ async fn try_run_sampling_request(
                 // draining and cancellation so it cannot be hidden by a later abort result.
                 if let Some(recovery) = post_compact_recovery
                     && let Err(err) = sess
-                        .record_post_compact_recovery_sampling_success(
+                        .record_post_compact_recovery_sampling_success_for_task(
                             recovery,
                             &turn_context.sub_id,
+                            &cancellation_token,
                         )
                         .await
                 {

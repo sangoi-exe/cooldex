@@ -4125,12 +4125,51 @@ impl Session {
         state.replace_history(items, reference_context_item);
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_compacted_history(
+        &self,
+        items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        metadata: impl Into<CompactedHistoryInstallation>,
+    ) -> CodexResult<()> {
+        self.replace_compacted_history_inner(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata.into(),
+            /*cancellation_token*/ None,
+        )
+        .await
+    }
+
+    /// Installs a compaction checkpoint only while its originating task remains uncancelled after
+    /// persistence-publication admission.
+    pub(crate) async fn replace_compacted_history_for_task(
+        &self,
+        cancellation_token: &CancellationToken,
+        items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        metadata: impl Into<CompactedHistoryInstallation>,
+    ) -> CodexResult<()> {
+        self.replace_compacted_history_inner(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata.into(),
+            Some(cancellation_token),
+        )
+        .await
+    }
+
+    async fn replace_compacted_history_inner(
         &self,
         mut items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
-        metadata: impl Into<CompactedHistoryInstallation>,
+        metadata: CompactedHistoryInstallation,
+        cancellation_token: Option<&CancellationToken>,
     ) -> CodexResult<()> {
         // Merge-safety anchor: compacted history, recovery identity, and the final transient
         // handoff/recovery packet are prepared before durable persistence and published together
@@ -4138,11 +4177,16 @@ impl Session {
         let CompactedHistoryInstallation {
             metadata,
             prepared_handoff,
-        } = metadata.into();
+        } = metadata;
         // Merge-safety anchor: take the settings-persistence permit before validating a
         // prepared source or building its recovery packet, then retain it through the durable
-        // checkpoint and live publication so later settings cannot cross that boundary.
+        // checkpoint and live publication so later settings cannot cross that boundary. Lifecycle
+        // retirement cancels its exact task token under this permit, before a later publisher can
+        // acquire it.
         let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(CodexErr::TurnAborted);
+        }
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -4774,11 +4818,46 @@ impl Session {
         state.take_new_context_window_request()
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_new_context_window_with_prepared_handoff(
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
         prepared_handoff: PreparedPreCompactHandoff,
+    ) -> CodexResult<u64> {
+        self.start_new_context_window_with_prepared_handoff_inner(
+            step_context,
+            world_state,
+            prepared_handoff,
+            /*cancellation_token*/ None,
+        )
+        .await
+    }
+
+    /// Starts a token-budget context window only while the preparing task remains uncancelled
+    /// after persistence-publication admission.
+    pub(crate) async fn start_new_context_window_with_prepared_handoff_for_task(
+        &self,
+        step_context: &StepContext,
+        world_state: Arc<WorldState>,
+        prepared_handoff: PreparedPreCompactHandoff,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<u64> {
+        self.start_new_context_window_with_prepared_handoff_inner(
+            step_context,
+            world_state,
+            prepared_handoff,
+            Some(cancellation_token),
+        )
+        .await
+    }
+
+    async fn start_new_context_window_with_prepared_handoff_inner(
+        &self,
+        step_context: &StepContext,
+        world_state: Arc<WorldState>,
+        prepared_handoff: PreparedPreCompactHandoff,
+        cancellation_token: Option<&CancellationToken>,
     ) -> CodexResult<u64> {
         // Merge-safety anchor: token-budget context windows install through the same prepared
         // handoff/recovery checkpoint as every other compaction route.
@@ -4825,11 +4904,12 @@ impl Session {
             compaction_model_hash: None,
             reviewer_compaction_hash: None,
         };
-        self.replace_compacted_history(
+        self.replace_compacted_history_inner(
             context_items,
             Some(turn_context_item),
             Some(world_state),
             metadata.with_prepared_handoff(prepared_handoff),
+            cancellation_token,
         )
         .await?;
         self.recompute_token_usage(turn_context).await;

@@ -133,11 +133,47 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_post_compact_recovery_sampling_success(
         &self,
         identity: &PostCompactRecoveryIdentity,
         turn_id: &str,
     ) -> CodexResult<()> {
+        self.record_post_compact_recovery_sampling_success_inner(
+            identity, turn_id, /*cancellation_token*/ None,
+        )
+        .await
+    }
+
+    /// Records a recovery proof only while the sampling task remains uncancelled after
+    /// persistence-publication admission.
+    pub(crate) async fn record_post_compact_recovery_sampling_success_for_task(
+        &self,
+        identity: &PostCompactRecoveryIdentity,
+        turn_id: &str,
+        cancellation_token: &tokio_util::sync::CancellationToken,
+    ) -> CodexResult<()> {
+        self.record_post_compact_recovery_sampling_success_inner(
+            identity,
+            turn_id,
+            Some(cancellation_token),
+        )
+        .await
+    }
+
+    async fn record_post_compact_recovery_sampling_success_inner(
+        &self,
+        identity: &PostCompactRecoveryIdentity,
+        turn_id: &str,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> CodexResult<()> {
+        // Merge-safety anchor: retain the shared persistence-publication permit from the
+        // application proof through the matching live clear, so retirement cannot cross it. A
+        // retiring lifecycle cancels this task token before releasing the shared permit.
+        let _persistence_guard = self.acquire_thread_settings_persistence().await;
+        if cancellation_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return Err(CodexErr::TurnAborted);
+        }
         let application = {
             let state = self.state.lock().await;
             state

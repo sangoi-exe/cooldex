@@ -192,6 +192,7 @@ async fn run_remote_compact_task_inner(
         compaction_metadata,
         &mut analytics_details,
         prepared_handoff,
+        cancellation_token,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -239,6 +240,7 @@ async fn run_remote_compact_task_inner_impl(
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
     prepared_handoff: PreparedPreCompactHandoff,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let context_compaction_item = ContextCompactionItem::new();
@@ -370,7 +372,8 @@ async fn run_remote_compact_task_inner_impl(
     } else {
         None
     };
-    sess.replace_compacted_history(
+    sess.replace_compacted_history_for_task(
+        cancellation_token,
         new_history,
         reference_context_item,
         world_state_baseline,

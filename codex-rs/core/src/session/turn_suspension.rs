@@ -11,13 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-// Merge-safety anchor: suspension flushes durable history before retiring and cancelling active
-// root execution.
+// Merge-safety anchor: suspension flushes durable history, waits for compaction/recovery live
+// publication before retirement, cancels the retired task under the permit, and leaves forced
+// shutdown outside the permit.
 pub(super) async fn suspend_turn_and_shutdown(
     session: &Arc<Session>,
     submission_id: String,
 ) -> CodexResult<SuspendTurnOutcome> {
     {
+        let _persistence_guard = session.acquire_thread_settings_persistence().await;
         let active = session.active_turn.lock().await;
         let Some(task) = active.running_task() else {
             return Ok(SuspendTurnOutcome::NotActive);
@@ -52,6 +54,7 @@ pub(super) async fn suspend_turn_and_shutdown(
     // kind while acquiring the slot's terminal-transition ownership.
     let retired_turn = loop {
         let mut generation_rx = {
+            let _persistence_guard = session.acquire_thread_settings_persistence().await;
             let mut active = session.active_turn.lock().await;
             let Some(task) = active.running_task() else {
                 return Ok(SuspendTurnOutcome::NotActive);
@@ -66,13 +69,15 @@ pub(super) async fn suspend_turn_and_shutdown(
             {
                 active.subscribe_generation()
             } else {
-                break active
+                let retired_turn = active
                     .begin_transition(TerminalTransitionKind::Interrupting, None)
                     .map_err(|error| {
                         CodexErr::Fatal(format!(
                             "accepted root turn suspension could not begin terminal transition: {error}"
                         ))
                     })?;
+                retired_turn.task.cancellation_token.cancel();
+                break retired_turn;
             }
         };
         if generation_rx.changed().await.is_err() {
@@ -85,7 +90,6 @@ pub(super) async fn suspend_turn_and_shutdown(
     let turn_id = task.turn_context.sub_id.clone();
     // Normal shutdown records a terminal turn event, preventing another worker from
     // recovering this turn under its original ID. Cancel the task without that event.
-    task.cancellation_token.cancel();
     task.turn_context
         .turn_metadata_state
         .cancel_git_enrichment_task();

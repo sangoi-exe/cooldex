@@ -16,7 +16,8 @@ use codex_protocol::user_input::UserInput;
 use tokio_util::sync::CancellationToken;
 
 // Merge-safety anchor: manual compact task cancellation flows through every selected compaction
-// implementation before transient handoff preparation and never interrupts installation.
+// implementation before transient handoff preparation; durable installation either owns
+// persistence-publication admission or is rejected before it begins.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CompactTask;
 

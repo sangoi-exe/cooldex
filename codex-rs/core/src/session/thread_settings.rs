@@ -18,6 +18,12 @@ use std::sync::Arc;
 use tokio::sync::SemaphorePermit;
 
 impl Session {
+    /// Acquires the shared permit before persistent publication or forced lifecycle retirement
+    /// admission.
+    pub(crate) async fn acquire_thread_settings_persistence(&self) -> SemaphorePermit<'_> {
+        acquire_persistence_lock(self).await
+    }
+
     /// Captures and flushes current settings under the shared persistence permit.
     pub(crate) async fn checkpoint_thread_settings(&self) -> ThreadStoreResult<()> {
         let _settings_guard = acquire_persistence_lock(self).await;

@@ -62,7 +62,8 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
-    /// Orders accepted settings commits and their persisted events with compaction checkpoints.
+    /// Merge-safety anchor: serializes accepted settings, compaction/recovery durable publication,
+    /// and forced lifecycle-retirement admission so live state cannot cross a durable publication.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
     pub(super) thread_settings_persistence: Semaphore,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle

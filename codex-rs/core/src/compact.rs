@@ -259,6 +259,7 @@ async fn run_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         prepared_handoff,
+        cancellation_token,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -309,6 +310,7 @@ async fn run_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     prepared_handoff: PreparedPreCompactHandoff,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
     let turn_context = &step_context.turn;
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -459,7 +461,8 @@ async fn run_compact_task_inner_impl(
             Some(step_context.to_turn_context_item())
         }
     };
-    sess.replace_compacted_history(
+    sess.replace_compacted_history_for_task(
+        cancellation_token,
         new_history,
         reference_context_item,
         world_state_baseline,

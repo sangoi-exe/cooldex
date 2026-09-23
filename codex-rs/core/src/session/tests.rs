@@ -214,6 +214,21 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rmcp_client::ElicitationAction;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::ArchiveThreadParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::DeleteThreadParams;
+use codex_thread_store::ListThreadsParams;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::ReadThreadByRolloutPathParams;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::StoredThread;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadPage;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreFuture;
+use codex_thread_store::UpdateThreadMetadataParams;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::context_snapshot;
@@ -5649,7 +5664,9 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
     assert_ne!(committed, restored);
     drop(refresh_guard);
     update.await.expect("accepted settings update");
-    checkpoint.await;
+    checkpoint
+        .await
+        .expect("compaction checkpoint should persist after accepted settings update");
     settings_checkpoint
         .await
         .expect("checkpoint current settings");
@@ -11951,11 +11968,144 @@ enum TerminalEventKind {
     TurnAborted,
 }
 
+struct PendingPostFlushGate {
+    entered_tx: async_channel::Sender<()>,
+    release_rx: async_channel::Receiver<()>,
+}
+
+pub(crate) struct PostFlushGate {
+    entered_rx: async_channel::Receiver<()>,
+    release_tx: async_channel::Sender<()>,
+}
+
+impl PostFlushGate {
+    pub(crate) async fn wait_until_flushed(&self) {
+        self.entered_rx
+            .recv()
+            .await
+            .expect("gated persistence should report its durable flush");
+    }
+
+    pub(crate) async fn release(&self) {
+        self.release_tx
+            .send(())
+            .await
+            .expect("gated persistence should still await live publication");
+    }
+}
+
+pub(crate) struct GatedInMemoryThreadStore {
+    inner: Arc<codex_thread_store::InMemoryThreadStore>,
+    post_flush_gate: std::sync::Mutex<Option<PendingPostFlushGate>>,
+}
+
+macro_rules! delegate_store_methods {
+    ($(fn $name:ident($($param:ident: $params:ty),*) -> $result:ty;)*) => {
+        $(fn $name(&self, $($param: $params),*) -> ThreadStoreFuture<'_, $result> {
+            ThreadStore::$name(self.inner.as_ref(), $($param),*)
+        })*
+    };
+}
+
+impl GatedInMemoryThreadStore {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(codex_thread_store::InMemoryThreadStore::default()),
+            post_flush_gate: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Pauses exactly one successful underlying durable flush before its caller can publish live
+    /// state.
+    pub(crate) fn gate_next_flush(&self) -> PostFlushGate {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let mut gate = self
+            .post_flush_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            gate.replace(PendingPostFlushGate {
+                entered_tx,
+                release_rx,
+            })
+            .is_none(),
+            "only one test-local durable-flush gate may be armed at a time"
+        );
+        PostFlushGate {
+            entered_rx,
+            release_tx,
+        }
+    }
+}
+
+impl ThreadStore for GatedInMemoryThreadStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    delegate_store_methods! {
+        fn create_thread(params: CreateThreadParams) -> ();
+        fn resume_thread(params: ResumeThreadParams) -> ();
+        fn append_items(params: AppendThreadItemsParams) -> ();
+        fn persist_thread(thread_id: ThreadId, context: PersistContext) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: LoadThreadHistoryParams) -> StoredThreadHistory;
+        fn read_thread(params: ReadThreadParams) -> StoredThread;
+        fn read_thread_by_rollout_path(params: ReadThreadByRolloutPathParams) -> StoredThread;
+        fn list_threads(params: ListThreadsParams) -> ThreadPage;
+        fn update_thread_metadata(params: UpdateThreadMetadataParams) -> Option<StoredThread>;
+        fn archive_thread(params: ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: ArchiveThreadParams) -> StoredThread;
+        fn delete_thread(params: DeleteThreadParams) -> ();
+    }
+
+    fn flush_thread(&self, thread_id: ThreadId) -> codex_thread_store::ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            self.inner.flush_thread(thread_id).await?;
+            let gate = self
+                .post_flush_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(gate) = gate {
+                gate.entered_tx
+                    .send(())
+                    .await
+                    .expect("gated persistence observer should remain open");
+                gate.release_rx
+                    .recv()
+                    .await
+                    .expect("gated persistence should be released by the test");
+            }
+            Ok(())
+        })
+    }
+}
+
 async fn attach_in_memory_thread_store(
     session: &mut Session,
 ) -> Arc<codex_thread_store::InMemoryThreadStore> {
     let store = Arc::new(codex_thread_store::InMemoryThreadStore::default());
     let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    attach_test_thread_store(session, thread_store).await;
+    store
+}
+
+pub(crate) async fn attach_gated_in_memory_thread_store(
+    session: &mut Session,
+) -> Arc<GatedInMemoryThreadStore> {
+    let store = Arc::new(GatedInMemoryThreadStore::new());
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    attach_test_thread_store(session, thread_store).await;
+    store
+}
+
+async fn attach_test_thread_store(
+    session: &mut Session,
+    thread_store: Arc<dyn codex_thread_store::ThreadStore>,
+) {
     let config = session.get_config().await;
     let live_thread = LiveThread::create(
         Arc::clone(&thread_store),
@@ -11993,7 +12143,6 @@ async fn attach_in_memory_thread_store(
     .expect("create thread persistence");
     session.services.thread_store = thread_store;
     session.services.live_thread = Some(live_thread);
-    store
 }
 
 #[tokio::test]
