@@ -2074,6 +2074,10 @@ impl Session {
     }
 
     /// Captures a V2 child's immutable birth identity from the canonical persisted settings owner.
+    #[expect(
+        clippy::expect_used,
+        reason = "fresh V2 identity snapshots must fail loud if required birth-identity fields are absent"
+    )]
     pub(crate) async fn agent_identity_snapshot(&self) -> AgentIdentitySnapshot {
         let state = self.state.lock().await;
         let configuration = &state.session_configuration;
@@ -5483,6 +5487,14 @@ impl Session {
         .await
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "queued-input delivery keeps active-turn context, state, metadata, and retained input explicit"
+    )]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn validation and queue insertion must remain atomic across queued delivery"
+    )]
     async fn queue_turn_input(
         &self,
         active_turn_context: Arc<TurnContext>,

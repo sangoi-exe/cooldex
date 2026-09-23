@@ -82,6 +82,10 @@ const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
 
 // Merge-safety anchor: remote-v2 compaction prepares one transient handoff after the accepted
 // hook and carries it only to the shared durable-before-live installer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "remote auto compaction keeps explicit context, client session, metadata, and cancellation ownership"
+)]
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
@@ -232,6 +236,10 @@ async fn run_remote_compact_task_inner(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "remote compaction preserves explicit fallback, analytics, prepared handoff, and cancellation ownership"
+)]
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     step_context: &Arc<StepContext>,

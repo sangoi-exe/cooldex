@@ -1450,6 +1450,10 @@ async fn maybe_run_previous_model_inline_compact(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "auto compaction must retain its explicit step, fallback, client session, injection, reason, phase, and cancellation inputs"
+)]
 #[instrument(
     level = "trace",
     skip_all,

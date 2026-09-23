@@ -386,7 +386,7 @@ async fn restore_v2_identity_snapshot(
         latest_thread_settings.reasoning_summary,
         base_instructions,
         first_persisted_developer_instructions(&history),
-        latest_thread_settings.service_tier.clone(),
+        latest_thread_settings.service_tier,
         Some(shell_tool_enabled),
         agent_role_feature_opt_outs,
         agent_role_skill_restrictions,

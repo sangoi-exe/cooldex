@@ -71,10 +71,6 @@ impl Session {
     /// Merge-safety anchor: trusted client provenance stays attached through transition waits,
     /// queued delivery, and history fallback.
     /// Preserves trusted client provenance while items wait for an active turn.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub(crate) async fn inject_client_response_items(
         &self,
         items: Vec<ResponseItem>,

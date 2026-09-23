@@ -333,6 +333,10 @@ impl SessionConfiguration {
         .into_iter()
         .filter_map(|(feature, opt_out)| (!config.features.enabled(feature)).then_some(opt_out))
         .collect();
+        #[expect(
+            clippy::expect_used,
+            reason = "session configuration has already validated skills settings and must fail loud if that invariant is broken"
+        )]
         let skills = config
             .config_layer_stack
             .effective_config()

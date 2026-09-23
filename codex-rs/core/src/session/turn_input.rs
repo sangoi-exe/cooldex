@@ -391,10 +391,6 @@ async fn start_or_steer(
 
 // Merge-safety anchor: idle start reserves the sole ActiveTurn, rechecks admission, and cancels
 // an unopened reservation while returning a rejection reason.
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "the previous turn check and idle reservation must be atomic"
-)]
 async fn start_if_idle(
     session: &Arc<Session>,
     request: TurnInputRequest,

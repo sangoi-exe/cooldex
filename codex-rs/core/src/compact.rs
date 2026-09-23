@@ -213,6 +213,10 @@ pub(crate) async fn run_compact_task(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "compaction preserves explicit input, trigger, reason, phase, and cancellation ownership"
+)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,

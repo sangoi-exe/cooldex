@@ -285,8 +285,10 @@ impl Session {
         if active.is_some() {
             return None;
         }
-        let mut turn = ActiveTurn::default();
-        turn.reserved_turn_id = Some(turn_id.to_string());
+        let turn = ActiveTurn {
+            reserved_turn_id: Some(turn_id.to_string()),
+            ..Default::default()
+        };
         let turn_state = Arc::clone(&turn.turn_state);
         *active = Some(turn);
         Some(turn_state)
@@ -324,8 +326,10 @@ impl Session {
                 }
                 Some(_) => return false,
                 None => {
-                    let mut turn = ActiveTurn::default();
-                    turn.reserved_turn_id = Some(turn_context.sub_id.clone());
+                    let turn = ActiveTurn {
+                        reserved_turn_id: Some(turn_context.sub_id.clone()),
+                        ..Default::default()
+                    };
                     let turn_state = Arc::clone(&turn.turn_state);
                     *active = Some(turn);
                     turn_state
