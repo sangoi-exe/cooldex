@@ -2,7 +2,7 @@ use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::context::ContextualUserFragment;
 use crate::context_manager::ContextManager;
-use codex_guardian_reviewer::ReviewerPool;
+use crate::session::Submission;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_guardian_reviewer::guardian_output_contract_prompt;
 use codex_history::CodexHarnessMetadata;
@@ -14,7 +14,6 @@ use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ErrorEvent;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -50,7 +49,6 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
     .unwrap();
     params.parent_session = Arc::clone(&parent);
     params.parent_context = GuardianReviewContext::from(Arc::clone(&turn));
-    params.compaction_model_hash = Some("matching".to_owned());
     let evidence: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call_output", "call_id": "prior-inspection", "output": EVIDENCE
     }))
@@ -100,8 +98,7 @@ async fn run_review_preserves_evidence_during_parent_compaction() {
                 reviewer_compaction_hash: Some("matching".to_owned()),
             },
         )
-        .await
-        .expect("parent compaction should install");
+        .await;
     let ((outcome, _), submitted_text) = tokio::join!(manager.review(prepared), async {
         let submission = rx_sub.recv().await.unwrap();
         let id = submission.id;
@@ -254,7 +251,6 @@ async fn test_review_params() -> GuardianReviewSessionParams {
             model_overridden: false,
             model_override: None,
         },
-        compaction_model_hash: None,
         reasoning_summary,
         personality,
         external_cancel: None,
@@ -481,7 +477,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
     }]);
     assert_eq!(
         policy
-            .parent_compaction(&history, Some("compatible"))
+            .parent_compaction(&history)
             .expect("valid checkpoint"),
         Some(item)
     );
@@ -496,7 +492,7 @@ async fn encrypted_parent_compaction_requires_original_item_id(thread_context_en
         .into(),
     );
     history.replace_annotated(items);
-    let result = policy.parent_compaction(&history, Some("compatible"));
+    let result = policy.parent_compaction(&history);
     if thread_context_enabled {
         assert!(result.is_err());
     } else {
@@ -660,6 +656,7 @@ async fn guardian_review_session_config_resolves_policy_and_template(
         Some(
             GuardianPolicyInstructions::new(
                 expected_policy,
+                "",
                 expected_template,
                 guardian_output_contract_prompt(),
             )
@@ -1020,7 +1017,7 @@ async fn wait_for_guardian_review_cancel_drains_expected_turn_after_stale_termin
 }
 
 #[tokio::test]
-async fn wait_for_guardian_review_drains_expected_turn_after_prior_completion() {
+async fn interrupt_and_drain_turn_ignores_prior_turn_completion() {
     let (review_session, tx_event, _rx_sub) = test_review_session().await;
     tx_event
         .send(turn_complete_event("prior-turn", Some("stale"), Some(9)))
@@ -1050,10 +1047,10 @@ async fn wait_for_guardian_review_drains_expected_turn_after_prior_completion() 
 async fn prewarm_test_session(
     params: &GuardianReviewSessionParams,
     session: GuardianReviewSession,
-) -> ReviewerPool<GuardianReviewSession> {
+) -> GuardianReviewSessionManager {
     let key = session.reuse_key.clone();
     let session = Arc::new(Mutex::new(Some(session)));
-    let pool = ReviewerPool::<GuardianReviewSession>::new(
+    let pool = GuardianReviewSessionManager::new(
         Arc::new(codex_guardian_reviewer::ReviewerTasks::default()),
         move |_, _, _, _, _| {
             let session = Arc::clone(&session);

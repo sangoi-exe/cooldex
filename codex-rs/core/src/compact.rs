@@ -198,6 +198,7 @@ pub(crate) async fn run_compact_task(
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
+    sess.emit_turn_started(turn_context.as_ref()).await;
     run_compact_task_inner(
         sess,
         step_context,
@@ -327,14 +328,9 @@ async fn run_compact_task_inner_impl(
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
+    // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
+    // request tracking) survives retries within this compact turn.
     let mut client_session = sess.services.model_client.new_session();
-    // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
-    // request tracking)
-    // survives retries within this compact turn.
-    let responses_metadata = sess
-        .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
-        .await;
-
     let compaction_response = loop {
         // Clone is required because of the loop
         let mut turn_input = history
@@ -349,6 +345,9 @@ async fn run_compact_task_inner_impl(
             base_instructions: sess.get_prompt_base_instructions().await,
             ..Default::default()
         };
+        let responses_metadata = sess
+            .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
+            .await;
         let attempt_result = drain_to_completed(
             &sess,
             turn_context.as_ref(),

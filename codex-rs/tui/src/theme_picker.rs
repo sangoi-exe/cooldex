@@ -405,7 +405,7 @@ pub(crate) fn build_theme_picker_params(
         preserve_side_content_bg: true,
         on_selection_changed,
         on_cancel,
-        ..Default::default()
+        ..SelectionViewParams::picker()
     }
 }
 

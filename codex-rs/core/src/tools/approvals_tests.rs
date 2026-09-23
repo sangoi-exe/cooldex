@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::tests::claimed_turn_slot;
+use crate::session::tests::active_turn_for_tests;
 use crate::session::tests::make_session_and_context_with_rx;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::approvals::NetworkPolicyAmendment;
@@ -119,8 +119,7 @@ async fn non_utf8_cwd_preserves_approval_routing(
         .context("session is uniquely owned")?
         .services
         .extensions = Arc::new(extensions.build());
-    // Merge-safety anchor: approval fixtures use session-owned TurnSlot state, not a legacy ActiveTurn substitute.
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let mut review_context = GuardianReviewContext::from(&turn);
     review_context.approval_policy = AskForApproval::OnRequest;
     review_context.approvals_reviewer = reviewer;

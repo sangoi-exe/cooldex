@@ -1,10 +1,14 @@
 use super::*;
+use crate::agent::api::AgentInfo;
+use crate::agent::api::StatusSubscription;
 use crate::agent::status::is_final;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
 use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v2;
 use codex_protocol::ThreadId;
+use codex_protocol::error::Result as CodexResult;
 use codex_tools::ToolSpec;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::BTreeMap;
@@ -289,7 +293,7 @@ enum WaitMode {
 struct ConditionTarget {
     reference: String,
     thread_id: ThreadId,
-    status_rx: Option<watch::Receiver<AgentStatus>>,
+    status_rx: Option<StatusSubscription>,
     status: AgentStatus,
     initially_final: bool,
 }
@@ -324,12 +328,21 @@ async fn resolve_condition_targets(
                     "target `{reference}` could not be resolved: {err}"
                 ))
             })?;
-        let status = status_rx.borrow_and_update().clone();
+        let initial_update = status_rx.next().await;
+        let status = match &initial_update {
+            Some(Ok(agent)) => match agent.status() {
+                Some(status) => status.clone(),
+                None => session.services.agent_control.get_status(thread_id).await,
+            },
+            Some(Err(error)) => AgentStatus::Errored(error.to_string()),
+            None => session.services.agent_control.get_status(thread_id).await,
+        };
         targets.push(ConditionTarget {
             reference,
             thread_id,
             initially_final: is_final(&status),
-            status_rx: Some(status_rx),
+            status_rx: matches!(initial_update, Some(Ok(agent)) if agent.status().is_some())
+                .then_some(status_rx),
             status,
         });
     }
@@ -360,15 +373,16 @@ async fn wait_for_condition(
     let mut activity_closed = false;
     loop {
         let mut status_changes = FuturesUnordered::new();
-        for (index, target) in targets.iter().enumerate() {
-            if let Some(status_rx) = &target.status_rx {
-                let mut status_rx = status_rx.clone();
-                status_changes.push(async move { (index, status_rx.changed().await) });
+        for (index, target) in targets.iter_mut().enumerate() {
+            if let Some(status_rx) = target.status_rx.as_mut() {
+                status_changes.push(async move { (index, status_rx.next().await) });
             }
         }
 
         tokio::select! {
-            Some((_index, _changed)) = status_changes.next() => {
+            Some((index, status_update)) = status_changes.next() => {
+                drop(status_changes);
+                apply_condition_target_status_update(session, &mut targets[index], status_update).await;
                 if let Some(outcome) =
                     reconcile_condition_wait(session, turn_state, targets, return_when).await
                 {
@@ -376,6 +390,7 @@ async fn wait_for_condition(
                 }
             }
             changed = activity_rx.changed(), if !activity_closed => {
+                drop(status_changes);
                 match changed {
                     Ok(()) => {
                         drop(activity_rx.borrow_and_update());
@@ -400,16 +415,7 @@ async fn reconcile_condition_wait(
     targets: &mut [ConditionTarget],
     return_when: ReturnWhen,
 ) -> Option<WaitConditionOutcome> {
-    for target in targets.iter_mut() {
-        if target
-            .status_rx
-            .as_ref()
-            .is_some_and(|status_rx| status_rx.has_changed().is_err())
-        {
-            retire_condition_target_status_receiver(session, target).await;
-        }
-    }
-    refresh_condition_target_statuses(targets);
+    refresh_condition_target_statuses(session, targets).await;
 
     let (_, pending_activity) = session.input_queue.subscribe_activity(turn_state).await;
 
@@ -425,11 +431,39 @@ async fn reconcile_condition_wait(
     None
 }
 
-fn refresh_condition_target_statuses(targets: &mut [ConditionTarget]) {
+async fn refresh_condition_target_statuses(
+    session: &crate::session::session::Session,
+    targets: &mut [ConditionTarget],
+) {
     for target in targets {
-        if let Some(status_rx) = target.status_rx.as_mut() {
-            target.status = status_rx.borrow_and_update().clone();
+        while let Some(status_update) = target
+            .status_rx
+            .as_mut()
+            .and_then(|status_rx| status_rx.next().now_or_never())
+        {
+            apply_condition_target_status_update(session, target, status_update).await;
         }
+    }
+}
+
+async fn apply_condition_target_status_update(
+    session: &crate::session::session::Session,
+    target: &mut ConditionTarget,
+    status_update: Option<CodexResult<AgentInfo>>,
+) {
+    match status_update {
+        Some(Ok(agent)) => {
+            if let Some(status) = agent.status() {
+                target.status = status.clone();
+            } else {
+                retire_condition_target_status_receiver(session, target).await;
+            }
+        }
+        Some(Err(error)) => {
+            target.status = AgentStatus::Errored(error.to_string());
+            target.status_rx = None;
+        }
+        None => retire_condition_target_status_receiver(session, target).await,
     }
 }
 
@@ -437,17 +471,12 @@ async fn retire_condition_target_status_receiver(
     session: &crate::session::session::Session,
     target: &mut ConditionTarget,
 ) {
-    if let Some(mut status_rx) = target.status_rx.take() {
-        let status = status_rx.borrow_and_update().clone();
-        target.status = if is_final(&status) {
-            status
-        } else {
-            session
-                .services
-                .agent_control
-                .get_status(target.thread_id)
-                .await
-        };
+    if target.status_rx.take().is_some() && !is_final(&target.status) {
+        target.status = session
+            .services
+            .agent_control
+            .get_status(target.thread_id)
+            .await;
     }
 }
 

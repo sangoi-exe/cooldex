@@ -119,6 +119,7 @@ pub(crate) async fn run_remote_compact_task(
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
+    sess.emit_turn_started(turn_context.as_ref()).await;
 
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Manual,
@@ -589,6 +590,7 @@ fn is_retained_for_remote_compaction_v2(
                 content.first(),
                 Some(AgentMessageInputContent::InputText { text })
                     if text.starts_with("Message Type: MESSAGE\n")
+                        || text.starts_with("Message Type: CHANNEL_POST\n")
             );
         let is_completion = matches!(
             content.first(),

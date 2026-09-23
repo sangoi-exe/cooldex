@@ -1,11 +1,14 @@
 use super::*;
 use crate::context::MultiAgentRoleInstructions;
+use codex_config::SkillsConfig;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::AgentUsageHintInstructions;
+use codex_utils_absolute_path::test_support::PathExt;
+use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use pretty_assertions::assert_ne;
 
@@ -33,6 +36,22 @@ fn snapshot() -> AgentIdentitySnapshot {
         Some(DEVELOPER_SECRET.to_string()),
         Some("priority".to_string()),
         Some(false),
+        vec![AgentRoleFeatureOptOut::Apps],
+        AgentRoleSkillRestrictions {
+            bundled_skills_disabled: true,
+            skill_instructions_disabled: true,
+            disabled_skills: vec![
+                AgentRoleSkillRestriction::Name {
+                    name: "restricted-skill".to_string(),
+                },
+                AgentRoleSkillRestriction::Path {
+                    path: test_path_buf("/tmp/restricted-path-skill").as_path().abs(),
+                },
+            ],
+        },
+        Some(196_000),
+        Some(160_000),
+        codex_protocol::config_types::AutoCompactTokenLimitScope::BodyAfterPrefix,
         AgentUsageHintBinding::Inherited {
             instructions: Some(AgentUsageHintInstructions {
                 text: HINT_SECRET.to_string(),
@@ -79,6 +98,21 @@ fn identity_equality_covers_every_field() {
     different_tier.service_tier = None;
     let mut different_shell_tool = expected.clone();
     different_shell_tool.shell_tool_enabled = Some(true);
+    let mut different_feature_opt_outs = expected.clone();
+    different_feature_opt_outs
+        .agent_role_feature_opt_outs
+        .clear();
+    let mut different_skill_restrictions = expected.clone();
+    different_skill_restrictions
+        .agent_role_skill_restrictions
+        .disabled_skills
+        .clear();
+    let mut different_context_window = expected.clone();
+    different_context_window.model_context_window = Some(128_000);
+    let mut different_auto_compact_limit = expected.clone();
+    different_auto_compact_limit.model_auto_compact_token_limit = None;
+    let mut different_auto_compact_scope = expected.clone();
+    different_auto_compact_scope.model_auto_compact_token_limit_scope = Default::default();
     let mut different_usage_hint_binding = expected.clone();
     different_usage_hint_binding.agent_usage_hint_binding = AgentUsageHintBinding::Resolve;
 
@@ -94,6 +128,11 @@ fn identity_equality_covers_every_field() {
         different_developer,
         different_tier,
         different_shell_tool,
+        different_feature_opt_outs,
+        different_skill_restrictions,
+        different_context_window,
+        different_auto_compact_limit,
+        different_auto_compact_scope,
         different_usage_hint_binding,
     ] {
         assert_ne!(actual, expected);
@@ -103,10 +142,7 @@ fn identity_equality_covers_every_field() {
 #[tokio::test]
 async fn identity_apply_restores_persisted_shell_tool_state() {
     let mut config = crate::config::test_config().await;
-    config
-        .features
-        .enable(Feature::ShellTool)
-        .expect("test config should enable shell tool");
+    config.features.enable(Feature::ShellTool);
     let mut session_source = thread_spawn_source();
 
     snapshot()
@@ -114,6 +150,40 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
         .expect("identity should apply");
 
     assert!(!config.features.enabled(Feature::ShellTool));
+    assert!(!config.features.enabled(Feature::Apps));
+    assert_eq!(config.model_context_window, Some(196_000));
+    assert_eq!(config.model_auto_compact_token_limit, Some(160_000));
+    assert_eq!(
+        config.model_auto_compact_token_limit_scope,
+        codex_protocol::config_types::AutoCompactTokenLimitScope::BodyAfterPrefix
+    );
+    assert!(!config.include_skill_instructions);
+    let skills = config
+        .config_layer_stack
+        .effective_config()
+        .as_table()
+        .and_then(|table| table.get("skills"))
+        .cloned()
+        .map(SkillsConfig::try_from)
+        .expect("identity should restore a skills layer")
+        .expect("restored skills layer should be valid");
+    assert!(skills.bundled.is_some_and(|bundled| !bundled.enabled));
+    assert_eq!(skills.include_instructions, Some(false));
+    assert_eq!(
+        skills
+            .config
+            .into_iter()
+            .filter(|skill| !skill.enabled)
+            .map(|skill| (skill.name, skill.path))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("restricted-skill".to_string()), None),
+            (
+                None,
+                Some(test_path_buf("/tmp/restricted-path-skill").as_path().abs()),
+            ),
+        ]
+    );
     assert_eq!(config.base_instructions, Some(BASE_SECRET.to_string()));
     assert_eq!(
         config.base_instructions_provenance,
@@ -135,10 +205,7 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
 #[tokio::test]
 async fn identity_apply_preserves_reload_shell_tool_state_when_missing() {
     let mut config = crate::config::test_config().await;
-    config
-        .features
-        .enable(Feature::ShellTool)
-        .expect("test config should enable shell tool");
+    config.features.enable(Feature::ShellTool);
     let mut identity = snapshot();
     identity.shell_tool_enabled = None;
     let mut session_source = thread_spawn_source();

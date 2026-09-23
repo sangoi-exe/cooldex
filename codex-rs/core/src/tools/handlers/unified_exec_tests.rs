@@ -280,7 +280,7 @@ async fn shell_mode_for_environment_uses_direct_mode_for_remote_environments() -
     Ok(())
 }
 
-// Merge-safety anchor: Windows grant fixture follows the current TurnSlot API.
+// Merge-safety anchor: Windows grant fixture follows the ActiveTurn owner.
 #[tokio::test]
 #[cfg(not(windows))]
 async fn exec_command_reuses_foreign_windows_grant() {
@@ -313,11 +313,10 @@ async fn exec_command_reuses_foreign_windows_grant() {
         )),
         ..Default::default()
     };
-    *session.active_turn.lock().await = crate::session::tests::claimed_turn_slot();
+    *session.active_turn.lock().await = crate::session::tests::active_turn_for_tests();
     let turn_state = {
         let active_turn = session.active_turn.lock().await;
-        let turn_state = active_turn.turn_state().expect("active turn state");
-        Arc::clone(turn_state)
+        Arc::clone(&active_turn.as_ref().expect("active turn state").turn_state)
     };
     turn_state.lock().await.record_granted_permissions(
         codex_exec_server::REMOTE_ENVIRONMENT_ID,

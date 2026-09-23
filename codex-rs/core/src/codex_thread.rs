@@ -3,9 +3,9 @@ use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
 use crate::elicitation::ElicitationRegistration;
-use crate::environment_selection::TurnEnvironmentState;
 use crate::session::SessionIo;
 use crate::session::SessionSettingsUpdate;
+use crate::session::Submission;
 use crate::session::TurnInput;
 use crate::session::new_submission_id;
 use crate::session::session::Session;
@@ -49,7 +49,6 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
@@ -80,6 +79,7 @@ use rmcp::model::ReadResourceRequestParams;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -168,31 +168,21 @@ pub struct CodexThreadSettingsOverrides {
 
 pub use codex_guardian_context::GuardianRootMessage;
 
-// Merge-safety anchor: automatic idle admission preserves local rejection reasons
-// and returns the original input across the TurnSlot lifecycle.
-/// Explains why `CodexThread::try_start_turn_if_idle` rejected an automatic
-/// idle turn.
+// Merge-safety anchor: automatic idle admission preserves local rejection reasons and returns
+// the original input through the upstream ActiveTurn lifecycle.
+/// Explains why `CodexThread::try_start_turn_if_idle` rejected an automatic idle turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryStartTurnIfIdleRejectionReason {
-    /// User/client-triggered mailbox work is already queued and must take
-    /// priority over extension-initiated idle work.
     PendingTriggerTurn,
-    /// The thread is in Plan mode, where idle work without user input must not
-    /// start a new model turn.
     PlanMode,
-    /// Another turn or task is active, or the idle reservation was lost before
-    /// the automatic turn could start.
     Busy,
-    /// A user-prompt hook consumed and rejected the submitted input.
     RejectedByHook,
-    /// The automatic turn ended before its initial input was persisted.
     TaskEndedBeforePersistence,
-    /// The initial input could not be durably written to the rollout.
     PersistenceFailed,
 }
 
-/// Rejection returned when an extension asks to start automatic idle work but
-/// the thread is not eligible to run it.
+/// Rejection returned when an extension asks to start automatic idle work but the thread is not
+/// eligible to run it.
 #[derive(Debug)]
 pub struct TryStartTurnIfIdleError {
     reason: TryStartTurnIfIdleRejectionReason,
@@ -204,13 +194,10 @@ impl TryStartTurnIfIdleError {
         Self { reason, input }
     }
 
-    /// Returns the stable reason the automatic idle turn was rejected.
     pub fn reason(&self) -> TryStartTurnIfIdleRejectionReason {
         self.reason
     }
 
-    /// Consumes the rejection and returns the original turn input unchanged,
-    /// so callers can retry, drop, or log it explicitly.
     pub fn into_input(self) -> Vec<TurnInput> {
         self.input
     }
@@ -240,6 +227,8 @@ pub struct GuardianRootSnapshot {
 pub struct CodexThread {
     pub(crate) session: Arc<Session>,
     pub(crate) io: SessionIo,
+    // Queued agent mail owns a read guard until handled or dropped; eviction needs a write guard.
+    pub(crate) residency_gate: Arc<RwLock<()>>,
     // Registration source controls live access and lifecycle hooks. Managed Guardian
     // reviewers keep their existing subagent identity inside the session.
     pub(crate) session_source: SessionSource,
@@ -276,6 +265,7 @@ impl CodexThread {
         Self {
             session,
             io,
+            residency_gate: Arc::default(),
             session_source,
             startup_metadata,
             rollout_path,
@@ -288,19 +278,8 @@ impl CodexThread {
         self.io.submit(op).await
     }
 
-    /// Starts an automatic regular turn with response items or user input only
-    /// when idle work is allowed for this thread.
-    ///
-    /// This is the required entry point for extensions that want to launch
-    /// model-visible work from `ThreadLifecycleContributor::on_thread_idle`.
-    /// The call succeeds only if no user/client-triggered turn is queued and no
-    /// task is currently active. Work without user input is also rejected in
-    /// Plan mode. Active Review tasks are rejected by the active-task check
-    /// because Review turns are not steerable.
-    ///
-    /// On rejection, the returned error includes a stable reason and carries
-    /// the original `items` unchanged so the caller can decide whether to drop
-    /// them, retry later, or log why no automatic turn was started.
+    /// Starts automatic regular work only when no user/client-triggered turn is queued and no
+    /// task is active. Rejections preserve the original input for the extension caller.
     pub async fn try_start_turn_if_idle(
         &self,
         items: Vec<TurnInput>,
@@ -376,6 +355,13 @@ impl CodexThread {
         self.session.emit_thread_idle_lifecycle_if_idle(cause).await;
     }
 
+    /// Checkpoint initialization without activating speculative persistence.
+    pub async fn checkpoint_preparation(&self) -> std::io::Result<()> {
+        self.session
+            .try_ensure_rollout_materialized(PersistContext::ThreadPreparation)
+            .await
+    }
+
     #[doc(hidden)]
     pub async fn ensure_rollout_materialized(&self) {
         self.session
@@ -396,13 +382,14 @@ impl CodexThread {
         self.io
             .submit_with_trace(
                 op, trace, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+                /*residency_guard*/ None,
             )
             .await
     }
 
-    // Merge-safety anchor: paired immediate/persisted admission APIs keep typed outcomes;
-    // persisted admission requires client identity, a live persistence owner, and awaits durable rollout acknowledgement.
-    /// Waits until Core has started a turn or steered the active turn.
+    // Merge-safety anchor: immediate and persisted user admission share submission routing while
+    // only the persisted path awaits its durable rollout acknowledgement.
+    /// Waits until Core starts a turn or steers the active turn.
     pub async fn submit_user_input_and_wait_for_admission(
         &self,
         request: TurnInputRequest,
@@ -415,9 +402,7 @@ impl CodexThread {
         .map_err(Into::into)
     }
 
-    /// Waits for durable admission and preserves its typed failure outcome.
-    ///
-    /// A client user-message id is required to identify the persisted message.
+    /// Waits until a client-identified user input is durably admitted.
     pub async fn submit_user_input_and_wait_for_persisted_admission(
         &self,
         request: TurnInputRequest,
@@ -572,6 +557,7 @@ impl CodexThread {
                 trace: current_span_w3c_trace_context(),
                 parent_turn_id: None,
                 root_turn_id: None,
+                residency_guard: None,
             })
             .await
             .map_err(|_| CodexErr::Fatal("thread session has stopped".to_string()))?;
@@ -604,8 +590,6 @@ impl CodexThread {
         }
     }
 
-    // Merge-safety anchor: shared admission registration preserves the selected immediate/persisted
-    // state through routing, so only the persisted path completes after durable rollout flush.
     async fn submit_user_input_and_wait_for_admission_inner(
         &self,
         mut request: TurnInputRequest,
@@ -623,17 +607,13 @@ impl CodexThread {
                 ),
             ));
         }
-        if matches!(
-            &state,
-            PendingUserMessageAdmissionState::WaitingForAdmission
-        ) {
+        if matches!(state, PendingUserMessageAdmissionState::WaitingForAdmission) {
             self.session
                 .live_thread_for_persistence("admit persisted user message")
                 .map_err(|error| {
                     UserMessageAdmissionError::Admission(CodexErr::Fatal(error.to_string()))
                 })?;
         }
-
         self.session
             .services
             .agent_control
@@ -659,6 +639,7 @@ impl CodexThread {
                 trace,
                 parent_turn_id: None,
                 root_turn_id: None,
+                residency_guard: None,
             })
             .await
             .map_err(UserMessageAdmissionError::Admission)?;
@@ -670,7 +651,6 @@ impl CodexThread {
                 return Err(UserMessageAdmissionError::TaskEndedBeforePersistence);
             }
         };
-
         match routing_result.unwrap_or(Err(CodexErr::InternalAgentDied)) {
             Ok(TurnInputSubmission::Started { turn_id }) => {
                 self.session.pending_user_message_admissions.complete(
@@ -760,26 +740,13 @@ impl CodexThread {
         self.session.inject_if_running(items).await
     }
 
-    /// Environment selections captured by the active turn, before later settings updates.
-    /// Includes environments that are still starting or have failed. Hosts use this snapshot
-    /// to authorize steering against every executor that the active turn selected.
+    /// Environment selections captured by the active turn before later settings updates.
     pub async fn active_turn_environment_selections(
         &self,
     ) -> Option<Vec<TurnEnvironmentSelection>> {
-        let slot = self.session.active_turn.lock().await;
-        let task = slot.running_task()?;
-        Some(
-            task.turn_context
-                .initial_environments
-                .environments
-                .iter()
-                .map(|environment| match environment {
-                    TurnEnvironmentState::Ready(environment) => environment.selection(),
-                    TurnEnvironmentState::Starting(environment) => environment.selection.clone(),
-                    TurnEnvironmentState::Failed { selection, .. } => selection.clone(),
-                })
-                .collect(),
-        )
+        let active = self.session.active_turn.lock().await;
+        let task = active.as_ref()?.task.as_ref()?;
+        Some(task.turn_context.initial_environments.all_selections())
     }
 
     /// Captures a regular turn only after its input is recorded. The caller must flush the rollout.
@@ -792,7 +759,7 @@ impl CodexThread {
     /// Returns the trusted root when the expected turn is currently active.
     pub async fn active_turn_root(&self, expected_turn_id: &str) -> Option<String> {
         let active = self.session.active_turn.lock().await;
-        let task = active.running_task()?;
+        let task = active.as_ref()?.task.as_ref()?;
         if task.turn_context.sub_id != expected_turn_id {
             return None;
         }
@@ -934,7 +901,7 @@ impl CodexThread {
     /// Record raw Responses API items without starting a new turn.
     pub async fn inject_response_items(&self, items: Vec<ResponseItem>) -> CodexResult<()> {
         self.inject_response_items_for_turn(items).await?;
-        self.session.flush_rollout().await?;
+        self.checkpoint_preparation().await?;
         Ok(())
     }
 
@@ -1066,13 +1033,13 @@ impl CodexThread {
 
     /// Returns the active turn's reviewer, including live updates, or the thread default.
     pub async fn approvals_reviewer_for_turn(&self, turn_id: &str) -> ApprovalsReviewer {
-        if let Some((turn, inputs, _)) = self
+        if let Some((turn, settings, _, _)) = self
             .session
             .active_turn_context_and_strict_auto_review()
             .await
             && turn.sub_id == turn_id
         {
-            inputs.settings.approvals_reviewer()
+            settings.approvals_reviewer()
         } else {
             self.config_snapshot().await.approvals_reviewer
         }

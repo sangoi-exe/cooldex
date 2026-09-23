@@ -52,6 +52,11 @@ fn settings_item(
                     },
                 },
                 shell_tool_enabled: None,
+                agent_role_feature_opt_outs: Some(Vec::new()),
+                agent_role_skill_restrictions: Some(Default::default()),
+                model_context_window: Some(None),
+                model_auto_compact_token_limit: Some(None),
+                model_auto_compact_token_limit_scope: Some(Default::default()),
             },
         },
     ))

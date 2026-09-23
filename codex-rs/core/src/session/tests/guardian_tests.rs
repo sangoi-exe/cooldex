@@ -88,8 +88,6 @@ where
     }
 }
 
-// Merge-safety anchor: guardian authority tests install tasks through the current Session owner
-// so published task and TurnSlot state remain coupled.
 async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<TurnContext> {
     let (current_turn, _) = session
         .new_turn_with_sub_id(
@@ -108,7 +106,7 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
         .await
         .expect("next turn should accept different approval authority");
     session
-        .spawn_task(
+        .start_task(
             current_turn,
             Vec::new(),
             super::NeverEndingTask {
@@ -118,7 +116,7 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
         )
         .await;
 
-    let (active_turn, _, _) = session
+    let (active_turn, _, _, _) = session
         .active_turn_context_and_strict_auto_review()
         .await
         .expect("next turn should have active review authority");
@@ -206,7 +204,7 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     update_turn_settings_for_test(&mut turn_context_raw, |settings| {
         Arc::make_mut(&mut settings.model_info).node_repl_auto_review_required = true;
     });
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
         .approval_policy
@@ -342,7 +340,7 @@ async fn request_permissions_uses_issuing_step_policy_and_reviewer() {
         },
     )
     .await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     let mut step = StepContext::for_test(turn);
     let captured = Arc::get_mut(&mut step).expect("unshared step");
     // The issuing step differs from the admitted Never/User turn.
@@ -416,7 +414,7 @@ async fn request_permissions_guardian_review_stops_when_cancelled(
     .await;
 
     let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
@@ -660,6 +658,26 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
+    let active_turn = crate::state::ActiveTurn::default();
+    let originating_turn_state = Arc::clone(&active_turn.turn_state);
+    *session.active_turn.lock().await = Some(active_turn);
+    session
+        .record_granted_request_permissions_for_turn(
+            &RequestPermissionsResponse {
+                permissions: RequestPermissionProfile {
+                    network: Some(NetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..Default::default()
+                },
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: true,
+            },
+            codex_exec_server::LOCAL_ENVIRONMENT_ID,
+            Some(&originating_turn_state),
+        )
+        .await;
+
     Arc::make_mut(&mut turn_context_raw.config)
         .permissions
         .approval_policy
@@ -698,36 +716,13 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
     session
-        .spawn_task(
+        .start_task(
             Arc::clone(&turn_context),
             Vec::new(),
             super::NeverEndingTask {
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
-        )
-        .await;
-    let originating_turn_state = {
-        let active_turn = session.active_turn.lock().await;
-        active_turn
-            .turn_state()
-            .cloned()
-            .expect("running test task should expose its turn state")
-    };
-    session
-        .record_granted_request_permissions_for_turn(
-            &RequestPermissionsResponse {
-                permissions: RequestPermissionProfile {
-                    network: Some(NetworkPermissions {
-                        enabled: Some(true),
-                    }),
-                    ..Default::default()
-                },
-                scope: PermissionGrantScope::Turn,
-                strict_auto_review: true,
-            },
-            codex_exec_server::LOCAL_ENVIRONMENT_ID,
-            Some(&originating_turn_state),
         )
         .await;
 
@@ -785,7 +780,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
     )
     .await;
     session
-        .spawn_task(
+        .start_task(
             Arc::clone(&turn),
             Vec::new(),
             super::NeverEndingTask {
@@ -797,9 +792,13 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
     // Inject later-step authority directly while live policy changes remain gated.
     {
         let active = session.active_turn.lock().await;
-        let task = active.running_task().expect("active task");
-        let current = task.turn_context.next_step_input.load_full();
-        let mut settings = Arc::clone(&current.settings);
+        let task = active
+            .as_ref()
+            .expect("active turn")
+            .task
+            .as_ref()
+            .expect("active task");
+        let mut settings = task.turn_context.next_step_settings.load_full();
         update_selected_settings_for_test(Arc::make_mut(&mut settings), |selected| {
             selected
                 .approval_policy
@@ -807,12 +806,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 .expect("update policy");
             selected.approvals_reviewer = ApprovalsReviewer::User;
         });
-        task.turn_context
-            .next_step_input
-            .store(Arc::new(StepInputs {
-                settings,
-                environments: current.environments.clone(),
-            }));
+        task.turn_context.next_step_settings.store(settings);
     }
     let decision = session
         .services
@@ -1127,14 +1121,10 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
         world_state,
         step_context,
     };
-    let (_, window_ids) = session.prepare_auto_compact_window().await;
 
-    let (refreshed, _) = crate::compact::build_compaction_initial_context(
-        &session,
-        &initial_context_injection,
-        window_ids,
-    )
-    .await;
+    let (refreshed, _) =
+        crate::compact::build_compaction_initial_context(&session, &initial_context_injection)
+            .await;
 
     let developer_messages = refreshed
         .iter()
@@ -1182,11 +1172,11 @@ async fn exec_command_allows_sticky_turn_permissions_without_inline_request_perm
         .features
         .enable(Feature::RequestPermissionsTool)
         .expect("test setup should allow enabling request permissions tool");
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     {
-        let active_turn = session.active_turn.lock().await;
-        let turn_state = active_turn.turn_state().expect("active turn state");
-        let mut turn_state = turn_state.lock().await;
+        let mut active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn.as_mut().expect("active turn");
+        let mut turn_state = active_turn.turn_state.lock().await;
         turn_state.record_granted_permissions(
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             PermissionProfile {

@@ -4,7 +4,6 @@ mod post_compact_recovery;
 mod service;
 mod session;
 mod turn;
-mod turn_slot;
 mod turn_token_usage;
 
 pub(crate) use crate::tools::ExecutedToolCalls;
@@ -17,18 +16,11 @@ pub(crate) use post_compact_recovery::PostCompactRecoveryRuntimeState;
 pub(crate) use service::SessionServices;
 pub(crate) use session::ReasoningEffortPin;
 pub(crate) use session::SessionState;
-// Merge-safety anchor: explicit TurnSlot and post-compaction recovery remain canonical state
-// owners; do not restore the legacy active-turn export.
 pub(crate) use turn::AcceptedUserInputResponse;
+pub(crate) use turn::ActiveTurn;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
-pub(crate) use turn::SteerAdmission;
 pub(crate) use turn::TaskKind;
 pub(crate) use turn::TurnState;
-pub(crate) use turn_slot::RetiredTurn;
-pub(crate) use turn_slot::TerminalTransitionKind;
-pub(crate) use turn_slot::TurnSlot;
-pub(crate) use turn_slot::TurnSlotError;
-pub(crate) use turn_slot::TurnStartClaim;
 pub(crate) use turn_token_usage::TurnTokenUsage;

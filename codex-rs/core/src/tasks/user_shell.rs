@@ -41,9 +41,7 @@ use codex_shell_command::parse_command::parse_command;
 use codex_thread_store::PersistContext;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
-use super::emit_standard_turn_started;
 use crate::session::session::Session;
 use codex_protocol::models::PermissionProfile;
 
@@ -85,14 +83,6 @@ impl SessionTask for UserShellCommandTask {
         "session_task.user_shell"
     }
 
-    fn emit_turn_started(
-        &self,
-        session: Arc<SessionTaskContext>,
-        turn_context: Arc<TurnContext>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        emit_standard_turn_started(session, turn_context)
-    }
-
     async fn run(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -121,6 +111,9 @@ pub(crate) async fn execute_user_shell_command(
     cancellation_token: CancellationToken,
     mode: UserShellCommandMode,
 ) {
+    if mode == UserShellCommandMode::StandaloneTurn {
+        session.emit_turn_started(turn_context.as_ref()).await;
+    }
     session
         .services
         .session_telemetry

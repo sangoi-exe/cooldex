@@ -228,7 +228,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
+                    ..SelectionViewParams::picker()
                 });
                 self.request_redraw();
             }
@@ -261,7 +261,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
+                    ..SelectionViewParams::picker()
                 });
                 self.request_redraw();
             }
@@ -359,7 +359,10 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Voice => {
-                self.toggle_realtime_conversation();
+                self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Toggle,
+                });
             }
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
@@ -461,6 +464,7 @@ impl ChatWidget {
                 let enabled = self.toggle_raw_output_mode_and_notify();
                 self.emit_raw_output_mode_changed(enabled);
             }
+            SlashCommand::Tui => self.show_tui_mode_picker(),
             SlashCommand::Diff => {
                 self.add_diff_in_progress();
                 let tx = self.app_event_tx.clone();
@@ -501,6 +505,7 @@ impl ChatWidget {
                 self.add_hooks_output();
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
+            SlashCommand::Warnings => self.app_event_tx.send(AppEvent::OpenWarnings),
             SlashCommand::Status => {
                 if self.should_prefetch_rate_limits() {
                     let request_id = self.next_status_refresh_request_id;
@@ -785,8 +790,14 @@ impl ChatWidget {
             }
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
                 "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
-                "mute" => self.toggle_realtime_microphone(),
-                "stop" => self.stop_realtime_conversation(),
+                "mute" => self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Mute,
+                }),
+                "stop" => self.app_event_tx.send(AppEvent::VoiceControl {
+                    thread_id: self.thread_id(),
+                    control: crate::app_event::VoiceControl::Stop,
+                }),
                 _ => self.add_error_message("Usage: /voice [settings|mute|stop]".to_string()),
             },
             SlashCommand::Ide => {
@@ -1232,6 +1243,7 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Feedback
+            | SlashCommand::Warnings
             | SlashCommand::Export
             | SlashCommand::New
             | SlashCommand::Archive
@@ -1265,6 +1277,7 @@ impl ChatWidget {
             | SlashCommand::Title
             | SlashCommand::Statusline
             | SlashCommand::Theme
+            | SlashCommand::Tui
             | SlashCommand::Pets => QueueDrain::Stop,
         }
     }

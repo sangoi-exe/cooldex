@@ -1,5 +1,8 @@
 use crate::config::Config;
 use crate::context::MultiAgentRoleInstructions;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
 use codex_features::Feature;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::ReasoningSummary;
@@ -7,6 +10,9 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentRoleFeatureOptOut;
+use codex_protocol::protocol::AgentRoleSkillRestriction;
+use codex_protocol::protocol::AgentRoleSkillRestrictions;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -33,6 +39,11 @@ pub(crate) struct AgentIdentitySnapshot {
     developer_instructions: Option<Arc<str>>,
     service_tier: Option<String>,
     shell_tool_enabled: Option<bool>,
+    agent_role_feature_opt_outs: Vec<AgentRoleFeatureOptOut>,
+    agent_role_skill_restrictions: AgentRoleSkillRestrictions,
+    model_context_window: Option<i64>,
+    model_auto_compact_token_limit: Option<i64>,
+    model_auto_compact_token_limit_scope: codex_protocol::config_types::AutoCompactTokenLimitScope,
     agent_usage_hint_binding: AgentUsageHintBinding,
 }
 
@@ -49,6 +60,11 @@ impl AgentIdentitySnapshot {
         developer_instructions: Option<String>,
         service_tier: Option<String>,
         shell_tool_enabled: Option<bool>,
+        agent_role_feature_opt_outs: Vec<AgentRoleFeatureOptOut>,
+        agent_role_skill_restrictions: AgentRoleSkillRestrictions,
+        model_context_window: Option<i64>,
+        model_auto_compact_token_limit: Option<i64>,
+        model_auto_compact_token_limit_scope: codex_protocol::config_types::AutoCompactTokenLimitScope,
         agent_usage_hint_binding: AgentUsageHintBinding,
     ) -> Self {
         Self {
@@ -64,6 +80,11 @@ impl AgentIdentitySnapshot {
             developer_instructions: developer_instructions.map(Arc::from),
             service_tier,
             shell_tool_enabled,
+            agent_role_feature_opt_outs,
+            agent_role_skill_restrictions,
+            model_context_window,
+            model_auto_compact_token_limit,
+            model_auto_compact_token_limit_scope,
             agent_usage_hint_binding,
         }
     }
@@ -109,6 +130,9 @@ impl AgentIdentitySnapshot {
             .as_ref()
             .map(ToString::to_string);
         config.service_tier.clone_from(&self.service_tier);
+        config.model_context_window = self.model_context_window;
+        config.model_auto_compact_token_limit = self.model_auto_compact_token_limit;
+        config.model_auto_compact_token_limit_scope = self.model_auto_compact_token_limit_scope;
         config
             .agent_usage_hint_binding
             .clone_from(&self.agent_usage_hint_binding);
@@ -121,6 +145,100 @@ impl AgentIdentitySnapshot {
                         "failed to restore V2 child shell-tool state: {error}"
                     ))
                 })?;
+        }
+        for opt_out in &self.agent_role_feature_opt_outs {
+            let feature = match opt_out {
+                AgentRoleFeatureOptOut::ShellTool => Feature::ShellTool,
+                AgentRoleFeatureOptOut::Apps => Feature::Apps,
+                AgentRoleFeatureOptOut::Plugins => Feature::Plugins,
+                AgentRoleFeatureOptOut::MemoryTool => Feature::MemoryTool,
+                AgentRoleFeatureOptOut::RequestPermissionsTool => Feature::RequestPermissionsTool,
+            };
+            config.features.disable(feature).map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to restore V2 child role feature opt-out {opt_out:?}: {error}"
+                ))
+            })?;
+        }
+        let AgentRoleSkillRestrictions {
+            bundled_skills_disabled,
+            skill_instructions_disabled,
+            disabled_skills,
+        } = &self.agent_role_skill_restrictions;
+        if *skill_instructions_disabled {
+            config.include_skill_instructions = false;
+        }
+        if *bundled_skills_disabled || *skill_instructions_disabled || !disabled_skills.is_empty() {
+            let mut skills = toml::map::Map::new();
+            if *bundled_skills_disabled {
+                let mut bundled = toml::map::Map::new();
+                bundled.insert("enabled".to_string(), toml::Value::Boolean(false));
+                skills.insert("bundled".to_string(), toml::Value::Table(bundled));
+            }
+            if *skill_instructions_disabled {
+                skills.insert(
+                    "include_instructions".to_string(),
+                    toml::Value::Boolean(false),
+                );
+            }
+            if !disabled_skills.is_empty() {
+                let disabled_skills = disabled_skills
+                    .iter()
+                    .map(|restriction| -> CodexResult<toml::Value> {
+                        match restriction {
+                            AgentRoleSkillRestriction::Name { name } => {
+                                let mut skill = toml::map::Map::new();
+                                skill
+                                    .insert("name".to_string(), toml::Value::String(name.clone()));
+                                skill.insert("enabled".to_string(), toml::Value::Boolean(false));
+                                Ok(toml::Value::Table(skill))
+                            }
+                            AgentRoleSkillRestriction::Path { path } => {
+                                let mut skill = toml::map::Map::new();
+                                skill.insert(
+                                    "path".to_string(),
+                                    toml::Value::try_from(path).map_err(|error| {
+                                        CodexErr::Fatal(format!(
+                                            "failed to serialize V2 child skill path restriction: {error}"
+                                        ))
+                                    })?,
+                                );
+                                skill.insert("enabled".to_string(), toml::Value::Boolean(false));
+                                Ok(toml::Value::Table(skill))
+                            }
+                        }
+                    })
+                    .collect::<CodexResult<Vec<_>>>()?;
+                skills.insert("config".to_string(), toml::Value::Array(disabled_skills));
+            }
+            let mut identity_layer = toml::map::Map::new();
+            identity_layer.insert("skills".to_string(), toml::Value::Table(skills));
+            let identity_layer = ConfigLayerEntry::new(
+                ConfigLayerSource::SessionFlags,
+                toml::Value::Table(identity_layer),
+            );
+            let mut layers = config
+                .config_layer_stack
+                .all_layers_low_to_high()
+                .cloned()
+                .collect::<Vec<_>>();
+            let insertion_index = layers.partition_point(|layer| layer.name <= identity_layer.name);
+            layers.insert(insertion_index, identity_layer);
+            config.config_layer_stack = ConfigLayerStack::new(
+                layers,
+                config.config_layer_stack.requirements().clone(),
+                config.config_layer_stack.requirements_toml().clone(),
+            )
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to restore V2 child skill restrictions: {error}"
+                ))
+            })?
+            .with_user_and_project_exec_policy_rules_ignored(
+                config
+                    .config_layer_stack
+                    .ignore_user_and_project_exec_policy_rules(),
+            );
         }
         Ok(())
     }
@@ -143,6 +261,23 @@ impl fmt::Debug for AgentIdentitySnapshot {
             )
             .field("service_tier", &self.service_tier)
             .field("shell_tool_enabled", &self.shell_tool_enabled)
+            .field(
+                "agent_role_feature_opt_outs",
+                &self.agent_role_feature_opt_outs,
+            )
+            .field(
+                "agent_role_skill_restrictions",
+                &self.agent_role_skill_restrictions,
+            )
+            .field("model_context_window", &self.model_context_window)
+            .field(
+                "model_auto_compact_token_limit",
+                &self.model_auto_compact_token_limit,
+            )
+            .field(
+                "model_auto_compact_token_limit_scope",
+                &self.model_auto_compact_token_limit_scope,
+            )
             .field(
                 "agent_usage_hint_binding",
                 &match &self.agent_usage_hint_binding {

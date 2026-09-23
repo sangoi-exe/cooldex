@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -28,6 +29,19 @@ use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
+/// Metadata about the currently running turn.
+pub(crate) struct ActiveTurn {
+    pub(crate) task: Option<RunningTask>,
+    pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    /// A start admitted before asynchronous preparation finishes. The ActiveTurn owner verifies
+    /// this ID before task installation so cancellation cannot admit a stale task.
+    pub(crate) reserved_turn_id: Option<String>,
+    /// Automatic idle admission resolves only after its first user input reaches durable
+    /// persistence, or a terminal lifecycle path settles it.
+    pub(crate) input_persisted:
+        Option<oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>>,
+}
+
 /// Whether mailbox deliveries should still be folded into the current turn.
 ///
 /// State machine:
@@ -49,6 +63,17 @@ pub(crate) enum MailboxDeliveryPhase {
     NextTurn,
 }
 
+impl Default for ActiveTurn {
+    fn default() -> Self {
+        Self {
+            task: None,
+            turn_state: Arc::new(Mutex::new(TurnState::default())),
+            reserved_turn_id: None,
+            input_persisted: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskKind {
     Regular,
@@ -56,22 +81,10 @@ pub(crate) enum TaskKind {
     Compact,
 }
 
-// Merge-safety anchor: task-specific completion, input persistence, and steer
-// admission remain distinct so a new turn cannot inherit a prior task's state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SteerAdmission {
-    Starting,
-    Open,
-    Sealed,
-}
-
 pub(crate) struct RunningTask {
-    pub(crate) task_done: Arc<Notify>,
+    pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
-    pub(crate) steer_admission: SteerAdmission,
     pub(crate) task: Arc<dyn AnySessionTask>,
-    pub(crate) input_persisted:
-        Option<oneshot::Sender<Result<(), TryStartTurnIfIdleRejectionReason>>>,
     pub(crate) cancellation_token: CancellationToken,
     pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,

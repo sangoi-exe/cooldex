@@ -59,7 +59,7 @@ async fn review_regression_agents_overview_creation_is_fresh_but_returning_is_no
         trust_launch_folder(&mut app);
         app.cli_kv_overrides.extend([
             ("tui.animations".into(), TomlValue::Boolean(true)),
-            ("tui.whimsy".into(), TomlValue::Boolean(true)),
+            ("tui.effects.starfield".into(), TomlValue::Boolean(true)),
         ]);
         app.harness_overrides.model = Some(model.into());
         let mut server = start_config_write_test_app_server(&app).await?;
@@ -588,6 +588,7 @@ async fn command_center_new_preserves_only_selected_server_profiles() -> Result<
         /*log_db*/ None,
         /*state_db*/ None,
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Default::default(),
     )
     .await?;
     let mut server = AppServerSession::new(

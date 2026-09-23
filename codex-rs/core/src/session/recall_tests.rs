@@ -83,6 +83,7 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
         mcp_resource_origins: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })
 }
 
@@ -113,6 +114,7 @@ fn compacted_window(
         mcp_resource_origins: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })
 }
 
@@ -137,6 +139,7 @@ fn legacy_compacted_window(
         mcp_resource_origins: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })
 }
 

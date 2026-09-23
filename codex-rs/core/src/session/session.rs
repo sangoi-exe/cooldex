@@ -19,9 +19,10 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::shell_snapshot::SnapshotCredentialBrokerState;
-use crate::state::TurnSlot;
+use crate::state::ActiveTurn;
 use crate::turn_metadata::ExecutionMetadata;
 use codex_attachment_store::AttachmentStore;
+use codex_config::SkillsConfig;
 use codex_extension_api::ExtensionDataInit;
 use codex_features::Feature;
 use codex_http_client::ClientRouteClass;
@@ -36,6 +37,9 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ProfileWorkspaceRoot;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::protocol::AgentRoleFeatureOptOut;
+use codex_protocol::protocol::AgentRoleSkillRestriction;
+use codex_protocol::protocol::AgentRoleSkillRestrictions;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::McpInvocation;
@@ -62,8 +66,7 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
-    /// Merge-safety anchor: serializes accepted settings, compaction/recovery durable publication,
-    /// and forced lifecycle-retirement admission so live state cannot cross a durable publication.
+    /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
     pub(super) thread_settings_persistence: Semaphore,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
@@ -74,7 +77,7 @@ pub(crate) struct Session {
     pub(super) features: ManagedFeatures,
     pub(crate) guardian_context_mode: GuardianContextMode,
     pub(super) isolation: codex_extension_api::SessionIsolation,
-    pub(crate) allowed_tools: Option<Arc<codex_extension_api::AllowedTools>>,
+    pub(crate) tool_policy: Arc<codex_extension_api::ToolPolicy>,
     pub(crate) windows_sandbox_proxy_settings_mode:
         codex_sandboxing::WindowsSandboxProxySettingsMode,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
@@ -88,12 +91,11 @@ pub(crate) struct Session {
     pub(super) mcp_prewarm_shutdown: CancellationToken,
     pub(super) mcp_prewarm_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
-    // Merge-safety anchor: combine upstream realtime history with the fork-owned TurnSlot lifecycle state.
     pub(crate) realtime_history: Option<Mutex<crate::realtime_history::RealtimeHistoryState>>,
-    pub(crate) active_turn: Mutex<TurnSlot>,
-    pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
+    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) pending_user_message_admissions:
         crate::user_message_admission::PendingUserMessageAdmissions,
+    pub(crate) async_hook_results: async_channel::Receiver<HookCompletedEvent>,
     pub(crate) input_queue: InputQueue,
     pub(crate) services: SessionServices,
     pub(super) git_enrichment_policy: GitEnrichmentPolicy,
@@ -183,7 +185,9 @@ impl SessionConfiguration {
             permission_profile: self.permission_profile_state.snapshot(),
             shell_environment_policy: self.shell_environment_policy.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_type: self.windows_sandbox_type,
+            windows_sandbox_type: self
+                .original_config_do_not_use
+                .windows_sandbox_type_from_config(),
             use_legacy_landlock: self.use_legacy_landlock,
             exec_policy: None,
             mcp_policy: None,
@@ -315,6 +319,53 @@ impl SessionConfiguration {
         &self,
         environment_selections: &[TurnEnvironmentSelection],
     ) -> ThreadSettingsSnapshot {
+        let config = &self.original_config_do_not_use;
+        let agent_role_feature_opt_outs = [
+            (Feature::ShellTool, AgentRoleFeatureOptOut::ShellTool),
+            (Feature::Apps, AgentRoleFeatureOptOut::Apps),
+            (Feature::Plugins, AgentRoleFeatureOptOut::Plugins),
+            (Feature::MemoryTool, AgentRoleFeatureOptOut::MemoryTool),
+            (
+                Feature::RequestPermissionsTool,
+                AgentRoleFeatureOptOut::RequestPermissionsTool,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(feature, opt_out)| (!config.features.enabled(feature)).then_some(opt_out))
+        .collect();
+        let skills = config
+            .config_layer_stack
+            .effective_config()
+            .get("skills")
+            .cloned()
+            .map(SkillsConfig::try_from)
+            .transpose()
+            .expect("session configuration must retain validated skills settings");
+        let agent_role_skill_restrictions = if let Some(skills) = skills {
+            AgentRoleSkillRestrictions {
+                bundled_skills_disabled: skills
+                    .bundled
+                    .as_ref()
+                    .is_some_and(|bundled| !bundled.enabled),
+                skill_instructions_disabled: skills.include_instructions == Some(false),
+                disabled_skills: skills
+                    .config
+                    .into_iter()
+                    .filter(|skill| !skill.enabled)
+                    .filter_map(|skill| match (skill.name, skill.path) {
+                        (Some(name), None) => Some(AgentRoleSkillRestriction::Name { name }),
+                        (None, Some(path)) => Some(AgentRoleSkillRestriction::Path { path }),
+                        (Some(_), Some(_)) | (None, None) => None,
+                    })
+                    .collect(),
+            }
+        } else {
+            AgentRoleSkillRestrictions {
+                bundled_skills_disabled: false,
+                skill_instructions_disabled: false,
+                disabled_skills: Vec::new(),
+            }
+        };
         ThreadSettingsSnapshot {
             model: self.step_settings.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
@@ -335,6 +386,11 @@ impl SessionConfiguration {
                     .features
                     .enabled(Feature::ShellTool),
             ),
+            agent_role_feature_opt_outs: Some(agent_role_feature_opt_outs),
+            agent_role_skill_restrictions: Some(agent_role_skill_restrictions),
+            model_context_window: Some(config.model_context_window),
+            model_auto_compact_token_limit: Some(config.model_auto_compact_token_limit),
+            model_auto_compact_token_limit_scope: Some(config.model_auto_compact_token_limit_scope),
         }
     }
 
@@ -374,7 +430,7 @@ impl SessionConfiguration {
     ) -> ConstraintResult<()> {
         self.step_settings
             .validate(&self.step_settings_constraints(environments))?;
-        super::environment::validate_environment_selections(environments)
+        super::environment::validate_environment_configs(environments)
     }
 
     pub(super) fn step_settings_constraints(
@@ -545,7 +601,7 @@ impl SessionConfiguration {
             .map_or(current_environments, |environments| {
                 environments.environments.as_slice()
             });
-        super::environment::validate_environment_selections(next_environments)?;
+        super::environment::validate_environment_configs(next_environments)?;
         // Apply step settings last: the proposed permissions and environment
         // selections must be complete before deriving their validation constraints.
         next_configuration.step_settings = Arc::new(self.step_settings.apply(
@@ -726,6 +782,7 @@ impl Session {
         CodexResponsesMetadata {
             window_number: Some(window_number),
             context_window_id: Some(context_window_id),
+            mcp_attribution: Some(self.services.executed_tool_calls.mcp_attribution_snapshot()),
             analytics_enabled: Some(self.services.analytics_events_client.is_enabled()),
             history_ingest_requested: turn_context
                 .config
@@ -817,7 +874,7 @@ impl Session {
             ForkPersistence::Referenced { history_base, .. } => {
                 history_base.map(|position| position.end_ordinal_exclusive)
             }
-            ForkPersistence::Copied => match &initial_history {
+            ForkPersistence::Copied | ForkPersistence::CopiedDeferred => match &initial_history {
                 InitialHistory::Resumed(resumed) => {
                     // Both local and CCA thread stores place the resumed thread's
                     // canonical SessionMeta first. Never inspect inherited metadata:
@@ -931,293 +988,14 @@ impl Session {
         let restore_child_window = matches!(&initial_history, InitialHistory::Forked(_))
             && session_configuration.session_source.is_non_root_agent()
             && config.features.enabled(Feature::TokenBudget);
-        // Merge-safety anchor: child checkpoint restoration validates UUID-v7 lineage and remaps
-        // retained recovery-application identities to the checkpoint window.
         if restore_child_window && let InitialHistory::Forked(items) = &mut initial_history {
-            #[derive(Clone)]
-            struct SourceCheckpoint {
-                item_index: usize,
-                window_id_text: String,
-                window_id: Uuid,
-                window_number: u64,
-                first_window_id: Uuid,
-                previous_window_id: Option<Uuid>,
-            }
-
-            #[derive(Clone, Copy)]
-            struct MappedCheckpoint {
-                item_index: usize,
-                window_number: u64,
-                first_window_id: Uuid,
-                previous_window_id: Option<Uuid>,
-                window_id: Uuid,
-            }
-
-            let parse_v7 = |item_index: usize,
-                            field: &str,
-                            value: Option<&str>|
-             -> anyhow::Result<Uuid> {
-                let value = value.ok_or_else(|| {
-                    anyhow::anyhow!("inherited checkpoint {item_index} is missing required {field}")
-                })?;
-                let uuid = Uuid::parse_str(value).map_err(|_| {
-                    anyhow::anyhow!(
-                        "inherited checkpoint {item_index} has invalid {field}: {value}"
-                    )
-                })?;
-                if uuid.get_version_num() != 7 {
-                    return Err(anyhow::anyhow!(
-                        "inherited checkpoint {item_index} has non-v7 {field}: {value}"
-                    ));
-                }
-                Ok(uuid)
-            };
-
-            let mut source_checkpoints = Vec::new();
-            let mut retained_window_ids = HashSet::new();
-            for (item_index, item) in items.iter().enumerate() {
-                let RolloutItem::Compacted(checkpoint) = item else {
-                    continue;
-                };
-                let window_id_text = checkpoint.window_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "inherited checkpoint {item_index} is missing required window_id"
-                    )
-                })?;
-                let window_id = parse_v7(item_index, "window_id", Some(window_id_text.as_str()))?;
-                if !retained_window_ids.insert(window_id) {
-                    return Err(anyhow::anyhow!(
-                        "inherited checkpoint {item_index} duplicates window_id {window_id_text}"
-                    ));
-                }
-                let window_number = checkpoint.window_number.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "inherited checkpoint {item_index} is missing required window_number"
-                    )
-                })?;
-                let first_window_id = parse_v7(
-                    item_index,
-                    "first_window_id",
-                    checkpoint.first_window_id.as_deref(),
-                )?;
-                let previous_window_id = checkpoint
-                    .previous_window_id
-                    .as_deref()
-                    .map(|value| parse_v7(item_index, "previous_window_id", Some(value)))
-                    .transpose()?;
-                source_checkpoints.push(SourceCheckpoint {
-                    item_index,
-                    window_id_text,
-                    window_id,
-                    window_number,
-                    first_window_id,
-                    previous_window_id,
-                });
-            }
-
-            let mut mapped_checkpoints = Vec::with_capacity(source_checkpoints.len());
-            if let Some(first) = source_checkpoints.first() {
-                let child_root_window_id = initial_auto_compact_window_ids.window_id;
-                let mut admitted_windows: HashMap<Uuid, (Uuid, u64, u64)> = HashMap::new();
-                let mut mapped_window_ids = HashSet::from([child_root_window_id]);
-
-                if first.window_number == 0 {
-                    if first.first_window_id != first.window_id
-                        || first.previous_window_id.is_some()
-                    {
-                        return Err(anyhow::anyhow!(
-                            "inherited root checkpoint {} has a noncanonical window-zero shape",
-                            first.item_index
-                        ));
-                    }
-                } else {
-                    let previous_alias = first.previous_window_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "inherited compressed root checkpoint {} is missing previous_window_id",
-                            first.item_index
-                        )
-                    })?;
-                    if retained_window_ids.contains(&first.first_window_id)
-                        || retained_window_ids.contains(&previous_alias)
-                    {
-                        return Err(anyhow::anyhow!(
-                            "inherited compressed root checkpoint {} aliases a retained window",
-                            first.item_index
-                        ));
-                    }
-                    if (first.window_number == 1 && first.first_window_id != previous_alias)
-                        || (first.window_number > 1 && first.first_window_id == previous_alias)
-                    {
-                        return Err(anyhow::anyhow!(
-                            "inherited compressed root checkpoint {} has invalid omitted-prefix aliases",
-                            first.item_index
-                        ));
-                    }
-                    admitted_windows.insert(first.first_window_id, (child_root_window_id, 0, 0));
-                    let previous_alias_source_number = first.window_number.saturating_sub(1);
-                    if let Some((_, source_number, _)) = admitted_windows.insert(
-                        previous_alias,
-                        (child_root_window_id, previous_alias_source_number, 0),
-                    ) && source_number != previous_alias_source_number
-                    {
-                        return Err(anyhow::anyhow!(
-                            "inherited compressed root checkpoint {} assigns conflicting alias numbers",
-                            first.item_index
-                        ));
-                    }
-                }
-
-                admitted_windows.insert(
-                    first.window_id,
-                    (child_root_window_id, first.window_number, 0),
-                );
-                mapped_checkpoints.push(MappedCheckpoint {
-                    item_index: first.item_index,
-                    window_number: 0,
-                    first_window_id: child_root_window_id,
-                    previous_window_id: None,
-                    window_id: child_root_window_id,
-                });
-
-                for source in &source_checkpoints[1..] {
-                    if source.first_window_id != first.first_window_id {
-                        return Err(anyhow::anyhow!(
-                            "inherited checkpoint {} changes first_window_id",
-                            source.item_index
-                        ));
-                    }
-                    let previous_window_id = source.previous_window_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "inherited checkpoint {} is missing previous_window_id",
-                            source.item_index
-                        )
-                    })?;
-                    let Some(&(
-                        mapped_previous_window_id,
-                        predecessor_source_number,
-                        mapped_predecessor_number,
-                    )) = admitted_windows.get(&previous_window_id)
-                    else {
-                        return Err(anyhow::anyhow!(
-                            "inherited checkpoint {} references a self, forward, cyclic, or unknown predecessor",
-                            source.item_index
-                        ));
-                    };
-                    if source.window_number != predecessor_source_number.saturating_add(1) {
-                        return Err(anyhow::anyhow!(
-                            "inherited checkpoint {} has a window_number that is not the saturating successor of its predecessor",
-                            source.item_index
-                        ));
-                    }
-                    let mapped_window_number = mapped_predecessor_number.saturating_add(1);
-                    let mapped_window_id = loop {
-                        let candidate = Uuid::now_v7();
-                        if mapped_window_ids.insert(candidate) {
-                            break candidate;
-                        }
-                    };
-                    admitted_windows.insert(
-                        source.window_id,
-                        (mapped_window_id, source.window_number, mapped_window_number),
-                    );
-                    mapped_checkpoints.push(MappedCheckpoint {
-                        item_index: source.item_index,
-                        window_number: mapped_window_number,
-                        first_window_id: child_root_window_id,
-                        previous_window_id: Some(mapped_previous_window_id),
-                        window_id: mapped_window_id,
-                    });
-                }
-            }
-
-            let mapped_by_item_index = mapped_checkpoints
-                .iter()
-                .map(|mapped| (mapped.item_index, *mapped))
-                .collect::<HashMap<_, _>>();
-            let mut recovery_window_mappings = HashMap::new();
-            for (source, mapped) in source_checkpoints.iter().zip(&mapped_checkpoints) {
-                let RolloutItem::Compacted(checkpoint) = &items[source.item_index] else {
-                    unreachable!("source checkpoint index must still name a checkpoint");
-                };
-                let Some(replacement_history) = checkpoint.replacement_history.as_deref() else {
-                    continue;
-                };
-                let Some(boundary_item_id) = replacement_history.last().and_then(|item| item.id())
-                else {
-                    continue;
-                };
-                let boundary_item_id = boundary_item_id.as_str();
-                let boundary_occurrences = replacement_history
-                    .iter()
-                    .filter(|item| {
-                        item.id()
-                            .is_some_and(|item_id| item_id.as_str() == boundary_item_id)
-                    })
-                    .count();
-                if boundary_item_id.is_empty()
-                    || boundary_occurrences != 1
-                    || checkpoint
-                        .post_compact_recovery
-                        .as_ref()
-                        .is_some_and(|marker| {
-                            marker.boundary_item_id.is_empty()
-                                || marker.boundary_item_id != boundary_item_id
-                        })
-                {
-                    continue;
-                }
-                recovery_window_mappings.insert(
-                    (source.window_id_text.clone(), boundary_item_id.to_string()),
-                    mapped.window_id.to_string(),
-                );
-            }
-
-            let mut active_turn_id = None;
-            for (item_index, item) in items.iter_mut().enumerate() {
-                match item {
-                    RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
-                        active_turn_id = Some(event.turn_id.clone());
-                    }
-                    RolloutItem::EventMsg(EventMsg::TurnComplete(event))
-                        if active_turn_id.as_deref() == Some(event.turn_id.as_str()) =>
-                    {
-                        active_turn_id = None;
-                    }
-                    RolloutItem::EventMsg(EventMsg::TurnAborted(event))
-                        if event
-                            .turn_id
-                            .as_deref()
-                            .is_some_and(|turn_id| active_turn_id.as_deref() == Some(turn_id)) =>
-                    {
-                        active_turn_id = None;
-                    }
-                    RolloutItem::Compacted(checkpoint) => {
-                        let mapped = mapped_by_item_index.get(&item_index).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "inherited checkpoint {item_index} is missing its admitted mapping"
-                            )
-                        })?;
-                        checkpoint.window_number = Some(mapped.window_number);
-                        checkpoint.first_window_id = Some(mapped.first_window_id.to_string());
-                        checkpoint.previous_window_id = mapped
-                            .previous_window_id
-                            .map(|window_id| window_id.to_string());
-                        checkpoint.window_id = Some(mapped.window_id.to_string());
-                    }
-                    RolloutItem::PostCompactRecoveryApplied(applied) => {
-                        if !applied.compaction_window_id.is_empty()
-                            && !applied.boundary_item_id.is_empty()
-                            && !applied.turn_id.is_empty()
-                            && active_turn_id.as_deref() == Some(applied.turn_id.as_str())
-                            && let Some(mapped_window_id) = recovery_window_mappings.get(&(
-                                applied.compaction_window_id.clone(),
-                                applied.boundary_item_id.clone(),
-                            ))
-                        {
-                            applied.compaction_window_id.clone_from(mapped_window_id);
-                        }
-                    }
-                    _ => {}
+            let child_window_id = initial_auto_compact_window_ids.window_id.to_string();
+            for item in items {
+                if let RolloutItem::Compacted(checkpoint) = item {
+                    checkpoint.window_number = Some(0);
+                    checkpoint.first_window_id = Some(child_window_id.clone());
+                    checkpoint.previous_window_id = None;
+                    checkpoint.window_id = Some(child_window_id.clone());
                 }
             }
         }
@@ -1248,12 +1026,15 @@ impl Session {
         // Publish the already resolved model before extensions make startup decisions.
         // Turn construction refreshes this attachment when the selected model changes.
         thread_extension_init.insert(model_info);
-        let allowed_tools = thread_extension_init
-            .get::<codex_extension_api::AllowedTools>()
-            .or_else(|| {
-                // Older reviewer rollouts predate the explicit startup setting.
-                crate::guardian::is_basic_session_source(&session_configuration.session_source)
-                    .then(|| Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()))
+        let tool_policy = thread_extension_init
+            .get::<codex_extension_api::ToolPolicy>()
+            .unwrap_or_else(|| {
+                // Older reviewer rollouts predate the explicit startup policy.
+                if crate::guardian::is_basic_session_source(&session_configuration.session_source) {
+                    Arc::new(codex_guardian_reviewer::reviewer_tool_policy())
+                } else {
+                    Arc::default()
+                }
             });
         let mcp_thread_init = thread_extension_init.clone();
         let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
@@ -1268,6 +1049,8 @@ impl Session {
         // - initialize thread persistence with new or resumed session info
         // - perform default shell discovery
         // - load history metadata (skipped for subagents)
+        let persistence_auth = futures::FutureExt::shared(auth_manager.auth());
+        let mcp_auth = persistence_auth.clone();
         let thread_persistence_fut = async {
             if config.ephemeral {
                 Ok::<_, anyhow::Error>((None, LiveThreadInitGuard::new(/*live_thread*/ None)))
@@ -1280,7 +1063,10 @@ impl Session {
                 let guard = managed_guard.as_deref_mut().unwrap_or(&mut local_guard);
                 let live_thread = match &initial_history {
                     InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                        let auth = persistence_auth.await;
                         let params = CreateThreadParams {
+                            creator_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+                            creator_account_id: auth.as_ref().and_then(CodexAuth::get_account_id),
                             session_id,
                             thread_id,
                             extra_config: config.extra_config.clone(),
@@ -1297,11 +1083,11 @@ impl Session {
                             selected_capability_roots: selected_capability_roots.clone(),
                             multi_agent_version: initial_multi_agent_version,
                             // Merge-safety anchor: session creation freezes the already-selected
-                            // runtime binding into durable metadata without resolving/rendering it.
+                            // runtime binding into durable metadata without resolving or rendering it.
                             agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
                             history_mode: session_configuration.history_mode,
                             history_base: match &fork_persistence {
-                                ForkPersistence::Copied => None,
+                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred => None,
                                 ForkPersistence::Referenced { history_base, .. } => *history_base,
                             },
                             subagent_history_start_ordinal: None,
@@ -1320,7 +1106,10 @@ impl Session {
                             },
                         };
                         if is_paginated_subagent
-                            && matches!(&fork_persistence, ForkPersistence::Copied)
+                            && matches!(
+                                &fork_persistence,
+                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred
+                            )
                             && let InitialHistory::Forked(items) = &initial_history
                         {
                             LiveThread::create_with_inherited_model_context(
@@ -1387,7 +1176,6 @@ impl Session {
         ));
 
         let mut mcp_auth_changes = auth_manager.auth_change_receiver();
-        let auth_manager_clone = Arc::clone(&auth_manager);
         let plugins_manager_for_prewarm = Arc::clone(&plugins_manager);
         let config_for_mcp = Arc::clone(&config);
         let mcp_manager_for_mcp = Arc::clone(&mcp_manager);
@@ -1402,7 +1190,7 @@ impl Session {
             .map(|cwd| cwd.to_path_buf())
             .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
         let auth_and_mcp_fut = async move {
-            let auth = auth_manager_clone.auth().await;
+            let auth = mcp_auth.await;
             if config_for_mcp.features.plugin_recommendations_enabled() {
                 let plugins_config = config_for_mcp.plugins_config_input();
                 let auth_for_prewarm = auth.clone();
@@ -1693,15 +1481,15 @@ impl Session {
             let turn_environments = Arc::new(ThreadEnvironments::new(
                 environment_manager,
                 default_shell.clone(),
-                session_configuration.inferred_environment_config(),
+                ThreadEnvironmentDefaults::new(
+                    session_configuration.inferred_environment_config(),
+                    session_configuration.windows_sandbox_type,
+                ),
                 shell_snapshot,
                 inherited_environments.unwrap_or_default(),
                 config.features.enabled(Feature::DeferredExecutor),
             ));
-            turn_environments.update_selections(
-                environment_selections,
-                &session_configuration.inferred_environment_config(),
-            );
+            turn_environments.update_selections(environment_selections);
             session_configuration.environments = turn_environments.selections();
             let resolved_environments = turn_environments.snapshot().await;
             let agents_md_manager = Arc::new(AgentsMdManager::new(instructions));
@@ -1716,12 +1504,18 @@ impl Session {
                 "session_init.plugin_skill_warmup",
                 otel.name = "session_init.plugin_skill_warmup",
             ));
-            let thread_name_lookup =
-                thread_title_from_thread_store(live_thread.as_ref(), &thread_store, thread_id)
-                    .instrument(info_span!(
-                        "session_init.thread_name_lookup",
-                        otel.name = "session_init.thread_name_lookup",
-                    ));
+            let thread_name_lookup = async {
+                if config.ephemeral && matches!(&initial_history, InitialHistory::Forked(_)) {
+                    None
+                } else {
+                    thread_title_from_thread_store(live_thread.as_ref(), &thread_store, thread_id)
+                        .await
+                }
+            }
+            .instrument(info_span!(
+                "session_init.thread_name_lookup",
+                otel.name = "session_init.thread_name_lookup",
+            ));
             let (instruction_refresh, plugin_skill_errors, thread_name) = tokio::join!(
                 agents_md_manager.refresh(config.as_ref(), &resolved_environments),
                 plugin_skill_warmup,
@@ -1752,12 +1546,6 @@ impl Session {
                     &session_configuration.session_source,
                 ),
             );
-            state.last_started_turn_id = initial_history.get_rollout_items().iter().rev().find_map(|item| {
-                match item {
-                    RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => Some(event.turn_id.clone()),
-                    _ => None,
-                }
-            });
             state.base_instructions_provenance = base_instructions_provenance.clone();
             state.active_disabled_plugin_ids = session_configuration.disabled_plugin_ids.clone();
             let managed_network_requirements_configured = config
@@ -1803,7 +1591,7 @@ impl Session {
                         spec,
                         current_exec_policy.as_ref(),
                         config.permissions.permission_profile(),
-                        config.permissions.windows_sandbox_type,
+                        config.effective_local_windows_sandbox_type(),
                         network_policy_decider.as_ref().map(Arc::clone),
                         blocked_request_observer.as_ref().map(Arc::clone),
                         managed_network_requirements_configured,
@@ -1883,13 +1671,13 @@ impl Session {
                     | RolloutItem::ResponseItem(_)
                     | RolloutItem::InterAgentCommunication(_)
                     | RolloutItem::InterAgentCommunicationMetadata { .. }
-                    | RolloutItem::PostCompactRecoveryApplied(_)
                     | RolloutItem::TurnContext(_)
                     | RolloutItem::WorldState(_)
                     | RolloutItem::RealtimeItem(_)
                     | RolloutItem::TokenUsageRecord(_)
                     | RolloutItem::RetainedContext(_)
-                    | RolloutItem::SecurityRiskScore(_) => {}
+                    | RolloutItem::SecurityRiskScore(_)
+                    | RolloutItem::PostCompactRecoveryApplied(_) => {}
                 }
             }
             let session_extension_data =
@@ -1898,6 +1686,8 @@ impl Session {
             let mcp_resource_client = Arc::new(McpResourceClient::new(Arc::clone(&mcp_runtime)));
             let extension_metrics =
                 extension_metrics::from_session_telemetry(session_telemetry.clone());
+            let workspace_routing = thread_extension_data
+                .get_or_init(|| config.workspace_routing_context());
             for contributor in extensions.thread_lifecycle_contributors() {
                 contributor.on_thread_start(codex_extension_api::ThreadStartInput {
                     config: config.as_ref(),
@@ -1963,6 +1753,7 @@ impl Session {
                 selected_capability_roots,
                 mcp_thread_init,
                 client_mcp_extensions,
+                local_agent_runtime: agent_control.runtime.clone(),
                 agent_control,
                 network_proxy: arc_swap::ArcSwapOption::from(network_proxy.map(Arc::new)),
                 network_proxy_audit_metadata,
@@ -1996,7 +1787,7 @@ impl Session {
                         .enabled(Feature::ConcurrentReasoningSummaries),
                     attestation_provider,
                     config.http_client_factory(),
-                    config.workspace_routing_context(),
+                    workspace_routing.as_ref().clone(),
                 )
                 .with_restored_history(matches!(
                     &initial_history,
@@ -2033,7 +1824,7 @@ impl Session {
                 features: config.features.clone(),
                 guardian_context_mode,
                 isolation,
-                allowed_tools,
+                tool_policy,
                 windows_sandbox_proxy_settings_mode,
                 multi_agent_version,
                 mcp_refresh: McpRefresh::new(),
@@ -2047,9 +1838,9 @@ impl Session {
                 realtime_history: (session_configuration.history_mode == ThreadHistoryMode::Paginated
                     && services.live_thread.is_some())
                 .then(|| Mutex::new(Default::default())),
-                active_turn: Mutex::new(TurnSlot::default()),
-                async_hook_results,
+                active_turn: Mutex::new(None),
                 pending_user_message_admissions: Default::default(),
+                async_hook_results,
                 input_queue: InputQueue::new(),
                 services,
                 git_enrichment_policy,
@@ -2161,6 +1952,12 @@ impl Session {
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
+            if restore_child_window {
+                sess.state.lock().await.restore_auto_compact_window(
+                    /*window_number*/ 0,
+                    initial_auto_compact_window_ids,
+                );
+            }
             if matches!(&sess.fork_persistence, ForkPersistence::Referenced { .. }) {
                 // Keep the source reserved until the child's history reference is durable.
                 sess.try_ensure_rollout_materialized(PersistContext::Standard)

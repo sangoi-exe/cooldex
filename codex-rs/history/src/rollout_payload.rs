@@ -192,6 +192,8 @@ pub(super) struct CompactedItemWire<'a> {
     compaction_response_id: Option<Cow<'a, str>>,
     #[serde(default)]
     latest_token_usage_record: Option<Cow<'a, TokenUsageRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_metadata: Option<Cow<'a, crate::CompactionResumeMetadata>>,
 }
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
@@ -232,6 +234,7 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
             post_compact_recovery: item.post_compact_recovery.as_ref().map(Cow::Borrowed),
             compaction_response_id: item.compaction_response_id.as_deref().map(Cow::Borrowed),
             latest_token_usage_record: item.latest_token_usage_record.as_ref().map(Cow::Borrowed),
+            resume_metadata: item.resume_metadata.as_ref().map(Cow::Borrowed),
         }
     }
 }
@@ -298,6 +301,7 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
             post_compact_recovery: item.post_compact_recovery.map(Cow::into_owned),
             compaction_response_id: item.compaction_response_id.map(Cow::into_owned),
             latest_token_usage_record: item.latest_token_usage_record.map(Cow::into_owned),
+            resume_metadata: item.resume_metadata.map(Cow::into_owned),
         })
     }
 }

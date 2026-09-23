@@ -1,7 +1,6 @@
 use super::handlers;
 use super::session::Session;
 use crate::state::TaskKind;
-use crate::state::TerminalTransitionKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::Event;
@@ -21,7 +20,10 @@ pub(super) async fn suspend_turn_and_shutdown(
     {
         let _persistence_guard = session.acquire_thread_settings_persistence().await;
         let active = session.active_turn.lock().await;
-        let Some(task) = active.running_task() else {
+        let Some(task) = active
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+        else {
             return Ok(SuspendTurnOutcome::NotActive);
         };
         if task.kind != TaskKind::Regular {
@@ -50,44 +52,40 @@ pub(super) async fn suspend_turn_and_shutdown(
         CodexErr::Fatal(format!("flush before root turn suspension failed: {error}"))
     })?;
 
-    // The flush can yield while the active turn completes or changes. Recheck its
-    // kind while acquiring the slot's terminal-transition ownership.
-    let retired_turn = loop {
-        let mut generation_rx = {
-            let _persistence_guard = session.acquire_thread_settings_persistence().await;
-            let mut active = session.active_turn.lock().await;
-            let Some(task) = active.running_task() else {
-                return Ok(SuspendTurnOutcome::NotActive);
-            };
-            if task.kind != TaskKind::Regular {
-                return Ok(SuspendTurnOutcome::UnsupportedTask);
-            }
-            if active.is_transitioning()
-                || active.running_task().is_some_and(|task| {
-                    task.steer_admission == crate::state::SteerAdmission::Starting
-                })
-            {
-                active.subscribe_generation()
-            } else {
-                let retired_turn = active
-                    .begin_transition(TerminalTransitionKind::Interrupting, None)
-                    .map_err(|error| {
-                        CodexErr::Fatal(format!(
-                            "accepted root turn suspension could not begin terminal transition: {error}"
-                        ))
-                    })?;
-                retired_turn.task.cancellation_token.cancel();
-                break retired_turn;
-            }
-        };
-        if generation_rx.changed().await.is_err() {
+    // The flush can yield while the active turn completes or changes. Recheck its kind while
+    // taking the exact current ActiveTurn. Keep the persistence-publication permit through the
+    // take and cancellation, so no late compaction or recovery publisher can cross retirement.
+    let (turn_state, input_persisted, task) = {
+        let _persistence_guard = session.acquire_thread_settings_persistence().await;
+        let mut active = session.active_turn.lock().await;
+        let Some(active_turn) = active.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
+        };
+        let Some(task) = active_turn.task.as_ref() else {
+            return Ok(SuspendTurnOutcome::NotActive);
+        };
+        if task.kind != TaskKind::Regular {
+            return Ok(SuspendTurnOutcome::UnsupportedTask);
         }
+        let mut active_turn = active.take().ok_or_else(|| {
+            CodexErr::Fatal("accepted root turn suspension had no running turn".to_string())
+        })?;
+        let task = active_turn.task.take().ok_or_else(|| {
+            CodexErr::Fatal("accepted root turn suspension had no running task".to_string())
+        })?;
+        task.cancellation_token.cancel();
+        (
+            active_turn.turn_state,
+            active_turn.input_persisted.take(),
+            task,
+        )
     };
-    let transition_generation = retired_turn.transition_generation;
-    let turn_state = retired_turn.turn_state;
-    let task = retired_turn.task;
     let turn_id = task.turn_context.sub_id.clone();
+    if let Some(sender) = input_persisted {
+        let _ = sender.send(Err(
+            crate::codex_thread::TryStartTurnIfIdleRejectionReason::TaskEndedBeforePersistence,
+        ));
+    }
     // Normal shutdown records a terminal turn event, preventing another worker from
     // recovering this turn under its original ID. Cancel the task without that event.
     task.turn_context
@@ -116,6 +114,9 @@ pub(super) async fn suspend_turn_and_shutdown(
     // Pending accepted input and interactive waiters live only in this process. Handoff
     // intentionally drops that state; persisting or replaying it needs a separate protocol.
     session
+        .pending_user_message_admissions
+        .complete_task_end(&turn_id);
+    session
         .input_queue
         .clear_pending_for_turn_state(turn_state.as_ref())
         .await;
@@ -130,18 +131,8 @@ pub(super) async fn suspend_turn_and_shutdown(
     live_thread.shutdown().await.map_err(|error| {
         CodexErr::Fatal(format!("close suspended root turn writer failed: {error}"))
     })?;
-    // Announce completion only after extension cleanup and writer closure so a
-    // replacement worker cannot write the same thread concurrently.
-    {
-        let mut active = session.active_turn.lock().await;
-        active
-            .finish_transition_idle(transition_generation, &turn_id)
-            .map_err(|error| {
-                CodexErr::Fatal(format!(
-                    "finish suspended root turn transition failed: {error}"
-                ))
-            })?;
-    }
+    // Announce completion only after extension cleanup and writer closure so a replacement
+    // worker cannot write the same thread concurrently.
     session
         .deliver_event_raw(Event {
             id: submission_id,

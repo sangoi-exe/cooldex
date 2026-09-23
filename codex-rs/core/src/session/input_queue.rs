@@ -1,5 +1,5 @@
+use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
-use crate::state::TurnSlot;
 use crate::state::TurnState;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -190,13 +190,16 @@ impl InputQueue {
 
     pub(crate) async fn turn_state_for_sub_id(
         &self,
-        active_turn: &Mutex<TurnSlot>,
+        active_turn: &Mutex<Option<ActiveTurn>>,
         sub_id: &str,
     ) -> Option<Arc<Mutex<TurnState>>> {
-        let slot = active_turn.lock().await;
-        (slot.running_turn_id() == Some(sub_id))
-            .then(|| slot.turn_state().cloned())
-            .flatten()
+        let active_turn = active_turn.lock().await;
+        let active_turn = active_turn.as_ref()?;
+        (active_turn
+            .task
+            .as_ref()
+            .is_some_and(|task| task.turn_context.sub_id == sub_id))
+        .then(|| Arc::clone(&active_turn.turn_state))
     }
 
     /// Clear any pending waiters and input buffered for the current turn.
@@ -208,7 +211,7 @@ impl InputQueue {
 
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(
         &self,
-        active_turn: &Mutex<TurnSlot>,
+        active_turn: &Mutex<Option<ActiveTurn>>,
         sub_id: &str,
     ) {
         let turn_state = self.turn_state_for_sub_id(active_turn, sub_id).await;
@@ -231,7 +234,7 @@ impl InputQueue {
 
     pub(crate) async fn accept_mailbox_delivery_for_current_turn(
         &self,
-        active_turn: &Mutex<TurnSlot>,
+        active_turn: &Mutex<Option<ActiveTurn>>,
         sub_id: &str,
     ) {
         let turn_state = self.turn_state_for_sub_id(active_turn, sub_id).await;
@@ -280,24 +283,25 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
-    // Merge-safety anchor: keep active-turn metadata in the TurnSlot owner so late mailbox
-    // delivery cannot bypass rooted turn provenance.
+    // Merge-safety anchor: ActiveTurn owns both task identity and pending-input metadata so late
+    // mailbox delivery cannot bypass rooted turn provenance.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
     pub(crate) async fn get_pending_input(
         &self,
-        active_turn: &Mutex<TurnSlot>,
+        active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
         let (pending_input, accepts_mailbox_delivery, active_turn_metadata) = {
-            let slot = active_turn.lock().await;
-            match slot.turn_state() {
-                Some(turn_state) => {
-                    let active_turn_metadata = slot
-                        .running_task()
+            let active_turn = active_turn.lock().await;
+            match active_turn.as_ref() {
+                Some(turn) => {
+                    let active_turn_metadata = turn
+                        .task
+                        .as_ref()
                         .map(|task| Arc::clone(&task.turn_context.turn_metadata_state));
-                    let mut turn_state = turn_state.lock().await;
+                    let mut turn_state = turn.turn_state.lock().await;
                     let accepts_mailbox_delivery =
                         turn_state.accepts_mailbox_delivery_for_current_turn();
                     let pending_input = if accepts_mailbox_delivery {
@@ -337,12 +341,12 @@ impl InputQueue {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state reads must remain atomic"
     )]
-    pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<TurnSlot>) -> bool {
+    pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<Option<ActiveTurn>>) -> bool {
         let (has_turn_pending_input, accepts_mailbox_delivery) = {
-            let slot = active_turn.lock().await;
-            match slot.turn_state() {
-                Some(turn_state) => {
-                    let turn_state = turn_state.lock().await;
+            let active_turn = active_turn.lock().await;
+            match active_turn.as_ref() {
+                Some(turn) => {
+                    let turn_state = turn.turn_state.lock().await;
                     (
                         !turn_state.pending_input.is_empty(),
                         turn_state.accepts_mailbox_delivery_for_current_turn(),

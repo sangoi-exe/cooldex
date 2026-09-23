@@ -1,4 +1,7 @@
 use super::*;
+use crate::agent::api::AgentControl;
+use crate::agent::api::AgentInput;
+use crate::agent::api::SpawnRequest;
 use crate::agent::types::SpawnAgentOptions;
 use crate::config::RolloutBudgetConfig;
 use crate::config::test_config;
@@ -227,6 +230,7 @@ async fn thread_analytics_opt_out_overrides_shared_client() {
             }
             services.analytics_events_client.track_app_used(
                 codex_analytics::TrackEventsContext {
+                    turn_metadata: None,
                     model_slug: "test-model".to_string(),
                     turn_id: format!("test-turn-{thread_id}"),
                     thread_id,
@@ -378,26 +382,28 @@ async fn thread_id_generator_applies_to_roots_children_and_forks() {
         .session
         .services
         .agent_control
-        .spawn_agent_with_metadata(
-            config.clone(),
-            vec![UserInput::Text {
+        .spawn(SpawnRequest {
+            caller: root.thread_id,
+            config: config.clone(),
+            input: AgentInput::UserInput(vec![UserInput::Text {
                 text: "child task".to_string(),
                 text_elements: Vec::new(),
-            }],
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            }]),
+            source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id: root.thread_id,
                 depth: 1,
                 agent_path: None,
                 agent_nickname: None,
                 agent_role: None,
-            })),
-            SpawnAgentOptions {
+            }),
+            options: SpawnAgentOptions {
                 parent_thread_id: Some(root.thread_id),
                 ..Default::default()
             },
-        )
+        })
         .await
-        .expect("spawn actual child agent");
+        .expect("spawn actual child agent")
+        .0;
     let fork = manager
         .spawn_subagent(root.thread_id, StartThreadOptions::new(config))
         .await

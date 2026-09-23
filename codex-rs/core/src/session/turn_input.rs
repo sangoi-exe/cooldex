@@ -20,7 +20,6 @@ use super::thread_settings;
 use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnContext;
 use crate::context::GuardianContextMode;
-use crate::tasks::MailboxParentProvenance;
 use crate::tasks::RegularTask;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -330,7 +329,10 @@ async fn start_or_steer(
             settings.apply_steered(session, submission_id).await?;
             Ok(TurnInputSubmission::Steered { turn_id })
         }
-        Err(SteerInputError::NoActiveTurn(_)) => {
+        Err(SteerInputError::NoActiveTurn(retained_input)) => {
+            if let SubmittedTurnInput::UserInput { content, .. } = &mut input {
+                *content = retained_input;
+            }
             // MAv1 sends explicit input to spawned agents as part of an existing
             // parent's work. Client RPCs are gated separately by the host.
             let is_delegated_input = settings.start_options.parent_turn_id.is_some()
@@ -387,8 +389,8 @@ async fn start_or_steer(
     }
 }
 
-// Merge-safety anchor: idle start reserves an idle TurnSlot, rechecks admission, and cancels the
-// uninstalled claim while returning a rejection reason.
+// Merge-safety anchor: idle start reserves the sole ActiveTurn, rechecks admission, and cancels
+// an unopened reservation while returning a rejection reason.
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "the previous turn check and idle reservation must be atomic"
@@ -444,26 +446,21 @@ async fn start_if_idle(
         });
     }
 
-    let claim = {
-        let mut slot = session.active_turn.lock().await;
-        if !slot.is_idle() {
-            return Ok(TurnInputSubmission::NotSubmitted {
-                reason: NotSubmittedReason::NotIdle,
-            });
-        }
-        if let Some(expected) = expected_previous_turn_id
-            && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
-        {
-            return Ok(TurnInputSubmission::NotSubmitted {
-                reason: NotSubmittedReason::Superseded,
-            });
-        }
-        slot.claim_start(submission_id.clone())
-            .map_err(|error| CodexErr::Fatal(format!("turn-slot invariant violation: {error}")))?
+    if let Some(expected) = expected_previous_turn_id
+        && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
+    {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded,
+        });
+    }
+    let Some(turn_state) = session.reserve_turn_start(&submission_id).await else {
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
     };
 
     if session.input_queue.has_trigger_turn_mailbox_items().await {
-        session.cancel_claimed_start(&claim).await;
+        session.cancel_reserved_turn_start(&submission_id).await;
         session.maybe_start_turn_for_pending_work().await;
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -473,7 +470,7 @@ async fn start_if_idle(
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
         Ok(settings) => settings,
         Err(error) => {
-            session.cancel_claimed_start(&claim).await;
+            session.cancel_reserved_turn_start(&submission_id).await;
             return Err(error);
         }
     };
@@ -483,13 +480,13 @@ async fn start_if_idle(
     {
         Ok(Some(turn_context)) => turn_context,
         Ok(None) => {
-            session.cancel_claimed_start(&claim).await;
+            session.cancel_reserved_turn_start(&submission_id).await;
             return Ok(TurnInputSubmission::NotSubmitted {
                 reason: NotSubmittedReason::PlanMode,
             });
         }
         Err(error) => {
-            session.cancel_claimed_start(&claim).await;
+            session.cancel_reserved_turn_start(&submission_id).await;
             return Err(error);
         }
     };
@@ -517,22 +514,22 @@ async fn start_if_idle(
                 session
                     .input_queue
                     .extend_pending_input_for_turn_state(
-                        claim.turn_state.as_ref(),
+                        turn_state.as_ref(),
                         vec![pending_turn_input(session, input, &turn_context.sub_id).await],
                     )
                     .await;
             }
         }
     }
-    session
-        .start_claimed_regular_task_with_options(
-            claim,
-            turn_context,
-            task_input,
-            None,
-            MailboxParentProvenance::Ignore,
-        )
-        .await?;
+    if !session
+        .start_task(turn_context, task_input, RegularTask::new())
+        .await
+    {
+        session.cancel_reserved_turn_start(&submission_id).await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::NotIdle,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
@@ -664,13 +661,11 @@ fn map_steer_rejection(error: SteerInputError) -> CodexResult<NotSubmittedReason
             Ok(NotSubmittedReason::ActiveTurnOutputSchemaMismatch)
         }
         SteerInputError::EmptyInput => Ok(NotSubmittedReason::EmptyInput),
-        SteerInputError::TurnSlotInvariant(message) => Err(CodexErr::Fatal(format!(
-            "turn-slot invariant violation: {message}"
-        ))),
     }
 }
 
-// Merge-safety anchor: keep schema preflight here while Session::steer_submitted_input remains the canonical TurnSlot steering owner.
+// Merge-safety anchor: keep schema preflight here while Session::steer_submitted_input remains
+// the canonical ActiveTurn steering owner.
 async fn active_turn_output_schema_mismatch(
     session: &Session,
     expected_turn_id: Option<&str>,
@@ -680,8 +675,8 @@ async fn active_turn_output_schema_mismatch(
         return false;
     };
     let active_turn_context = {
-        let slot = session.active_turn.lock().await;
-        let Some(active_task) = slot.running_task() else {
+        let active_turn = session.active_turn.lock().await;
+        let Some(active_task) = active_turn.as_ref().and_then(|turn| turn.task.as_ref()) else {
             return false;
         };
         if let Some(expected_turn_id) = expected_turn_id

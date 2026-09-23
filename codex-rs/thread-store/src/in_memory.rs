@@ -172,6 +172,8 @@ mod tests {
         ] {
             store
                 .create_thread(CreateThreadParams {
+                    creator_user_id: None,
+                    creator_account_id: None,
                     session_id: thread_id.into(),
                     thread_id,
                     extra_config: None,
@@ -688,6 +690,8 @@ mod tests {
         history_mode: ThreadHistoryMode,
     ) -> CreateThreadParams {
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -844,6 +848,8 @@ impl InMemoryThreadStore {
             agent_role: params.source.get_agent_role(),
             agent_path: params.source.get_agent_path().map(Into::into),
             originator: params.originator.clone(),
+            creator_user_id: params.creator_user_id.clone(),
+            creator_account_id: params.creator_account_id.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
             model_provider: Some(params.metadata.model_provider.clone()),
@@ -969,7 +975,9 @@ impl InMemoryThreadStore {
                     thread_id: params.thread_id,
                 })?;
         Ok(items.iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(params.thread_id) =>
+            {
                 Some(event.thread_settings.clone())
             }
             _ => None,

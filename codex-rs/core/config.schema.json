@@ -413,6 +413,10 @@
           "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
           "type": "string"
         },
+        "extra_policy": {
+          "description": "Additional policy text inserted into the Guardian template's `{{ extra_policy }}` slot.",
+          "type": "string"
+        },
         "policy": {
           "description": "Additional policy instructions inserted into the guardian prompt.",
           "type": "string"
@@ -520,6 +524,21 @@
         "enabled": {
           "default": true,
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "CloudToml": {
+      "additionalProperties": false,
+      "description": "Cloud-owned feature settings.",
+      "properties": {
+        "skills": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FeatureToggleToml"
+            }
+          ],
+          "description": "Cloud skills are permitted by default; the host must supply a cloud provider."
         }
       },
       "type": "object"
@@ -706,6 +725,9 @@
           "default": null,
           "description": "Optional feature toggles scoped to this profile.",
           "properties": {
+            "agent_message_board": {
+              "type": "boolean"
+            },
             "analytics_plan_history": {
               "type": "boolean"
             },
@@ -987,6 +1009,9 @@
               "type": "boolean"
             },
             "powershell_shell_version": {
+              "type": "boolean"
+            },
+            "prefer_mxc": {
               "type": "boolean"
             },
             "prevent_idle_sleep": {
@@ -1446,6 +1471,16 @@
       },
       "type": "object"
     },
+    "FeatureToggleToml": {
+      "additionalProperties": false,
+      "description": "Optional enablement of a configured feature.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "FeatureToml_for_CodeModeConfigToml": {
       "anyOf": [
         {
@@ -1846,7 +1881,7 @@
           "type": "number"
         },
         "thread_context": {
-          "description": "Use thread-owned context for sync and async Guardian. Defaults to false. Independent of the Guardian v2 `enabled` toggle.",
+          "description": "Use thread-owned context for sync and async Guardian. Defaults to true. Independent of the Guardian v2 `enabled` toggle.",
           "type": "boolean"
         },
         "transcript": {
@@ -3173,25 +3208,20 @@
         }
       ]
     },
-    "OrchestratorFeatureToml": {
-      "additionalProperties": false,
-      "description": "Settings for a feature owned by the orchestrator.",
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        }
-      },
-      "type": "object"
-    },
     "OrchestratorToml": {
       "additionalProperties": false,
       "description": "Orchestrator-owned feature settings.",
       "properties": {
         "mcp": {
-          "$ref": "#/definitions/OrchestratorFeatureToml"
+          "$ref": "#/definitions/FeatureToggleToml"
         },
         "skills": {
-          "$ref": "#/definitions/OrchestratorFeatureToml"
+          "allOf": [
+            {
+              "$ref": "#/definitions/FeatureToggleToml"
+            }
+          ],
+          "description": "Legacy no-op setting retained for compatibility. Use `cloud.skills` to configure cloud skills."
         }
       },
       "type": "object"
@@ -4304,6 +4334,27 @@
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
           "type": "boolean"
         },
+        "effects": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TuiEffects"
+            }
+          ],
+          "default": {
+            "effort": true,
+            "progress": true,
+            "shimmer": true,
+            "starfield": true,
+            "title": true,
+            "welcome": true
+          },
+          "description": "Individual visual effects. Each also requires animations to be enabled."
+        },
+        "fullscreen_transcript": {
+          "default": true,
+          "description": "Own the fullscreen transcript, including scrolling, selection, and search. Defaults to `true`; alternate-screen restrictions take precedence.",
+          "type": "boolean"
+        },
         "keymap": {
           "allOf": [
             {
@@ -4374,6 +4425,8 @@
             "global": {
               "clear_terminal": null,
               "copy": null,
+              "find_transcript": null,
+              "focus_activity": null,
               "open_agents": null,
               "open_external_editor": null,
               "open_transcript": null,
@@ -4400,6 +4453,7 @@
             "pager": {
               "close": null,
               "close_transcript": null,
+              "find": null,
               "half_page_down": null,
               "half_page_up": null,
               "jump_bottom": null,
@@ -4549,6 +4603,20 @@
           "description": "Start the TUI in raw scrollback mode for copy-friendly transcript output. Defaults to `false`.",
           "type": "boolean"
         },
+        "rendering": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TuiRendering"
+            }
+          ],
+          "default": {
+            "lists": true,
+            "math": true,
+            "mermaid": true,
+            "tables": true
+          },
+          "description": "Rich content rendering. Independent of animations and visual effects."
+        },
         "resume_cwd": {
           "allOf": [
             {
@@ -4617,11 +4685,6 @@
         "vim_mode_default": {
           "default": false,
           "description": "Start the composer in Vim mode (`Normal`) by default. Defaults to `false`.",
-          "type": "boolean"
-        },
-        "whimsy": {
-          "default": true,
-          "description": "Enable decorative effects such as Astra composer stars. Also requires animations. Defaults to `true`.",
           "type": "boolean"
         }
       },
@@ -5062,6 +5125,43 @@
       },
       "type": "object"
     },
+    "TuiEffects": {
+      "additionalProperties": false,
+      "description": "Optional visual effects. Disabling an effect preserves its underlying activity.",
+      "properties": {
+        "effort": {
+          "default": true,
+          "description": "Animate reasoning-effort changes in the composer and footer.",
+          "type": "boolean"
+        },
+        "progress": {
+          "default": true,
+          "description": "Animate activity bullets and loading spinners.",
+          "type": "boolean"
+        },
+        "shimmer": {
+          "default": true,
+          "description": "Shimmer status and loading text.",
+          "type": "boolean"
+        },
+        "starfield": {
+          "default": true,
+          "description": "Animate the composer starfield.",
+          "type": "boolean"
+        },
+        "title": {
+          "default": true,
+          "description": "Blink the terminal-title indicator when user action is required.",
+          "type": "boolean"
+        },
+        "welcome": {
+          "default": true,
+          "description": "Animate the welcome artwork.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "TuiGlobalKeymap": {
       "additionalProperties": false,
       "description": "Global keybindings. These are used when a context does not define an override.",
@@ -5081,6 +5181,22 @@
             }
           ],
           "description": "Copy the last agent response to the clipboard."
+        },
+        "find_transcript": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Find text in the full transcript."
+        },
+        "focus_activity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Focus activity groups in the owned transcript to inspect their details."
         },
         "open_agents": {
           "allOf": [
@@ -5273,6 +5389,8 @@
           "default": {
             "clear_terminal": null,
             "copy": null,
+            "find_transcript": null,
+            "focus_activity": null,
             "open_agents": null,
             "open_external_editor": null,
             "open_transcript": null,
@@ -5313,6 +5431,7 @@
           "default": {
             "close": null,
             "close_transcript": null,
+            "find": null,
             "half_page_down": null,
             "half_page_up": null,
             "jump_bottom": null,
@@ -5538,6 +5657,14 @@
           ],
           "description": "Close the transcript overlay via its dedicated toggle key."
         },
+        "find": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Find text in a transcript pager."
+        },
         "half_page_down": {
           "allOf": [
             {
@@ -5622,6 +5749,33 @@
           "type": "string"
         }
       ]
+    },
+    "TuiRendering": {
+      "additionalProperties": false,
+      "description": "Optional rich renderers. Disabled renderers preserve the original source.",
+      "properties": {
+        "lists": {
+          "default": true,
+          "description": "Render Markdown bullets and task-list markers as Unicode symbols.",
+          "type": "boolean"
+        },
+        "math": {
+          "default": true,
+          "description": "Render math expressions using Unicode notation.",
+          "type": "boolean"
+        },
+        "mermaid": {
+          "default": true,
+          "description": "Render Mermaid code blocks as diagrams.",
+          "type": "boolean"
+        },
+        "tables": {
+          "default": true,
+          "description": "Render pipe tables, including tables inside Markdown fences.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
     },
     "TuiVimNormalKeymap": {
       "additionalProperties": false,
@@ -6427,6 +6581,14 @@
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
     },
+    "cloud": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CloudToml"
+        }
+      ],
+      "description": "Cloud-owned feature settings."
+    },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"
@@ -6504,6 +6666,9 @@
       "default": null,
       "description": "Centralized feature flags (new). Prefer this over individual toggles.",
       "properties": {
+        "agent_message_board": {
+          "type": "boolean"
+        },
         "analytics_plan_history": {
           "type": "boolean"
         },
@@ -6785,6 +6950,9 @@
           "type": "boolean"
         },
         "powershell_shell_version": {
+          "type": "boolean"
+        },
+        "prefer_mxc": {
           "type": "boolean"
         },
         "prevent_idle_sleep": {

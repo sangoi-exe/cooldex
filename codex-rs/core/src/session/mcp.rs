@@ -554,20 +554,16 @@ impl Session {
         server_name: String,
         request_id: RequestId,
         request: ElicitationRequest,
-    ) -> anyhow::Result<McpServerElicitationOutcome> {
-        anyhow::ensure!(
-            !turn_context.session_source.is_non_root_agent(),
-            codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE
-        );
+    ) -> McpServerElicitationOutcome {
         if self.services.mcp_runtime.elicitations_auto_deny() {
-            return Ok(McpServerElicitationOutcome {
+            return McpServerElicitationOutcome {
                 response: Some(ElicitationResponse {
                     action: codex_rmcp_client::ElicitationAction::Accept,
                     content: Some(serde_json::json!({})),
                     meta: None,
                 }),
                 sent: false,
-            });
+            };
         }
 
         let _elicitation = self.services.elicitations.register();
@@ -575,10 +571,10 @@ impl Session {
         // Merge-safety anchor: MCP elicitations access active slot state only
         // when it exists, never a stale or synthetic turn state.
         let prev_entry = {
-            let slot = self.active_turn.lock().await;
-            match slot.turn_state() {
-                Some(turn_state) => {
-                    let mut ts = turn_state.lock().await;
+            let mut active = self.active_turn.lock().await;
+            match active.as_mut() {
+                Some(at) => {
+                    let mut ts = at.turn_state.lock().await;
                     ts.insert_pending_elicitation(
                         server_name.clone(),
                         request_id.clone(),
@@ -621,10 +617,10 @@ impl Session {
                     plugin_install_telemetry.tool_name.as_str(),
                 );
         }
-        Ok(McpServerElicitationOutcome {
+        McpServerElicitationOutcome {
             response: rx_response.await.ok(),
             sent: true,
-        })
+        }
     }
 
     #[expect(
@@ -638,10 +634,10 @@ impl Session {
         response: ElicitationResponse,
     ) -> anyhow::Result<()> {
         let entry = {
-            let slot = self.active_turn.lock().await;
-            match slot.turn_state() {
-                Some(turn_state) => {
-                    let mut ts = turn_state.lock().await;
+            let mut active = self.active_turn.lock().await;
+            match active.as_mut() {
+                Some(at) => {
+                    let mut ts = at.turn_state.lock().await;
                     ts.remove_pending_elicitation(&server_name, &id)
                 }
                 None => None,
@@ -750,7 +746,7 @@ async fn review_guardian_mcp_elicitation(
     let Some(mcp_config) = session.services.mcp_runtime.current_config() else {
         return Ok(None);
     };
-    let step_settings = Arc::clone(&turn_context.next_step_input.load().settings);
+    let step_settings = turn_context.next_step_settings.load_full();
 
     // User approval skips ordinary CUA checks, not separate sensitive requests.
     let user_cua_execution = step_settings.approvals_reviewer() == ApprovalsReviewer::User

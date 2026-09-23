@@ -81,7 +81,7 @@ async fn multi_agent_v2_request_user_input_rejects_subagent_threads() {
     );
 }
 
-// Merge-safety anchor: preserve upstream Guardian retained-answer coverage with the fork's TurnSlot-compatible test fixture.
+// Merge-safety anchor: preserve upstream Guardian retained-answer coverage with the ActiveTurn fixture.
 #[test_case(None, RenderedVerifiedAnswers { fragments: vec![], complete: true }; "empty")]
 #[test_case(Some(("other_question", "A".to_owned())), RenderedVerifiedAnswers { fragments: vec![], complete: true }; "unrequested question")]
 #[test_case(Some(("pick_one", " ".to_owned())), RenderedVerifiedAnswers { fragments: vec![], complete: true }; "blank answer")]
@@ -119,7 +119,7 @@ async fn request_user_input_sets_non_blocking_outside_plan_mode(
             .thread_extension_data
             .insert(GuardianReviewEvidence::default());
         let original_history = session.conversation_history_snapshot().await;
-        *session.active_turn.lock().await = crate::session::tests::claimed_turn_slot();
+        *session.active_turn.lock().await = crate::session::tests::active_turn_for_tests();
 
         let request = tokio::spawn({
             let session = Arc::clone(&session);
@@ -269,7 +269,7 @@ async fn request_user_input_sets_blocking_from_turn_mode() {
             });
         },
     );
-    *session.active_turn.lock().await = crate::session::tests::claimed_turn_slot();
+    *session.active_turn.lock().await = crate::session::tests::active_turn_for_tests();
 
     let request = tokio::spawn({
         let session = Arc::clone(&session);

@@ -50,7 +50,9 @@ pub(super) async fn load_latest_thread_settings_snapshot(
     if session_meta.meta.history_mode != ThreadHistoryMode::Paginated {
         let history = store.load_history(params).await?;
         return Ok(history.items.into_iter().rev().find_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(session_meta.meta.id) =>
+            {
                 Some(event.thread_settings)
             }
             _ => None,
@@ -128,7 +130,9 @@ async fn scan_segment_for_latest_thread_settings(
                 break;
             }
         }
-        if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = line.item {
+        if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = line.item
+            && event.thread_id == Some(thread_id)
+        {
             latest_snapshot = Some(event.thread_settings);
         }
     }

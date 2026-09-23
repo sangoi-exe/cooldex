@@ -1,4 +1,5 @@
 use super::residency::is_v2_resident_session_source;
+use super::spawn_guard::PendingSpawn;
 use super::*;
 use crate::agent::AgentIdentitySnapshot;
 use crate::agent::child_config::build_agent_resume_config;
@@ -8,7 +9,9 @@ use crate::agent::types::SpawnAgentForkMode;
 use crate::agent::types::SpawnAgentOptions;
 use crate::agents_md_manager::SessionInstructions;
 use crate::codex_thread::CodexThread;
+use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::PermissionProfileSnapshot;
+use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::CurrentTimeUnavailable;
 use crate::context::GuardianContextMode;
@@ -19,16 +22,16 @@ use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::full_history_usage_hint_binding;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::session::multi_agents::usage_hint_text_for_turn;
-use codex_context_fragments::ContextualUserFragment;
+use crate::session::multi_agents::validate_usage_hint_binding;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_extension_api::ExtensionDataInit;
 use codex_history::ResponseItemEnvelope;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::intersect_effective_permission_profiles;
-use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_thread_store::PersistContext;
 use codex_utils_path_uri::PathUri;
 use std::collections::HashSet;
 
@@ -40,9 +43,23 @@ struct SpawnAgentThreadInheritance {
 }
 
 enum V2AgentMetadataRestoreError {
-    MissingThreadSettingsSnapshot { thread_id: ThreadId },
-    MissingShellToolState { thread_id: ThreadId },
-    MissingAgentUsageHintBinding { thread_id: ThreadId },
+    MissingThreadSettingsSnapshot {
+        thread_id: ThreadId,
+    },
+    MissingShellToolState {
+        thread_id: ThreadId,
+    },
+    MissingBirthIdentityField {
+        thread_id: ThreadId,
+        field: &'static str,
+    },
+    MissingSessionSource {
+        thread_id: ThreadId,
+    },
+    MissingAgentUsageHintBinding {
+        thread_id: ThreadId,
+    },
+    InvalidAgentUsageHintBinding(CodexErr),
     Other(CodexErr),
 }
 
@@ -59,7 +76,7 @@ impl From<CodexErr> for V2AgentMetadataRestoreError {
 /// provide user input directly, making an uncontextualized inter-agent communication
 /// unrepresentable.
 #[allow(clippy::large_enum_variant)]
-enum SpawnInitialInput {
+pub(super) enum SpawnInitialInput {
     UserInput(Vec<UserInput>),
     InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
 }
@@ -207,37 +224,10 @@ fn retain_forked_developer_message(
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
 
-async fn load_agent_model_context(
-    state: &ThreadManagerState,
-    thread_id: ThreadId,
-    history_mode: ThreadHistoryMode,
-) -> CodexResult<Option<Vec<RolloutItem>>> {
-    match history_mode {
-        ThreadHistoryMode::Legacy => Ok(state
-            .read_stored_thread(ReadThreadParams {
-                thread_id,
-                include_archived: true,
-                include_history: true,
-            })
-            .await?
-            .history
-            .map(|history| history.items)),
-        ThreadHistoryMode::Paginated => Ok(Some(
-            state
-                .load_latest_model_context(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived: true,
-                })
-                .await?
-                .items,
-        )),
-    }
-}
-
-// Merge-safety anchor: V2 reload restores captured identity from persisted thread
-// settings and rollout history, never a mutable role file. Typed usage-hint content must not
-// be reclassified as developer instructions while resolving the persisted identity.
-fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
+// Merge-safety anchor: V2 reload restores captured identity from persisted thread settings and
+// rollout history, never a mutable role file. Typed usage-hint content must not be reclassified
+// as developer instructions while resolving the persisted identity.
+pub(super) fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
     for item in history {
         let response_items = match item {
             RolloutItem::ResponseItem(response_item) => std::slice::from_ref(response_item),
@@ -271,23 +261,11 @@ fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<Str
                         }
                     }
                 }
-                ResponseItem::Message { role, content, .. }
-                    if role == "user"
-                        && !crate::event_mapping::is_contextual_user_message_content(content) =>
-                {
-                    return None;
-                }
                 _ => {}
             }
         }
     }
     None
-}
-
-fn missing_v2_agent_usage_hint_binding_error(thread_id: ThreadId) -> CodexErr {
-    CodexErr::InvalidRequest(format!(
-        "agent {thread_id} is missing a canonical agent_usage_hint_binding required to restore its identity snapshot"
-    ))
 }
 
 async fn restore_v2_identity_snapshot(
@@ -321,6 +299,11 @@ async fn restore_v2_identity_snapshot(
         .ok_or(V2AgentMetadataRestoreError::MissingAgentUsageHintBinding {
             thread_id: stored_thread.thread_id,
         })?;
+    validate_usage_hint_binding(
+        &agent_usage_hint_binding,
+        "persisted agent_usage_hint_binding",
+    )
+    .map_err(V2AgentMetadataRestoreError::InvalidAgentUsageHintBinding)?;
     let latest_thread_settings = state
         .load_latest_thread_settings_snapshot(LoadThreadHistoryParams {
             thread_id: stored_thread.thread_id,
@@ -342,48 +325,74 @@ async fn restore_v2_identity_snapshot(
                 CodexErr::InvalidRequest(format!("Model provider `{model_provider_id}` not found"))
             })?
     };
-    let model = latest_thread_settings.model.clone();
-    let reasoning_effort = latest_thread_settings.reasoning_effort.clone();
-    let reasoning_summary = latest_thread_settings.reasoning_summary;
     let base_instructions = initial_history
         .get_base_instructions()
-        .or_else(|| {
-            config
-                .base_instructions
-                .as_ref()
-                .map(|text| BaseInstructions {
-                    text: text.clone(),
-                    provenance: config.base_instructions_provenance.clone(),
-                })
-        })
         .ok_or_else(|| {
             CodexErr::InvalidRequest(format!(
                 "agent {} is missing persisted base instructions required to restore its identity snapshot",
                 stored_thread.thread_id
             ))
         })?;
-    let service_tier = latest_thread_settings.service_tier.clone();
     let shell_tool_enabled = latest_thread_settings.shell_tool_enabled.ok_or(
         V2AgentMetadataRestoreError::MissingShellToolState {
             thread_id: stored_thread.thread_id,
         },
     )?;
+    let agent_role_feature_opt_outs = latest_thread_settings
+        .agent_role_feature_opt_outs
+        .clone()
+        .ok_or(V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "agent_role_feature_opt_outs",
+        })?;
+    let agent_role_skill_restrictions = latest_thread_settings
+        .agent_role_skill_restrictions
+        .clone()
+        .ok_or(V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "agent_role_skill_restrictions",
+        })?;
+    let model_context_window = latest_thread_settings.model_context_window.ok_or(
+        V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "model_context_window",
+        },
+    )?;
+    let model_auto_compact_token_limit = latest_thread_settings
+        .model_auto_compact_token_limit
+        .ok_or(V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "model_auto_compact_token_limit",
+        })?;
+    let model_auto_compact_token_limit_scope = latest_thread_settings
+        .model_auto_compact_token_limit_scope
+        .ok_or(V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "model_auto_compact_token_limit_scope",
+        })?;
     let session_source = initial_history
         .get_resumed_session_sources()
         .map(|(session_source, _)| session_source)
-        .unwrap_or_else(|| stored_thread.source.clone());
+        .ok_or(V2AgentMetadataRestoreError::MissingSessionSource {
+            thread_id: stored_thread.thread_id,
+        })?;
 
     Ok(Some(AgentIdentitySnapshot::capture(
         session_source.get_agent_role(),
         model_provider_id,
         model_provider,
-        model,
-        reasoning_effort,
-        reasoning_summary,
+        latest_thread_settings.model.clone(),
+        latest_thread_settings.reasoning_effort.clone(),
+        latest_thread_settings.reasoning_summary,
         base_instructions,
         first_persisted_developer_instructions(&history),
-        service_tier,
+        latest_thread_settings.service_tier.clone(),
         Some(shell_tool_enabled),
+        agent_role_feature_opt_outs,
+        agent_role_skill_restrictions,
+        model_context_window,
+        model_auto_compact_token_limit,
+        model_auto_compact_token_limit_scope,
         agent_usage_hint_binding,
     )))
 }
@@ -399,6 +408,33 @@ async fn verify_loaded_v2_agent_identity(
         )));
     }
     Ok(())
+}
+
+async fn load_agent_model_context(
+    state: &ThreadManagerState,
+    thread_id: ThreadId,
+    history_mode: ThreadHistoryMode,
+) -> CodexResult<Option<Vec<RolloutItem>>> {
+    match history_mode {
+        ThreadHistoryMode::Legacy => Ok(state
+            .read_stored_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await?
+            .history
+            .map(|history| history.items)),
+        ThreadHistoryMode::Paginated => Ok(Some(
+            state
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: true,
+                })
+                .await?
+                .items,
+        )),
+    }
 }
 
 impl LocalAgentControl {
@@ -418,9 +454,7 @@ impl LocalAgentControl {
             .await;
     }
 
-    /// Restore persisted V2 descendant metadata for a resumed root, including
-    /// enough stored identity to lazily reload descendants without rereading
-    /// mutable live role files.
+    /// Restore V2 descendants for a resumed root without consulting mutable role files.
     pub(crate) async fn restore_v2_root_agent_metadata(
         &self,
         config: &Config,
@@ -440,7 +474,8 @@ impl LocalAgentControl {
         root_thread_id: ThreadId,
         restore_identity_snapshots: bool,
     ) -> CodexResult<()> {
-        self.state.register_root_thread(root_thread_id);
+        let registry = &self.runtime.registry;
+        registry.register_root_thread(root_thread_id);
 
         let Ok(state) = self.upgrade() else {
             return Ok(());
@@ -463,7 +498,7 @@ impl LocalAgentControl {
         };
 
         for thread_id in descendant_ids {
-            if self.state.agent_metadata_for_thread(thread_id).is_some() {
+            if registry.agent_metadata_for_thread(thread_id).is_some() {
                 continue;
             }
             let restore_result = async {
@@ -474,7 +509,7 @@ impl LocalAgentControl {
                         include_history: false,
                     })
                     .await?;
-                let restored_identity_snapshot = if restore_identity_snapshots {
+                let identity_snapshot = if restore_identity_snapshots {
                     restore_v2_identity_snapshot(&state, config, &stored_thread).await?
                 } else {
                     None
@@ -487,7 +522,7 @@ impl LocalAgentControl {
                     .map_err(|err| {
                         CodexErr::InvalidRequest(format!("invalid stored agent path: {err}"))
                     })?;
-                let mut reservation = self.state.reserve_spawn_slot(/*max_threads*/ None)?;
+                let mut reservation = registry.reserve_spawn_slot(/*max_threads*/ None)?;
                 let mut metadata = self.prepare_agent_metadata(
                     &mut reservation,
                     config,
@@ -500,7 +535,7 @@ impl LocalAgentControl {
                         .or_else(|| stored_thread.source.get_nickname()),
                 )?;
                 metadata.agent_id = Some(thread_id);
-                reservation.commit_with_identity_snapshot(metadata, restored_identity_snapshot);
+                reservation.commit_with_identity_snapshot(metadata, identity_snapshot);
                 Ok::<(), V2AgentMetadataRestoreError>(())
             }
             .await;
@@ -516,8 +551,26 @@ impl LocalAgentControl {
                         "agent {thread_id} is missing a persisted shell_tool_enabled value required to restore its identity snapshot"
                     )));
                 }
+                Err(V2AgentMetadataRestoreError::MissingBirthIdentityField {
+                    thread_id,
+                    field,
+                }) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} is missing persisted {field} required to restore its identity snapshot"
+                    )));
+                }
+                Err(V2AgentMetadataRestoreError::MissingSessionSource { thread_id }) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} is missing persisted session source required to restore its identity snapshot"
+                    )));
+                }
                 Err(V2AgentMetadataRestoreError::MissingAgentUsageHintBinding { thread_id }) => {
-                    return Err(missing_v2_agent_usage_hint_binding_error(thread_id));
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "agent {thread_id} is missing a canonical agent_usage_hint_binding required to restore its identity snapshot"
+                    )));
+                }
+                Err(V2AgentMetadataRestoreError::InvalidAgentUsageHintBinding(error)) => {
+                    return Err(error);
                 }
                 Err(V2AgentMetadataRestoreError::Other(err)) => {
                     warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
@@ -535,7 +588,7 @@ impl LocalAgentControl {
         initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
-        let spawned_agent = Box::pin(self.spawn_agent_internal(
+        let (spawned_agent, _) = Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::UserInput(initial_input),
             session_source,
@@ -543,40 +596,6 @@ impl LocalAgentControl {
         ))
         .await?;
         Ok(spawned_agent.thread_id)
-    }
-
-    /// Spawn an agent thread with some metadata.
-    pub(crate) async fn spawn_agent_with_metadata(
-        &self,
-        config: Config,
-        initial_input: Vec<UserInput>,
-        session_source: Option<SessionSource>,
-        options: SpawnAgentOptions, // TODO(jif) drop with new fork.
-    ) -> CodexResult<LiveAgent> {
-        Box::pin(self.spawn_agent_internal(
-            config,
-            SpawnInitialInput::UserInput(initial_input),
-            session_source,
-            options,
-        ))
-        .await
-    }
-
-    pub(crate) async fn spawn_agent_with_communication(
-        &self,
-        config: Config,
-        communication: InterAgentCommunication,
-        context: AgentCommunicationContext,
-        session_source: Option<SessionSource>,
-        options: SpawnAgentOptions,
-    ) -> CodexResult<LiveAgent> {
-        Box::pin(self.spawn_agent_internal(
-            config,
-            SpawnInitialInput::InterAgentCommunication(communication, context),
-            session_source,
-            options,
-        ))
-        .await
     }
 
     fn validate_loaded_v2_child(
@@ -587,7 +606,10 @@ impl LocalAgentControl {
         if thread.is_running()
             && thread.multi_agent_version() == Some(MultiAgentVersion::V2)
             && thread.session_source.parent_thread_id() == Some(parent_thread_id)
-            && Arc::ptr_eq(&self.state, &thread.session.services.agent_control.state)
+            && Arc::ptr_eq(
+                &self.runtime.registry,
+                &thread.session.services.local_agent_runtime.registry,
+            )
         {
             return Ok(());
         }
@@ -614,7 +636,10 @@ impl LocalAgentControl {
                 .is_some_and(|registered| Arc::ptr_eq(registered, parent))
                 || !parent.is_running()
                 || parent.multi_agent_version() != Some(MultiAgentVersion::V2)
-                || !Arc::ptr_eq(&self.state, &parent.session.services.agent_control.state)
+                || !Arc::ptr_eq(
+                    &self.runtime.registry,
+                    &parent.session.services.local_agent_runtime.registry,
+                )
             {
                 return Err(CodexErr::InvalidRequest(format!(
                     "cannot resume multi-agent v2 child {thread_id}: parent ownership is unavailable; resume the parent first"
@@ -631,10 +656,15 @@ impl LocalAgentControl {
             return Ok(());
         }
         let agent_metadata = self
-            .state
+            .runtime
+            .registry
             .agent_metadata_for_thread(thread_id)
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
-        let identity_snapshot = match self.state.agent_identity_snapshot_for_thread(thread_id) {
+        let identity_snapshot = match self
+            .runtime
+            .registry
+            .agent_identity_snapshot_for_thread(thread_id)
+        {
             Some(identity_snapshot) => identity_snapshot,
             None if agent_metadata
                 .agent_path
@@ -660,7 +690,7 @@ impl LocalAgentControl {
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
         }
-        let mut environment_selections = self.state.evicted_environments(thread_id);
+        let mut environment_selections = self.runtime.registry.evicted_environments(thread_id);
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -737,8 +767,8 @@ impl LocalAgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
-        // Cold V2 reload must restore the agent's stored identity, not reinterpret the
-        // current role file. The live role config can drift or disappear after spawn.
+        // Cold V2 reload must restore the persisted birth identity, not reinterpret a mutable
+        // role file. The role can drift or disappear after the child was first spawned.
         identity_snapshot.apply(&mut config, &mut session_source)?;
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
@@ -854,7 +884,8 @@ impl LocalAgentControl {
         {
             Some(parent.session.inherited_instructions().await)
         } else {
-            self.shared_thread_instructions_provider
+            self.runtime
+                .shared_thread_instructions_provider
                 .get()
                 .map(|provider| SessionInstructions {
                     thread_provider: Some(Arc::clone(provider)),
@@ -892,20 +923,19 @@ impl LocalAgentControl {
                     &identity_snapshot,
                 )
                 .await?;
-                self.state.clear_evicted_environments(thread_id);
+                self.runtime.registry.clear_evicted_environments(thread_id);
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
             }
             Err(err) => {
-                if let Ok(loaded_thread) = state.get_thread(thread_id).await {
+                if let Ok(thread) = state.get_thread(thread_id).await {
                     if let Some(parent_thread_id) = owner_thread_id {
-                        self.validate_loaded_v2_child(&loaded_thread, parent_thread_id)?;
+                        self.validate_loaded_v2_child(&thread, parent_thread_id)?;
                     }
-                    self.state.clear_evicted_environments(thread_id);
+                    self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot)
-                        .await?;
+                    verify_loaded_v2_agent_identity(&thread, thread_id, &identity_snapshot).await?;
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
                 }
@@ -914,22 +944,23 @@ impl LocalAgentControl {
         }
     }
 
-    async fn spawn_agent_internal(
+    pub(super) async fn spawn_agent_internal(
         &self,
         mut config: Config,
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
-    ) -> CodexResult<LiveAgent> {
+    ) -> CodexResult<(LiveAgent, ThreadConfigSnapshot)> {
         let is_full_history_fork = matches!(
             options.fork_mode.as_ref(),
             Some(SpawnAgentForkMode::FullHistory)
         );
         if !is_full_history_fork {
-            // Fresh and bounded children must resolve their own V2 hint. Only a full-history
-            // capture may carry an inherited binding into a new child session.
+            // Fresh and bounded children resolve their own hint. Only a full-history capture may
+            // carry an inherited binding into the child session.
             config.agent_usage_hint_binding = AgentUsageHintBinding::Resolve;
         }
+        validate_usage_hint_binding(&config.agent_usage_hint_binding, "agent_usage_hint_binding")?;
         let state = self.upgrade()?;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -961,7 +992,10 @@ impl LocalAgentControl {
         } else {
             agent_max_threads
         };
-        let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
+        let mut reservation = self
+            .runtime
+            .registry
+            .reserve_spawn_slot(reservation_max_threads)?;
         let inheritance = SpawnAgentThreadInheritance {
             environments: self
                 .inherited_environments_for_source(&state, session_source.as_ref())
@@ -1041,10 +1075,7 @@ impl LocalAgentControl {
         } else {
             None
         };
-        reservation.commit_with_identity_snapshot(agent_metadata.clone(), identity_snapshot);
-        if let Some(residency_slot) = residency_slot {
-            residency_slot.commit(new_thread.thread_id);
-        }
+        let mut pending_spawn = PendingSpawn::new(Arc::clone(&state), new_thread.thread_id);
 
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
@@ -1079,17 +1110,30 @@ impl LocalAgentControl {
             );
         }
 
-        // Notify a new thread has been created. This notification will be processed by clients
-        // to subscribe or drain this newly created thread.
-        // TODO(jif) add helper for drain
-        state.notify_thread_created(new_thread.thread_id);
-
-        self.persist_thread_spawn_edge_for_source(
-            new_thread.thread.as_ref(),
-            new_thread.thread_id,
-            notification_source.as_ref(),
-        )
-        .await;
+        let control = self.clone();
+        let child = Arc::clone(&new_thread.thread);
+        let child_thread_id = new_thread.thread_id;
+        let source = notification_source.clone();
+        pending_spawn.set_edge_write(tokio::spawn(async move {
+            control
+                .persist_thread_spawn_edge_for_source(
+                    child.as_ref(),
+                    child_thread_id,
+                    source.as_ref(),
+                )
+                .await;
+        }));
+        if options.fork_mode.is_some() {
+            tokio::join!(
+                new_thread
+                    .thread
+                    .session
+                    .ensure_rollout_materialized(PersistContext::Standard),
+                pending_spawn.wait_for_edge(),
+            );
+        } else {
+            pending_spawn.wait_for_edge().await;
+        }
 
         let start_options = TurnStartOptions {
             parent_turn_id: options.parent_turn_id,
@@ -1114,6 +1158,16 @@ impl LocalAgentControl {
                 .await?;
             }
         }
+        reservation.commit_with_identity_snapshot(agent_metadata.clone(), identity_snapshot);
+        if let Some(residency_slot) = residency_slot {
+            residency_slot.commit(new_thread.thread_id);
+        }
+        pending_spawn.disarm();
+
+        // Notify a new thread has been created. This notification will be processed by clients
+        // to subscribe or drain this newly created thread.
+        // TODO(jif) add helper for drain
+        state.notify_thread_created(new_thread.thread_id);
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
@@ -1128,11 +1182,13 @@ impl LocalAgentControl {
             );
         }
 
-        Ok(LiveAgent {
+        let agent = LiveAgent {
             thread_id: new_thread.thread_id,
             metadata: agent_metadata,
             status: self.get_status(new_thread.thread_id).await,
-        })
+        };
+        let config = new_thread.thread.config_snapshot().await;
+        Ok((agent, config))
     }
 
     async fn spawn_forked_thread(
@@ -1179,7 +1235,7 @@ impl LocalAgentControl {
             {
                 // Direct AgentControl callers do not have the public handler's captured identity.
                 // Freeze their parent turn only when no explicit inherited binding was supplied.
-                config.agent_usage_hint_binding = full_history_usage_hint_binding(&parent_turn);
+                config.agent_usage_hint_binding = full_history_usage_hint_binding(&parent_turn)?;
             }
             Some(parent_turn)
         } else {
@@ -1229,7 +1285,7 @@ impl LocalAgentControl {
                     &parent_config.multi_agent_v2,
                     ResolvedModelMessages::bundled().multi_agent(),
                     !parent_config.update_plan_enabled,
-                );
+                )?;
                 [parent_usage_hints.root, parent_usage_hints.subagent]
                     .into_iter()
                     .flatten()
@@ -1237,7 +1293,9 @@ impl LocalAgentControl {
                     .chain(
                         parent_turn
                             .as_deref()
-                            .and_then(usage_hint_text_for_turn)
+                            .map(usage_hint_text_for_turn)
+                            .transpose()?
+                            .flatten()
                             .map(|instructions| instructions.render()),
                     )
                     .collect()
@@ -1549,7 +1607,10 @@ impl LocalAgentControl {
             )
             .await;
         let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
-        let mut reservation = self.state.reserve_spawn_slot(agent_max_threads)?;
+        let mut reservation = self
+            .runtime
+            .registry
+            .reserve_spawn_slot(agent_max_threads)?;
         let (session_source, agent_metadata) = match session_source {
             SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,

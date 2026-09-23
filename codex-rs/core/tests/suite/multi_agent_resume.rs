@@ -29,6 +29,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
 
+#[path = "multi_agent_restore_tests.rs"]
+mod restore_tests;
+
 const COLLABORATION_NAMESPACE: &str = "collaboration";
 const SPAWN_CALL_ID: &str = "spawn-worker";
 const NESTED_CALL_ID: &str = "spawn-grandchild";
@@ -167,7 +170,7 @@ fn configure_multi_agent_v2_with_role(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Result<()> {
+async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() -> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
         "message": INITIAL_TASK,
@@ -342,6 +345,56 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             PermissionProfile::Disabled,
         )
     );
+
+    // Exercise the real paginated compactor after later user input; cold reload must retain the
+    // role developer identity from the resulting replacement history.
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL) && body_contains(request, "later child user")
+        },
+        sse(vec![ev_completed("resp-worker-later-user")]),
+    )
+    .await;
+    worker_thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "later child user".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(worker_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let child_thread_id_for_compaction = worker_thread_id;
+    let child_compaction = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL)
+                && request_has_input_type(request, "compaction_trigger")
+                && request.body_json::<Value>().is_ok_and(|body| {
+                    body["client_metadata"]["thread_id"] == json!(child_thread_id_for_compaction)
+                })
+        },
+        sse(vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "DURABLE_CHILD_COMPACTION_SUMMARY",
+                }
+            }),
+            ev_completed("resp-worker-compact"),
+        ]),
+    )
+    .await;
+    worker_thread.submit(Op::Compact).await?;
+    wait_for_event(worker_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    child_compaction.single_request();
 
     // Merge-safety anchor: flush the worker while it is still resident before sibling
     // creation can evict it at the configured thread capacity; retain the later sibling/root

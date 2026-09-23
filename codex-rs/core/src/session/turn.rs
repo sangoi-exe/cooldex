@@ -142,13 +142,6 @@ use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
 
-// Merge-safety anchor: recovery acknowledgement belongs to accepted sampling, so terminal turn
-// output carries no stale recovery identity across tool, mailbox, or hook continuations.
-#[derive(Debug, Default)]
-pub(crate) struct RunTurnOutput {
-    pub(crate) last_agent_message: Option<String>,
-}
-
 /// Explicit MCP startup requirements retained across restarts within one user turn.
 #[derive(Default)]
 pub(crate) struct McpStartupRequirements {
@@ -177,12 +170,13 @@ pub(crate) async fn run_turn(
     mcp_startup_requirements: &mut McpStartupRequirements,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> CodexResult<RunTurnOutput> {
+) -> CodexResult<Option<String>> {
     if crate::guardian::is_basic_session_source(&turn_context.session_source) {
         crate::guardian::check_pending_guardian_input(&sess, &turn_context).await?;
     }
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
+
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
@@ -227,7 +221,7 @@ pub(crate) async fn run_turn(
         )
         .await;
         error!("Failed to run pre-sampling compact");
-        return Ok(RunTurnOutput::default());
+        return Ok(None);
     }
 
     let user_input = turn_user_input(&input);
@@ -323,11 +317,11 @@ pub(crate) async fn run_turn(
     )
     .await
     else {
-        return Ok(RunTurnOutput::default());
+        return Ok(None);
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(RunTurnOutput::default());
+        return Ok(None);
     }
     if crate::guardian::is_basic_session_source(&turn_context.session_source)
         && let Err(error) = crate::guardian::finalize_guardian_input(
@@ -382,7 +376,7 @@ pub(crate) async fn run_turn(
     )
     .await
     {
-        return Ok(RunTurnOutput::default());
+        return Ok(None);
     }
 
     // Only speculate after hooks accept the turn, using its finalized tools and permissions.
@@ -528,16 +522,12 @@ pub(crate) async fn run_turn(
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
 
-            let responses_metadata = sess
-                .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
-                .await;
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),
                 Arc::clone(&turn_context.extension_data),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
-                &responses_metadata,
                 sampling_request_input,
                 cancellation_token.child_token(),
             )
@@ -643,10 +633,10 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(RunTurnOutput::default());
+                        return Ok(None);
                     }
                     if run_pending_session_start_hooks(&sess, &turn_context).await {
-                        return Ok(RunTurnOutput::default());
+                        return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     continue;
@@ -710,15 +700,10 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        return Ok(RunTurnOutput {
-                            last_agent_message: None,
-                        });
+                        return Ok(None);
                     }
                     // Token-budget resets do not summarize, so preserve their existing rollover
                     // policy. Keep summarizing compaction in this task to serialize history updates.
-                    // Merge-safety anchor: post-turn compaction preserves completed answers for
-                    // ordinary failures, but fatal compacted-history installation/recovery errors
-                    // must enter the same turn's terminal-error lifecycle.
                     let config = &turn_context.config;
                     if config.model_post_turn_compact_threshold_percent > 0
                         && !config.features.enabled(Feature::TokenBudget)
@@ -833,7 +818,7 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(RunTurnOutput { last_agent_message })
+    Ok(last_agent_message)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1048,6 +1033,7 @@ async fn build_skills_and_plugins(
         sess.thread_id.to_string(),
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
+        Some(turn_context.turn_metadata_state.clone()),
     );
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
@@ -1479,8 +1465,6 @@ async fn run_auto_compact(
     phase: CompactionPhase,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
-    // Merge-safety anchor: automatic compaction propagates the turn cancellation token into the
-    // selected route's pre-install preparation without adding cancellation inside installation.
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
     if turn_context.config.features.enabled(Feature::TokenBudget) {
@@ -1638,7 +1622,6 @@ async fn run_sampling_request(
     turn_store: Arc<codex_extension_api::ExtensionData>,
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
-    responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
@@ -1685,13 +1668,16 @@ async fn run_sampling_request(
             ),
             post_compact_recovery,
         };
+        let responses_metadata = sess
+            .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
+            .await;
         if crate::guardian::is_basic_session_source(&turn_context.session_source) {
             crate::guardian::check_guardian_prompt_budget(
                 &sess,
                 &prepared_prompt.prompt,
                 &turn_context.config,
                 &step_context.settings.model_info,
-                responses_metadata,
+                &responses_metadata,
             )?;
         }
         let post_compact_recovery = prepared_prompt
@@ -1704,7 +1690,7 @@ async fn run_sampling_request(
             Arc::clone(&step_context),
             Arc::clone(&turn_store),
             client_session,
-            responses_metadata,
+            &responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prepared_prompt.prompt,
             post_compact_recovery,
@@ -2061,7 +2047,13 @@ pub(super) fn agent_message_text(item: &codex_protocol::items::AgentMessageItem)
         .collect()
 }
 
-pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<MessagePhase>)> {
+#[derive(Debug, PartialEq)]
+pub(super) enum RealtimeEventText {
+    Handoff(String, Option<MessagePhase>),
+    QuietReasoning(String),
+}
+
+pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<RealtimeEventText> {
     match msg {
         EventMsg::ElicitationRequest(request)
             if matches!(
@@ -2069,11 +2061,27 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
                 codex_protocol::approvals::ElicitationRequest::UserVerification { .. }
             ) =>
         {
-            Some((UserVerificationNotice.render(), None))
+            Some(RealtimeEventText::Handoff(
+                UserVerificationNotice.render(),
+                None,
+            ))
         }
-        EventMsg::AgentMessage(event) => Some((event.message.clone(), event.phase.clone())),
+        EventMsg::AgentMessage(event) => Some(RealtimeEventText::Handoff(
+            event.message.clone(),
+            event.phase.clone(),
+        )),
         EventMsg::ItemCompleted(event) => match &event.item {
-            TurnItem::AgentMessage(item) => Some((agent_message_text(item), item.phase.clone())),
+            TurnItem::AgentMessage(item) => Some(RealtimeEventText::Handoff(
+                agent_message_text(item),
+                item.phase.clone(),
+            )),
+            TurnItem::Reasoning(item) => item
+                .summary_text
+                .iter()
+                .rev()
+                .map(|summary| summary.trim())
+                .find(|summary| !summary.is_empty())
+                .map(|summary| RealtimeEventText::QuietReasoning(summary.to_owned())),
             _ => None,
         },
         EventMsg::ExecApprovalRequest(_)
@@ -2091,7 +2099,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
             };
             serde_json::to_string(msg)
                 .ok()
-                .map(|request| (format!("{message}\n\n{request}"), None))
+                .map(|request| RealtimeEventText::Handoff(format!("{message}\n\n{request}"), None))
         }
         EventMsg::Error(_)
         | EventMsg::Warning(_)
@@ -2476,7 +2484,7 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
-                return Err(err);
+                error_or_panic(format!("in-flight tool future failed during drain: {err}"));
             }
         }
     }

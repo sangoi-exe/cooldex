@@ -34,11 +34,10 @@ async fn loads_latest_snapshot_from_leaf_segment() {
         home.path(),
         root_id,
         None,
-        vec![thread_settings_applied_item(settings_snapshot(
-            home.path(),
-            "root-model",
-            Some(false),
-        ))],
+        vec![thread_settings_applied_item(
+            root_id,
+            settings_snapshot(home.path(), "root-model", Some(false)),
+        )],
     );
     let child_id = ThreadId::new();
     write_paginated_rollout(
@@ -49,11 +48,10 @@ async fn loads_latest_snapshot_from_leaf_segment() {
             root_id,
             /*end_ordinal_exclusive*/ 2,
         )),
-        vec![thread_settings_applied_item(settings_snapshot(
-            home.path(),
-            "child-model",
-            Some(true),
-        ))],
+        vec![thread_settings_applied_item(
+            child_id,
+            settings_snapshot(home.path(), "child-model", Some(true)),
+        )],
     );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
@@ -71,7 +69,7 @@ async fn loads_latest_snapshot_from_leaf_segment() {
 }
 
 #[tokio::test]
-async fn loads_snapshot_from_compressed_ancestor_without_crossing_cutoff() {
+async fn returns_none_when_only_an_ancestor_owns_a_snapshot() {
     let home = TempDir::new().expect("temp dir");
     let root_id = ThreadId::new();
     let root_path = write_paginated_rollout(
@@ -79,16 +77,14 @@ async fn loads_snapshot_from_compressed_ancestor_without_crossing_cutoff() {
         root_id,
         None,
         vec![
-            thread_settings_applied_item(settings_snapshot(
-                home.path(),
-                "before-cutoff",
-                Some(false),
-            )),
-            thread_settings_applied_item(settings_snapshot(
-                home.path(),
-                "after-cutoff",
-                Some(true),
-            )),
+            thread_settings_applied_item(
+                root_id,
+                settings_snapshot(home.path(), "before-cutoff", Some(false)),
+            ),
+            thread_settings_applied_item(
+                root_id,
+                settings_snapshot(home.path(), "after-cutoff", Some(true)),
+            ),
         ],
     );
     let original = fs::read_to_string(root_path.as_path()).expect("read root rollout");
@@ -131,11 +127,9 @@ async fn loads_snapshot_from_compressed_ancestor_without_crossing_cutoff() {
             include_archived: false,
         })
         .await
-        .expect("load latest settings snapshot")
-        .expect("inherited snapshot");
+        .expect("load latest settings snapshot");
 
-    assert_eq!(snapshot.model, "before-cutoff");
-    assert_eq!(snapshot.shell_tool_enabled, Some(false));
+    assert_eq!(snapshot, None);
 }
 
 #[tokio::test]
@@ -175,11 +169,10 @@ async fn returns_found_legacy_snapshot_when_shell_state_is_missing() {
         home.path(),
         thread_id,
         None,
-        vec![thread_settings_applied_item(settings_snapshot(
-            home.path(),
-            "legacy-model",
-            None,
-        ))],
+        vec![thread_settings_applied_item(
+            thread_id,
+            settings_snapshot(home.path(), "legacy-model", None),
+        )],
     );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
 
@@ -276,10 +269,13 @@ fn rollout_line(ordinal: u64, item: RolloutItem) -> String {
     .expect("serialize rollout line")
 }
 
-fn thread_settings_applied_item(snapshot: ThreadSettingsSnapshot) -> RolloutItem {
+fn thread_settings_applied_item(
+    thread_id: ThreadId,
+    snapshot: ThreadSettingsSnapshot,
+) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
         ThreadSettingsAppliedEvent {
-            thread_id: None,
+            thread_id: Some(thread_id),
             thread_settings: snapshot,
         },
     ))
@@ -313,6 +309,11 @@ fn settings_snapshot(
         },
         disabled_plugin_ids: Vec::new(),
         shell_tool_enabled,
+        agent_role_feature_opt_outs: Some(Vec::new()),
+        agent_role_skill_restrictions: Some(Default::default()),
+        model_context_window: Some(None),
+        model_auto_compact_token_limit: Some(None),
+        model_auto_compact_token_limit_scope: Some(Default::default()),
     }
 }
 

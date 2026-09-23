@@ -99,6 +99,8 @@ pub(super) async fn run_main_inner(
         launch_loader_overrides.user_config_path = Some(user_config_path);
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
+    let embedded_network_policy =
+        codex_app_server_client::EmbeddedNetworkPolicy::load(&launch_loader_overrides).await;
     let workload_identity_selected = is_workload_identity_selected();
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -139,6 +141,7 @@ pub(super) async fn run_main_inner(
                 &validation_target,
                 &validation_bootstrap,
                 &codex_home,
+                &embedded_network_policy,
             )
             .await?
         } else {
@@ -209,74 +212,81 @@ pub(super) async fn run_main_inner(
     } else {
         startup_draft::StartupDraftSessionAction::New
     };
-    let mut startup_draft = startup_draft::StartupDraft::new(initial_screen, session_action)?;
-
-    // Merge-safety anchor: load config against the provisional remote/embedded target before
-    // selecting InstanceChild, then validate that the final launch can replay its configuration.
-    let provisional_app_server_target =
-        explicit_remote_endpoint
-            .as_ref()
-            .map_or(AppServerTarget::Embedded, |endpoint| {
-                AppServerTarget::Remote {
-                    endpoint: endpoint.clone(),
-                }
-            });
-
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
-        arg0_paths.codex_self_exe.clone(),
-        arg0_paths.codex_linux_sandbox_exe.clone(),
+    // Local-daemon discovery does not change client config precedence. Resolve explicit
+    // remote selection and the environment without opening a server connection.
+    let presentation_target = app_server_target_for_launch(
+        explicit_remote_endpoint.clone(),
+        /*default_daemon_socket*/ None,
+        reuse_implicit_local_daemon,
+        AppServerMode::Upstream,
+        workload_identity_selected,
+        std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
     )?;
     let prepared_environment_manager =
-        if should_load_configured_environments(&loader_overrides, &provisional_app_server_target) {
-            startup_draft
-                .run_until(EnvironmentManager::prepare_from_codex_home(&codex_home))
-                .await?
+        if should_load_configured_environments(&launch_loader_overrides, &presentation_target) {
+            EnvironmentManager::prepare_from_codex_home(&codex_home).await
         } else {
-            startup_draft
-                .run_until(EnvironmentManager::prepare_from_env())
-                .await?
+            EnvironmentManager::prepare_from_env().await
         }
         .map_err(std::io::Error::other)?;
+    if cli.shared.worktree
+        && (presentation_target.uses_remote_workspace()
+            || prepared_environment_manager.default_environment_is_remote())
+    {
+        return Err(std::io::Error::other(
+            "`--worktree` is only supported for local sessions",
+        ));
+    }
     let cwd = cli.cwd.clone();
     let config_cwd = config_cwd_for_app_server_target(
         cwd.as_deref(),
-        &provisional_app_server_target,
+        &presentation_target,
         prepared_environment_manager.default_environment_is_remote(),
     )?;
-    let mut loader_overrides = loader_overrides;
-    if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
-        let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
-        loader_overrides.user_config_path = Some(user_config_path);
-        loader_overrides.user_config_profile = Some(profile_v2.clone());
-    }
-    loader_overrides.ignore_login_requirements =
-        provisional_app_server_target.uses_remote_workspace();
-
-    let bootstrap_config = startup_draft
-        .run_until(load_bootstrap_config_or_exit(
-            &codex_home,
-            config_cwd.as_ref(),
-            cli_kv_overrides.clone(),
-            loader_overrides.clone(),
-            strict_config,
-            CloudConfigBundleLoader::default(),
-        ))
-        .await?;
-    let screen_reader_result = if !loader_overrides.ignore_user_config {
-        startup_draft
-            .run_until(screen_reader::initialize(
-                &bootstrap_config.config_layer_stack,
+    // Reuse the profile path resolved above; do not reconstruct profile precedence here.
+    let mut loader_overrides = launch_loader_overrides;
+    loader_overrides.ignore_login_requirements = presentation_target.uses_remote_workspace();
+    let presentation = startup_presentation::load(
+        &cli,
+        &codex_home,
+        loader_overrides.clone(),
+        cli_kv_overrides.clone(),
+        config_cwd,
+    )
+    .await
+    .map_err(|err| {
+        if let Some(config_error) = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ConfigLoadError>())
+        {
+            std::io::Error::other(format!(
+                "loading config.toml:\n{}",
+                format_config_error_with_source(config_error.config_error())
             ))
-            .await?
-    } else {
-        Ok(())
-    };
-    let bootstrap_config_toml = &bootstrap_config.config_toml;
-    let app_server_mode = bootstrap_config_toml
+        } else {
+            err
+        }
+    })?;
+    // Keep normal terminal signals available until local configuration is ready. Once raw
+    // mode begins, StartupDraft immediately takes ownership of input.
+    let (initialized_terminal, terminal_restore_guard) = tokio::task::spawn_blocking(|| {
+        tui::init().map(|terminal| (terminal, TerminalRestoreGuard::new()))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let startup_presentation::StartupPresentation {
+        bootstrap_config,
+        config_cwd,
+        mut screen,
+    } = presentation;
+    let app_server_mode = bootstrap_config
+        .config_toml
         .tui
         .as_ref()
         .map(|tui| tui.app_server_mode)
         .unwrap_or_default();
+    // Merge-safety anchor: select the instance-owned child only after loading the effective
+    // configuration, and reject invocation state that the child cannot replay.
     if explicit_remote_endpoint.is_none() && app_server_mode == AppServerMode::InstanceChild {
         #[cfg(not(target_os = "linux"))]
         return Err(std::io::Error::new(
@@ -299,6 +309,28 @@ pub(super) async fn run_main_inner(
             ));
         }
     }
+    screen.use_alt_screen = determine_alt_screen_mode(
+        cli.no_alt_screen,
+        bootstrap_config
+            .config_toml
+            .tui
+            .as_ref()
+            .map(|tui| tui.alternate_screen)
+            .unwrap_or_default(),
+        initialized_terminal.terminal_app_over_ssh,
+    );
+    screen.transcript_mode = crate::transcript_mode::TranscriptMode::resolve(
+        screen.transcript_mode.is_owned(),
+        screen.use_alt_screen,
+    );
+    let mut startup_draft = startup_draft::StartupDraft::new(
+        initialized_terminal,
+        terminal_restore_guard,
+        initial_screen,
+        session_action,
+        screen,
+    )?;
+
     let default_daemon = if explicit_remote_endpoint.is_none()
         && app_server_mode == AppServerMode::Upstream
         && reuse_implicit_local_daemon
@@ -317,25 +349,35 @@ pub(super) async fn run_main_inner(
         workload_identity_selected,
         std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
     )?;
-    if cli.shared.worktree
-        && (app_server_target.uses_remote_workspace()
-            || prepared_environment_manager.default_environment_is_remote())
-    {
-        return Err(std::io::Error::other(
-            "`--worktree` is only supported for local sessions",
-        ));
-    }
     let remote_cwd_override = cli
         .cwd
         .clone()
         .filter(|_| app_server_target.uses_remote_workspace());
+
+    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+        arg0_paths.codex_self_exe.clone(),
+        arg0_paths.codex_linux_sandbox_exe.clone(),
+    )?;
+    // The pre-paint bootstrap used these same local/remote config inputs. Reuse it here;
+    // implicit daemon discovery above changes transport, not the client configuration cwd.
+    let screen_reader_result = if !loader_overrides.ignore_user_config {
+        startup_draft
+            .run_until(screen_reader::initialize(
+                &bootstrap_config.config_layer_stack,
+            ))
+            .await?
+    } else {
+        Ok(())
+    };
     let cloud_config_bundle = startup_draft
         .run_until(cloud_config_bundle_for_app_server_target(
             &app_server_target,
             &bootstrap_config,
             &codex_home,
+            &embedded_network_policy,
         ))
         .await??;
+    let bootstrap_config_toml = &bootstrap_config.config_toml;
 
     let cwd_override = if app_server_target.uses_remote_workspace() {
         None
@@ -442,6 +484,9 @@ pub(super) async fn run_main_inner(
             strict_config,
         ))
         .await?;
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
+    }
     startup_draft.apply_config(&config);
 
     let mut cloud_config_bundle = if workload_identity_selected {
@@ -449,7 +494,9 @@ pub(super) async fn run_main_inner(
     } else {
         startup_draft
             .run_until(cloud_config_bundle_loader_for_storage(
-                app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+                embedded_network_policy.bind_bootstrap_auth(
+                    app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+                ),
                 /*enable_codex_api_key_env*/ false,
             ))
             .await??
@@ -466,11 +513,15 @@ pub(super) async fn run_main_inner(
                 &app_server_target,
                 &arg0_paths,
                 cloud_config_bundle.clone(),
+                &embedded_network_policy,
             ))
             .await?
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         config = destination;
         cloud_config_bundle = bundle;
+        if app_server_target.uses_embedded_network_policy() {
+            embedded_network_policy.activate(&mut config);
+        }
         startup_draft.apply_config(&config);
         Some(worktree)
     } else {
@@ -504,7 +555,10 @@ pub(super) async fn run_main_inner(
         daemon_exclusion = Some("Bedrock sign-in");
         app_server_target = AppServerTarget::Embedded;
     }
-    let daemon_features = daemon_startup::server_features(&cli_kv_overrides);
+    let mut daemon_features = daemon_startup::server_features(&cli_kv_overrides);
+    // Disabling shared services requires confirmation, even on a fresh auto-start.
+    daemon_features.retain(|_, enabled| *enabled);
+    let mut managed_daemon = false;
     if auto_start_daemon && daemon_exclusion.is_none() {
         startup_draft.flush_pending_events().await?;
         let output = startup_draft
@@ -519,6 +573,7 @@ pub(super) async fn run_main_inner(
                 })
             })
             .await?;
+        managed_daemon = output.backend.is_some();
         app_server_target = AppServerTarget::LocalDaemon {
             endpoint: RemoteAppServerEndpoint::UnixSocket {
                 socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
@@ -530,16 +585,20 @@ pub(super) async fn run_main_inner(
     let compatibility_warning = if cli.agents_overview {
         None
     } else {
-        startup_draft
-            .run_until(daemon_startup::compatibility_warning(
-                &app_server_target,
-                &config,
-            ))
-            .await?
+        daemon_recovery::check(
+            &mut startup_draft,
+            &app_server_target,
+            &config,
+            managed_daemon,
+        )
+        .await?
     };
     if compatibility_warning.is_some() {
         app_server_target = AppServerTarget::Embedded;
         daemon_exclusion = Some("daemon feature settings");
+    }
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
     }
     let daemon_startup_warning = compatibility_warning.or_else(|| {
         daemon_exclusion
@@ -556,7 +615,11 @@ pub(super) async fn run_main_inner(
     );
     let environment_manager = Arc::new(
         prepared_environment_manager
-            .build(Some(local_runtime_paths), config.http_client_factory())
+            .build(
+                Some(local_runtime_paths),
+                app_server_target
+                    .environment_http_client_factory(&config, &embedded_network_policy),
+            )
             .map_err(std::io::Error::other)?,
     );
 
@@ -822,7 +885,8 @@ pub(super) async fn run_main_inner(
         tracing::warn!("Could not save screen-reader detection: {err}");
     }
 
-    let app_result = run_ratatui_app(
+    // Keep the large app future off the enclosing CLI startup stack during transitions.
+    let app_result = Box::pin(run_ratatui_app(
         cli,
         arg0_paths,
         loader_overrides,
@@ -838,11 +902,12 @@ pub(super) async fn run_main_inner(
         log_db,
         state_db,
         environment_manager,
+        embedded_network_policy,
         managed_worktree.clone(),
         daemon_startup_warning,
         launch_telemetry,
         startup_draft,
-    )
+    ))
     .await
     .map_err(|err| {
         err.downcast::<std::io::Error>()

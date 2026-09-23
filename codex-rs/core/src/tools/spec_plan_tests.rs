@@ -24,7 +24,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::EnvironmentConfigState;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -49,6 +48,7 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::responses_metadata::TurnToolFunctionInfo;
 use crate::responses_metadata::TurnToolNamespacesInfo;
 use crate::responses_metadata::TurnToolSource;
+use crate::session::multi_agents::MAX_MULTI_AGENT_USAGE_HINT_TOKENS;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::mcp_config_for_test;
@@ -546,16 +546,16 @@ fn apply_patch_accepts_environment_id(spec: &ToolSpec) -> bool {
 #[tokio::test]
 async fn allowed_tools_filter_sources_before_code_mode_and_discovery() {
     use crate::tools::registry::ToolRegistry;
-    use codex_extension_api::AllowedTools;
+    use codex_extension_api::ToolPolicy;
 
     for allowed in [
         None,
-        Some(AllowedTools(vec![
+        Some(vec![
             ToolName::namespaced("kept", "lookup"),
             ToolName::plain("exec"),
             ToolName::plain("wait"),
-        ])),
-        Some(AllowedTools::default()),
+        ]),
+        Some(Vec::new()),
     ] {
         let (_, mut turn) = make_session_and_context().await;
         set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
@@ -565,7 +565,10 @@ async fn allowed_tools_filter_sources_before_code_mode_and_discovery() {
             model.supports_search_tool = true;
             model.use_responses_lite = false;
         });
-        let mut registry = ToolRegistry::with_allowed_tools(allowed.clone().map(Arc::new));
+        let mut registry = ToolRegistry::with_tool_policy(Arc::new(ToolPolicy {
+            allowed_tools: allowed.clone(),
+            ..Default::default()
+        }));
         registry.add(crate::tools::handlers::PlanHandler);
         let hosted = append_source_tools(
             &turn,
@@ -599,7 +602,7 @@ async fn allowed_tools_filter_sources_before_code_mode_and_discovery() {
                 plan.assert_registered_contains(&["update_plan", "extension_echo", "dynamic_echo"]);
                 plan.assert_visible_contains(&["web_search", "tool_search", "exec", "wait"]);
             }
-            Some(allowed) if allowed.0.is_empty() => {
+            Some(allowed) if allowed.is_empty() => {
                 assert_eq!(plan.registered_names, Vec::<String>::new());
                 assert_eq!(plan.visible_specs, Vec::<ToolSpec>::new());
                 assert_eq!(plan.code_mode_tool_names, BTreeMap::new());
@@ -626,10 +629,9 @@ async fn allowed_tools_filter_sources_before_code_mode_and_discovery() {
 }
 
 #[tokio::test]
-async fn internal_guardian_sessions_exclude_optional_core_tools() {
+async fn reviewer_tool_policy_exclude_optional_core_tools() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.session_source = SessionSource::Internal(InternalSessionSource::Guardian);
-    session.allowed_tools = Some(Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()));
+    session.tool_policy = Arc::new(codex_guardian_reviewer::reviewer_tool_policy());
     set_feature(&mut turn, Feature::ViewImage, /*enabled*/ true);
     Arc::make_mut(&mut turn.config).update_plan_enabled = true;
     turn.multi_agent_version = MultiAgentVersion::V2;
@@ -659,15 +661,14 @@ async fn internal_guardian_sessions_exclude_optional_core_tools() {
 }
 
 #[tokio::test]
-async fn internal_guardian_sessions_respect_managed_shell_restrictions() {
+async fn reviewer_tool_policy_respect_managed_shell_restrictions() {
     for (disabled_feature, shell_type) in [
         (Some(Feature::ShellTool), ConfigShellToolType::UnifiedExec),
         (Some(Feature::UnifiedExec), ConfigShellToolType::UnifiedExec),
         (None, ConfigShellToolType::Disabled),
     ] {
         let (mut session, mut turn) = make_session_and_context().await;
-        turn.session_source = SessionSource::Internal(InternalSessionSource::Guardian);
-        session.allowed_tools = Some(Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()));
+        session.tool_policy = Arc::new(codex_guardian_reviewer::reviewer_tool_policy());
         set_feature(&mut turn, Feature::ViewImage, /*enabled*/ true);
         set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
         if let Some(feature) = disabled_feature {
@@ -718,10 +719,9 @@ async fn internal_guardian_sessions_respect_managed_shell_restrictions() {
 }
 
 #[tokio::test]
-async fn internal_guardian_sessions_preserve_code_mode() {
+async fn reviewer_tool_policy_preserve_code_mode() {
     let (mut session, mut turn) = make_session_and_context().await;
-    turn.session_source = SessionSource::Internal(InternalSessionSource::Guardian);
-    session.allowed_tools = Some(Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()));
+    session.tool_policy = Arc::new(codex_guardian_reviewer::reviewer_tool_policy());
     set_feature(&mut turn, Feature::CodeMode, /*enabled*/ true);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
@@ -753,7 +753,7 @@ async fn internal_guardian_sessions_preserve_code_mode() {
 }
 
 #[tokio::test]
-async fn internal_guardian_sessions_require_managed_secondary_environments() {
+async fn reviewer_tool_policy_require_managed_secondary_environments() {
     for (secondary_profile, expected_tools) in [
         (
             codex_protocol::models::PermissionProfile::workspace_write(),
@@ -765,8 +765,7 @@ async fn internal_guardian_sessions_require_managed_secondary_environments() {
         ),
     ] {
         let (mut session, mut turn) = make_session_and_context().await;
-        turn.session_source = SessionSource::Internal(InternalSessionSource::Guardian);
-        session.allowed_tools = Some(Arc::new(codex_guardian_reviewer::reviewer_allowed_tools()));
+        session.tool_policy = Arc::new(codex_guardian_reviewer::reviewer_tool_policy());
         set_feature(&mut turn, Feature::ViewImage, /*enabled*/ true);
         let TurnEnvironmentState::Ready(primary) = turn
             .initial_environments
@@ -2903,6 +2902,116 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[tokio::test]
+async fn generic_usage_hint_limit_measures_the_complete_spawn_agent_description() {
+    for (multi_agent_v2, namespace_name) in [
+        (false, MULTI_AGENT_V1_NAMESPACE),
+        (true, MULTI_AGENT_V2_NAMESPACE),
+    ] {
+        let baseline = probe(|turn| {
+            set_feature(turn, Feature::Collab, /*enabled*/ true);
+            set_feature(turn, Feature::MultiAgentV2, multi_agent_v2);
+            update_config(turn, |config| {
+                config.multi_agent_v2.usage_hint_text = Some(String::new());
+            });
+        })
+        .await;
+        let ToolSpec::Namespace(namespace) = baseline.visible_spec(namespace_name) else {
+            panic!("expected {namespace_name} namespace");
+        };
+        let Some(ResponsesApiNamespaceTool::Function(spawn_agent)) =
+            namespace.tools.iter().find(|tool| {
+                matches!(
+                    tool,
+                    ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent"
+                )
+            })
+        else {
+            panic!("expected spawn_agent in {namespace_name} namespace");
+        };
+        let exact_raw_bytes =
+            codex_utils_string::approx_bytes_for_tokens(MAX_MULTI_AGENT_USAGE_HINT_TOKENS)
+                - spawn_agent.description.len();
+        let exact_hint = format!(
+            "{}{}",
+            "é".repeat(exact_raw_bytes / "é".len()),
+            "x".repeat(exact_raw_bytes % "é".len())
+        );
+
+        let exact = probe(|turn| {
+            set_feature(turn, Feature::Collab, /*enabled*/ true);
+            set_feature(turn, Feature::MultiAgentV2, multi_agent_v2);
+            update_config(turn, |config| {
+                config.multi_agent_v2.usage_hint_text = Some(exact_hint.clone());
+            });
+        })
+        .await;
+        let ToolSpec::Namespace(namespace) = exact.visible_spec(namespace_name) else {
+            panic!("expected {namespace_name} namespace");
+        };
+        let Some(ResponsesApiNamespaceTool::Function(spawn_agent)) =
+            namespace.tools.iter().find(|tool| {
+                matches!(
+                    tool,
+                    ResponsesApiNamespaceTool::Function(tool) if tool.name == "spawn_agent"
+                )
+            })
+        else {
+            panic!("expected spawn_agent in {namespace_name} namespace");
+        };
+        assert_eq!(
+            codex_utils_string::approx_token_count(&spawn_agent.description),
+            MAX_MULTI_AGENT_USAGE_HINT_TOKENS
+        );
+
+        let over_bound_hint = format!("{exact_hint}x");
+        assert!(
+            codex_utils_string::approx_token_count(&over_bound_hint)
+                < MAX_MULTI_AGENT_USAGE_HINT_TOKENS,
+            "the raw generic hint must remain below the limit so the fixed description overhead is the rejection cause"
+        );
+        let (_session, mut turn) = make_session_and_context().await;
+        set_feature(&mut turn, Feature::Collab, /*enabled*/ true);
+        set_feature(&mut turn, Feature::MultiAgentV2, multi_agent_v2);
+        update_config(&mut turn, |config| {
+            config.multi_agent_v2.usage_hint_text = Some(over_bound_hint);
+        });
+        let turn = Arc::new(turn);
+        let step_context = StepContext::for_test(Arc::clone(&turn));
+        let mut registry = build_core_tool_registry(
+            step_context.turn.as_ref(),
+            step_context.turn.model_info(),
+            &step_context.environments,
+            step_context.mcp.as_ref(),
+            /*tool_suggest_candidates*/ None,
+            /*wait_for_environment_tool_config*/ None,
+        );
+        let hosted_specs = append_source_tools(
+            step_context.turn.as_ref(),
+            step_context.turn.model_info(),
+            &mut registry,
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        let error = super::finalize_tool_router(
+            step_context.turn.as_ref(),
+            step_context.turn.model_info(),
+            registry,
+            hosted_specs,
+            &Default::default(),
+        )
+        .err()
+        .expect("a complete spawn_agent description one byte over the limit should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("features.multi_agent_v2.usage_hint_text")
+        );
+        assert!(error.to_string().contains("10001 estimated tokens"));
+    }
 }
 
 #[tokio::test]

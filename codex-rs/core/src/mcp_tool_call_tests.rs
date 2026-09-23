@@ -5,17 +5,14 @@ use crate::config::ManagedFeatures;
 use crate::environment_selection::EnvironmentConfigOrigin;
 use crate::environment_selection::TurnEnvironmentState;
 use crate::session::step_context::StepContext;
-use crate::session::tests::claimed_turn_slot;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::tests::mcp_config_for_test;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnEnvironment;
+use crate::state::ActiveTurn;
 use crate::test_support::models_manager_with_provider;
-use crate::tools::context::McpToolOutput;
-use crate::tools::context::ToolOutput;
-use crate::tools::context::ToolPayload;
 use crate::tools::hook_names::HookToolName;
 use crate::turn_metadata::ExecutionMetadata;
 use codex_app_server_protocol as app_server_protocol;
@@ -33,7 +30,6 @@ use codex_hooks::HooksConfig;
 use codex_model_provider::create_model_provider;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EnvironmentConfig;
@@ -1725,92 +1721,18 @@ async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_resu
     assert!(rx_event.try_recv().is_err());
 }
 
+#[test_case::test_case(SessionSource::Exec; "root")]
+#[test_case::test_case(SessionSource::SubAgent(SubAgentSource::Review); "subagent")]
+#[test_case::test_case(SessionSource::Internal(InternalSessionSource::Guardian); "guardian")]
 #[tokio::test]
-async fn codex_apps_auth_elicitation_returns_subagent_handoff_and_diagnostics() {
+async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation(
+    source: SessionSource,
+) {
     let (session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
     Arc::get_mut(&mut turn_context)
         .expect("single turn context ref")
-        .session_source = SessionSource::SubAgent(SubAgentSource::Review);
-    let structured_content = serde_json::json!({
-        "error": "reauthentication_required", "status": 401
-    });
-    let mut result = codex_apps_auth_failure_result();
-    result.structured_content = Some(structured_content.clone());
-    let diagnostic = format!(
-        "Connector reauthentication required: {}",
-        "diagnostic detail ".repeat(/*n*/ 500)
-    );
-    result.content[0]["text"] = serde_json::json!(diagnostic);
-    let metadata = codex_apps_auth_failure_metadata();
-    let returned = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        maybe_request_codex_apps_auth_elicitation(
-            &session,
-            &turn_context,
-            turn_context.approval_policy(),
-            "call_123",
-            CODEX_APPS_MCP_SERVER_NAME,
-            Some(&metadata),
-            result.clone(),
-        ),
-    )
-    .await
-    .expect("subagent auth must not wait for user input");
-
-    assert_eq!(returned.meta, result.meta);
-    assert_eq!(returned.is_error, Some(true));
-    assert!(rx_event.try_recv().is_err());
-
-    let output = McpToolOutput {
-        result: returned,
-        tool_input: serde_json::json!({}),
-        result_metadata_capture_allowed: true,
-        wall_time: std::time::Duration::ZERO,
-        original_image_detail_supported: false,
-        truncation_policy: TruncationPolicy::Tokens(256),
-    };
-    let payload = ToolPayload::Function {
-        arguments: "{}".to_string(),
-    };
-    let code_mode = output.code_mode_result(&payload);
-    assert_eq!(code_mode["isError"], serde_json::json!(true));
-    assert!(code_mode.get("_meta").is_none());
-    let code_text = code_mode["content"]
-        .as_array()
-        .expect("MCP content")
-        .iter()
-        .map(|item| item["text"].as_str().expect("auth diagnostic text"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(code_text.contains("Authentication for Google Calendar could not be completed."));
-    assert!(code_text.contains(codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE));
-    assert!(code_text.contains(&diagnostic));
-    assert!(code_text.contains(&structured_content.to_string()));
-    assert_eq!(output.tool_result_metadata(), result.meta.as_ref());
-    let mut expected_hook = code_mode;
-    expected_hook["_meta"] = result.meta.expect("original auth metadata");
-    assert_eq!(
-        output.post_tool_use_response("call_123", &payload),
-        Some(expected_hook)
-    );
-
-    let ResponseInputItem::FunctionCallOutput {
-        output: truncated, ..
-    } = output.to_response_item("call_123", &payload)
-    else {
-        panic!("expected FunctionCallOutput");
-    };
-    let truncated_text = truncated.body.to_text().expect("truncated auth diagnostic");
-    assert!(truncated_text.contains(codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE));
-    assert!(truncated_text.contains("truncated"));
-    assert!(!truncated_text.contains(&diagnostic));
-    assert_eq!(truncated.success, Some(false));
-}
-
-#[tokio::test]
-async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation() {
-    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+        .session_source = source;
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     let result = codex_apps_auth_failure_result();
     let metadata = codex_apps_auth_failure_metadata();
 
@@ -2283,7 +2205,7 @@ async fn dispatched_mcp_approval_with_closed_response_is_classified_as_approval(
         .expect("session should be uniquely owned")
         .services
         .analytics_events_client = client.clone();
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
 
     let call_id = "modern-missing-response";
     let thread_id = session.thread_id.to_string();
@@ -2359,7 +2281,7 @@ async fn dispatched_mcp_approval_with_closed_response_is_classified_as_approval(
         .expect("approval request should be dispatched")
         .expect("approval request should be received");
     assert!(matches!(event.msg, EventMsg::ElicitationRequest(_)));
-    *session.active_turn.lock().await = Default::default();
+    *session.active_turn.lock().await = None;
     assert_eq!(
         approval.await.expect("approval task should complete"),
         ReviewDecision::Abort
@@ -3194,14 +3116,13 @@ async fn strict_auto_review_forces_guardian_for_mcp_policy_skip() {
         turn_context.auth_manager.clone(),
     );
 
-    let active_turn = claimed_turn_slot();
+    let active_turn = ActiveTurn::default();
     active_turn
-        .turn_state()
-        .expect("claimed turn should have state")
+        .turn_state
         .lock()
         .await
         .enable_strict_auto_review();
-    *session.active_turn.lock().await = active_turn;
+    *session.active_turn.lock().await = Some(active_turn);
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context);
     let invocation = McpInvocation {
@@ -3278,7 +3199,7 @@ async fn assert_mcp_user_approval_persistence(
     expected_decision: ReviewDecision,
 ) {
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
     let invocation = McpInvocation {
         server: "memory".to_string(),
         tool: "create_entities".to_string(),
@@ -3363,7 +3284,7 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
     let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
     {
         let mut active_turn = session.active_turn.lock().await;
-        *active_turn = claimed_turn_slot();
+        *active_turn = Some(ActiveTurn::default());
     }
     let invocation = McpInvocation {
         server: "custom_server".to_string(),

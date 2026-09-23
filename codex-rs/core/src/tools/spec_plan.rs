@@ -107,6 +107,7 @@ const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
+    tool_policy: &'a codex_extension_api::ToolPolicy,
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
     environments: &'a TurnEnvironmentSnapshot,
@@ -136,6 +137,7 @@ pub(crate) fn build_tool_router(
         .thread_extension_data
         .get::<crate::WaitForEnvironmentToolConfig>();
     let context = CoreToolPlanContext {
+        tool_policy: &session.tool_policy,
         turn_context,
         model_info,
         environments,
@@ -145,7 +147,7 @@ pub(crate) fn build_tool_router(
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
     };
-    let mut registry = ToolRegistry::with_allowed_tools(session.allowed_tools.clone());
+    let mut registry = ToolRegistry::with_tool_policy(Arc::clone(&session.tool_policy));
     add_core_tool_sources(&context, &mut registry);
 
     let registered_mcp_tools = session.services.mcp_handler_cache.append_mcp_tools(
@@ -280,6 +282,7 @@ pub(crate) fn build_core_tool_registry(
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
     let context = CoreToolPlanContext {
+        tool_policy: &Default::default(),
         turn_context,
         model_info,
         environments,
@@ -350,9 +353,7 @@ pub(crate) fn finalize_tool_router(
     mut hosted_specs: Vec<ToolSpec>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> CodexResult<ToolRouter> {
-    if let Some(allowed) = &registry.allowed_tools {
-        hosted_specs.retain(|spec| allowed.contains(&ToolName::plain(spec.name())));
-    }
+    hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
     let code_mode_enabled = matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly);
@@ -474,6 +475,7 @@ pub(crate) fn finalize_tool_router(
         &code_mode_tool_names,
         hosted_specs,
     );
+    validate_generic_usage_hint_spawn_descriptions(turn_context, &model_visible_specs)?;
     let tool_namespaces_info = include_tool_namespaces_info
         .then(|| {
             collect_tool_namespaces_info(&registry, &code_mode_tool_names, &model_visible_specs)
@@ -489,6 +491,45 @@ pub(crate) fn finalize_tool_router(
         tool_namespaces_info,
         &child_management_tools,
     ))
+}
+
+fn validate_generic_usage_hint_spawn_descriptions(
+    turn_context: &TurnContext,
+    model_visible_specs: &[ToolSpec],
+) -> CodexResult<()> {
+    if turn_context.config.multi_agent_v2.usage_hint_text.is_none() {
+        return Ok(());
+    }
+
+    for spec in model_visible_specs {
+        match spec {
+            ToolSpec::Function(tool) if tool.name == "spawn_agent" => {
+                crate::session::multi_agents::validate_usage_hint_rendered(
+                    "features.multi_agent_v2.usage_hint_text",
+                    &tool.description,
+                )?;
+            }
+            ToolSpec::Namespace(namespace) => {
+                for tool in &namespace.tools {
+                    let ResponsesApiNamespaceTool::Function(tool) = tool else {
+                        continue;
+                    };
+                    if tool.name == "spawn_agent" {
+                        crate::session::multi_agents::validate_usage_hint_rendered(
+                            "features.multi_agent_v2.usage_hint_text",
+                            &tool.description,
+                        )?;
+                    }
+                }
+            }
+            ToolSpec::Function(_)
+            | ToolSpec::Freeform(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::WebSearch { .. } => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_direct_model_only_namespace_overrides(
@@ -874,6 +915,7 @@ fn register_code_mode_executors(
     );
     enabled_tools
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
+    let model_messages = ResolvedModelMessages::from_model(model_info);
     let execute_handler = CodeModeExecuteHandler::new(
         create_code_mode_tool(
             &enabled_tools,
@@ -886,11 +928,15 @@ fn register_code_mode_executors(
             } else {
                 codex_code_mode::ImageDetailVisibility::Visible
             },
+            model_messages.code_mode(),
         ),
         code_mode_nested_tool_specs,
     );
 
-    registry.prepend_trusted(Arc::new(CodeModeWaitHandler));
+    registry.prepend_trusted(Arc::new(CodeModeWaitHandler::new(
+        model_messages.code_mode_wait_description_override(),
+        model_messages.code_mode_wait_parameters_override(),
+    )));
     registry.prepend_trusted(Arc::new(execute_handler));
 
     code_mode_tool_names
@@ -972,9 +1018,8 @@ fn code_mode_namespace_descriptions(
 
 #[instrument(level = "trace", skip_all)]
 fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
-    // Preserve the reviewer's existing sandbox requirements. Tool selection is
-    // supplied separately by the extension through AllowedTools.
-    if crate::guardian::is_basic_session_source(&context.turn_context.session_source)
+    // The startup ceiling applies to the thread and every selected environment.
+    if context.tool_policy.require_managed_sandbox
         && (!matches!(
             context.turn_context.permission_profile(),
             PermissionProfile::Managed { .. }
@@ -1047,12 +1092,11 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
     }
 
     let allow_login_shell = any_environment_allows_login_shell(context.environments);
-    let is_guardian = crate::guardian::is_basic_session_source(&turn_context.session_source);
-    if is_guardian && !features.enabled(Feature::UnifiedExec) {
+    if context.tool_policy.require_unified_exec && !features.enabled(Feature::UnifiedExec) {
         return;
     }
-    let exec_permission_approvals_enabled =
-        features.enabled(Feature::ExecPermissionApprovals) && !is_guardian;
+    let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals)
+        && context.tool_policy.expose_additional_permissions;
     let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
     let options = ExecCommandHandlerOptions {
         allow_login_shell,
