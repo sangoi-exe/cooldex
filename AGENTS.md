@@ -55,6 +55,7 @@
 
 ### Durable branch-promotion and upstream-sync route
 
+<!-- Merge-safety anchor: admitted upstream syncs resolve the exact stable upstream Rust release and synchronize the canonical workspace version with its mechanical followers. -->
 - Fast-forward local `master` and `origin/master` from a reviewed `dev` candidate;
   do not rewrite either history.
 - Fetch `upstream/main`, fast-forward local `main`, then mirror that exact tip to
@@ -67,6 +68,7 @@
 - Reconcile direct followers and complete the selected resident profile's validation and
   review route before publishing the final `dev` candidate to `origin/dev`; that profile
   retains task classification, planning, Worker, Gate, lifecycle, and completion ownership.
+- For every admitted upstream sync, resolve the highest exact non-prerelease upstream tag matching `rust-vMAJOR.MINOR.PATCH`, set `[workspace.package].version` to that version, update Cargo-generated or mechanical followers through guarded repository routes, and validate the resulting build and version identity.
 - Commit and publish task-owned sync documentation from the separate `.sangoi` repository,
   excluding unrelated dirty inner-repository work.
 
