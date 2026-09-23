@@ -426,7 +426,7 @@ def normalize_repo_path(path_text: str, repo_root: Path) -> str:
             return raw_path.resolve().relative_to(repo_root).as_posix()
         except ValueError:
             return raw_path.as_posix()
-    return raw_path.as_posix().lstrip("./")
+    return raw_path.as_posix()
 
 
 def run_capture(argv: list[str], cwd: Path) -> str:

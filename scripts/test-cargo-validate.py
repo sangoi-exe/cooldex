@@ -46,6 +46,7 @@ class CargoValidateTests(unittest.TestCase):
         self.repo_root = Path(self.temp_dir.name)
         package_roots = {
             "codex-analytics": "analytics",
+            "codex-agent-message-board-extension": "ext/agent-message-board",
             "codex-app-server": "app-server",
             "codex-app-server-protocol": "app-server-protocol",
             "codex-app-server-transport": "app-server-transport",
@@ -120,8 +121,10 @@ class CargoValidateTests(unittest.TestCase):
             "codex-utils-string": "utils/string",
             "codex-voice-host": "voice-host",
             "codex-websocket-client": "websocket-client",
+            "codex-websocket-auth": "websocket-auth",
             "codex-windows-sandbox": "windows-sandbox-rs",
             "codex-windows-sandbox-service": "windows-sandbox-service",
+            "codex-workload-identity": "workload-identity",
             "codex-worktree": "worktree",
         }
         packages = []
@@ -484,6 +487,9 @@ class CargoValidateTests(unittest.TestCase):
         for path in (pwsh_path, wslpath_path, cargo_path):
             path.chmod(0o755)
         return pwsh_path, tool_dir, pwsh_argv_path, wslpath_argv_path, cargo_marker_path
+
+    def windows_fixture_path(self, tool_dir: Path) -> str:
+        return f"{tool_dir}{os.pathsep}{os.environ['PATH']}"
 
     def test_plan_help_works_without_codex_repo_root_env(self) -> None:
         env = os.environ.copy()
@@ -2978,7 +2984,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 0, planner.verify_plan(yolo, self.repo_root, keep_going=False)
@@ -3007,7 +3015,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 7, planner.verify_plan(yolo_failure, self.repo_root, keep_going=False)
@@ -3914,7 +3924,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             status = planner.verify_plan(plan, self.repo_root, keep_going=False)
 
@@ -4030,7 +4042,11 @@ class CargoValidateTests(unittest.TestCase):
                 )
                 with (
                     mock.patch.object(planner.shutil, "which", side_effect=which),
-                    mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+                    mock.patch.dict(
+                        os.environ,
+                        {"PATH": self.windows_fixture_path(tool_dir)},
+                        clear=False,
+                    ),
                 ):
                     status = planner.verify_plan(plan, self.repo_root, keep_going=False)
 
@@ -4105,7 +4121,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
             self.assertRaises(planner.PlannerError) as context,
         ):
             planner.verify_plan(plan, self.repo_root, keep_going=False)
@@ -4143,7 +4161,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 0, planner.verify_plan(plan, self.repo_root, keep_going=False)
@@ -4185,7 +4205,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 7, planner.verify_plan(failure_plan, self.repo_root, keep_going=False)
@@ -4238,7 +4260,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 7, planner.verify_plan(stop_plan, self.repo_root, keep_going=False)
@@ -4274,7 +4298,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 7, planner.verify_plan(keep_going_plan, self.repo_root, keep_going=True)
@@ -4296,7 +4322,9 @@ class CargoValidateTests(unittest.TestCase):
                 "which",
                 side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
             ),
-            mock.patch.dict(os.environ, {"PATH": str(tool_dir)}, clear=False),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
         ):
             self.assertEqual(
                 0,
@@ -4614,6 +4642,25 @@ class CargoValidateTests(unittest.TestCase):
             commands,
         )
 
+    def test_final_sync_known_workspace_roots_are_explicit_in_strict_mode(
+        self,
+    ) -> None:
+        cases = {
+            "codex-rs/ext/agent-message-board/src/lib.rs": "codex-agent-message-board-extension",
+            "codex-rs/websocket-auth/src/lib.rs": "codex-websocket-auth",
+            "codex-rs/workload-identity/src/lib.rs": "codex-workload-identity",
+        }
+        for file_path, package_name in cases.items():
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "strict")
+                self.assertEqual([], plan["warnings"])
+                self.assertIn(package_name, plan["selected_packages"])
+                self.assertIn("cli", plan["selected_surfaces"])
+                self.assertIn(
+                    ["just", "clippy-strict", "-p", package_name],
+                    self.command_lines(plan),
+                )
+
     def test_deleted_unowned_rust_path_does_not_block_current_workspace_validation(
         self,
     ) -> None:
@@ -4681,7 +4728,12 @@ class CargoValidateTests(unittest.TestCase):
         self.assertIn("not owned by a Cargo workspace package", process.stderr)
 
     def test_unmapped_durable_paths_fail_loudly_for_plan_and_verify(self) -> None:
-        for file_path in ("scripts/test-remote-env.sh", "scripts/install/install.sh"):
+        for file_path in (
+            ".github/workflows/unmapped.yml",
+            "scripts/test-remote-env.sh",
+            "scripts/install/install.sh",
+            "sdk/python/unmapped.py",
+        ):
             for action in ("plan", "verify"):
                 with self.subTest(file_path=file_path, action=action):
                     process = self.run_planner(
@@ -4706,6 +4758,73 @@ class CargoValidateTests(unittest.TestCase):
                         process.stderr,
                     )
                     self.assertIn(file_path, process.stderr)
+
+    def test_normalize_repo_path_preserves_dotfile_and_parent_identity(self) -> None:
+        planner = load_planner_module()
+        self.assertEqual(
+            ".github/workflows/rust-release-prepare.yml",
+            planner.normalize_repo_path(
+                ".github/workflows/rust-release-prepare.yml", self.repo_root
+            ),
+        )
+        self.assertEqual(
+            "../github/workflows/rust-release-prepare.yml",
+            planner.normalize_repo_path(
+                "../github/workflows/rust-release-prepare.yml", self.repo_root
+            ),
+        )
+        self.assertEqual(
+            "ordinary/path",
+            planner.normalize_repo_path("./ordinary/path", self.repo_root),
+        )
+
+    def test_final_sync_durable_path_rules_use_exact_existing_owners(self) -> None:
+        paths = (
+            "AGENTS.md",
+            ".github/workflows/rust-release-prepare.yml",
+            "scripts/check-module-bazel-lock.sh",
+            "sdk/python/scripts/update_sdk_artifacts.py",
+            "sdk/python/src/openai_codex/generated/notification_registry.py",
+            "sdk/python/src/openai_codex/generated/v2_all.py",
+            "sdk/python/tests/test_artifact_workflow_and_binaries.py",
+        )
+        file_args = [argument for path in paths for argument in ("--file", path)]
+
+        for path in (paths[0], paths[1], paths[-1]):
+            with self.subTest(path=path):
+                classification_only_plan = self.plan_json(
+                    "--file", path, "--mode", "standard"
+                )
+                self.assertEqual([path], classification_only_plan["changed_files"])
+                self.assertEqual([], self.command_lines(classification_only_plan))
+
+        schema_paths = paths[3:6]
+        schema_file_args = [
+            argument for path in schema_paths for argument in ("--file", path)
+        ]
+        prep_plan = self.action_json("prep-plan", *schema_file_args, "--mode", "full")
+        self.assertEqual(list(schema_paths), prep_plan["changed_files"])
+        self.assertEqual(
+            [["just", "write-app-server-schema"]], self.command_lines(prep_plan)
+        )
+
+        bazel_lock_plan = self.plan_json("--file", paths[2], "--mode", "standard")
+        self.assertEqual([paths[2]], bazel_lock_plan["changed_files"])
+        self.assertEqual(
+            [["just", "bazel-lock-check"]], self.command_lines(bazel_lock_plan)
+        )
+
+        prep_plan = self.action_json("prep-plan", *file_args, "--mode", "full")
+        self.assertEqual(list(paths), prep_plan["changed_files"])
+        self.assertEqual(
+            [["just", "write-app-server-schema"]], self.command_lines(prep_plan)
+        )
+
+        validation_plan = self.plan_json(*file_args, "--mode", "full")
+        validation_commands = self.command_lines(validation_plan)
+        self.assertEqual(list(paths), validation_plan["changed_files"])
+        self.assertIn(["just", "bazel-lock-check"], validation_commands)
+        self.assertNotIn(["just", "write-app-server-schema"], validation_commands)
 
     def test_resource_profile_env_includes_adaptive_job_contract(self) -> None:
         plan = self.plan_json(

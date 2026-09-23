@@ -584,6 +584,7 @@ patterns = [
   "codex-rs/exec-server-protocol/**",
   "codex-rs/execpolicy/**",
   "codex-rs/ext/agent/**",
+  "codex-rs/ext/agent-message-board/**",
   "codex-rs/ext/computer-use/**",
   "codex-rs/ext/connectors/**",
   "codex-rs/ext/extension-api/**",
@@ -644,8 +645,10 @@ patterns = [
   "codex-rs/utils/sandbox-summary/**",
   "codex-rs/utils/string/**",
   "codex-rs/websocket-client/**",
+  "codex-rs/websocket-auth/**",
   "codex-rs/windows-sandbox-rs/**",
   "codex-rs/windows-sandbox-service/**",
+  "codex-rs/workload-identity/**",
 ]
 surfaces = ["cli"]
 
@@ -727,6 +730,23 @@ commands = ["guard-test-syntax", "guard-tests"]
 [[path_rules]]
 patterns = ["justfile"]
 commands = ["just-summary", "validate-plan-self"]
+
+[[path_rules]]
+patterns = ["AGENTS.md"]
+
+[[path_rules]]
+patterns = [".github/workflows/rust-release-prepare.yml"]
+
+[[path_rules]]
+patterns = ["scripts/check-module-bazel-lock.sh"]
+commands = ["bazel-lock-check"]
+
+[[path_rules]]
+patterns = ["sdk/python/scripts/update_sdk_artifacts.py", "sdk/python/src/openai_codex/generated/notification_registry.py", "sdk/python/src/openai_codex/generated/v2_all.py"]
+generators = ["write-app-server-schema"]
+
+[[path_rules]]
+patterns = ["sdk/python/tests/test_artifact_workflow_and_binaries.py"]
 
 [[path_rules]]
 patterns = ["scripts/clear-windows-build-cache.ps1", "scripts/test-clear-windows-build-cache.py"]
