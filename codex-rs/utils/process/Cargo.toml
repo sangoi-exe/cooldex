@@ -13,10 +13,11 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["fs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread"] }

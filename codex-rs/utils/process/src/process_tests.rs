@@ -1,26 +1,64 @@
 use std::process::Stdio;
 
+use pretty_assertions::assert_eq;
+
 use super::ProcessIdentity;
 use super::ProcessSignal;
-#[cfg(target_os = "linux")]
 use super::arm_parent_death_sigkill;
-#[cfg(target_os = "linux")]
+use super::parse_start_ticks;
 use super::process_exists;
 use super::send_signal;
 
 #[tokio::test]
-async fn captured_identity_matches_only_the_same_process_start() {
+async fn captured_identity_matches_only_the_same_pid_boot_and_start_ticks() {
     let identity = ProcessIdentity::current()
         .await
         .expect("capture current process");
-    let different_start = ProcessIdentity::from_parts(
+    let different_start_ticks = ProcessIdentity::from_parts(
         identity.pid(),
-        format!("{}-different", identity.process_start_time()),
+        identity.boot_id().to_owned(),
+        identity
+            .start_ticks()
+            .checked_add(1)
+            .expect("current process start ticks should not overflow"),
     )
-    .expect("different identity");
+    .expect("different start-ticks identity");
 
     assert!(identity.is_active().await.expect("match current process"));
-    assert!(!different_start.is_active().await.expect("reject mismatch"));
+    assert!(
+        !different_start_ticks
+            .is_active()
+            .await
+            .expect("reject PID reuse mismatch")
+    );
+}
+
+#[tokio::test]
+async fn a_boot_mismatch_is_inactive_before_pid_inspection() {
+    let current_identity = ProcessIdentity::current()
+        .await
+        .expect("capture current process");
+    let identity = ProcessIdentity::from_parts(
+        current_identity.pid(),
+        format!("{}-previous-boot", current_identity.boot_id()),
+        current_identity.start_ticks(),
+    )
+    .expect("boot mismatch identity");
+
+    assert!(
+        !identity
+            .is_active()
+            .await
+            .expect("boot mismatch should reject an otherwise matching live process")
+    );
+}
+
+#[test]
+fn parses_start_ticks_after_comm_with_spaces_and_closing_parentheses() {
+    let stat =
+        b"123 (codex \xff) worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654321 20";
+
+    assert_eq!(parse_start_ticks(stat).unwrap(), 987654321);
 }
 
 #[tokio::test]

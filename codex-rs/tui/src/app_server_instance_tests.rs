@@ -38,7 +38,12 @@ fn absolute(path: &Path) -> Result<AbsolutePathBuf> {
 }
 
 fn dead_identity(label: &str) -> ProcessIdentity {
-    ProcessIdentity::from_parts(u32::MAX, label.to_string()).expect("valid dead identity")
+    ProcessIdentity::from_parts(
+        /*pid*/ u32::MAX,
+        format!("{label}-boot-id"),
+        /*start_ticks*/ 0,
+    )
+    .expect("valid dead identity")
 }
 
 async fn identity_is_active(identity: &ProcessIdentity) -> Result<bool> {
@@ -217,7 +222,7 @@ async fn wait_for_process_exit(identity: &ProcessIdentity, wait: Duration) -> Re
 }
 
 #[tokio::test]
-async fn owner_record_validation_is_strict_and_state_aware() -> Result<()> {
+async fn owner_record_serializes_strict_locale_and_timezone_independent_identity() -> Result<()> {
     let parent = ProcessIdentity::current()
         .await
         .map_err(|err| color_eyre::eyre::eyre!("failed to capture test identity: {err}"))?;
@@ -227,11 +232,21 @@ async fn owner_record_validation_is_strict_and_state_aware() -> Result<()> {
 
     let serialized = serde_json::to_value(&preparing)?;
     assert_eq!(
-        serialized.get("processStartTime"),
-        None,
-        "process identity should remain nested"
+        serialized,
+        serde_json::json!({
+            "version": OWNER_RECORD_VERSION,
+            "nonce": nonce,
+            "state": "preparing",
+            "parent": {
+                "pid": parent.pid(),
+                "bootId": parent.boot_id(),
+                "startTicks": parent.start_ticks(),
+            },
+            "child": null,
+        })
     );
-    assert!(serialized["parent"].get("processStartTime").is_some());
+    assert!(serialized.get("processStartTime").is_none());
+    assert!(serialized["parent"].get("processStartTime").is_none());
 
     let ready_without_child = owner_record(&nonce, OwnerState::Ready, parent.clone(), None);
     assert!(validate_record(&ready_without_child, &nonce).is_err());
@@ -241,9 +256,62 @@ async fn owner_record_validation_is_strict_and_state_aware() -> Result<()> {
     with_unknown["unexpected"] = serde_json::json!(true);
     assert!(serde_json::from_value::<OwnerRecord>(with_unknown).is_err());
 
+    let mut with_legacy_identity = serde_json::to_value(&preparing)?;
+    with_legacy_identity["parent"]["processStartTime"] = serde_json::json!("legacy value");
+    assert!(serde_json::from_value::<OwnerRecord>(with_legacy_identity).is_err());
+
     let noncanonical_nonce = nonce.to_uppercase();
     let noncanonical = owner_record(&noncanonical_nonce, OwnerState::Preparing, parent, None);
     assert!(validate_record(&noncanonical, &noncanonical_nonce).is_err());
+
+    let mut v1_record = preparing;
+    v1_record.version = 1;
+    assert!(validate_record(&v1_record, &nonce).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(app_server_instance)]
+async fn v1_owner_and_claim_artifacts_are_preserved_byte_for_byte() -> Result<()> {
+    let home = TempDir::new()?;
+    let root = home.path().join("instances");
+    prepare_instance_root(&root)?;
+    let nonce = Uuid::new_v4().to_string();
+    let claim_id = Uuid::new_v4();
+    create_instance_dir(&root, &nonce)?;
+    let owner_path = root.join(format!("{nonce}{OWNER_SUFFIX}"));
+    let claim_path = root.join(format!("{nonce}.claim-{claim_id}.json"));
+    let owner_bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "nonce": nonce,
+        "state": "preparing",
+        "parent": {
+            "pid": u32::MAX,
+            "processStartTime": "legacy locale-dependent start time",
+        },
+        "child": null,
+    }))?;
+    let claim_bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "nonce": nonce,
+        "state": "ready",
+        "parent": {
+            "pid": u32::MAX,
+            "processStartTime": "legacy locale-dependent start time",
+        },
+        "child": {
+            "pid": u32::MAX,
+            "processStartTime": "legacy locale-dependent start time",
+        },
+    }))?;
+    write_new_file(&owner_path, &owner_bytes)?;
+    write_new_file(&claim_path, &claim_bytes)?;
+
+    cleanup_orphans(&root).await?;
+
+    assert_eq!(std::fs::read(&owner_path)?, owner_bytes);
+    assert_eq!(std::fs::read(&claim_path)?, claim_bytes);
+    assert!(root.join(&nonce).is_dir());
     Ok(())
 }
 

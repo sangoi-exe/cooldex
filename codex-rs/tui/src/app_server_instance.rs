@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 const INSTANCE_ROOT_MODE: u32 = 0o700;
 const OWNER_FILE_MODE: u32 = 0o600;
-const OWNER_RECORD_VERSION: u32 = 1;
+const OWNER_RECORD_VERSION: u32 = 2;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -571,14 +571,14 @@ fn validate_record(record: &OwnerRecord, filename_nonce: &str) -> Result<()> {
     }
     if record.version != OWNER_RECORD_VERSION
         || record.parent.pid() == 0
-        || record.parent.process_start_time().trim().is_empty()
+        || record.parent.boot_id().trim().is_empty()
     {
         return Err(eyre!("owner record version or parent identity is invalid"));
     }
     match (record.state, record.child.as_ref()) {
         (OwnerState::Preparing, None) => Ok(()),
         (OwnerState::Spawned | OwnerState::Ready, Some(child))
-            if child.pid() != 0 && !child.process_start_time().trim().is_empty() =>
+            if child.pid() != 0 && !child.boot_id().trim().is_empty() =>
         {
             Ok(())
         }
