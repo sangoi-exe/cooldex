@@ -1710,6 +1710,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 self.assertEqual(process.returncode, 1)
                 self.assertEqual(summary["status"], "preflight-failed")
                 self.assertIn(expected.casefold(), str(result["error"]).casefold())
+                self.assertNotIn("OrderedDictionary", process.stderr)
                 self.assertFalse(
                     self.unix_path(result["paths"]["tool_staging"])
                     .joinpath("command-1", "cargo.exe")

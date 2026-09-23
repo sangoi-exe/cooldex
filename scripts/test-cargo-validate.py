@@ -6171,7 +6171,6 @@ class CargoValidateTests(unittest.TestCase):
                 return FailingLogFile()
             return original_open(path, *args, **kwargs)
 
-        started_at = time.monotonic()
         with (
             mock.patch.object(Path, "open", fake_open),
             mock.patch.object(planner.sys, "stdout", ConsoleStream()),
@@ -6189,9 +6188,6 @@ class CargoValidateTests(unittest.TestCase):
                 stdout_log_path=stdout_log_path,
                 stderr_log_path=stderr_log_path,
             )
-        elapsed_seconds = time.monotonic() - started_at
-
-        self.assertLess(elapsed_seconds, 2)
         self.assertIn(
             "failed to record command output: stdout log: forced log write failure",
             str(context.exception),

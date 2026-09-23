@@ -3197,7 +3197,7 @@ try {
     $script:Runtime = $runtime
     $script:CacheRoot = $runtime.cache_root
     $testFixture = Get-TestOnlyPreflightFixture
-    $nativeMutex = Enter-NativeExecutionMutex $testFixture
+    $nativeMutexEvidence = Enter-NativeExecutionMutex $testFixture
     $script:RunPaths = New-RunPaths $runtime.workflow_namespace $runtime.reuse_run_root
     $script:Preflight = [ordered]@{
         schema = 2
@@ -3216,7 +3216,7 @@ try {
             rust_toolchain = $runtime.rust_toolchain
             source_materialization = $runtime.source_materialization
         }
-        native_mutex = $nativeMutex
+        native_mutex = $nativeMutexEvidence
         native_git = $null
         direct_toolchain = $null
         bootstrap = [ordered]@{
