@@ -234,9 +234,7 @@ async fn resolve_inner(
         message: format!("failed to locate archived thread id {thread_id}: {err}"),
     })?;
     match path {
-        Some(path) => {
-            resolve_path_in_scope(store, thread_id, path, scope, budget.as_deref_mut()).await
-        }
+        Some(path) => resolve_path_in_scope(store, thread_id, path, scope, budget).await,
         None => Ok(None),
     }
 }
@@ -467,7 +465,7 @@ fn source_limit_exhausted() -> io::Error {
 
 fn is_source_limit_exhausted(err: &io::Error) -> bool {
     err.get_ref()
-        .is_some_and(|source| source.is::<MetadataSourceLimitExhausted>())
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<MetadataSourceLimitExhausted>)
 }
 
 #[derive(Debug)]
