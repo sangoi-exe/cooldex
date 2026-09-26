@@ -202,14 +202,7 @@ current-user rescope. -->
   run, benchmark, and generator command through `./scripts/cargo-guard.sh` or a root
   `just` recipe that delegates to that wrapper. Raw Cargo execution is not valid Cooldex
   workspace evidence.
-- If a guarded local WSL build hits the upstream `rusty_v8` prebuilt `404` path, do not
-  invent a mirror or a broad local compatibility route. Read the current owners first:
-  `third_party/v8/README.md`, `scripts/codex_package/v8.py`, and
-  `scripts/cargo-validation.toml`. Those owners define the paired
-  `RUSTY_V8_ARCHIVE` plus `RUSTY_V8_SRC_BINDING_PATH` route for package/release/CI
-  flows, require an exact `codex-rs/Cargo.lock` version match, and already register the
-  guarded host-artifact command `first-party-runtime-support-bins` with
-  `codex_v8_target = "host"`. Keep this root note at owner-pointer altitude only.
+- If a guarded local WSL build hits the upstream `rusty_v8` prebuilt `404` path, do not invent a mirror or broad local compatibility route. Read `third_party/v8/README.md`, `scripts/codex_package/v8.py`, `scripts/cargo-validation.toml`, and `scripts/cargo-validate.py`: they define the paired `RUSTY_V8_ARCHIVE` plus `RUSTY_V8_SRC_BINDING_PATH` route for package/release/CI flows, require an exact `codex-rs/Cargo.lock` version match, and apply `codex_v8_target = "host"` to guarded V8-consumer commands. Keep this root note at owner-pointer altitude only.
 - `scripts/cargo-validation.toml` owns resource profiles, job caps, one-thread runtime-test
   limits, and receipt placement under `.sangoi/validation/`. Missing guard, policy,
   profile, or receipt ownership fails closed.
@@ -237,47 +230,22 @@ current-user rescope. -->
   resource and safety boundaries remain in force. This sequencing rule does not
   change validator implementation or CLI availability.
 
-<!-- Merge-safety anchor: native-Windows bulk validation is planner-accounted and PowerShell-executed; full-mode WSL test preparation uses the config-owned explicit package mapper while Linux production builds remain on the guarded WSL path. -->
+<!-- Merge-safety anchor: native-Windows validation is planner-accounted and PowerShell-executed; selected runtime packages use native Nextest while WSL test preparation uses the config-owned explicit package mapper and Linux production builds remain on the guarded WSL path. -->
 ### Native-Windows bulk test procedure
 
-- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...`
-  to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use
-  `--changed` to select paths from the current worktree and `--range <base>..<merge>` for
-  a merge commit, with `<base>` set to its first parent. `--changed` does not materialize
-  arbitrary unstaged or untracked worktree bytes: the native executor consumes the index
-  candidate, which requires worktree/index equality and no ordinary untracked source. The
-  root owns exact task staging; Workers do not stage. An explicit `--windows-reuse-root
-  'F:\.cache\...existing-run-root...'` on either guarded action selects in-place native
-  reuse; no selector keeps cold preparation. `--mode full` is the bulk collector. Never run
-  Cargo or Nextest directly on native Windows, and never use the former Windows `just test`
-  route.
+- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...` to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use `--changed` to select all current staged, unstaged, and ordinary untracked paths, not a delta since a prior full collection; use `--file <corrected-path>` or an appropriate correction `--range <base>..<merge>` for a narrower post-collection batch, with `<base>` set to the merge's first parent. `--changed` does not materialize arbitrary unstaged or untracked worktree bytes: the native executor consumes the index candidate, which requires worktree/index equality and no ordinary untracked source. The root owns exact task staging; Workers do not stage. An explicit `--windows-reuse-root 'F:\.cache\...existing-run-root...'` on either guarded action selects in-place native reuse; no selector keeps cold preparation. Standard and strict runtime selections send their eligible selected packages plus evidenced native binary prerequisites to native Nextest while its test filter runs only affected package tests; non-runtime selections do not acquire a native test run. `--mode full` remains the complete bulk collector. Never run Cargo or Nextest directly on native Windows, and never use the former Windows `just test` route.
 - `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` are the only owners of
   selection, platform classification, exclusions, the frozen manifest, and resource
   contracts. The PowerShell executor runs only manifest-authorized Windows entries; it
   must not infer or invent partitions.
-- Native Windows runs the bulk platform-neutral and Linux-relevant test surface.
-  Windows-only tests must be explicit exclusions and do not count as coverage.
-  Linux/Unix-only tests run only as targeted guarded WSL commands; macOS-only tests are
-  not applicable in this topology. WSL runs Linux checks and builds, plus those targeted
-  Linux/Unix-only tests.
-<!-- Merge-safety anchor: only the native aggregate uses direct dev/test opt1 overrides;
-it retains limited symbols, debug assertions, and overflow checks while WSL codegen stays
-unchanged. -->
-- `commands.windows-nextest-workspace` in `scripts/cargo-validation.toml` applies direct
-  Cargo `--config` overrides to both `dev` and `test`: `opt-level=1`,
-  `debug="limited"`, `debug-assertions=true`, and `overflow-checks=true`. These settings
-  apply only to the native aggregate; WSL commands retain their existing codegen settings.
-  The default uses the existing profiles and does not add diagnostic verbosity.
+- Native Windows runs selected platform-neutral tests and the complete platform-neutral bulk collector; Windows-only tests must be explicit exclusions and do not count as coverage, Linux/Unix-only tests run only as targeted guarded WSL commands, macOS-only tests are not applicable in this topology, and WSL runs Linux checks and builds plus those targeted Linux/Unix-only tests.
+<!-- Merge-safety anchor: native Nextest uses direct dev/test opt1 overrides; it retains
+limited symbols, debug assertions, and overflow checks while WSL codegen stays unchanged. -->
+- `commands.windows-nextest-workspace` in `scripts/cargo-validation.toml` is the canonical native Nextest argv: it applies direct Cargo `--config` overrides to both `dev` and `test` (`opt-level=1`, `debug="limited"`, `debug-assertions=true`, and `overflow-checks=true`), and selected package commands derive their common policy, platform exclusions, features, and test filter from it; these settings apply only to native Nextest, WSL commands retain their existing codegen settings, and the default uses existing profiles without diagnostic verbosity.
 <!-- Merge-safety anchor: codex-voice-host source and workspace membership stay intact,
 but the planner must exclude only its validation and visibly retain its unvalidated limit. -->
-- `codex-voice-host` remains in the workspace and its source is not removed, but the
-  planner excludes it from every package-derived WSL validation rung and the native full
-  workspace aggregate. Each applicable plan must warn that it remains unvalidated; this
-  is not a claim that voice functionality works.
-- In `--mode full`, WSL test-target check/link preparation follows only the explicit WSL
-  package mapping in `scripts/cargo-validation.toml`, which remains the list owner.
-  Normal per-package Linux checks, strict Clippy, and Linux product builds stay on WSL;
-  other modes retain their existing selection policy.
+- `codex-voice-host` remains in the workspace and its source is not removed, but the planner excludes it from every package-derived WSL validation rung, native selected-package test, and native full workspace aggregate; each applicable plan must warn that it remains unvalidated, which is not a claim that voice functionality works.
+- WSL runtime and test-target check/link preparation follow only the explicit WSL package mapping in `scripts/cargo-validation.toml`, which remains the list owner; normal per-package Linux checks, strict Clippy, and Linux product builds stay on WSL, quick omits runtime execution, standard and strict use native selected-package tests, and full retains the explicit workspace collector.
 - Build and product output are always Linux/WSL. An ephemeral `codex.exe` is permitted
   only when a platform-neutral test requires it; it must never be installed, promoted,
   published, or operated as the Windows Codex CLI product.

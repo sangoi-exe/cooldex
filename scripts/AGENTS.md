@@ -22,27 +22,18 @@
 ## Durable Notes
 
 - Keep Cargo/build-like validation behavior centralized in `cargo-guard.sh`, `cargo-validate.py`, and `cargo-validation.toml`; do not add parallel ad hoc validation wrappers.
-<!-- Merge-safety anchor: native-Windows execution remains a thin checked-in PowerShell backend for the planner-owned manifest; full-mode WSL test preparation follows the config-owned explicit package mapper, with WSL guard dispatch and exact F-cache cleanup kept separate. -->
+<!-- Merge-safety anchor: native-Windows execution remains a thin checked-in PowerShell backend for the planner-owned manifest; selected runtime packages use native Nextest while WSL runtime and test preparation follow the config-owned explicit package mapper, with WSL guard dispatch and exact F-cache cleanup kept separate. -->
 - `cargo-validation.toml` and `cargo-validate.py` own the frozen manifest, platform
   partitions, explicit exclusions, and the native-Windows 16-build-job/8-test-thread
   resource contract. The executor fixes native test-child `RUST_MIN_STACK` at `8388608`
   (8 MiB). `cargo-guard.sh` owns WSL dispatch; the PowerShell helpers own native Windows
   execution, writes, and cleanup, not a second partitioning policy.
-<!-- Merge-safety anchor: native aggregate dev/test opt1 configuration remains literal
-command arguments with limited symbols, debug assertions, and overflow checks; WSL
-codegen remains unchanged. -->
-- `commands.windows-nextest-workspace` owns the exact native `--config` pairs for
-  `profile.dev` and `profile.test`: `opt-level=1`, `debug="limited"`,
-  `debug-assertions=true`, and `overflow-checks=true`. The settings are direct TOML argv
-  entries for the existing profiles. The default adds no diagnostic verbosity and leaves
-  WSL codegen unchanged.
+<!-- Merge-safety anchor: native Nextest dev/test opt1 configuration remains literal command arguments with limited symbols, debug assertions, and overflow checks; WSL codegen remains unchanged. -->
+- `commands.windows-nextest-workspace` owns the exact native `--config` pairs for `profile.dev` and `profile.test` (`opt-level=1`, `debug="limited"`, `debug-assertions=true`, and `overflow-checks=true`); selected package commands derive common native policy, platform exclusions, features, and the test filter from that canonical argv, while `native_binary_prerequisites` contributes only evidenced helper-producing build packages without expanding the affected test filter.
 <!-- Merge-safety anchor: voice source remains workspace-owned, while only
 codex-voice-host validation is deliberately excluded through the TOML selection policy
 and planner warnings retain the unvalidated limitation. -->
-- `defaults.validation_excluded_packages` in `cargo-validation.toml` excludes only
-  `codex-voice-host` from package-derived WSL validation rungs and the full native
-  workspace aggregate. Retain its explicit path classification and plan warning; do not
-  treat this validation exclusion as source removal or product proof.
+- `defaults.validation_excluded_packages` in `cargo-validation.toml` excludes only `codex-voice-host` from package-derived WSL validation rungs and native selected-package and full workspace aggregates; retain its explicit path classification and plan warning, and do not treat this validation exclusion as source removal or product proof.
 - `cargo-validate.py` owns parsing and frozen-manifest projection of explicit
   `--windows-reuse-root` and native-Windows-only `--yolo`; `cargo-validate-windows.ps1`
   owns selected-root compatibility and source checks, in-place synchronization, fresh run
@@ -90,9 +81,7 @@ junctions as leaf entries and never traverses or deletes through their targets. 
   Cargo and fake built binaries so the transitive helper route remains covered.
 - Planner-driven `verify` defaults to `--telemetry-level full`; direct guarded Cargo commands and known profiled `just` recipes that invoke `cargo-guard.sh` receive TSV paths under `.sangoi/validation/command-logs/**` beside stdout/stderr logs. Non-Cargo commands do not get fake telemetry artifacts. Use `summary` for lighter receipt metadata, `debug` for per-process rustc detail rows, and `off` only when telemetry is intentionally disabled.
 - `cargo-validate.py` keeps pre-review mechanical materialization separate from validation: `prep-plan`/`prep` may run tree-mutating formatter, generator, and lock-refresh commands before review, while `plan`/`verify` must stay non-mutating validation actions.
-- In `--mode full`, `cargo-validate.py` gates WSL test-target preparation through the
-  `wsl_runtime_packages` path-rule mapping in `cargo-validation.toml`; update that mapper
-  and `test-cargo-validate.py` together. Other modes retain their current selection policy.
+- `cargo-validate.py` gates WSL runtime and test-target preparation through the `wsl_runtime_packages` path-rule mapping in `cargo-validation.toml`; standard and strict runtime selections instead send eligible selected packages plus configured native binary prerequisites to native Nextest while the Nextest filter remains restricted to affected packages. Update that mapper and `test-cargo-validate.py` together.
 - Root `AGENTS.md` `Guarded Rust Validation` and `Native-Windows bulk test procedure`
   own all-batch terminal collection before failure investigation/correction plus the
   exact-match retry and fresh-collection requirements.
@@ -106,11 +95,7 @@ junctions as leaf entries and never traverses or deletes through their targets. 
   and fail loud on malformed status records. A historical deletion cannot
   override a revision re-add, a current path, or an explicit `--file` selector.
   `--json` is machine-readable output, not a selector-input schema.
-- `--changed` selects paths from cached, unstaged, and ordinary untracked worktree
-  changes; it does not turn arbitrary worktree bytes into a native candidate.
-  `cargo-validate-windows.ps1` consumes the index candidate and requires
-  worktree/index equality with no ordinary untracked source. The root owns exact
-  task staging; Workers do not stage.
+- `--changed` selects all current cached, unstaged, and ordinary untracked worktree changes rather than changes since a prior full collection; use `--file` or an appropriate correction `--range` for a narrower batch. It does not turn arbitrary worktree bytes into a native candidate: `cargo-validate-windows.ps1` consumes the index candidate and requires worktree/index equality with no ordinary untracked source, and the root owns exact task staging while Workers do not stage.
 - `cargo-guard.sh` preserves successful `-p/--package` caches and cleans only the failed package with `cargo clean -p <package>` after package-targeted failures or disk emergencies; broad clean stays limited to clean-required pressure without package targets.
 - When changing validation command selection, resource profiles, receipt semantics, cleanup behavior, or target-cache behavior, update the matching script tests and root Atlas/validation notes if validation truth changes.
 - `cargo-validate.py` and `cargo-validation.toml` should fail loud on unknown durable surfaces instead of silently skipping them.

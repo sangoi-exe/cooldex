@@ -1443,9 +1443,9 @@ function Test-ManifestCommand {
         $argv[0] -cne "cargo" -or
         $argv[1] -cne "nextest" -or
         $argv[2] -cne "run" -or
-        $argv[3] -cne "--workspace"
+        (-not ($argv -contains "--workspace") -and -not ($argv -contains "-p") -and -not ($argv -contains "--package"))
     ) {
-        Fail-Manifest "Windows commands must use the cargo nextest run --workspace test route"
+        Fail-Manifest "Windows commands must use the cargo nextest run test route with --workspace or -p/--package selection"
     }
     $fixture = Get-TestFixture $environment
 

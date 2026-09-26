@@ -99,8 +99,6 @@ WINDOWS_HELPER_STATUS_EXIT_CODES = {
 PLAN_ACTIONS = {"plan", "prep-plan"}
 PREP_ACTIONS = {"prep", "prep-plan"}
 VALIDATION_ACTIONS = {"plan", "verify"}
-FIRST_PARTY_RUNTIME_SUPPORT_BINS_COMMAND = "first-party-runtime-support-bins"
-FIRST_PARTY_RUNTIME_EXPECTED_GROWTH_SOURCE = "forced:post-support-bins"
 CODEX_V8_HOST_TARGET = "host"
 # Merge-safety anchor: the selected code-mode V8 closure must receive the
 # checksum-verified host archive/binding pair through direct guarded Cargo
@@ -118,11 +116,8 @@ CODEX_V8_REQUIRED_ENV_KEYS = {
     "RUSTY_V8_ARCHIVE",
     "RUSTY_V8_SRC_BINDING_PATH",
 }
-FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES = {
-    "codex-app-server",
-    "codex-core",
-    "codex-rmcp-client",
-}
+WINDOWS_NEXTEST_WORKSPACE_COMMAND = "windows-nextest-workspace"
+WINDOWS_NEXTEST_PACKAGES_KIND = "windows-nextest-packages"
 BUILD_LIKE_CARGO = {
     "bench",
     "build",
@@ -2123,6 +2118,15 @@ def validate_config(
             raise PlannerError(
                 f"validation command {command_name!r} codex_v8_target requires a direct guarded Cargo build-like command"
             )
+    windows_nextest_command = config.get("commands", {}).get(
+        WINDOWS_NEXTEST_WORKSPACE_COMMAND
+    )
+    if windows_nextest_command is not None:
+        if not isinstance(windows_nextest_command, dict):
+            raise PlannerError(
+                f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must be a table"
+            )
+        validate_windows_nextest_config(windows_nextest_command, package_names, config)
 
     for surface in config.get("surfaces", []):
         surface_name = surface.get("name")
@@ -2300,25 +2304,34 @@ def command_from_config(
     command_name: str,
     reason: str,
     history_entries: list[dict[str, Any]],
+    *,
+    argv: list[str] | None = None,
+    kind: str | None = None,
 ) -> CommandEntry:
     command_config = config.get("commands", {}).get(command_name)
     if not command_config:
         raise PlannerError(
             f"validation command {command_name!r} is not defined in cargo-validation.toml"
         )
-    argv = command_config.get("argv")
-    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
-        raise PlannerError(
-            f"validation command {command_name!r} must define argv as a string array"
-        )
+    if argv is None:
+        configured_argv = command_config.get("argv")
+        if not isinstance(configured_argv, list) or not all(
+            isinstance(item, str) for item in configured_argv
+        ):
+            raise PlannerError(
+                f"validation command {command_name!r} must define argv as a string array"
+            )
+        resolved_argv = configured_argv
+    else:
+        resolved_argv = argv
     platform, executor, classification, artifact_policy = command_manifest_metadata(
-        command_config, argv
+        command_config, resolved_argv
     )
     return replace(
         command_with_profile(
-            tuple(argv),
+            tuple(resolved_argv),
             reason,
-            command_name,
+            kind or command_name,
             config,
             command_config.get("profile"),
             history_entries,
@@ -2328,6 +2341,155 @@ def command_from_config(
             artifact_policy=artifact_policy,
         ),
         codex_v8_target=command_config.get("codex_v8_target"),
+    )
+
+
+def windows_nextest_workspace_argv(command_config: dict[str, Any]) -> list[str]:
+    return list(command_config["argv"])
+
+
+def selected_native_test_filter(packages: list[str], test_filter: str) -> str:
+    return f"({' | '.join(f'package({package})' for package in packages)}) & ({test_filter})"
+
+
+def windows_nextest_packages_argv(
+    command_config: dict[str, Any], test_packages: list[str]
+) -> list[str]:
+    workspace_argv = windows_nextest_workspace_argv(command_config)
+    if tuple(workspace_argv[:4]) != ("cargo", "nextest", "run", "--workspace"):
+        raise PlannerError(
+            f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must begin with cargo nextest run --workspace"
+        )
+    argv = list(workspace_argv[:3])
+    workspace_features: list[str] = []
+    package_exclusions: set[str] = set()
+    test_filter: str | None = None
+    index = 4
+    while index < len(workspace_argv):
+        argument = workspace_argv[index]
+        if argument == "--features":
+            if index + 1 >= len(workspace_argv):
+                raise PlannerError(
+                    f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} --features requires a value"
+                )
+            workspace_features.extend(workspace_argv[index + 1].split())
+            index += 2
+        elif argument == "--exclude":
+            if index + 1 >= len(workspace_argv):
+                raise PlannerError(
+                    f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} --exclude requires a package"
+                )
+            package_exclusions.add(workspace_argv[index + 1])
+            index += 2
+        elif argument == "-E":
+            if index + 2 != len(workspace_argv):
+                raise PlannerError(
+                    f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must end with its Nextest filter"
+                )
+            test_filter = workspace_argv[index + 1]
+            break
+        else:
+            argv.append(argument)
+            index += 1
+    if test_filter is None:
+        raise PlannerError(
+            f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must define a Nextest filter"
+        )
+
+    selected_test_packages = [
+        package for package in test_packages if package not in package_exclusions
+    ]
+    build_packages = list(selected_test_packages)
+    for package in selected_test_packages:
+        for prerequisite in command_config["native_binary_prerequisites"].get(
+            package, []
+        ):
+            if prerequisite not in build_packages:
+                build_packages.append(prerequisite)
+    argv.extend(
+        ("-E", selected_native_test_filter(selected_test_packages, test_filter))
+    )
+    argv.extend(argument for package in build_packages for argument in ("-p", package))
+    feature_args = [
+        feature
+        for feature in workspace_features
+        if feature.partition("/")[0] in build_packages
+    ]
+    if feature_args:
+        argv.extend(("--features", " ".join(feature_args)))
+    return argv
+
+
+def validate_windows_nextest_config(
+    command_config: dict[str, Any],
+    package_names: set[str],
+    config: dict[str, Any],
+) -> None:
+    context = f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r}"
+    native_binary_prerequisites = command_config.get("native_binary_prerequisites")
+    if not isinstance(native_binary_prerequisites, dict):
+        raise PlannerError(f"{context} native_binary_prerequisites must be a table")
+    for package, prerequisites in native_binary_prerequisites.items():
+        if package not in package_names:
+            raise PlannerError(
+                f"{context} native_binary_prerequisites references unknown package {package!r}"
+            )
+        if not isinstance(prerequisites, list) or not all(
+            isinstance(prerequisite, str) and prerequisite in package_names
+            for prerequisite in prerequisites
+        ):
+            raise PlannerError(
+                f"{context} native_binary_prerequisites.{package} must name known packages"
+            )
+
+    platform, executor, classification, artifact_policy = command_manifest_metadata(
+        command_config, windows_nextest_workspace_argv(command_config)
+    )
+    validate_manifest_command(
+        CommandEntry(
+            tuple(windows_nextest_workspace_argv(command_config)),
+            f"{context} workspace argv",
+            platform=platform,
+            executor=executor,
+            classification=classification,
+            artifact_policy=artifact_policy,
+            resource_profile=command_config.get("profile"),
+        ),
+        config,
+        f"{context} workspace argv",
+    )
+
+
+def windows_nextest_workspace_command(
+    config: dict[str, Any], reason: str, history_entries: list[dict[str, Any]]
+) -> CommandEntry:
+    command_config = config["commands"][WINDOWS_NEXTEST_WORKSPACE_COMMAND]
+    return command_from_config(
+        config,
+        WINDOWS_NEXTEST_WORKSPACE_COMMAND,
+        reason,
+        history_entries,
+        argv=windows_nextest_workspace_argv(command_config),
+    )
+
+
+def windows_nextest_packages_command(
+    config: dict[str, Any],
+    packages: list[str],
+    reason: str,
+    history_entries: list[dict[str, Any]],
+) -> CommandEntry | None:
+    command_config = config["commands"][WINDOWS_NEXTEST_WORKSPACE_COMMAND]
+    argv = windows_nextest_packages_argv(command_config, packages)
+    if "-p" not in argv:
+        return None
+    return command_from_config(
+        config,
+        WINDOWS_NEXTEST_WORKSPACE_COMMAND,
+        reason,
+        history_entries,
+        argv=argv,
+        kind=WINDOWS_NEXTEST_PACKAGES_KIND,
     )
 
 
@@ -2433,24 +2595,6 @@ def cargo_command(
     )
 
 
-def force_no_clean_runtime(command: CommandEntry) -> CommandEntry:
-    env = dict(command.env)
-    env["CARGO_GUARD_EXPECTED_GROWTH_GIB"] = "0"
-    env["CARGO_GUARD_NO_CLEAN"] = "1"
-    return replace(
-        command,
-        env=env,
-        effective_expected_growth_gib=0,
-        expected_growth_source=FIRST_PARTY_RUNTIME_EXPECTED_GROWTH_SOURCE,
-    )
-
-
-def protect_produced_artifacts(command: CommandEntry) -> CommandEntry:
-    env = dict(command.env)
-    env["CARGO_GUARD_NO_POST_CLEAN"] = "1"
-    return replace(command, env=env)
-
-
 def add_command(
     commands: list[CommandEntry],
     command: CommandEntry,
@@ -2485,30 +2629,6 @@ def surface_by_name(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def runtime_test_args(package: str) -> list[str]:
     return ["test", "-p", package]
-
-
-def add_first_party_runtime_support_binary_commands(
-    commands: list[CommandEntry],
-    config: dict[str, Any],
-    history_entries: list[dict[str, Any]],
-) -> None:
-    # Merge-safety anchor: some runtime tests spawn first-party binaries via
-    # codex_utils_cargo_bin (for example `codex --broker`). Keep the exact
-    # helper build argv in cargo-validation.toml, and schedule it immediately
-    # before every dependent runtime rung so clean-target validation does not
-    # delete prepared helpers.
-    add_command(
-        commands,
-        protect_produced_artifacts(
-            command_from_config(
-                config,
-                FIRST_PARTY_RUNTIME_SUPPORT_BINS_COMMAND,
-                "support binaries required by runtime tests",
-                history_entries,
-            )
-        ),
-        allow_duplicate=True,
-    )
 
 
 def build_plan(
@@ -2588,14 +2708,13 @@ def build_plan(
         {"runtime", "test_scope", "manifest_changed"} & selection.flags
     )
     need_runtime_tests = "runtime" in selection.flags
-    runtime_packages = set(validation_packages) if need_runtime_tests else set()
-    # Merge-safety anchor: in full mode, WSL runtime and test-target
-    # preparation must use the config-owned explicit WSL package selection,
-    # while normal checks and strict Clippy stay selected per validation package.
-    test_preparation_packages = set(validation_packages)
-    if mode == "full":
-        runtime_packages &= selection.wsl_runtime_packages
-        test_preparation_packages &= selection.wsl_runtime_packages
+    # Merge-safety anchor: WSL runtime and test-target preparation use only the
+    # config-owned Linux/Unix package mapping. Ordinary runtime selections run
+    # the eligible package set through native Windows Nextest instead.
+    runtime_packages = set(validation_packages) & selection.wsl_runtime_packages
+    test_preparation_packages = (
+        set(validation_packages) & selection.wsl_runtime_packages
+    )
 
     if stage == "prep":
         if windows_reuse_root is not None:
@@ -2654,15 +2773,19 @@ def build_plan(
             ),
         )
 
-    # Merge-safety anchor: full-mode Windows aggregate and its platform
-    # exclusions must follow cheap structural checks and precede every WSL Cargo
-    # build/check/test/clippy rung, preserving native preflight capacity.
+    # Merge-safety anchor: native Windows Nextest receives only the selected
+    # eligible runtime package set outside full mode. Full remains the explicit
+    # workspace aggregate and records its platform exclusions.
     if mode == "full":
-        for command_name, reason in (
-            (
-                "windows-nextest-workspace",
+        add_command(
+            commands,
+            windows_nextest_workspace_command(
+                config,
                 "full mode requests the native Windows platform-neutral aggregate",
+                history_entries,
             ),
+        )
+        for command_name, reason in (
             (
                 "windows-only-excluded",
                 "full mode records Windows-only tests as excluded from the aggregate",
@@ -2676,6 +2799,15 @@ def build_plan(
                 commands,
                 command_from_config(config, command_name, reason, history_entries),
             )
+    elif mode_at_least(mode, "standard") and need_runtime_tests:
+        windows_nextest_command = windows_nextest_packages_command(
+            config,
+            validation_packages,
+            "selected runtime packages request native Windows platform-neutral tests",
+            history_entries,
+        )
+        if windows_nextest_command is not None:
+            add_command(commands, windows_nextest_command)
 
     for package in validation_packages:
         package_info = package_infos[package]
@@ -2726,24 +2858,9 @@ def build_plan(
             and package in runtime_packages
             and (package_info.has_test_targets or package_info.has_doctests)
         ):
-            if package in FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES:
-                add_first_party_runtime_support_binary_commands(
-                    commands, config, history_entries
-                )
             add_command(
                 commands,
-                force_no_clean_runtime(
-                    cargo_command(
-                        runtime_test_args(package),
-                        f"runtime behavior is in scope for {package}",
-                        config,
-                        "package_test",
-                        history_entries,
-                        codex_v8_target=codex_v8_target,
-                    )
-                )
-                if package in FIRST_PARTY_RUNTIME_SUPPORT_PACKAGES
-                else cargo_command(
+                cargo_command(
                     runtime_test_args(package),
                     f"runtime behavior is in scope for {package}",
                     config,

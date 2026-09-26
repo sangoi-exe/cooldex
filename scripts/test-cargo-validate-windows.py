@@ -807,7 +807,44 @@ class CargoValidateWindowsTests(unittest.TestCase):
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
-    def test_rejects_unsafe_entries_before_creating_or_launching_fake_cargo(
+    def test_accepts_planner_owned_selected_package_argv(self) -> None:
+        planner_argv = [
+            "cargo",
+            "nextest",
+            "run",
+            "--profile",
+            "local",
+            "--no-fail-fast",
+            "--no-tests",
+            "fail",
+            "-p",
+            "planner-owned-package-one",
+            "-p",
+            "planner-owned-package-two",
+            "-E",
+            "package(codex-cli)",
+        ]
+        process, summary, result = self.invoke(
+            self.manifest([self.command(argv=planner_argv, env=self.fixture_env())]),
+            fixture_opt_in=True,
+        )
+
+        self.assertEqual(process.returncode, 0, msg=process.stderr)
+        self.assertEqual(summary["status"], "success")
+        command_result = result["command_results"][0]
+        self.assertEqual(command_result["argv"], planner_argv)
+        self.assertEqual(command_result["launch_arguments"], planner_argv[1:])
+        self.assertEqual(
+            self.unix_path(command_result["fake_argv_path"])
+            .read_text(encoding="utf-8")
+            .splitlines(),
+            planner_argv[1:],
+        )
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_rejects_non_test_entries_before_creating_or_launching_fake_cargo(
         self,
     ) -> None:
         unsafe_argv = (
@@ -815,8 +852,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
             ["cargo", "package"],
             ["cargo", "release"],
             ["cargo", "generate"],
-            ["cargo", "nextest", "run", "-p", "codex-cli"],
-            ["cargo", "nextest", "run", "-p", "codex-cli", "--release"],
+            ["cargo", "nextest", "list"],
             ["cargo", "test"],
             ["just", "test"],
             ["codex", "install"],

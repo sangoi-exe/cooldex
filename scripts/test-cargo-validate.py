@@ -55,6 +55,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-aws-auth": "aws-auth",
             "codex-backend-client": "backend-client",
             "codex-build-info": "build-info",
+            "codex-bwrap": "bwrap",
             "codex-chatgpt": "chatgpt",
             "codex-cli": "cli",
             "codex-cloud-config": "cloud-config",
@@ -119,6 +120,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-utils-pty": "utils/pty",
             "codex-utils-sandbox-summary": "utils/sandbox-summary",
             "codex-utils-string": "utils/string",
+            "codex-v8-poc": "v8-poc",
             "codex-voice-host": "voice-host",
             "codex-websocket-client": "websocket-client",
             "codex-websocket-auth": "websocket-auth",
@@ -369,13 +371,11 @@ class CargoValidateTests(unittest.TestCase):
         )
 
     def windows_workspace_aggregate_argv(self) -> list[str]:
-        command = tomllib.loads(PRODUCTION_CONFIG.read_text(encoding="utf-8"))[
-            "commands"
-        ]["windows-nextest-workspace"]
-        argv = command["argv"]
-        self.assertIsInstance(argv, list)
-        self.assertTrue(all(isinstance(argument, str) for argument in argv))
-        return list(argv)
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        return planner.windows_nextest_workspace_argv(
+            config["commands"]["windows-nextest-workspace"]
+        )
 
     def windows_aggregate_command(self, planner: object) -> object:
         return planner.CommandEntry(
@@ -856,17 +856,6 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
-            [
-                "./scripts/cargo-guard.sh",
-                "cargo",
-                "test",
-                "-p",
-                "codex-core",
-                "--no-run",
-            ],
-            commands,
-        )
         prep_plan = self.action_json(
             "prep-plan",
             "--file",
@@ -886,43 +875,6 @@ class CargoValidateTests(unittest.TestCase):
             prep_commands.index(["just", "fmt"]),
             prep_commands.index(["just", "write-config-schema"]),
         )
-        support_bins_argv = [
-            "./scripts/cargo-guard.sh",
-            "cargo",
-            "build",
-            "-p",
-            "codex-cli",
-            "--bin",
-            "codex",
-            "-p",
-            "codex-code-mode-host",
-            "--bin",
-            "codex-code-mode-host",
-            "-p",
-            "codex-rmcp-client",
-            "--bin",
-            "test_stdio_server",
-            "--bin",
-            "test_streamable_http_server",
-            "-p",
-            "codex-exec",
-            "--bin",
-            "codex-exec",
-            "-p",
-            "codex-linux-sandbox",
-            "--bin",
-            "codex-linux-sandbox",
-            "-p",
-            "codex-shell-escalation",
-            "--bin",
-            "codex-execve-wrapper",
-        ]
-        runtime_argv = ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-core"]
-        self.assertIn(support_bins_argv, commands)
-        self.assertIn(runtime_argv, commands)
-        self.assertEqual(
-            commands.index(support_bins_argv) + 1, commands.index(runtime_argv)
-        )
         self.assertNotIn(
             [
                 "./scripts/cargo-guard.sh",
@@ -939,25 +891,26 @@ class CargoValidateTests(unittest.TestCase):
             plan, ["./scripts/cargo-guard.sh", "cargo", "check", "-p", "codex-core"]
         )
         self.assertEqual("check", check_command["env"]["CARGO_GUARD_RESOURCE_PROFILE"])  # type: ignore[index]
-        support_bins_command = self.command_for_argv(plan, support_bins_argv)
+        windows_command = next(
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        )
         self.assertEqual(
-            "build", support_bins_command["env"]["CARGO_GUARD_RESOURCE_PROFILE"]
-        )  # type: ignore[index]
-        self.assertEqual("host", support_bins_command["codex_v8_target"])
-        self.assertEqual("1", support_bins_command["env"]["CARGO_GUARD_NO_POST_CLEAN"])  # type: ignore[index]
-        runtime_command = self.command_for_argv(plan, runtime_argv)
-        self.assertEqual(
-            "package_test", runtime_command["env"]["CARGO_GUARD_RESOURCE_PROFILE"]
-        )  # type: ignore[index]
-        self.assertEqual("1", runtime_command["env"]["CARGO_GUARD_TEST_THREADS_MAX"])  # type: ignore[index]
-        self.assertEqual(
-            "1", runtime_command["env"]["CARGO_GUARD_LOW_DISK_TEST_THREADS_MAX"]
-        )  # type: ignore[index]
-        self.assertEqual("1", runtime_command["env"]["CARGO_GUARD_NO_CLEAN"])  # type: ignore[index]
-        self.assertEqual("0", runtime_command["env"]["CARGO_GUARD_EXPECTED_GROWTH_GIB"])  # type: ignore[index]
-        self.assertEqual(0, runtime_command["effective_expected_growth_gib"])
-        self.assertEqual(
-            "forced:post-support-bins", runtime_command["expected_growth_source"]
+            [
+                "codex-core",
+                "codex-cli",
+                "codex-exec",
+                "codex-code-mode-host",
+                "codex-rmcp-client",
+            ],
+            [
+                package
+                for flag, package in zip(
+                    windows_command["argv"], windows_command["argv"][1:]
+                )
+                if flag == "-p"
+            ],
         )
 
     def test_code_mode_v8_packages_use_host_artifacts_for_generated_cargo_rungs(
@@ -995,23 +948,6 @@ class CargoValidateTests(unittest.TestCase):
         for package in ("codex-code-mode-host", "codex-code-mode-runtime"):
             for argv in (
                 ["./scripts/cargo-guard.sh", "cargo", "check", "-p", package],
-                [
-                    "./scripts/cargo-guard.sh",
-                    "cargo",
-                    "check",
-                    "-p",
-                    package,
-                    "--tests",
-                ],
-                [
-                    "./scripts/cargo-guard.sh",
-                    "cargo",
-                    "test",
-                    "-p",
-                    package,
-                    "--no-run",
-                ],
-                ["./scripts/cargo-guard.sh", "cargo", "test", "-p", package],
             ):
                 with self.subTest(package=package, argv=argv):
                     command = self.command_for_argv(plan, argv)
@@ -1041,15 +977,28 @@ class CargoValidateTests(unittest.TestCase):
             )
 
         self.assertIn(["just", "clippy-strict", "-p", "codex-core"], commands)
-        support_index = next(
-            index
-            for index, command in enumerate(plan["commands"])
-            if command["kind"] == "first-party-runtime-support-bins"
+        windows_command = next(
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
         )
-        core_runtime_index = commands.index(
-            ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-core"]
+        self.assertEqual(
+            [
+                "codex-code-mode-host",
+                "codex-code-mode-runtime",
+                "codex-core",
+                "codex-cli",
+                "codex-exec",
+                "codex-rmcp-client",
+            ],
+            [
+                package
+                for flag, package in zip(
+                    windows_command["argv"], windows_command["argv"][1:]
+                )
+                if flag == "-p"
+            ],
         )
-        self.assertEqual(support_index + 1, core_runtime_index)
 
     def test_config_schema_generator_path_has_explicit_strict_and_prep_ownership(
         self,
@@ -1087,9 +1036,7 @@ class CargoValidateTests(unittest.TestCase):
             [["just", "fmt"], ["just", "write-config-schema"]], prep_commands
         )
 
-    def test_app_server_runtime_test_builds_first_party_support_binary_first(
-        self,
-    ) -> None:
+    def test_app_server_runtime_selection_uses_native_nextest_packages(self) -> None:
         plan = self.plan_json(
             "--file",
             "codex-rs/app-server/tests/common/test_app_server.rs",
@@ -1097,58 +1044,108 @@ class CargoValidateTests(unittest.TestCase):
             "standard",
         )
         commands = self.command_lines(plan)
-        support_bins_argv = [
-            "./scripts/cargo-guard.sh",
-            "cargo",
-            "build",
-            "-p",
-            "codex-cli",
-            "--bin",
-            "codex",
-            "-p",
-            "codex-code-mode-host",
-            "--bin",
-            "codex-code-mode-host",
-            "-p",
-            "codex-rmcp-client",
-            "--bin",
-            "test_stdio_server",
-            "--bin",
-            "test_streamable_http_server",
-            "-p",
-            "codex-exec",
-            "--bin",
-            "codex-exec",
-            "-p",
-            "codex-linux-sandbox",
-            "--bin",
-            "codex-linux-sandbox",
-            "-p",
-            "codex-shell-escalation",
-            "--bin",
-            "codex-execve-wrapper",
-        ]
-        runtime_argv = [
-            "./scripts/cargo-guard.sh",
-            "cargo",
-            "test",
-            "-p",
-            "codex-app-server",
-        ]
         self.assertIn("codex-app-server", plan["selected_packages"])
-        self.assertIn(support_bins_argv, commands)
-        self.assertIn(runtime_argv, commands)
+        windows_commands = [
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        ]
+        self.assertEqual(1, len(windows_commands))
+        windows_command = windows_commands[0]
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        workspace_argv = config["commands"]["windows-nextest-workspace"]["argv"]
+        filter_expression = workspace_argv[workspace_argv.index("-E") + 1]
         self.assertEqual(
-            commands.index(support_bins_argv) + 1, commands.index(runtime_argv)
+            f"(package(codex-app-server)) & ({filter_expression})",
+            windows_command["argv"][windows_command["argv"].index("-E") + 1],
         )
-        support_bins_command = self.command_for_argv(plan, support_bins_argv)
-        self.assertEqual("host", support_bins_command["codex_v8_target"])
-        runtime_command = self.command_for_argv(plan, runtime_argv)
-        self.assertEqual("1", runtime_command["env"]["CARGO_GUARD_NO_CLEAN"])  # type: ignore[index]
-        self.assertEqual("0", runtime_command["env"]["CARGO_GUARD_EXPECTED_GROWTH_GIB"])  # type: ignore[index]
-        self.assertEqual(0, runtime_command["effective_expected_growth_gib"])
         self.assertEqual(
-            "forced:post-support-bins", runtime_command["expected_growth_source"]
+            [
+                "codex-app-server",
+                "codex-code-mode-host",
+                "codex-rmcp-client",
+                "codex-cli",
+            ],
+            [
+                package
+                for flag, package in zip(
+                    windows_command["argv"], windows_command["argv"][1:]
+                )
+                if flag == "-p"
+            ],
+        )
+        self.assertNotIn("--workspace", windows_command["argv"])
+        self.assertNotIn("--exclude", windows_command["argv"])
+        self.assertNotIn(
+            [
+                "./scripts/cargo-guard.sh",
+                "cargo",
+                "test",
+                "-p",
+                "codex-app-server",
+                "--no-fail-fast",
+            ],
+            commands,
+        )
+        self.assertIn("windows_runtime", plan)
+
+    def test_windows_nextest_package_features_follow_selected_packages(self) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        command = planner.windows_nextest_packages_command(
+            config,
+            ["codex-app-server", "codex-v8-poc"],
+            "fixture",
+            [],
+        )
+        self.assertIsNotNone(command)
+        self.assertEqual(
+            [
+                "codex-app-server",
+                "codex-v8-poc",
+                "codex-code-mode-host",
+                "codex-rmcp-client",
+                "codex-cli",
+            ],
+            [
+                package
+                for flag, package in zip(command.argv, command.argv[1:])
+                if flag == "-p"
+            ],
+        )
+        self.assertEqual(
+            [
+                "--features",
+                "codex-v8-poc/sandbox",
+            ],
+            list(command.argv[-2:]),
+        )
+
+    def test_rmcp_client_native_selection_builds_cli_without_expanding_test_scope(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        command = planner.windows_nextest_packages_command(
+            config,
+            ["codex-rmcp-client"],
+            "fixture",
+            [],
+        )
+        self.assertIsNotNone(command)
+        self.assertEqual(
+            ["codex-rmcp-client", "codex-cli"],
+            [
+                package
+                for flag, package in zip(command.argv, command.argv[1:])
+                if flag == "-p"
+            ],
+        )
+        workspace_argv = config["commands"]["windows-nextest-workspace"]["argv"]
+        self.assertEqual(
+            f"(package(codex-rmcp-client)) & ({workspace_argv[workspace_argv.index('-E') + 1]})",
+            command.argv[command.argv.index("-E") + 1],
         )
 
     def test_structural_commands_run_before_expensive_package_ladder(self) -> None:
@@ -1244,51 +1241,6 @@ class CargoValidateTests(unittest.TestCase):
         self.assertIn(["just", "fmt"], non_root_prep_commands)
         self.assertIn(["just", "bazel-lock-update"], non_root_prep_commands)
         self.assertNotIn(["just", "bazel-lock-check"], non_root_prep_commands)
-
-    def test_codex_core_runtime_test_ignores_stale_growth_history_after_support_prebuilds(
-        self,
-    ) -> None:
-        initial_plan = self.plan_json(
-            "--file", "codex-rs/core/src/config/mod.rs", "--mode", "standard"
-        )
-        initial_runtime_command = self.command_for_argv(
-            initial_plan,
-            ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-core"],
-        )
-        receipt_dir = self.repo_root / ".validation-receipts"
-        receipt_dir.mkdir()
-        (receipt_dir / "history.jsonl").write_text(
-            json.dumps(
-                {
-                    "disk_emergency": False,
-                    "fingerprint": initial_runtime_command["fingerprint"],
-                    "observed_growth_gib": 6,
-                    "resource_profile": "package_test",
-                    "risk_kind": "success",
-                    "status": 0,
-                }
-            )
-            + "\n"
-        )
-
-        plan = self.plan_json(
-            "--file",
-            "codex-rs/core/src/config/mod.rs",
-            "--mode",
-            "standard",
-            receipt_dir=receipt_dir,
-        )
-        runtime_command = self.command_for_argv(
-            plan,
-            ["./scripts/cargo-guard.sh", "cargo", "test", "-p", "codex-core"],
-        )
-
-        self.assertEqual("0", runtime_command["env"]["CARGO_GUARD_EXPECTED_GROWTH_GIB"])  # type: ignore[index]
-        self.assertEqual("1", runtime_command["env"]["CARGO_GUARD_NO_CLEAN"])  # type: ignore[index]
-        self.assertEqual(0, runtime_command["effective_expected_growth_gib"])
-        self.assertEqual(
-            "forced:post-support-bins", runtime_command["expected_growth_source"]
-        )
 
     def test_tui_path_selects_snapshot_note_and_cli_surface(self) -> None:
         plan = self.plan_json("--file", "codex-rs/tui/src/app.rs", "--mode", "standard")
@@ -1573,7 +1525,7 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
+        self.assertNotIn(
             [
                 "./scripts/cargo-guard.sh",
                 "cargo",
@@ -1584,7 +1536,7 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
+        self.assertNotIn(
             [
                 "./scripts/cargo-guard.sh",
                 "cargo",
@@ -1595,15 +1547,14 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
-            [
-                "./scripts/cargo-guard.sh",
-                "cargo",
-                "test",
-                "-p",
-                "codex-app-server-transport",
-            ],
-            commands,
+        windows_command = next(
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        )
+        self.assertEqual(
+            ["-p", "codex-app-server-transport"],
+            windows_command["argv"][-2:],
         )
 
     def test_cloud_config_path_has_explicit_cli_runtime_rule(self) -> None:
@@ -1627,15 +1578,20 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
+        windows_command = next(
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        )
+        self.assertEqual(
+            ["codex-cloud-config"],
             [
-                "./scripts/cargo-guard.sh",
-                "cargo",
-                "test",
-                "-p",
-                "codex-cloud-config",
+                package
+                for flag, package in zip(
+                    windows_command["argv"], windows_command["argv"][1:]
+                )
+                if flag == "-p"
             ],
-            commands,
         )
         self.assertIn(
             [
@@ -1690,15 +1646,15 @@ class CargoValidateTests(unittest.TestCase):
             ],
             commands,
         )
-        self.assertIn(
-            [
-                "./scripts/cargo-guard.sh",
-                "cargo",
-                "test",
-                "-p",
-                "codex-cloud-config",
-            ],
-            commands,
+        windows_commands = [
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        ]
+        self.assertEqual(1, len(windows_commands))
+        self.assertEqual(
+            ["-p", "codex-cloud-config"],
+            windows_commands[0]["argv"][-2:],
         )
 
     def test_known_cli_fallback_roots_have_explicit_strict_rule(self) -> None:
@@ -1897,11 +1853,40 @@ class CargoValidateTests(unittest.TestCase):
                     ]
                     self.assertEqual([], wsl_voice_commands)
 
-                    expected_commands = [
-                        command["argv"]
-                        for command in baseline["commands"]
-                        if "codex-voice-host" not in command["argv"]
-                    ]
+                    expected_commands = []
+                    for command in baseline["commands"]:
+                        argv = list(command["argv"])
+                        if command["kind"] == "windows-nextest-packages":
+                            selected_packages = [
+                                package
+                                for flag, package in zip(argv, argv[1:])
+                                if flag == "-p"
+                            ]
+                            retained_packages = [
+                                package
+                                for package in selected_packages
+                                if package != "codex-voice-host"
+                            ]
+                            if not retained_packages:
+                                continue
+                            filter_index = argv.index("-E") + 1
+                            selection_prefix = f"({' | '.join(f'package({package})' for package in selected_packages)}) & ("
+                            self.assertTrue(
+                                argv[filter_index].startswith(selection_prefix)
+                            )
+                            self.assertTrue(argv[filter_index].endswith(")"))
+                            argv[filter_index] = (
+                                f"({' | '.join(f'package({package})' for package in retained_packages)}) & ("
+                                f"{argv[filter_index][len(selection_prefix) : -1]})"
+                            )
+                            for index in range(len(argv) - 2, -1, -1):
+                                if argv[index : index + 2] == [
+                                    "-p",
+                                    "codex-voice-host",
+                                ]:
+                                    del argv[index : index + 2]
+                        if "codex-voice-host" not in argv:
+                            expected_commands.append(argv)
                     actual_commands = []
                     for command in plan["commands"]:
                         argv = list(command["argv"])
@@ -3270,9 +3255,7 @@ class CargoValidateTests(unittest.TestCase):
         no_windows_config.pop("windows_runtime")
         planner.validate_config(no_windows_config, [], self.repo_root)
 
-        plan = self.plan_json(
-            "--file", "codex-rs/core/src/config/mod.rs", "--mode", "standard"
-        )
+        plan = self.plan_json("--file", "AGENTS.md", "--mode", "standard")
         self.assertNotIn("windows_runtime", plan)
 
     def test_manifest_fails_loud_and_windows_raw_cargo_is_explicit(self) -> None:
@@ -3479,12 +3462,7 @@ class CargoValidateTests(unittest.TestCase):
     def test_production_windows_workspace_filter_selects_only_windows_only_sandbox_tests(
         self,
     ) -> None:
-        command = tomllib.loads(PRODUCTION_CONFIG.read_text(encoding="utf-8"))[
-            "commands"
-        ]["windows-nextest-workspace"]
-        argv = command["argv"]
-        self.assertIsInstance(argv, list)
-        self.assertTrue(all(isinstance(argument, str) for argument in argv))
+        argv = self.windows_workspace_aggregate_argv()
         # Merge-safety anchor: Windows aggregate defaults retain direct dev/test opt1
         # configuration plus limited symbols, debug assertions, and overflow checks; WSL
         # codegen does not use these arguments.
@@ -3559,12 +3537,7 @@ class CargoValidateTests(unittest.TestCase):
     def test_native_aggregate_excludes_proven_elevated_windows_sandbox_tests(
         self,
     ) -> None:
-        command = tomllib.loads(PRODUCTION_CONFIG.read_text(encoding="utf-8"))[
-            "commands"
-        ]["windows-nextest-workspace"]
-        argv = command["argv"]
-        self.assertIsInstance(argv, list)
-        self.assertTrue(all(isinstance(argument, str) for argument in argv))
+        argv = self.windows_workspace_aggregate_argv()
         filter_expression = argv[argv.index("-E") + 1]
         self.assertIsInstance(filter_expression, str)
 
@@ -3699,7 +3672,12 @@ class CargoValidateTests(unittest.TestCase):
         )[0]
         self.assertNotIn("cargo nextest run", windows_test_recipe)
         self.assertIn(
-            "./scripts/cargo-guard.sh verify --changed --mode full", windows_test_recipe
+            "./scripts/cargo-guard.sh verify --file <corrected-path> --mode standard",
+            windows_test_recipe,
+        )
+        self.assertIn(
+            "./scripts/cargo-guard.sh verify --changed --mode full",
+            windows_test_recipe,
         )
 
     def test_full_mode_scopes_wsl_test_preparation_and_runtime_to_explicit_linux_unix_packages(
@@ -3780,7 +3758,7 @@ class CargoValidateTests(unittest.TestCase):
                     full_commands,
                 )
 
-        for mode in ("standard", "strict"):
+        for mode in ("standard", "strict", "full"):
             commands = commands_by_mode[mode]
             for package in packages:
                 test_preparation = (
@@ -3804,7 +3782,12 @@ class CargoValidateTests(unittest.TestCase):
                 )
                 for argv in test_preparation:
                     with self.subTest(mode=mode, package=package, argv=argv):
-                        self.assertIn(argv, commands)
+                        assertion = (
+                            self.assertIn
+                            if package in wsl_runtime_packages
+                            else self.assertNotIn
+                        )
+                        assertion(argv, commands)
 
         quick_commands = commands_by_mode["quick"]
         for package in packages:
@@ -4369,12 +4352,34 @@ class CargoValidateTests(unittest.TestCase):
                 for key in ("platform", "executor", "classification", "artifact_policy")
             },
         )
+        windows_command = next(
+            command
+            for command in plan["commands"]  # type: ignore[index]
+            if command["kind"] == "windows-nextest-packages"
+        )
+        self.assertEqual(
+            [
+                "codex-core",
+                "codex-cli",
+                "codex-exec",
+                "codex-code-mode-host",
+                "codex-rmcp-client",
+            ],
+            [
+                package
+                for flag, package in zip(
+                    windows_command["argv"], windows_command["argv"][1:]
+                )
+                if flag == "-p"
+            ],
+        )
         self.assertTrue(
             all(
-                command["platform"] == "wsl" and command["artifact_policy"] == "none"
-                for command in plan["commands"]
+                command["artifact_policy"] == "none"
+                for command in plan["commands"]  # type: ignore[index]
+                if command["platform"] == "wsl"
             )
-        )  # type: ignore[index]
+        )
         self.assertEqual(
             {"head": None, "merge_head": None, "index_tree": None},
             plan["candidate_identity"],
