@@ -49,6 +49,7 @@ and planner warnings retain the unvalidated limitation. -->
   ownership of maintained native Cargo/Nextest, candidate materialization, and destructive
   cleanup; a bounded diagnostic need not be checked in. Installation, destructive actions,
   and privileged work retain their separate authorization boundaries.
+- For a direct WSL-to-PowerShell diagnostic, resolve an available `pwsh.exe` or `pwsh` first and quote PowerShell source so Bash cannot expand `$...` expressions, such as by passing the PowerShell program in Bash single quotes. Do not hardcode an installation path or add a wrapper or install path; this remains a bounded diagnostic and does not create a direct native Cargo/Nextest route.
 - Windows-created mutable candidate, target, Cargo/Rustup, temporary, cache, staging, log,
   and evidence state must remain below literal `F:\.cache`; C: toolchains are read-only
   inputs, and WSL must not write directly to `/mnt/f`.

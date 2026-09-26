@@ -56,18 +56,21 @@
 ### Durable branch-promotion and upstream-sync route
 
 <!-- Merge-safety anchor: admitted upstream syncs resolve the exact stable upstream Rust release and synchronize the canonical workspace version with its mechanical followers. -->
+<!-- Merge-safety anchor: each semantic conflict retains profile-registered Luna Recon evidence and direct-follower propagation rather than treating a textual merge as proof that the integrated contract survives. -->
 - Fast-forward local `master` and `origin/master` from a reviewed `dev` candidate;
   do not rewrite either history.
 - Fetch `upstream/main`, fast-forward local `main`, then mirror that exact tip to
   `origin/main` while retaining local `main`'s `upstream/main` tracking relationship.
 - Merge the updated `main` into `dev` with a normal two-parent merge that preserves
   Cooldex as the first-parent lineage.
+- Before resolving each semantic conflict, obtain read-only Recon through the selected profile's registered Luna lane. Compare the common base, fork, and selected upstream to identify the changed contract and map canonical producers and consumers, callers, causally related automatically merged code, direct and integration tests, helpers, fixtures, snapshots, and generators. Inspect test expectations against the intended integrated contract rather than merely matching symbols or filenames. Related textual hunks may share one Recon, but account for every semantic conflict and state reviewed, unreviewed, and blocked related surfaces; incomplete evidence is not complete coverage. Recon supplies evidence and does not choose material behavior.
 - Preserve admitted Cooldex behavior by adapting fork-owned islands to current upstream
   canonical owners, contracts, and architecture; do not retain obsolete local structure
   through aliases, wrappers, dual reads, fallbacks, or whole-side conflict selection.
-- Reconcile direct followers and complete the selected resident profile's validation and
-  review route before publishing the final `dev` candidate to `origin/dev`; that profile
-  retains task classification, planning, Worker, Gate, lifecycle, and completion ownership.
+- Carry affected tests and other direct followers, including stale expectations in automatically merged tests, into the same coherent resolution and propagation batch. Complete the selected resident profile's validation and review route before publishing the final `dev` candidate to `origin/dev`; that profile retains task classification, planning, Worker, Gate, lifecycle, and completion ownership.
+- Once source and manifests reconcile, use the existing guarded `prep-plan` and `plan` actions against the complete merge selection before expensive preparation and validation to expose routing or mapping gaps. `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` remain the selection owners; close a demonstrated mapping class coherently without changing full-versus-affected runtime behavior or requiring another full collection after corrections.
+- Diagnose materialization, compilation, and runtime-test failures at their own owners after the current batch reaches terminal completion. Git pack or checksum failures require source-object integrity diagnosis rather than repeated test execution. Bazel external-materialization failures require inspection of output, repository, and content-cache ownership; `.bazelrc` and `.github/scripts/run_bazel_with_buildbuddy.py` are live owner anchors, not a recovery recipe. Do not authorize automatic repair, cleanup, bypass, or new wrappers.
+- Keep required full staged diff checks. Attribute whitespace to local-resolution bytes or the relevant upstream blob before correcting it; do not normalize unrelated imported snapshots or licenses merely to silence checks. Resolve generating source first, then regenerate derived conflicts through existing owners, and do not substitute task-only checks for mandatory commit checks.
 - For every admitted upstream sync, resolve the highest exact non-prerelease upstream tag matching `rust-vMAJOR.MINOR.PATCH`, set `[workspace.package].version` to that version, update Cargo-generated or mechanical followers through guarded repository routes, and validate the resulting build and version identity.
 - Commit and publish task-owned sync documentation from the separate `.sangoi` repository,
   excluding unrelated dirty inner-repository work.
