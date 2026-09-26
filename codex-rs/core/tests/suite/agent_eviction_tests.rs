@@ -94,18 +94,17 @@ async fn queued_mail_and_cancelled_eviction_keep_worker_ownership() -> Result<()
     )
     .await;
 
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = mpsc::channel();
+    let pause_after_commit = Arc::new(PauseAfterCommit {
+        gate: Mutex::new(None),
+    });
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    extensions.config_contributor(Arc::new(PauseAfterCommit {
-        gate: Mutex::new(Some((entered_tx, release_rx))),
-    }));
+    extensions.config_contributor(pause_after_commit.clone());
     extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
     let lifecycle = Arc::new(PauseShutdown::default());
     extensions.thread_lifecycle_contributor(lifecycle.clone());
     extensions.tool_lifecycle_contributor(lifecycle.clone());
     let test = test_codex()
-        .with_model("gpt-5.6-sol")
+        .with_model(COMMITTED_MODEL)
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
             config.features.enable(Feature::Collab).unwrap();
@@ -122,11 +121,15 @@ async fn queued_mail_and_cancelled_eviction_keep_worker_ownership() -> Result<()
     wait_for_event(&first, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     ThreadIdle::wait(&first).await;
 
-    // Reuse the settings fixture to pause the submission loop without starting a turn.
+    // Merge-safety anchor: arm only after root and child setup; pause with a mutable policy change while preserving the worker's immutable V2 birth model.
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *pause_after_commit.gate.lock().expect("commit gate lock") = Some((entered_tx, release_rx));
+
     first
         .submit(Op::ThreadSettings {
             thread_settings: ThreadSettingsOverrides {
-                model: Some(COMMITTED_MODEL.to_string()),
+                approval_policy: Some(codex_protocol::protocol::AskForApproval::OnRequest),
                 ..Default::default()
             },
         })
