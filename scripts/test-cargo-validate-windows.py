@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 import uuid
@@ -44,23 +45,50 @@ TEST_ONLY_PREFLIGHT_FIXTURE_OPT_IN = (
     "CARGO_VALIDATE_WINDOWS_TEST_ONLY_PREFLIGHT_FIXTURES"
 )
 TEST_ONLY_FAKE_CREATE_IGNORED = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_IGNORED"
+TEST_ONLY_FAKE_CREATE_UNTRACKED = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_UNTRACKED"
+TEST_ONLY_FAKE_CREATE_INSTA_PENDING = (
+    "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_INSTA_PENDING"
+)
+TEST_ONLY_FAKE_LONG_RUNNING = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_LONG_RUNNING"
+TEST_ONLY_FAKE_ROOT_EXITS_FIRST = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_ROOT_EXITS_FIRST"
+TEST_ONLY_FAKE_IMMEDIATE_DESCENDANT = (
+    "CARGO_VALIDATE_WINDOWS_TEST_FAKE_IMMEDIATE_DESCENDANT"
+)
+TEST_ONLY_FAKE_CONTAINMENT_TERMINATE_FAILURE = (
+    "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CONTAINMENT_TERMINATE_FAILURE"
+)
+TEST_ONLY_FAKE_WAIT_FOR_READINESS = (
+    "CARGO_VALIDATE_WINDOWS_TEST_FAKE_WAIT_FOR_READINESS"
+)
+TEST_ONLY_FAKE_SUPPRESS_READINESS = (
+    "CARGO_VALIDATE_WINDOWS_TEST_FAKE_SUPPRESS_READINESS"
+)
+TEST_ONLY_PREFLIGHT_FAIL_STAGE = "CARGO_VALIDATE_WINDOWS_TEST_PREFLIGHT_FAIL_STAGE"
+TEST_ONLY_PATH_OWNERSHIP = "CARGO_VALIDATE_WINDOWS_TEST_PATH_OWNERSHIP"
 TEST_ONLY_BOOTSTRAP_FIXTURE_OPT_IN = (
     "CARGO_VALIDATE_WINDOWS_TEST_ONLY_BOOTSTRAP_FIXTURES"
 )
 NATIVE_MUTEX_NAME = r"Local\Cooldex.WindowsBuildCacheCleanup.v1"
+FIXTURE_NAMESPACE_PREFIX = "cw-test-"
 PREFLIGHT_FIXTURE_FIELDS = (
     "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES",
+    "CARGO_VALIDATE_WINDOWS_TEST_DISK_TOTAL_BYTES",
     "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES",
     "CARGO_VALIDATE_WINDOWS_TEST_NATIVE_PROCESS_STATE",
     "CARGO_VALIDATE_WINDOWS_TEST_WSL_PROCESS_STATE",
     "CARGO_VALIDATE_WINDOWS_TEST_MUTEX_STATE",
+    "CARGO_VALIDATE_WINDOWS_TEST_CACHE_ROOT_STATE",
+    "CARGO_VALIDATE_WINDOWS_TEST_MONITOR_ERROR_AFTER_SAMPLES",
 )
 DEFAULT_PREFLIGHT_FIXTURE = {
     "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(128 * 1024**3),
+    "CARGO_VALIDATE_WINDOWS_TEST_DISK_TOTAL_BYTES": str(256 * 1024**3),
     "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES": str(64 * 1024**3),
     "CARGO_VALIDATE_WINDOWS_TEST_NATIVE_PROCESS_STATE": "clear",
     "CARGO_VALIDATE_WINDOWS_TEST_WSL_PROCESS_STATE": "clear",
     "CARGO_VALIDATE_WINDOWS_TEST_MUTEX_STATE": "clear",
+    "CARGO_VALIDATE_WINDOWS_TEST_CACHE_ROOT_STATE": "cleared",
+    "CARGO_VALIDATE_WINDOWS_TEST_MONITOR_ERROR_AFTER_SAMPLES": "0",
 }
 BOOTSTRAP_FIXTURE_FIELDS = (
     "CARGO_VALIDATE_WINDOWS_TEST_BOOTSTRAP_NEXTEST_ZIP",
@@ -68,6 +96,145 @@ BOOTSTRAP_FIXTURE_FIELDS = (
     "CARGO_VALIDATE_WINDOWS_TEST_BOOTSTRAP_V8_BINDING",
     "CARGO_VALIDATE_WINDOWS_TEST_BOOTSTRAP_FINAL_HOST",
 )
+
+NATIVE_FIXTURE_PATH_LIFETIME_COMMAND = r"""
+$ErrorActionPreference = "Stop"
+$root = [System.IO.Path]::GetFullPath("F:\.cache").TrimEnd("\")
+$token = $env:CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TOKEN
+$action = $env:CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_ACTION
+
+if ($token -notmatch "^[a-f0-9]{32}$") {
+    throw "fixture cleanup token must be 32 lowercase hexadecimal characters"
+}
+if ($action -notin @("assert-absent", "assert-present", "cleanup")) {
+    throw "fixture cleanup action is unsupported"
+}
+
+function Get-FixtureNames {
+    param([string]$Raw, [string]$Kind)
+
+    try {
+        $values = @(ConvertFrom-Json -InputObject $Raw)
+    } catch {
+        throw "fixture cleanup $Kind list is not valid JSON"
+    }
+    foreach ($value in $values) {
+        if ($value -isnot [string]) {
+            throw "fixture cleanup $Kind entries must be strings"
+        }
+    }
+    return $values
+}
+
+function Get-OwnedFixturePath {
+    param([string]$Name, [string]$Kind)
+
+    $pattern = if ($Kind -eq "namespace") {
+        "^cw-test-$token-[a-f0-9]{8}$"
+    } else {
+        "^p$token[a-f0-9]{8}$"
+    }
+    if ($Name -notmatch $pattern) {
+        throw "fixture cleanup $Kind is not bound to this test token"
+    }
+    $path = [System.IO.Path]::GetFullPath((Join-Path $root $Name))
+    if (-not [string]::Equals([System.IO.Path]::GetDirectoryName($path), $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "fixture cleanup target is not a direct child of literal F:\.cache"
+    }
+    if ($path -ieq (Join-Path $root "cw")) {
+        throw "fixture cleanup must never target canonical F:\.cache\cw"
+    }
+    return $path
+}
+
+function Remove-OwnedFixtureTree {
+    param([System.IO.DirectoryInfo]$Directory)
+
+    $Directory.Attributes = [System.IO.FileAttributes]::Normal
+    foreach ($child in @(Get-ChildItem -LiteralPath $Directory.FullName -Force)) {
+        if ($child -is [System.IO.DirectoryInfo]) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                [System.IO.Directory]::Delete($child.FullName)
+            } else {
+                $child.Attributes = [System.IO.FileAttributes]::Normal
+                Remove-OwnedFixtureTree $child
+            }
+        } else {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                [System.IO.File]::SetAttributes($child.FullName, [System.IO.FileAttributes]::Normal)
+            }
+            [System.IO.File]::Delete($child.FullName)
+        }
+    }
+    [System.IO.Directory]::Delete($Directory.FullName)
+}
+
+$namespaceNames = Get-FixtureNames $env:CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_NAMESPACES "namespace"
+$tempNames = Get-FixtureNames $env:CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TEMP_LEAVES "temp leaf"
+$paths = [System.Collections.Generic.List[string]]::new()
+foreach ($name in $namespaceNames) {
+    $paths.Add((Get-OwnedFixturePath $name "namespace"))
+}
+foreach ($name in $tempNames) {
+    $paths.Add((Get-OwnedFixturePath $name "temp leaf"))
+}
+
+if ($action -eq "assert-absent") {
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path) {
+            throw "fixture cleanup expected an absent path: $path"
+        }
+    }
+    exit 0
+}
+if ($action -eq "assert-present") {
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "fixture cleanup expected a present path: $path"
+        }
+    }
+    exit 0
+}
+
+$mutex = [System.Threading.Mutex]::new($false, "Local\Cooldex.WindowsBuildCacheCleanup.v1")
+$held = $false
+try {
+    if (-not $mutex.WaitOne(0)) {
+        throw "fixture cleanup refused while the native validation mutex is busy"
+    }
+    $held = $true
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        if (
+            $item -isnot [System.IO.DirectoryInfo] -or
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        ) {
+            throw "fixture cleanup target must be a non-reparse directory: $path"
+        }
+        Remove-OwnedFixtureTree $item
+        if (Test-Path -LiteralPath $path) {
+            throw "fixture cleanup did not remove its exact target: $path"
+        }
+    }
+} finally {
+    if ($held) {
+        $mutex.ReleaseMutex()
+    }
+    $mutex.Dispose()
+}
+"""
+
+NATIVE_CACHE_DIRECT_CHILD_COUNT_COMMAND = r"""
+$root = "F:\.cache"
+if (Test-Path -LiteralPath $root) {
+    [Console]::Out.Write((@(Get-ChildItem -LiteralPath $root -Force)).Count)
+} else {
+    [Console]::Out.Write("0")
+}
+"""
 
 
 class HarnessPrerequisiteTests(unittest.TestCase):
@@ -87,6 +254,55 @@ class HarnessPrerequisiteTests(unittest.TestCase):
 
 
 class CargoValidateWindowsTests(unittest.TestCase):
+    @staticmethod
+    def native_cache_direct_child_count() -> int:
+        process = subprocess.run(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                NATIVE_CACHE_DIRECT_CHILD_COUNT_COMMAND,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if process.returncode != 0:
+            raise RuntimeError(
+                "could not count direct F:\\cache children for fixture-lifetime "
+                f"coverage: {process.stderr}"
+            )
+        try:
+            return int(process.stdout)
+        except ValueError as error:
+            raise RuntimeError(
+                "native F:\\cache direct-child count was not an integer: "
+                f"{process.stdout!r}"
+            ) from error
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.direct_cache_child_count_before = cls.native_cache_direct_child_count()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            direct_cache_child_count_after = cls.native_cache_direct_child_count()
+            if direct_cache_child_count_after != cls.direct_cache_child_count_before:
+                raise AssertionError(
+                    "the Windows harness changed the direct-child count below F:\\cache: "
+                    f"before={cls.direct_cache_child_count_before}, "
+                    f"after={direct_cache_child_count_after}"
+                )
+        finally:
+            super().tearDownClass()
+
     def setUp(self) -> None:
         self.scratch_parent = TEST_SCRATCH_PARENT
         self.scratch_parent.mkdir(parents=True, exist_ok=True)
@@ -99,9 +315,182 @@ class CargoValidateWindowsTests(unittest.TestCase):
             self.temp_path.is_relative_to(self.scratch_parent),
             msg=f"temporary test directory escaped task cache parent: {self.temp_path}",
         )
+        self.fixture_token = uuid.uuid4().hex
+        self._namespace_sequence = 0
+        self._temp_sequence = 0
+        self._registered_namespaces: set[str] = set()
+        self._registered_temp_leaves: set[str] = set()
+        self._owned_namespaces: set[str] = set()
+        self._owned_temp_leaves: set[str] = set()
+        self._unadopted_namespaces: set[str] = set()
+        self.addCleanup(self._assert_owned_fixture_paths_absent)
+        self.addCleanup(self._cleanup_owned_fixture_paths)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def _is_current_case_namespace(self, namespace: str) -> bool:
+        prefix = f"{FIXTURE_NAMESPACE_PREFIX}{self.fixture_token}-"
+        suffix = namespace.removeprefix(prefix)
+        return (
+            namespace.startswith(prefix)
+            and len(suffix) == 8
+            and all(character in "0123456789abcdef" for character in suffix)
+        )
+
+    def _is_current_case_temp_leaf(self, temp_leaf: str) -> bool:
+        prefix = f"p{self.fixture_token}"
+        suffix = temp_leaf.removeprefix(prefix)
+        return (
+            temp_leaf.startswith(prefix)
+            and len(suffix) == 8
+            and all(character in "0123456789abcdef" for character in suffix)
+        )
+
+    def _new_owned_namespace(self) -> str:
+        self._namespace_sequence += 1
+        namespace = (
+            f"{FIXTURE_NAMESPACE_PREFIX}{self.fixture_token}-"
+            f"{self._namespace_sequence:08x}"
+        )
+        self._registered_namespaces.add(namespace)
+        self._unadopted_namespaces.add(namespace)
+        return namespace
+
+    def _register_owned_namespace(self, namespace: str) -> None:
+        self.assertTrue(
+            self._is_current_case_namespace(namespace),
+            msg=f"fixture namespace is not bound to the current test case: {namespace}",
+        )
+        if namespace not in self._registered_namespaces:
+            self._registered_namespaces.add(namespace)
+            self._unadopted_namespaces.add(namespace)
+
+    def _new_owned_temp_leaf(self) -> str:
+        self._temp_sequence += 1
+        temp_leaf = f"p{self.fixture_token}{self._temp_sequence:08x}"
+        self.assertTrue(self._is_current_case_temp_leaf(temp_leaf))
+        self._registered_temp_leaves.add(temp_leaf)
+        return temp_leaf
+
+    def _native_fixture_lifetime(
+        self,
+        action: str,
+        namespaces: set[str] | tuple[str, ...] | list[str],
+        temp_leaves: set[str] | tuple[str, ...] | list[str],
+        *,
+        token: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        lifetime_names = {
+            "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_ACTION",
+            "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TOKEN",
+            "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_NAMESPACES",
+            "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TEMP_LEAVES",
+        }
+        wslenv_entries = [
+            entry
+            for entry in environment.get("WSLENV", "").split(":")
+            if entry and entry.split("/", 1)[0] not in lifetime_names
+        ]
+        for name in lifetime_names:
+            environment.pop(name, None)
+        environment.update(
+            {
+                "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_ACTION": action,
+                "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TOKEN": token
+                or self.fixture_token,
+                "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_NAMESPACES": json.dumps(
+                    sorted(namespaces)
+                ),
+                "CARGO_VALIDATE_WINDOWS_TEST_FIXTURE_CLEANUP_TEMP_LEAVES": json.dumps(
+                    sorted(temp_leaves)
+                ),
+            }
+        )
+        wslenv_entries.extend(lifetime_names)
+        environment["WSLENV"] = ":".join(wslenv_entries)
+        return subprocess.run(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                NATIVE_FIXTURE_PATH_LIFETIME_COMMAND,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=environment,
+        )
+
+    def _assert_native_fixture_lifetime(
+        self,
+        action: str,
+        namespaces: set[str] | tuple[str, ...] | list[str],
+        temp_leaves: set[str] | tuple[str, ...] | list[str],
+    ) -> None:
+        process = self._native_fixture_lifetime(action, namespaces, temp_leaves)
+        self.assertEqual(
+            process.returncode,
+            0,
+            msg=(
+                f"native fixture-lifetime {action} failed\n"
+                f"stdout:\n{process.stdout}\nstderr:\n{process.stderr}"
+            ),
+        )
+
+    def _cleanup_owned_fixture_paths(self) -> None:
+        if not self._owned_namespaces and not self._owned_temp_leaves:
+            return
+        self._assert_native_fixture_lifetime(
+            "cleanup", self._owned_namespaces, self._owned_temp_leaves
+        )
+
+    def _assert_owned_fixture_paths_absent(self) -> None:
+        if not self._owned_namespaces and not self._owned_temp_leaves:
+            return
+        self._assert_native_fixture_lifetime(
+            "assert-absent", self._owned_namespaces, self._owned_temp_leaves
+        )
+
+    def _prepare_fixture_path_ownership(
+        self,
+        manifest: dict[str, object],
+        path_creation_failure: str | None,
+        fixture_process_opt_in: bool,
+    ) -> dict[str, str | None] | None:
+        if not fixture_process_opt_in:
+            self.assertIsNone(path_creation_failure)
+            return None
+        runtime = manifest.get("windows_runtime")
+        if not isinstance(runtime, dict):
+            self.assertIsNone(path_creation_failure)
+            return None
+        namespace = runtime.get("workflow_namespace")
+        if not isinstance(namespace, str) or not self._is_current_case_namespace(
+            namespace
+        ):
+            self.assertIsNone(path_creation_failure)
+            return None
+        self._register_owned_namespace(namespace)
+        if namespace in self._unadopted_namespaces:
+            self._assert_native_fixture_lifetime("assert-absent", {namespace}, set())
+            self._unadopted_namespaces.remove(namespace)
+            self._owned_namespaces.add(namespace)
+        temp_leaf = self._new_owned_temp_leaf()
+        self._assert_native_fixture_lifetime("assert-absent", set(), {temp_leaf})
+        self._owned_temp_leaves.add(temp_leaf)
+        return {
+            "token": self.fixture_token,
+            "namespace": namespace,
+            "temp_leaf": temp_leaf,
+            "path_creation_failure": path_creation_failure,
+        }
 
     def windows_path(self, path: Path | str) -> str:
         process = subprocess.run(
@@ -190,14 +579,16 @@ class CargoValidateWindowsTests(unittest.TestCase):
             ),
         }
 
-    def windows_runtime(self, source_root: Path | None = None) -> dict[str, object]:
+    def windows_runtime(
+        self, source_root: Path | None = None, namespace: str | None = None
+    ) -> dict[str, object]:
         source = (source_root or self.temp_path).resolve()
+        namespace = namespace or self._new_owned_namespace()
+        if self._is_current_case_namespace(namespace):
+            self._register_owned_namespace(namespace)
         return {
             "cache_root": r"F:\.cache",
-            "workflow_namespace": "cw",
-            "reuse_run_root": None,
-            "minimum_free_disk_gib": 120,
-            "minimum_available_memory_gib": 30,
+            "workflow_namespace": namespace,
             "target": "x86_64-pc-windows-msvc",
             "rust_toolchain": "1.95.0-x86_64-pc-windows-msvc",
             "nextest_version": "0.9.103",
@@ -210,8 +601,14 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "v8_binding_sha256": "3" * 64,
             "resource_contract": {
                 "resource_profile": "windows_nextest",
+                "cold_minimum_free_disk_gib": 120,
+                "warm_minimum_free_disk_gib": 5,
+                "minimum_available_memory_gib": 30,
                 "cargo_build_jobs": 16,
                 "nextest_test_threads": 8,
+                "monitor": True,
+                "abort_free_gib": 5,
+                "abort_free_pct": 5,
             },
             "source_materialization": {
                 "posix_repo_root": str(source),
@@ -265,6 +662,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         *,
         candidate_identity: dict[str, str | None] | None = None,
         source_root: Path | None = None,
+        namespace: str | None = None,
     ) -> dict[str, object]:
         return {
             "action": "plan",
@@ -281,7 +679,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "telemetry_level": "full",
             "candidate_identity": candidate_identity
             or {"head": None, "merge_head": None, "index_tree": None},
-            "windows_runtime": self.windows_runtime(source_root),
+            "windows_runtime": self.windows_runtime(source_root, namespace),
             "plan_id": "a" * 64,
             "validation_tooling_digest": "d" * 64,
         }
@@ -292,14 +690,56 @@ class CargoValidateWindowsTests(unittest.TestCase):
         fixture_opt_in: bool,
         preflight_fixture: dict[str, str] | None,
         preflight_fixture_opt_in: bool,
+        preflight_fail_stage: str | None,
         fake_create_ignored: bool,
+        fake_create_untracked: bool,
+        fake_create_insta_pending: bool,
+        fake_long_running: bool,
+        fake_root_exits_first: bool,
+        fake_immediate_descendant: bool,
+        fake_containment_terminate_failure: bool,
+        fake_wait_for_readiness: bool,
+        fake_suppress_readiness: bool,
         bootstrap_fixture: dict[str, str] | None,
         bootstrap_fixture_opt_in: bool,
         source_git_config: Path | None,
+        path_ownership: dict[str, str | None] | None,
     ) -> dict[str, str]:
         if fake_create_ignored and not fixture_opt_in:
             raise AssertionError(
                 "ignored-file fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_create_untracked and not fixture_opt_in:
+            raise AssertionError(
+                "untracked-file fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_create_insta_pending and not fixture_opt_in:
+            raise AssertionError(
+                "Insta-pending fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_long_running and not fixture_opt_in:
+            raise AssertionError(
+                "long-running fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_root_exits_first and not fixture_opt_in:
+            raise AssertionError(
+                "root-exits-first fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_immediate_descendant and not fixture_opt_in:
+            raise AssertionError(
+                "immediate-descendant fake behavior requires the fake-cargo process opt-in"
+            )
+        if fake_containment_terminate_failure and not fixture_opt_in:
+            raise AssertionError(
+                "containment termination failure requires the fake-cargo process opt-in"
+            )
+        if fake_wait_for_readiness and not fixture_opt_in:
+            raise AssertionError(
+                "fake readiness synchronization requires the fake-cargo process opt-in"
+            )
+        if fake_suppress_readiness and not fake_wait_for_readiness:
+            raise AssertionError(
+                "fake readiness suppression requires the fake readiness barrier"
             )
         if bootstrap_fixture is not None and not fixture_opt_in:
             raise AssertionError(
@@ -309,7 +749,18 @@ class CargoValidateWindowsTests(unittest.TestCase):
         test_names = {
             TEST_ONLY_FAKE_CARGO_OPT_IN,
             TEST_ONLY_PREFLIGHT_FIXTURE_OPT_IN,
+            TEST_ONLY_PREFLIGHT_FAIL_STAGE,
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES",
             TEST_ONLY_FAKE_CREATE_IGNORED,
+            TEST_ONLY_FAKE_CREATE_UNTRACKED,
+            TEST_ONLY_FAKE_CREATE_INSTA_PENDING,
+            TEST_ONLY_FAKE_LONG_RUNNING,
+            TEST_ONLY_FAKE_ROOT_EXITS_FIRST,
+            TEST_ONLY_FAKE_IMMEDIATE_DESCENDANT,
+            TEST_ONLY_FAKE_CONTAINMENT_TERMINATE_FAILURE,
+            TEST_ONLY_FAKE_WAIT_FOR_READINESS,
+            TEST_ONLY_FAKE_SUPPRESS_READINESS,
+            TEST_ONLY_PATH_OWNERSHIP,
             TEST_ONLY_BOOTSTRAP_FIXTURE_OPT_IN,
             *PREFLIGHT_FIXTURE_FIELDS,
             *BOOTSTRAP_FIXTURE_FIELDS,
@@ -338,12 +789,44 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 )
             process_env.update(preflight_fixture)
             wslenv_entries.extend(PREFLIGHT_FIXTURE_FIELDS)
+            if "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES" in preflight_fixture:
+                wslenv_entries.append("CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES")
             if preflight_fixture_opt_in:
                 process_env[TEST_ONLY_PREFLIGHT_FIXTURE_OPT_IN] = "1"
                 wslenv_entries.append(TEST_ONLY_PREFLIGHT_FIXTURE_OPT_IN)
+        if preflight_fail_stage is not None:
+            process_env[TEST_ONLY_PREFLIGHT_FAIL_STAGE] = preflight_fail_stage
+            wslenv_entries.append(TEST_ONLY_PREFLIGHT_FAIL_STAGE)
         if fake_create_ignored:
             process_env[TEST_ONLY_FAKE_CREATE_IGNORED] = "1"
             wslenv_entries.append(TEST_ONLY_FAKE_CREATE_IGNORED)
+        if fake_create_untracked:
+            process_env[TEST_ONLY_FAKE_CREATE_UNTRACKED] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_CREATE_UNTRACKED)
+        if fake_create_insta_pending:
+            process_env[TEST_ONLY_FAKE_CREATE_INSTA_PENDING] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_CREATE_INSTA_PENDING)
+        if fake_long_running:
+            process_env[TEST_ONLY_FAKE_LONG_RUNNING] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_LONG_RUNNING)
+        if fake_root_exits_first:
+            process_env[TEST_ONLY_FAKE_ROOT_EXITS_FIRST] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_ROOT_EXITS_FIRST)
+        if fake_immediate_descendant:
+            process_env[TEST_ONLY_FAKE_IMMEDIATE_DESCENDANT] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_IMMEDIATE_DESCENDANT)
+        if fake_containment_terminate_failure:
+            process_env[TEST_ONLY_FAKE_CONTAINMENT_TERMINATE_FAILURE] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_CONTAINMENT_TERMINATE_FAILURE)
+        if fake_wait_for_readiness:
+            process_env[TEST_ONLY_FAKE_WAIT_FOR_READINESS] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_WAIT_FOR_READINESS)
+        if fake_suppress_readiness:
+            process_env[TEST_ONLY_FAKE_SUPPRESS_READINESS] = "1"
+            wslenv_entries.append(TEST_ONLY_FAKE_SUPPRESS_READINESS)
+        if path_ownership is not None:
+            process_env[TEST_ONLY_PATH_OWNERSHIP] = json.dumps(path_ownership)
+            wslenv_entries.append(TEST_ONLY_PATH_OWNERSHIP)
         if bootstrap_fixture is not None:
             missing = set(BOOTSTRAP_FIXTURE_FIELDS).difference(bootstrap_fixture)
             if missing:
@@ -384,10 +867,20 @@ class CargoValidateWindowsTests(unittest.TestCase):
         fixture_opt_in: bool = False,
         preflight_fixture: dict[str, str] | None = DEFAULT_PREFLIGHT_FIXTURE,
         preflight_fixture_opt_in: bool = True,
+        preflight_fail_stage: str | None = None,
         fake_create_ignored: bool = False,
+        fake_create_untracked: bool = False,
+        fake_create_insta_pending: bool = False,
+        fake_long_running: bool = False,
+        fake_root_exits_first: bool = False,
+        fake_immediate_descendant: bool = False,
+        fake_containment_terminate_failure: bool = False,
+        fake_wait_for_readiness: bool = False,
+        fake_suppress_readiness: bool = False,
         bootstrap_fixture: dict[str, str] | None = None,
         bootstrap_fixture_opt_in: bool = True,
         source_git_config: Path | None = None,
+        path_creation_failure: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         manifest_path = (
             self.temp_path / f"manifest-{len(list(self.temp_path.iterdir()))}.json"
@@ -396,6 +889,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertTrue(
             manifest_path.resolve().is_relative_to(self.scratch_parent),
             msg=f"temporary manifest escaped task cache parent: {manifest_path}",
+        )
+        path_ownership = self._prepare_fixture_path_ownership(
+            manifest,
+            path_creation_failure,
+            preflight_fixture is not None and preflight_fixture_opt_in,
         )
         return subprocess.run(
             [
@@ -412,6 +910,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
             ],
             cwd=REPO_ROOT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -419,10 +919,20 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 fixture_opt_in=fixture_opt_in,
                 preflight_fixture=preflight_fixture,
                 preflight_fixture_opt_in=preflight_fixture_opt_in,
+                preflight_fail_stage=preflight_fail_stage,
                 fake_create_ignored=fake_create_ignored,
+                fake_create_untracked=fake_create_untracked,
+                fake_create_insta_pending=fake_create_insta_pending,
+                fake_long_running=fake_long_running,
+                fake_root_exits_first=fake_root_exits_first,
+                fake_immediate_descendant=fake_immediate_descendant,
+                fake_containment_terminate_failure=fake_containment_terminate_failure,
+                fake_wait_for_readiness=fake_wait_for_readiness,
+                fake_suppress_readiness=fake_suppress_readiness,
                 bootstrap_fixture=bootstrap_fixture,
                 bootstrap_fixture_opt_in=bootstrap_fixture_opt_in,
                 source_git_config=source_git_config,
+                path_ownership=path_ownership,
             ),
         )
 
@@ -433,20 +943,40 @@ class CargoValidateWindowsTests(unittest.TestCase):
         fixture_opt_in: bool = False,
         preflight_fixture: dict[str, str] | None = DEFAULT_PREFLIGHT_FIXTURE,
         preflight_fixture_opt_in: bool = True,
+        preflight_fail_stage: str | None = None,
         fake_create_ignored: bool = False,
+        fake_create_untracked: bool = False,
+        fake_create_insta_pending: bool = False,
+        fake_long_running: bool = False,
+        fake_root_exits_first: bool = False,
+        fake_immediate_descendant: bool = False,
+        fake_containment_terminate_failure: bool = False,
+        fake_wait_for_readiness: bool = False,
+        fake_suppress_readiness: bool = False,
         bootstrap_fixture: dict[str, str] | None = None,
         bootstrap_fixture_opt_in: bool = True,
         source_git_config: Path | None = None,
+        path_creation_failure: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], dict[str, object]]:
         process = self.invoke_raw(
             manifest,
             fixture_opt_in=fixture_opt_in,
             preflight_fixture=preflight_fixture,
             preflight_fixture_opt_in=preflight_fixture_opt_in,
+            preflight_fail_stage=preflight_fail_stage,
             fake_create_ignored=fake_create_ignored,
+            fake_create_untracked=fake_create_untracked,
+            fake_create_insta_pending=fake_create_insta_pending,
+            fake_long_running=fake_long_running,
+            fake_root_exits_first=fake_root_exits_first,
+            fake_immediate_descendant=fake_immediate_descendant,
+            fake_containment_terminate_failure=fake_containment_terminate_failure,
+            fake_wait_for_readiness=fake_wait_for_readiness,
+            fake_suppress_readiness=fake_suppress_readiness,
             bootstrap_fixture=bootstrap_fixture,
             bootstrap_fixture_opt_in=bootstrap_fixture_opt_in,
             source_git_config=source_git_config,
+            path_creation_failure=path_creation_failure,
         )
         lines = [line for line in process.stdout.splitlines() if line.strip()]
         self.assertTrue(
@@ -460,6 +990,146 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
         result = json.loads(result_path.read_text(encoding="utf-8"))
         return process, summary, result
+
+    def command_result(
+        self, process: subprocess.CompletedProcess[str], result: dict[str, object]
+    ) -> dict[str, object]:
+        commands = result["command_results"]
+        self.assertIsInstance(commands, list)
+        self.assertTrue(
+            commands,
+            msg=(
+                "expected a command result but the executor recorded none\n"
+                f"result.error: {result.get('error')!r}\n"
+                f"process.stderr:\n{process.stderr}"
+            ),
+        )
+        command = commands[0]
+        self.assertIsInstance(command, dict)
+        return command
+
+    def test_invoke_raw_replaces_oem_diagnostic_bytes(self) -> None:
+        global PWSH
+
+        fake_pwsh = self.temp_path / "fake-pwsh.py"
+        fake_pwsh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.buffer.write(b'fixture stdout\\n')\n"
+            "sys.stderr.buffer.write(b'CS0102: \\xa0localized diagnostic\\n')\n"
+            "raise SystemExit(17)\n",
+            encoding="utf-8",
+        )
+        fake_pwsh.chmod(fake_pwsh.stat().st_mode | stat.S_IXUSR)
+        original_pwsh = PWSH
+        PWSH = str(fake_pwsh)
+        try:
+            process = self.invoke_raw(self.manifest([]), preflight_fixture=None)
+        finally:
+            PWSH = original_pwsh
+
+        self.assertEqual(process.returncode, 17)
+        self.assertEqual(process.stdout, "fixture stdout\n")
+        self.assertIn("CS0102", process.stderr)
+        self.assertIn("\ufffdlocalized diagnostic", process.stderr)
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_fixture_lifetime_retains_evidence_until_case_cleanup(self) -> None:
+        manifest = self.manifest([])
+        runtime = manifest["windows_runtime"]
+        self.assertIsInstance(runtime, dict)
+        namespace = runtime["workflow_namespace"]
+        self.assertIsInstance(namespace, str)
+        process, summary, result = self.invoke(manifest, fixture_opt_in=True)
+
+        self.assertEqual(process.returncode, 0, msg=process.stderr)
+        self.assertEqual(summary["status"], "success")
+        evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+        self.assertTrue((evidence_dir / "preflight.json").is_file())
+        self.assertEqual(
+            result["paths"]["executor_root"].rsplit("\\", 1)[-1], namespace
+        )
+        temp_leaf = result["paths"]["temp_dir"].rsplit("\\", 1)[-1]
+        self.assertTrue(self._is_current_case_temp_leaf(temp_leaf))
+        self.assertFalse(self.unix_path(result["paths"]["temp_dir"]).exists())
+        self._assert_native_fixture_lifetime("assert-present", {namespace}, set())
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_fixture_lifetime_cleans_pre_summary_path_creation_failure(self) -> None:
+        manifest = self.manifest([])
+        runtime = manifest["windows_runtime"]
+        self.assertIsInstance(runtime, dict)
+        namespace = runtime["workflow_namespace"]
+        self.assertIsInstance(namespace, str)
+        process = self.invoke_raw(
+            manifest,
+            fixture_opt_in=True,
+            path_creation_failure="after-workset-root",
+        )
+
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(process.stdout.strip(), "")
+        self.assertIn("after executor namespace initialization", process.stderr)
+        self._assert_native_fixture_lifetime("assert-present", {namespace}, set())
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_fixture_lifetime_tracks_independent_manifest_paths(self) -> None:
+        first_manifest = self.manifest([])
+        second_manifest = self.manifest([])
+        first_runtime = first_manifest["windows_runtime"]
+        second_runtime = second_manifest["windows_runtime"]
+        self.assertIsInstance(first_runtime, dict)
+        self.assertIsInstance(second_runtime, dict)
+        first_namespace = first_runtime["workflow_namespace"]
+        second_namespace = second_runtime["workflow_namespace"]
+        self.assertIsInstance(first_namespace, str)
+        self.assertIsInstance(second_namespace, str)
+        self.assertNotEqual(first_namespace, second_namespace)
+
+        first_process, first_summary, first_result = self.invoke(
+            first_manifest, fixture_opt_in=True
+        )
+        second_process, second_summary, second_result = self.invoke(
+            second_manifest, fixture_opt_in=True
+        )
+
+        self.assertEqual(first_process.returncode, 0, msg=first_process.stderr)
+        self.assertEqual(second_process.returncode, 0, msg=second_process.stderr)
+        self.assertNotEqual(
+            first_summary["evidence_dir"], second_summary["evidence_dir"]
+        )
+        self.assertEqual(self._owned_namespaces, {first_namespace, second_namespace})
+        temp_leaves = {
+            first_result["paths"]["temp_dir"].rsplit("\\", 1)[-1],
+            second_result["paths"]["temp_dir"].rsplit("\\", 1)[-1],
+        }
+        self.assertEqual(len(temp_leaves), 2)
+        self.assertEqual(temp_leaves, self._owned_temp_leaves)
+        self._assert_native_fixture_lifetime(
+            "assert-present", self._owned_namespaces, set()
+        )
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_fixture_lifetime_rejects_unowned_and_canonical_paths(self) -> None:
+        foreign_token = "f" * 32
+        if foreign_token == self.fixture_token:
+            foreign_token = "e" * 32
+        foreign_namespace = f"{FIXTURE_NAMESPACE_PREFIX}{foreign_token}-00000001"
+        foreign = self._native_fixture_lifetime("cleanup", {foreign_namespace}, set())
+        canonical = self._native_fixture_lifetime("cleanup", {"cw"}, set())
+
+        self.assertNotEqual(foreign.returncode, 0)
+        self.assertIn("not bound to this test token", foreign.stderr)
+        self.assertNotEqual(canonical.returncode, 0)
+        self.assertIn("not bound to this test token", canonical.stderr)
 
     def assert_f_cache_path(self, value: str) -> None:
         self.assertTrue(value.lower().startswith("f:\\.cache\\"), value)
@@ -553,8 +1223,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
         include_shadow_cargo: bool = False,
         include_msvc_setup: bool = False,
         stage_index_change: bool = True,
+        source_name: str = "source",
     ) -> tuple[Path, dict[str, str | None], dict[str, object]]:
-        source = self.temp_path / "source"
+        source = self.temp_path / source_name
         codex_rs = source / "codex-rs"
         codex_rs.mkdir(parents=True)
         (codex_rs / "normal.txt").write_text("initial\n", encoding="utf-8")
@@ -617,6 +1288,23 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "index_tree": self.git_text(source, "write-tree"),
         }
 
+    def native_process_is_alive(self, pid: int) -> bool:
+        process = subprocess.run(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} exit 1",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return process.returncode == 0
+
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
@@ -655,8 +1343,14 @@ class CargoValidateWindowsTests(unittest.TestCase):
             result["resource_contract"],
             {
                 "resource_profile": "windows_nextest",
+                "cold_minimum_free_disk_gib": 120,
+                "warm_minimum_free_disk_gib": 5,
+                "minimum_available_memory_gib": 30,
                 "cargo_build_jobs": 16,
                 "nextest_test_threads": 8,
+                "monitor": True,
+                "abort_free_gib": 5,
+                "abort_free_pct": 5,
             },
         )
         self.assertEqual(
@@ -675,7 +1369,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(preflight["native_mutex"]["status"], "held")
         self.assertEqual(
             [check["stage"] for check in preflight["execution_preflight"]],
-            ["before-materialization-or-command", "before-approved-command-1"],
+            [
+                "before-cold-workset-initialization",
+                "before-materialization-or-command",
+                "before-approved-command-1",
+            ],
         )
         self.assertTrue(
             all(
@@ -702,7 +1400,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
         self.assertEqual(result["paths"]["cache_root"], r"F:\.cache")
         for key, value in result["paths"].items():
-            if key != "cache_root":
+            if key not in {"cache_root", "cache_mode"}:
                 self.assert_f_cache_path(value)
         command_result = next(
             record for record in result["command_results"] if record["index"] == 1
@@ -729,6 +1427,16 @@ class CargoValidateWindowsTests(unittest.TestCase):
             .splitlines()
         )
         self.assertEqual(fake_env["CARGO_BUILD_JOBS"], "16")
+        expected_output_root = result["paths"]["target_dir"]
+        self.assertEqual(
+            (
+                result["paths"]["build_dir"],
+                fake_env["CARGO_TARGET_DIR"],
+                fake_env["CARGO_BUILD_BUILD_DIR"],
+            ),
+            (expected_output_root, expected_output_root, expected_output_root),
+        )
+        self.assertEqual(fake_env["CARGO_CACHE_AUTO_CLEAN_FREQUENCY"], "never")
         self.assertEqual(fake_env["NEXTEST_TEST_THREADS"], "8")
         self.assertEqual(fake_env["RUST_MIN_STACK"], "8388608")
         self.assertEqual(fake_env["FORCE_COLOR"], "0")
@@ -745,6 +1453,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertTrue(self.unix_path(command_result["fake_env_path"]).is_file())
         for key in (
             "CARGO_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR",
             "CARGO_HOME",
             "RUSTUP_HOME",
             "TEMP",
@@ -752,6 +1461,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "PYTHONPYCACHEPREFIX",
         ):
             self.assert_f_cache_path(fake_env[key])
+        telemetry = command_result["runtime_telemetry"]
+        self.assertGreaterEqual(telemetry["monitor_sample_count"], 1)
+        self.assertEqual(telemetry["minimum_free_disk_bytes"], 128 * 1024**3)
+        self.assertGreaterEqual(telemetry["memory_sample_count"], 1)
+        self.assertEqual(telemetry["minimum_available_memory_bytes"], 64 * 1024**3)
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
@@ -903,7 +1617,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
             lambda value: value.__setitem__("unexpected", "value"),
             lambda value: value["windows_runtime"].__setitem__("unexpected", "value"),
             lambda value: value["windows_runtime"].pop("resource_contract"),
-            lambda value: value["windows_runtime"].pop("reuse_run_root"),
+            lambda value: value["windows_runtime"].__setitem__(
+                "reuse_run_root", r"F:\.cache\cw\workset"
+            ),
         ):
             with self.subTest(mutation=mutation):
                 malformed = self.manifest([self.command(env=self.fixture_env())])
@@ -957,6 +1673,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         process, summary, result = self.invoke(manifest)
         self.assertEqual(process.returncode, 1)
         self.assertEqual(summary["status"], "preflight-failed")
+        self.assertEqual(result["status"], "preflight-failed")
         self.assertIn("test-only process opt-in", str(result["error"]))
         self.assertFalse(
             self.unix_path(result["paths"]["tool_staging"])
@@ -965,7 +1682,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
             msg="fixture without process opt-in must not create a fake tool",
         )
 
-        process, summary, result = self.invoke(manifest, fixture_opt_in=True)
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]), fixture_opt_in=True
+        )
         self.assertEqual(process.returncode, 0, msg=process.stderr)
         self.assertEqual(summary["status"], "success")
         self.assertTrue(
@@ -1188,7 +1907,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.unix_path(result["paths"]["candidate_root"]).exists())
 
         process, summary, result = self.invoke(
-            manifest,
+            self.manifest(
+                [self.command(env=self.fixture_env(), artifact_policy="none")],
+                candidate_identity=identity,
+                source_root=source,
+            ),
             fixture_opt_in=True,
             source_git_config=scoped_git_config,
         )
@@ -1217,7 +1940,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
-    def test_bound_fixture_rechecks_candidate_after_fake_command(self) -> None:
+    def test_bound_fixture_rechecks_candidate_after_fake_command_and_resets_per_command_state(
+        self,
+    ) -> None:
         source, identity, before = self.create_source_fixture(
             include_symlink=False, include_shadow_cargo=True
         )
@@ -1259,6 +1984,200 @@ class CargoValidateWindowsTests(unittest.TestCase):
             command_result["launch_file_name"].casefold(),
             self.windows_path(candidate / "codex-rs" / "cargo.exe").casefold(),
         )
+        with self.subTest("second-command-preflight"):
+            source, identity, before = self.create_source_fixture(
+                include_symlink=False,
+                source_name="second-command-preflight-source",
+            )
+            command = self.command(env=self.fixture_env(), artifact_policy="none")
+            process, summary, result = self.invoke(
+                self.manifest(
+                    [command, command.copy()],
+                    candidate_identity=identity,
+                    source_root=source,
+                ),
+                fixture_opt_in=True,
+                preflight_fail_stage="before-approved-command-2",
+            )
+
+            self.assertEqual(process.returncode, 1, msg=process.stderr)
+            self.assertEqual(summary["status"], "preflight-failed")
+            self.assertEqual(result["status"], "preflight-failed")
+            self.assertIn("before-approved-command-2", str(result["error"]))
+            self.assertEqual(
+                [
+                    (record["index"], record["status"])
+                    for record in result["command_results"]
+                ],
+                [(1, "success")],
+            )
+            self.assertEqual(result["candidate_materialization"]["status"], "success")
+            evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+            preflight = json.loads(
+                (evidence_dir / "preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(preflight["status"], "failed")
+            self.assertEqual(
+                preflight["candidate_materialization"]["status"], "success"
+            )
+            self.assertEqual(
+                [check["status"] for check in preflight["execution_preflight"]],
+                ["passed", "passed", "passed", "failed"],
+            )
+            self.assertEqual(before, self.source_snapshot(source))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_bound_fixture_keeps_insta_pending_artifacts_under_command_evidence(
+        self,
+    ) -> None:
+        source, identity, before = self.create_source_fixture(
+            include_symlink=False,
+            include_shadow_cargo=True,
+        )
+        process, summary, result = self.invoke(
+            self.manifest(
+                [
+                    self.command(
+                        env=self.fixture_env(101),
+                        artifact_policy="none",
+                    )
+                ],
+                candidate_identity=identity,
+                source_root=source,
+            ),
+            fixture_opt_in=True,
+            fake_create_insta_pending=True,
+        )
+
+        self.assertEqual(process.returncode, 101, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command_result = result["command_results"][0]
+        self.assertEqual(command_result["status"], "failed")
+        self.assertEqual(command_result["exit_code"], 101)
+        fake_env = dict(
+            line.split("=", 1)
+            for line in self.unix_path(command_result["fake_env_path"])
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+        pending_dir = self.unix_path(fake_env["INSTA_PENDING_DIR"])
+        self.assert_f_cache_path(fake_env["INSTA_PENDING_DIR"])
+        self.assertEqual(fake_env["INSTA_UPDATE"], "new")
+        self.assertEqual(
+            command_result["insta_pending_dir"], fake_env["INSTA_PENDING_DIR"]
+        )
+        self.assertEqual(pending_dir, evidence_dir / "command-1.insta-pending")
+        self.assertEqual(
+            (pending_dir / "snapshots" / "fixture.snap.new").read_text(
+                encoding="utf-8"
+            ),
+            "external pending fixture\n",
+        )
+        self.assertEqual(
+            (pending_dir / "src" / "fixture.rs.pending-snap").read_text(
+                encoding="utf-8"
+            ),
+            "inline pending fixture\n",
+        )
+        candidate = self.unix_path(result["paths"]["candidate_root"])
+        self.assertEqual(
+            self.git_bytes(
+                candidate,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ),
+            b"",
+        )
+        self.assertFalse(
+            (candidate / "codex-rs" / "snapshots" / "fixture.snap.new").exists()
+        )
+        self.assertFalse(
+            (candidate / "codex-rs" / "src" / "fixture.rs.pending-snap").exists()
+        )
+        materialization = result["candidate_materialization"]
+        self.assertEqual(materialization["status"], "success")
+        self.assertEqual(
+            materialization["candidate_after_command"]["index_tree"],
+            identity["index_tree"],
+        )
+        self.assertEqual(before, self.source_snapshot(source))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_bound_fixture_reports_post_command_integrity_failure(self) -> None:
+        for command_exit, expected_exit, command_status in (
+            (0, 1, "success"),
+            (100, 100, "failed"),
+        ):
+            with self.subTest(command_exit=command_exit):
+                source, identity, before = self.create_source_fixture(
+                    include_symlink=False,
+                    source_name=f"integrity-failure-{command_exit}",
+                )
+                process, summary, result = self.invoke(
+                    self.manifest(
+                        [
+                            self.command(
+                                env=self.fixture_env(command_exit),
+                                artifact_policy="none",
+                            )
+                        ],
+                        candidate_identity=identity,
+                        source_root=source,
+                    ),
+                    fixture_opt_in=True,
+                    fake_create_untracked=True,
+                )
+
+                self.assertEqual(process.returncode, expected_exit, msg=process.stderr)
+                self.assertEqual(summary["status"], "command-failed")
+                self.assertEqual(summary["exit_code"], expected_exit)
+                self.assertEqual(result["status"], "command-failed")
+                self.assertEqual(result["exit_code"], expected_exit)
+                self.assertIn("candidate has untracked paths", str(result["error"]))
+                command_result = result["command_results"][0]
+                self.assertEqual(command_result["status"], command_status)
+                self.assertEqual(command_result["exit_code"], command_exit)
+                self.assertTrue(
+                    self.unix_path(command_result["fake_argv_path"]).is_file()
+                )
+                materialization = result["candidate_materialization"]
+                self.assertEqual(
+                    materialization["status"], "post-command-integrity-failed"
+                )
+                self.assertIsNone(materialization["candidate_after_command"])
+                evidence_dir = self.unix_path(str(summary["evidence_dir"]))
+                preflight = json.loads(
+                    (evidence_dir / "preflight.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(preflight["status"], "accepted")
+                self.assertIsNone(preflight["error"])
+                self.assertEqual(
+                    preflight["candidate_materialization"]["status"],
+                    "post-command-integrity-failed",
+                )
+                candidate = self.unix_path(result["paths"]["candidate_root"])
+                self.assertTrue(
+                    (candidate / "codex-rs" / "fixture-untracked.txt").is_file()
+                )
+                self.assertIn(
+                    b"fixture-untracked.txt\0",
+                    self.git_bytes(
+                        candidate,
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                        "-z",
+                    ),
+                )
+                self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
@@ -1269,12 +2188,19 @@ class CargoValidateWindowsTests(unittest.TestCase):
         source, first_identity, _ = self.create_source_fixture(
             include_symlink=False, include_msvc_setup=True
         )
+        staged_tail = source / "codex-rs" / "staged-tail.txt"
+        staged_tail.write_text("persisted staged tail\n", encoding="utf-8")
+        self.git_bytes(source, "add", "codex-rs/staged-tail.txt")
+        first_identity = self.candidate_identity_for(source)
         fixture, digests = self.make_bootstrap_fixture()
         cold_manifest = self.manifest(
             [self.command(env=self.fixture_env(), artifact_policy="none")],
             candidate_identity=first_identity,
             source_root=source,
         )
+        cold_runtime = cold_manifest["windows_runtime"]
+        self.assertIsInstance(cold_runtime, dict)
+        namespace = cold_runtime["workflow_namespace"]
         self.configure_bootstrap_runtime(cold_manifest, digests)
         cold_process, cold_summary, cold_result = self.invoke(
             cold_manifest,
@@ -1288,14 +2214,47 @@ class CargoValidateWindowsTests(unittest.TestCase):
         cold_result_path = self.unix_path(str(cold_summary["result_path"]))
         cold_result_bytes = cold_result_path.read_bytes()
         candidate = self.unix_path(str(cold_result["paths"]["candidate_root"]))
+        cache_state = json.loads(
+            self.unix_path(str(cold_result["paths"]["cache_state_path"])).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(cache_state["schema"], 2)
+        self.assertNotIn("resource_contract", cache_state)
+        self.assertEqual(
+            set(cache_state["candidate_materialization"]),
+            {"status", "materialized", "candidate_root"},
+        )
         unchanged = candidate / "codex-rs" / "executable.sh"
         unchanged_mtime_ns = unchanged.stat().st_mtime_ns
+        candidate_tail = candidate / "codex-rs" / "staged-tail.txt"
+        tail_mtime_ns = candidate_tail.stat().st_mtime_ns
         ignored_output = candidate / "codex-rs" / ".fixture-ignored"
         self.assertTrue(ignored_output.is_file())
         self.assertEqual(
             (candidate / "codex-rs" / "normal.txt").read_text(encoding="utf-8"),
             "staged indexed content\n",
         )
+
+        incompatible_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=first_identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(incompatible_manifest, digests)
+        incompatible_runtime = incompatible_manifest["windows_runtime"]
+        self.assertIsInstance(incompatible_runtime, dict)
+        incompatible_runtime["nextest_sha256"] = "4" * 64
+        incompatible_process, incompatible_summary, incompatible_result = self.invoke(
+            incompatible_manifest, fixture_opt_in=True
+        )
+        self.assertEqual(incompatible_process.returncode, 1)
+        self.assertEqual(incompatible_summary["status"], "preflight-failed")
+        self.assertIn(
+            "does not match the frozen manifest", incompatible_result["error"]
+        )
+        self.assertEqual(incompatible_result["command_results"], [])
 
         (source / "codex-rs" / "normal.txt").write_text(
             "warm indexed content\n", encoding="utf-8"
@@ -1306,12 +2265,14 @@ class CargoValidateWindowsTests(unittest.TestCase):
             [self.command(env=self.fixture_env(), artifact_policy="none")],
             candidate_identity=warm_identity,
             source_root=source,
+            namespace=namespace,
         )
         self.configure_bootstrap_runtime(warm_manifest, digests)
         warm_runtime = warm_manifest["windows_runtime"]
         self.assertIsInstance(warm_runtime, dict)
-        warm_runtime["reuse_run_root"] = self.windows_path(cold_root)
-        warm_runtime["minimum_free_disk_gib"] = 5
+        warm_resource_contract = warm_runtime["resource_contract"]
+        self.assertIsInstance(warm_resource_contract, dict)
+        warm_resource_contract["abort_free_pct"] = 6
         warm_process, warm_summary, warm_result = self.invoke(
             warm_manifest, fixture_opt_in=True
         )
@@ -1341,6 +2302,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "warm indexed content\n",
         )
         self.assertEqual(unchanged.stat().st_mtime_ns, unchanged_mtime_ns)
+        self.assertEqual(candidate_tail.stat().st_mtime_ns, tail_mtime_ns)
         self.assertTrue(ignored_output.is_file())
         sync_patch = self.unix_path(
             str(warm_result["candidate_materialization"]["patch_path"])
@@ -1357,6 +2319,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
             warm_result["bootstrap"]["nextest"]["zip"]["path"],
             cold_result["bootstrap"]["nextest"]["zip"]["path"],
         )
+        self.assertEqual(warm_result["resource_contract"]["abort_free_pct"], 6)
         warm_temp = str(warm_result["paths"]["temp_dir"])
         self.assertTrue(warm_temp.lower().startswith(r"f:\.cache\p"), warm_temp)
         self.assertNotIn("-", warm_temp)
@@ -1373,6 +2336,50 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(fake_env["FORCE_COLOR"], "0")
         self.assertEqual(
             fake_env["PYTHONPYCACHEPREFIX"], warm_temp + r"\python-pycache"
+        )
+
+        self.git_bytes(
+            source,
+            "commit",
+            "-m",
+            "commit warm indexed content",
+            "--",
+            "codex-rs/normal.txt",
+        )
+        committed_identity = self.candidate_identity_for(source)
+        committed_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=committed_identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(committed_manifest, digests)
+        committed_process, committed_summary, committed_result = self.invoke(
+            committed_manifest, fixture_opt_in=True
+        )
+        self.assertEqual(committed_process.returncode, 0, msg=committed_process.stderr)
+        self.assertEqual(committed_summary["status"], "success")
+        self.assertTrue(
+            committed_result["candidate_materialization"]["head_transition"]
+        )
+        self.assertEqual(
+            committed_result["candidate_materialization"]["candidate_after_command"][
+                "head"
+            ],
+            committed_identity["head"],
+        )
+        self.assertEqual(
+            committed_result["paths"]["target_dir"], cold_result["paths"]["target_dir"]
+        )
+        self.assertEqual(unchanged.stat().st_mtime_ns, unchanged_mtime_ns)
+        self.assertEqual(
+            candidate_tail.read_text(encoding="utf-8"), "persisted staged tail\n"
+        )
+        self.assertEqual(candidate_tail.stat().st_mtime_ns, tail_mtime_ns)
+        self.assertEqual(self._owned_namespaces, {namespace})
+        self.assertEqual(len(self._owned_temp_leaves), 4)
+        self._assert_native_fixture_lifetime(
+            "assert-present", self._owned_namespaces, self._owned_temp_leaves
         )
 
     @unittest.skipUnless(
@@ -1399,6 +2406,114 @@ class CargoValidateWindowsTests(unittest.TestCase):
             .exists()
         )
         self.assertEqual(before, self.source_snapshot(source))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_failed_bound_command_publishes_ready_cache_for_warm_retry(self) -> None:
+        source, identity, _ = self.create_source_fixture(
+            include_symlink=False, include_msvc_setup=True
+        )
+        fixture, digests = self.make_bootstrap_fixture()
+        cold_manifest = self.manifest(
+            [self.command(env=self.fixture_env(17), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+        )
+        self.configure_bootstrap_runtime(cold_manifest, digests)
+        cold_runtime = cold_manifest["windows_runtime"]
+        self.assertIsInstance(cold_runtime, dict)
+        namespace = cold_runtime["workflow_namespace"]
+        cold_process, cold_summary, cold_result = self.invoke(
+            cold_manifest,
+            fixture_opt_in=True,
+            bootstrap_fixture=fixture,
+        )
+        self.assertEqual(cold_process.returncode, 17, msg=cold_process.stderr)
+        self.assertEqual(cold_summary["status"], "command-failed")
+        self.assertTrue(
+            self.unix_path(cold_result["paths"]["cache_state_path"]).is_file(),
+            msg="a normally terminated failed command must leave a reusable ready cache",
+        )
+
+        warm_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(warm_manifest, digests)
+        warm_process, warm_summary, warm_result = self.invoke(
+            warm_manifest, fixture_opt_in=True
+        )
+        self.assertEqual(warm_process.returncode, 0, msg=warm_process.stderr)
+        self.assertEqual(warm_summary["status"], "success")
+        self.assertEqual(warm_result["bootstrap"]["source"], "reused")
+        self.assertNotEqual(warm_summary["evidence_dir"], cold_summary["evidence_dir"])
+        self.assertNotEqual(
+            warm_result["paths"]["temp_dir"], cold_result["paths"]["temp_dir"]
+        )
+        for name in (
+            "candidate_root",
+            "target_dir",
+            "cargo_home",
+            "rustup_home",
+            "helper_state",
+            "tool_staging",
+            "v8_cache",
+        ):
+            self.assertEqual(warm_result["paths"][name], cold_result["paths"][name])
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_warm_reuse_rejects_a_reparse_component_of_the_workset(self) -> None:
+        source, identity, _ = self.create_source_fixture(
+            include_symlink=False, include_msvc_setup=True
+        )
+        bootstrap_fixture, digests = self.make_bootstrap_fixture()
+        cold_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+        )
+        self.configure_bootstrap_runtime(cold_manifest, digests)
+        namespace = cold_manifest["windows_runtime"]["workflow_namespace"]
+        cold_process, _, cold_result = self.invoke(
+            cold_manifest,
+            fixture_opt_in=True,
+            bootstrap_fixture=bootstrap_fixture,
+        )
+        self.assertEqual(cold_process.returncode, 0, msg=cold_process.stderr)
+        candidate = cold_result["paths"]["candidate_root"]
+        junction_process = subprocess.run(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"$path = [IO.Path]::GetFullPath('{candidate}'); $target = \"$path.real\"; Move-Item -LiteralPath $path -Destination $target; New-Item -ItemType Junction -Path $path -Target $target | Out-Null",
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(junction_process.returncode, 0, msg=junction_process.stderr)
+        warm_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(warm_manifest, digests)
+        warm_process = self.invoke_raw(warm_manifest, fixture_opt_in=True)
+        self.assertEqual(warm_process.returncode, 1)
+        self.assertEqual(warm_process.stdout.strip(), "")
+        self.assertIn("reparse point", warm_process.stderr)
 
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
@@ -1525,8 +2640,14 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(fake_env["V8_FROM_SOURCE"], "")
         self.assertEqual(before, self.source_snapshot(source))
 
+        missing_fixture_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+        )
+        self.configure_bootstrap_runtime(missing_fixture_manifest, digests)
         process, summary, result = self.invoke(
-            manifest,
+            missing_fixture_manifest,
             fixture_opt_in=True,
             bootstrap_fixture=fixture,
             bootstrap_fixture_opt_in=False,
@@ -1642,6 +2763,92 @@ class CargoValidateWindowsTests(unittest.TestCase):
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
+    def test_residual_cache_without_canonical_workset_fails_without_cold_fallback(
+        self,
+    ) -> None:
+        process = self.invoke_raw(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            preflight_fixture={
+                **DEFAULT_PREFLIGHT_FIXTURE,
+                "CARGO_VALIDATE_WINDOWS_TEST_CACHE_ROOT_STATE": "residual",
+            },
+        )
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(process.stdout.strip(), "")
+        self.assertIn("not operator-cleared", process.stderr)
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_cold_resource_rejection_keeps_the_canonical_workset_absent(self) -> None:
+        first_manifest = self.manifest([self.command(env=self.fixture_env())])
+        namespace = first_manifest["windows_runtime"]["workflow_namespace"]
+        process, summary, result = self.invoke(
+            first_manifest,
+            fixture_opt_in=True,
+            preflight_fixture={
+                **DEFAULT_PREFLIGHT_FIXTURE,
+                "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(119 * 1024**3),
+            },
+        )
+        self.assertEqual(process.returncode, 1)
+        self.assertEqual(summary["status"], "preflight-failed")
+        self.assertFalse(self.unix_path(result["paths"]["workset_root"]).exists())
+        self.assertTrue(
+            self.unix_path(summary["evidence_dir"]).joinpath("preflight.json").is_file()
+        )
+        retry_process, retry_summary, retry_result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())], namespace=namespace),
+            fixture_opt_in=True,
+        )
+        self.assertEqual(retry_process.returncode, 0, msg=retry_process.stderr)
+        self.assertEqual(retry_summary["status"], "success")
+        self.assertEqual(retry_result["paths"]["cache_mode"], "cold")
+
+        malformed_manifest = self.manifest([self.command(env=self.fixture_env())])
+        malformed_namespace = malformed_manifest["windows_runtime"][
+            "workflow_namespace"
+        ]
+        malformed_process, _, malformed_result = self.invoke(
+            malformed_manifest,
+            fixture_opt_in=True,
+            preflight_fixture={
+                **DEFAULT_PREFLIGHT_FIXTURE,
+                "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(119 * 1024**3),
+            },
+        )
+        self.assertEqual(malformed_process.returncode, 1)
+        run_root = malformed_result["paths"]["execution_root"]
+        create_sibling = subprocess.run(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"New-Item -ItemType Directory -Path '{run_root}\\unexpected' | Out-Null",
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(create_sibling.returncode, 0, msg=create_sibling.stderr)
+        malformed_retry = self.invoke_raw(
+            self.manifest(
+                [self.command(env=self.fixture_env())], namespace=malformed_namespace
+            ),
+            fixture_opt_in=True,
+        )
+        self.assertEqual(malformed_retry.returncode, 1)
+        self.assertIn("residual state", malformed_retry.stderr)
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
     def test_test_only_resource_and_writer_preflight_fails_closed(self) -> None:
         manifest = self.manifest([self.command(env=self.fixture_env())])
         manifest["windows_runtime"]["source_materialization"]["wsl_distro_name"] = (
@@ -1665,7 +2872,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 check["wsl_processes"]["wsl_distro_name"]
                 for check in preflight["execution_preflight"]
             ],
-            ["FixtureDistro", "FixtureDistro"],
+            ["FixtureDistro", "FixtureDistro", "FixtureDistro"],
         )
 
         cases = (
@@ -1848,10 +3055,295 @@ class CargoValidateWindowsTests(unittest.TestCase):
     @unittest.skipUnless(
         PWSH, "PowerShell 7 is required for the Windows executor harness"
     )
+    def test_runtime_disk_monitor_aborts_the_fake_process_tree_without_cleanup(
+        self,
+    ) -> None:
+        source, identity, _ = self.create_source_fixture(
+            include_symlink=False, include_msvc_setup=True
+        )
+        bootstrap_fixture, digests = self.make_bootstrap_fixture()
+        samples = ",".join([str(128 * 1024**3)] * 8 + [str(4 * 1024**3)])
+        fixture = {
+            **DEFAULT_PREFLIGHT_FIXTURE,
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES": samples,
+        }
+        manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+        )
+        self.configure_bootstrap_runtime(manifest, digests)
+        runtime = manifest["windows_runtime"]
+        self.assertIsInstance(runtime, dict)
+        namespace = runtime["workflow_namespace"]
+        process, summary, result = self.invoke(
+            manifest,
+            fixture_opt_in=True,
+            preflight_fixture=fixture,
+            bootstrap_fixture=bootstrap_fixture,
+            fake_long_running=True,
+            fake_wait_for_readiness=True,
+        )
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "resource-aborted")
+        self.assertEqual(
+            command["resource_abort"]["cause"], "native-runtime-disk-floor"
+        )
+        self.assertTrue(command["resource_abort"]["termination"]["terminated"])
+        self.assertTrue(command["resource_abort"]["termination"]["quiescent"])
+        self.assertEqual(
+            command["resource_abort"]["sample"]["free_disk_bytes"], 4 * 1024**3
+        )
+        self.assertTrue(self.unix_path(result["paths"]["workset_root"]).is_dir())
+        self.assertTrue(
+            self.unix_path(result["paths"]["cache_state_path"]).is_file(),
+            msg="a resource-aborted but structurally intact workset remains reusable",
+        )
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(
+            child_pid_path.is_file(),
+            msg="the monitored fake command must start its child",
+        )
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+        warm_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(warm_manifest, digests)
+        warm_process, warm_summary, warm_result = self.invoke(
+            warm_manifest, fixture_opt_in=True
+        )
+        self.assertEqual(warm_process.returncode, 0, msg=warm_process.stderr)
+        self.assertEqual(warm_summary["status"], "success")
+        self.assertEqual(warm_result["bootstrap"]["source"], "reused")
+        self.assertEqual(
+            warm_result["paths"]["target_dir"], result["paths"]["target_dir"]
+        )
+
+        yolo_manifest = self.manifest([self.command(env=self.fixture_env())])
+        yolo_manifest["flags"].append("yolo")
+        low_fixture = {
+            **fixture,
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(1 * 1024**3),
+            "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES": str(1 * 1024**3),
+        }
+        process, summary, result = self.invoke(
+            yolo_manifest,
+            fixture_opt_in=True,
+            preflight_fixture=low_fixture,
+            fake_long_running=True,
+            fake_wait_for_readiness=True,
+        )
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "resource-aborted")
+        self.assertTrue(command["command_preflight"]["yolo"])
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_root_exit_with_contained_descendant_uses_bounded_containment_cleanup(
+        self,
+    ) -> None:
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            fake_root_exits_first=True,
+            fake_wait_for_readiness=True,
+        )
+
+        self.assertEqual(process.returncode, 0, msg=process.stderr)
+        self.assertEqual(summary["status"], "success")
+        self.assertEqual(result["status"], "success")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "success")
+        termination = command["termination"]
+        self.assertEqual(
+            termination["reason"], "root-exited-with-contained-descendants"
+        )
+        self.assertTrue(termination["root_exited_before_termination"])
+        self.assertGreaterEqual(termination["active_processes_before_termination"], 1)
+        self.assertTrue(termination["terminated"])
+        self.assertTrue(termination["quiescent"])
+        self.assertIsNone(termination["persistent_failure"])
+        self.assertEqual(termination["active_processes_after_termination"], 0)
+        self.assertEqual(command["containment"]["active_processes"], 0)
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(child_pid_path.is_file())
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_root_exit_termination_failure_finishes_without_waiting_for_child_eof(
+        self,
+    ) -> None:
+        started_at = time.monotonic()
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            fake_root_exits_first=True,
+            fake_immediate_descendant=True,
+            fake_containment_terminate_failure=True,
+            fake_wait_for_readiness=True,
+        )
+
+        self.assertLess(time.monotonic() - started_at, 20)
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "failed")
+        self.assertEqual(command["exit_code"], 1)
+        self.assertIsNone(command["resource_abort"])
+        self.assertIsNone(command["monitor_error"])
+        self.assertIn("could not terminate", command["post_launch_error"])
+        termination = command["termination"]
+        self.assertEqual(
+            termination["reason"], "root-exited-with-contained-descendants"
+        )
+        self.assertTrue(termination["root_exited_before_termination"])
+        self.assertGreaterEqual(termination["active_processes_before_termination"], 1)
+        self.assertFalse(termination["terminated"])
+        self.assertFalse(termination["quiescent"])
+        self.assertIn(
+            "test-only native command containment termination failure",
+            termination["termination_error"],
+        )
+        self.assertIn("could not terminate", termination["persistent_failure"])
+        self.assertIsNone(termination["active_processes_after_termination"])
+        self.assertIsNone(command["containment"]["active_processes"])
+        self.assertTrue(self.unix_path(str(command["stdout_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["stderr_path"])).is_file())
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(child_pid_path.is_file())
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_monitor_query_error_terminates_command_and_records_command_failure(
+        self,
+    ) -> None:
+        fixture = {
+            **DEFAULT_PREFLIGHT_FIXTURE,
+            "CARGO_VALIDATE_WINDOWS_TEST_MONITOR_ERROR_AFTER_SAMPLES": "2",
+        }
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            preflight_fixture=fixture,
+            fake_root_exits_first=True,
+            fake_wait_for_readiness=True,
+        )
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "failed")
+        self.assertIn("monitor query failed", command["monitor_error"])
+        self.assertIsNone(command["resource_abort"])
+        self.assertEqual(command["termination"]["reason"], "monitor-query-error")
+        self.assertTrue(command["termination"]["quiescent"])
+        self.assertEqual(command["containment"]["active_processes"], 0)
+        self.assertTrue(self.unix_path(str(command["stdout_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["stderr_path"])).is_file())
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(child_pid_path.is_file())
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_fake_readiness_timeout_terminates_the_contained_command(self) -> None:
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            fake_long_running=True,
+            fake_wait_for_readiness=True,
+            fake_suppress_readiness=True,
+        )
+
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "failed")
+        self.assertEqual(
+            command["monitor_error"],
+            "test-only fake readiness timed out after 5000 milliseconds",
+        )
+        self.assertEqual(
+            command["termination"]["reason"], "test-only-fake-readiness-timeout"
+        )
+        self.assertTrue(command["termination"]["quiescent"])
+        self.assertEqual(command["containment"]["active_processes"], 0)
+        self.assertTrue(self.unix_path(str(command["stdout_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["stderr_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["fake_argv_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["fake_env_path"])).is_file())
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(child_pid_path.is_file())
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_suspended_launch_enrolls_immediate_descendant_before_termination(
+        self,
+    ) -> None:
+        fixture = {
+            **DEFAULT_PREFLIGHT_FIXTURE,
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES": (
+                f"{128 * 1024**3},{128 * 1024**3},{128 * 1024**3},{4 * 1024**3}"
+            ),
+        }
+        process, summary, result = self.invoke(
+            self.manifest([self.command(env=self.fixture_env())]),
+            fixture_opt_in=True,
+            preflight_fixture=fixture,
+            fake_immediate_descendant=True,
+            fake_wait_for_readiness=True,
+        )
+        self.assertEqual(process.returncode, 1, msg=process.stderr)
+        self.assertEqual(summary["status"], "command-failed")
+        self.assertEqual(result["status"], "command-failed")
+        command = self.command_result(process, result)
+        self.assertEqual(command["status"], "resource-aborted")
+        self.assertEqual(command["launch_mode"], "CreateProcessW CREATE_SUSPENDED")
+        termination = command["resource_abort"]["termination"]
+        self.assertGreaterEqual(termination["active_processes_before_termination"], 2)
+        self.assertEqual(termination["active_processes_after_termination"], 0)
+        self.assertTrue(termination["quiescent"])
+        self.assertGreaterEqual(command["containment"]["peak_active_processes"], 2)
+        self.assertTrue(self.unix_path(str(command["stdout_path"])).is_file())
+        self.assertTrue(self.unix_path(str(command["stderr_path"])).is_file())
+        child_pid_path = self.unix_path(str(command["fake_child_pid_path"]))
+        self.assertTrue(child_pid_path.is_file())
+        child_pid = int(child_pid_path.read_text(encoding="utf-8").strip())
+        self.assertFalse(self.native_process_is_alive(child_pid))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
     def test_native_mutex_busy_and_abandoned_fail_closed(self) -> None:
-        namespace = f"mutex-{uuid.uuid4().hex}"
         manifest = self.manifest([self.command(env=self.fixture_env())])
-        manifest["windows_runtime"]["workflow_namespace"] = namespace
+        runtime = manifest["windows_runtime"]
+        self.assertIsInstance(runtime, dict)
+        namespace = runtime["workflow_namespace"]
+        self.assertIsInstance(namespace, str)
         expected_run_root = self.unix_path(rf"F:\.cache\{namespace}")
         self.assertFalse(expected_run_root.exists())
         mutex_env = os.environ.copy()
@@ -1904,9 +3396,11 @@ class CargoValidateWindowsTests(unittest.TestCase):
             if holder.stderr is not None:
                 holder.stderr.close()
 
-        namespace = f"mutex-{uuid.uuid4().hex}"
         manifest = self.manifest([self.command(env=self.fixture_env())])
-        manifest["windows_runtime"]["workflow_namespace"] = namespace
+        runtime = manifest["windows_runtime"]
+        self.assertIsInstance(runtime, dict)
+        namespace = runtime["workflow_namespace"]
+        self.assertIsInstance(namespace, str)
         expected_run_root = self.unix_path(rf"F:\.cache\{namespace}")
         self.assertFalse(expected_run_root.exists())
         process = self.invoke_raw(

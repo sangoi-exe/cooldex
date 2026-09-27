@@ -50,7 +50,7 @@ async fn execution_cancellation_respects_network_approval_boundary(
             cancellation_token: CancellationToken,
         ) -> crate::tasks::SessionTaskResult {
             cancellation_token.cancelled().await;
-            Ok(crate::tasks::SessionTaskOutput::default())
+            Ok(None)
         }
     }
 

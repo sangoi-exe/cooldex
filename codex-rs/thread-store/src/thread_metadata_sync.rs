@@ -755,6 +755,7 @@ mod tests {
                             developer_instructions: None,
                         },
                     },
+                    developer_instructions: Some(None),
                     shell_tool_enabled: None,
                     agent_role_feature_opt_outs: Some(Vec::new()),
                     agent_role_skill_restrictions: Some(Default::default()),

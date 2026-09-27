@@ -2253,6 +2253,18 @@ pub struct ThreadSettingsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub personality: Option<Personality>,
     pub collaboration_mode: CollaborationMode,
+    // Merge-safety anchor: V2 developer instructions are a birth identity field persisted beside
+    // the other thread settings so cold restoration never infers them from compacted context.
+    /// Required V2 birth identity. `null` is an explicit captured absence; an absent outer value
+    /// denotes an incomplete historical snapshot.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_with::rust::double_option"
+    )]
+    #[schemars(with = "Option<Option<String>>")]
+    #[ts(type = "string | null", optional)]
+    pub developer_instructions: Option<Option<String>>,
     /// Thread-owned plugin selection, retained even when a plugin is unavailable.
     #[serde(default)]
     pub disabled_plugin_ids: Vec<String>,
@@ -4649,6 +4661,7 @@ mod tests {
                     developer_instructions: None,
                 },
             },
+            developer_instructions: Some(Some("captured developer instructions".to_string())),
             disabled_plugin_ids: Vec::new(),
             shell_tool_enabled: Some(false),
             agent_role_feature_opt_outs: Some(Vec::new()),
@@ -4667,6 +4680,36 @@ mod tests {
             round_trip_snapshot.model_auto_compact_token_limit,
             Some(None)
         );
+        assert_eq!(
+            round_trip_snapshot.developer_instructions,
+            Some(Some("captured developer instructions".to_string()))
+        );
+
+        let explicit_absence_value = serde_json::to_value(ThreadSettingsSnapshot {
+            developer_instructions: Some(None),
+            ..snapshot.clone()
+        })?;
+        assert_eq!(
+            explicit_absence_value["developer_instructions"],
+            json!(null)
+        );
+        let explicit_absence_snapshot: ThreadSettingsSnapshot =
+            serde_json::from_value(explicit_absence_value)?;
+        assert_eq!(explicit_absence_snapshot.developer_instructions, Some(None));
+
+        let mut legacy_developer_value = serde_json::to_value(&snapshot)?;
+        let Some(legacy_developer_object) = legacy_developer_value.as_object_mut() else {
+            anyhow::bail!("thread settings snapshot must serialize as an object");
+        };
+        assert!(
+            legacy_developer_object
+                .remove("developer_instructions")
+                .is_some()
+        );
+        let legacy_developer_snapshot: ThreadSettingsSnapshot =
+            serde_json::from_value(legacy_developer_value)?;
+        assert_eq!(legacy_developer_snapshot.developer_instructions, None);
+
         let Some(legacy_object) = legacy_value.as_object_mut() else {
             anyhow::bail!("thread settings snapshot must serialize as an object");
         };

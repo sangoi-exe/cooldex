@@ -24,7 +24,11 @@ impl CodexThread {
     pub async fn interrupt_if_no_pending_input(&self, turn_id: &str) -> CodexResult<bool> {
         let cancellation_token = {
             let active = self.session.active_turn.lock().await;
-            let Some(task) = active.as_ref().and_then(|turn| turn.task.as_ref()) else {
+            let Some(task) = active
+                .as_ref()
+                .filter(|turn| !turn.finishing)
+                .and_then(|turn| turn.task.as_ref())
+            else {
                 return Ok(false);
             };
             if task.turn_context.sub_id != turn_id {
@@ -65,10 +69,14 @@ impl Session {
         let active_turn = {
             let _settings_guard = self.acquire_thread_settings_persistence().await;
             let mut active = self.active_turn.lock().await;
+            // Merge-safety anchor: terminal finalization retains event-delivery ownership of a
+            // finishing turn, so conditional interruption can only retire a running task.
             let Some(turn) = active.as_ref().filter(|turn| {
-                turn.task
-                    .as_ref()
-                    .is_some_and(|task| task.turn_context.sub_id == turn_id)
+                !turn.finishing
+                    && turn
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| task.turn_context.sub_id == turn_id)
             }) else {
                 let _ = reply.send(false);
                 return;

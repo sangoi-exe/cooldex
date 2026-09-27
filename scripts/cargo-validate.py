@@ -7,7 +7,6 @@ import argparse
 import contextlib
 import hashlib
 import json
-import ntpath
 import os
 import re
 import shutil
@@ -69,6 +68,7 @@ WINDOWS_RUNTIME_CONFIG_KEYS = frozenset(
 )
 WINDOWS_RUNTIME_CACHE_ROOT = r"F:\.cache"
 WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB = 120
+WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB = 5
 WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB = 30
 WINDOWS_RUNTIME_TARGET = "x86_64-pc-windows-msvc"
 WINDOWS_RUNTIME_URL_FIELDS = (
@@ -85,11 +85,22 @@ WINDOWS_RUNTIME_SOURCE_MATERIALIZATION_KEYS = frozenset(
     {"posix_repo_root", "wsl_distro_name"}
 )
 WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS = frozenset(
-    {"resource_profile", "cargo_build_jobs", "nextest_test_threads"}
+    {
+        "resource_profile",
+        "cold_minimum_free_disk_gib",
+        "warm_minimum_free_disk_gib",
+        "minimum_available_memory_gib",
+        "cargo_build_jobs",
+        "nextest_test_threads",
+        "monitor",
+        "abort_free_gib",
+        "abort_free_pct",
+    }
 )
-WINDOWS_RUNTIME_MANIFEST_KEYS = WINDOWS_RUNTIME_CONFIG_KEYS | frozenset(
-    {"resource_contract", "reuse_run_root", "source_materialization"}
-)
+WINDOWS_RUNTIME_MANIFEST_KEYS = (
+    WINDOWS_RUNTIME_CONFIG_KEYS
+    - frozenset({"minimum_free_disk_gib", "minimum_available_memory_gib"})
+) | frozenset({"resource_contract", "source_materialization"})
 WINDOWS_EXECUTOR_HELPER_PATH = Path("scripts/cargo-validate-windows.ps1")
 WINDOWS_HELPER_SUMMARY_SCHEMA = 1
 WINDOWS_HELPER_STATUS_EXIT_CODES = {
@@ -562,7 +573,7 @@ def windows_nextest_profile_from_config(
 
 
 def windows_resource_contract_from_config(
-    config: dict[str, Any], context: str
+    config: dict[str, Any], runtime: dict[str, Any], context: str
 ) -> dict[str, Any]:
     profile = windows_nextest_profile_from_config(config, context)
     if profile.get("cargo_jobs_mode") != "fixed":
@@ -597,20 +608,58 @@ def windows_resource_contract_from_config(
             f"{context} must use one fixed nextest thread value across its thread limits"
         )
 
+    cold_minimum_free_disk_gib = runtime["minimum_free_disk_gib"]
+    validate_positive_int(
+        cold_minimum_free_disk_gib,
+        "cargo-validation.toml [windows_runtime].minimum_free_disk_gib",
+    )
+    if cold_minimum_free_disk_gib < WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB:
+        raise PlannerError(
+            "cargo-validation.toml [windows_runtime].minimum_free_disk_gib "
+            f"must be at least {WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB}"
+        )
+
+    warm_minimum_free_disk_gib = profile.get("reserve_free_gib")
+    validate_positive_int(warm_minimum_free_disk_gib, f"{context}.reserve_free_gib")
+    if warm_minimum_free_disk_gib < WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB:
+        raise PlannerError(
+            f"{context}.reserve_free_gib must be at least "
+            f"{WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB}"
+        )
+
+    minimum_available_memory_gib = runtime["minimum_available_memory_gib"]
+    validate_positive_int(
+        minimum_available_memory_gib,
+        "cargo-validation.toml [windows_runtime].minimum_available_memory_gib",
+    )
+    if minimum_available_memory_gib < WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB:
+        raise PlannerError(
+            "cargo-validation.toml [windows_runtime].minimum_available_memory_gib "
+            f"must be at least {WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB}"
+        )
+
+    if profile.get("monitor") is not True:
+        raise PlannerError(
+            f"{context}.monitor must be true for the native runtime disk abort"
+        )
+    abort_free_gib = profile.get("abort_free_gib")
+    validate_positive_int(abort_free_gib, f"{context}.abort_free_gib")
+    abort_free_pct = profile.get("abort_free_pct")
+    validate_positive_int(abort_free_pct, f"{context}.abort_free_pct", allow_zero=True)
+    if abort_free_pct > 100:
+        raise PlannerError(f"{context}.abort_free_pct must not exceed 100")
+
     return {
         "resource_profile": WINDOWS_NEXTEST_PROFILE,
+        "cold_minimum_free_disk_gib": cold_minimum_free_disk_gib,
+        "warm_minimum_free_disk_gib": warm_minimum_free_disk_gib,
+        "minimum_available_memory_gib": minimum_available_memory_gib,
         "cargo_build_jobs": cargo_build_jobs,
         "nextest_test_threads": nextest_test_threads,
+        "monitor": True,
+        "abort_free_gib": abort_free_gib,
+        "abort_free_pct": abort_free_pct,
     }
-
-
-def windows_reuse_minimum_free_disk_gib_from_config(
-    config: dict[str, Any], context: str
-) -> int:
-    profile = windows_nextest_profile_from_config(config, context)
-    reserve_free_gib = profile.get("reserve_free_gib")
-    validate_positive_int(reserve_free_gib, f"{context}.reserve_free_gib")
-    return int(reserve_free_gib)
 
 
 def validate_windows_runtime_resource_contract(value: Any, context: str) -> None:
@@ -618,59 +667,43 @@ def validate_windows_runtime_resource_contract(value: Any, context: str) -> None
         raise PlannerError(f"{context} must be an object")
     if set(value) != WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS:
         raise PlannerError(
-            f"{context} must define exactly resource_profile, cargo_build_jobs, and nextest_test_threads"
+            f"{context} must define exactly "
+            "resource_profile, cold_minimum_free_disk_gib, warm_minimum_free_disk_gib, "
+            "minimum_available_memory_gib, cargo_build_jobs, nextest_test_threads, monitor, "
+            "abort_free_gib, and abort_free_pct"
         )
     if value["resource_profile"] != WINDOWS_NEXTEST_PROFILE:
         raise PlannerError(
             f"{context}.resource_profile must be {WINDOWS_NEXTEST_PROFILE!r}"
         )
-    validate_positive_int(value["cargo_build_jobs"], f"{context}.cargo_build_jobs")
-    validate_positive_int(
-        value["nextest_test_threads"], f"{context}.nextest_test_threads"
-    )
-
-
-def validate_windows_reuse_run_root(value: Any, context: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        raise PlannerError(f"{context} must be a non-empty Windows path or null")
-    if any(character in value for character in ("\x00", "\n", "\r")):
-        raise PlannerError(f"{context} contains an unsafe control character")
-
-    normalized = ntpath.normpath(value)
-    drive, tail = ntpath.splitdrive(normalized)
-    cache_root = ntpath.normpath(WINDOWS_RUNTIME_CACHE_ROOT)
-    normalized_cache_root = ntpath.normcase(cache_root)
-    if (
-        not ntpath.isabs(normalized)
-        or drive.casefold() != "f:"
-        or not tail.startswith("\\")
+    for field_name, floor in (
+        ("cold_minimum_free_disk_gib", WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB),
+        ("warm_minimum_free_disk_gib", WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB),
+        (
+            "minimum_available_memory_gib",
+            WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB,
+        ),
     ):
+        validate_positive_int(value[field_name], f"{context}.{field_name}")
+        if value[field_name] < floor:
+            raise PlannerError(f"{context}.{field_name} must be at least {floor}")
+    for field_name in ("cargo_build_jobs", "nextest_test_threads", "abort_free_gib"):
+        validate_positive_int(value[field_name], f"{context}.{field_name}")
+    validate_positive_int(
+        value["abort_free_pct"], f"{context}.abort_free_pct", allow_zero=True
+    )
+    if value["abort_free_pct"] > 100:
+        raise PlannerError(f"{context}.abort_free_pct must not exceed 100")
+    if value["monitor"] is not True:
         raise PlannerError(
-            f"{context} must be an absolute Windows path below {WINDOWS_RUNTIME_CACHE_ROOT!r}"
+            f"{context}.monitor must be true for the native runtime disk abort"
         )
-    if ntpath.normcase(normalized) == normalized_cache_root:
-        raise PlannerError(
-            f"{context} must name a workset below {WINDOWS_RUNTIME_CACHE_ROOT!r}, not the cache root"
-        )
-    try:
-        common_root = ntpath.commonpath((cache_root, normalized))
-    except ValueError:
-        common_root = ""
-    if ntpath.normcase(common_root) != normalized_cache_root:
-        raise PlannerError(
-            f"{context} must be an absolute Windows path below {WINDOWS_RUNTIME_CACHE_ROOT!r}"
-        )
-    return value
 
 
 def validate_windows_runtime_values(
     runtime: dict[str, Any],
     repo_root: Path,
     context: str,
-    *,
-    minimum_free_disk_gib_floor: int = WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB,
 ) -> None:
     actual_keys = set(runtime)
     if actual_keys != WINDOWS_RUNTIME_CONFIG_KEYS:
@@ -701,7 +734,7 @@ def validate_windows_runtime_values(
                 f"{context}.{field_name} must be a lowercase 64-hex SHA-256 digest"
             )
     for field_name, floor in (
-        ("minimum_free_disk_gib", minimum_free_disk_gib_floor),
+        ("minimum_free_disk_gib", WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB),
         (
             "minimum_available_memory_gib",
             WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB,
@@ -765,28 +798,21 @@ def project_windows_runtime(
     repo_root: Path,
     *,
     environ: Mapping[str, str] | None = None,
-    reuse_run_root: str | None = None,
 ) -> dict[str, Any]:
     runtime = windows_runtime_from_config(config, repo_root, required=True)
     if runtime is None:
         raise AssertionError("required Windows runtime was not returned")
-    reuse_run_root = validate_windows_reuse_run_root(
-        reuse_run_root, "--windows-reuse-root"
-    )
     resource_profile_context = (
         f"cargo-validation.toml [resource_profiles.{WINDOWS_NEXTEST_PROFILE}]"
     )
-    projected = dict(runtime)
+    projected = {
+        field_name: value
+        for field_name, value in runtime.items()
+        if field_name not in {"minimum_free_disk_gib", "minimum_available_memory_gib"}
+    }
     projected["resource_contract"] = windows_resource_contract_from_config(
-        config, resource_profile_context
+        config, runtime, resource_profile_context
     )
-    projected["reuse_run_root"] = reuse_run_root
-    if reuse_run_root is not None:
-        projected["minimum_free_disk_gib"] = (
-            windows_reuse_minimum_free_disk_gib_from_config(
-                config, resource_profile_context
-            )
-        )
     projected["source_materialization"] = {
         "posix_repo_root": str(repo_root.resolve()),
         "wsl_distro_name": current_wsl_distro_name(environ),
@@ -813,22 +839,25 @@ def validate_windows_runtime_manifest(
             f"{context} must define exactly the supported keys ({'; '.join(detail)})"
         )
 
-    reuse_run_root = validate_windows_reuse_run_root(
-        runtime["reuse_run_root"], f"{context}.reuse_run_root"
+    resource_contract = runtime["resource_contract"]
+    validate_windows_runtime_resource_contract(
+        resource_contract, f"{context}.resource_contract"
     )
     static_runtime = {
-        field_name: runtime[field_name] for field_name in WINDOWS_RUNTIME_CONFIG_KEYS
+        field_name: runtime[field_name]
+        for field_name in WINDOWS_RUNTIME_CONFIG_KEYS
+        if field_name not in {"minimum_free_disk_gib", "minimum_available_memory_gib"}
     }
+    static_runtime["minimum_free_disk_gib"] = resource_contract[
+        "cold_minimum_free_disk_gib"
+    ]
+    static_runtime["minimum_available_memory_gib"] = resource_contract[
+        "minimum_available_memory_gib"
+    ]
     validate_windows_runtime_values(
         static_runtime,
         repo_root,
         context,
-        minimum_free_disk_gib_floor=(
-            1 if reuse_run_root is not None else WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB
-        ),
-    )
-    validate_windows_runtime_resource_contract(
-        runtime["resource_contract"], f"{context}.resource_contract"
     )
     source_materialization = runtime["source_materialization"]
     if not isinstance(source_materialization, dict):
@@ -2072,8 +2101,12 @@ def validate_config(
                 )
 
     if requires_windows_runtime:
+        runtime = windows_runtime_from_config(config, resolved_repo_root, required=True)
+        if runtime is None:
+            raise AssertionError("required Windows runtime was not returned")
         windows_resource_contract_from_config(
             config,
+            runtime,
             f"cargo-validation.toml [resource_profiles.{WINDOWS_NEXTEST_PROFILE}]",
         )
 
@@ -2628,7 +2661,7 @@ def surface_by_name(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def runtime_test_args(package: str) -> list[str]:
-    return ["test", "-p", package]
+    return ["test", "-p", package, "--no-fail-fast"]
 
 
 def build_plan(
@@ -2643,7 +2676,6 @@ def build_plan(
     receipt_dir: Path | None,
     telemetry_level: str,
     path_evidence: dict[str, PathSelectionEvidence] | None = None,
-    windows_reuse_root: str | None = None,
     yolo: bool = False,
 ) -> Plan:
     history_entries = read_history_entries(
@@ -2717,10 +2749,6 @@ def build_plan(
     )
 
     if stage == "prep":
-        if windows_reuse_root is not None:
-            raise PlannerError(
-                "--windows-reuse-root requires a native Windows command; prep actions do not include native Windows commands"
-            )
         if yolo:
             raise PlannerError(
                 "--yolo requires a native Windows command; prep actions do not include native Windows commands"
@@ -2950,10 +2978,6 @@ def build_plan(
         )
 
     has_windows_command = any(command.platform == "windows" for command in commands)
-    if windows_reuse_root is not None and not has_windows_command:
-        raise PlannerError(
-            "--windows-reuse-root requires a native Windows command in the selected validation plan"
-        )
     if yolo and not has_windows_command:
         raise PlannerError(
             "--yolo requires a native Windows command in the selected validation plan"
@@ -2961,12 +2985,10 @@ def build_plan(
     if yolo:
         selection.flags.add("yolo")
         selection.warnings.append(
-            "--yolo bypasses only native Windows RAM and disk preflight floors; low resources can cause paging, out-of-memory, disk-full, or incomplete outputs, and do not trigger automatic cleanup"
+            "--yolo bypasses only native Windows RAM and disk preflight floors; it does not disable the native runtime disk abort or trigger automatic cleanup"
         )
     windows_runtime = (
-        project_windows_runtime(config, repo_root, reuse_run_root=windows_reuse_root)
-        if has_windows_command
-        else None
+        project_windows_runtime(config, repo_root) if has_windows_command else None
     )
 
     return Plan(
@@ -3777,7 +3799,9 @@ def successful_resume_source(entry: dict[str, Any] | None) -> bool:
     )
 
 
-def successful_run_entry(entry: dict[str, Any] | None) -> bool:
+def successful_entry_with_coverage(
+    entry: dict[str, Any] | None, accepted_coverage: tuple[str, ...]
+) -> bool:
     if entry is None or entry.get("status") != 0:
         return False
     if entry.get("guard_metrics_error") is not None:
@@ -3788,7 +3812,19 @@ def successful_run_entry(entry: dict[str, Any] | None) -> bool:
         return False
     if entry.get("windows_helper_summary_error") is not None:
         return False
-    return True
+    return entry.get("coverage") in accepted_coverage
+
+
+def successful_run_entry(entry: dict[str, Any] | None) -> bool:
+    return successful_entry_with_coverage(entry, ("executed", "skipped"))
+
+
+def successful_exclusion_entry(entry: dict[str, Any] | None) -> bool:
+    return (
+        successful_entry_with_coverage(entry, ("excluded",))
+        and entry is not None
+        and entry.get("coverage_source") in EXCLUSION_CLASSIFICATIONS
+    )
 
 
 def write_run_summary(receipt_dir: Path | None, summary: dict[str, Any]) -> None:
@@ -4267,14 +4303,12 @@ def verify_plan(
             continue
         if windows_executor_error is not None:
             exit_status = 2
-            if not keep_going:
-                print(
-                    f"[cargo-validate][error] stopping after failed command {index}",
-                    file=sys.stderr,
-                )
-                stopped_after_failure = True
-                break
-            continue
+            print(
+                f"[cargo-validate][error] stopping after failed command {index}",
+                file=sys.stderr,
+            )
+            stopped_after_failure = True
+            break
         if output_log_error is not None:
             exit_status = 2
             print(
@@ -4295,14 +4329,12 @@ def verify_plan(
             continue
         if windows_helper_summary_error is not None:
             exit_status = 2
-            if not keep_going:
-                print(
-                    f"[cargo-validate][error] stopping after failed command {index}",
-                    file=sys.stderr,
-                )
-                stopped_after_failure = True
-                break
-            continue
+            print(
+                f"[cargo-validate][error] stopping after failed command {index}",
+                file=sys.stderr,
+            )
+            stopped_after_failure = True
+            break
         if metrics is not None and (
             command_status == 0 or metrics.get("disk_emergency") is True
         ):
@@ -4376,10 +4408,35 @@ def verify_plan(
             write_run_entry(plan.receipt_dir, entry)
             records.append(entry)
 
+    final_candidate_identity = git_candidate_identity(repo_root)
+    final_tooling_digest = validation_tooling_digest(repo_root)
+    final_input_digest = plan_input_digest(
+        replace(plan, candidate_identity=final_candidate_identity), repo_root
+    )
+    identity_drift: dict[str, dict[str, Any]] = {}
+    for name, planned, observed in (
+        ("candidate_identity", plan.candidate_identity, final_candidate_identity),
+        ("input_digest", current_input_digest, final_input_digest),
+        ("validation_tooling_digest", tooling_digest, final_tooling_digest),
+    ):
+        if planned != observed:
+            identity_drift[name] = {"planned": planned, "observed": observed}
+    if identity_drift:
+        print(
+            "[cargo-validate][error] terminal receipt identity drift: "
+            + ", ".join(sorted(identity_drift)),
+            file=sys.stderr,
+        )
+        exit_status = 2
+
     full_coverage = (
         current_partial_mode is None
         and len(records) == len(plan.commands)
-        and all(successful_run_entry(entry) for entry in records)
+        and all(
+            successful_run_entry(entry) or successful_exclusion_entry(entry)
+            for entry in records
+        )
+        and not identity_drift
     )
     summary = {
         "schema_version": 1,
@@ -4392,6 +4449,7 @@ def verify_plan(
         "plan_id": current_plan_id,
         "input_digest": current_input_digest,
         "validation_tooling_digest": tooling_digest,
+        "identity_drift": identity_drift or None,
         "command_count": len(plan.commands),
         "command_log_dir": receipt_relative_path(
             plan.receipt_dir, plan.receipt_dir / COMMAND_LOG_DIR_NAME / run_id
@@ -4494,10 +4552,6 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
         help="add an explicit validation surface",
     )
     parser.add_argument("--mode", choices=VALID_MODES, default=default_mode)
-    parser.add_argument(
-        "--windows-reuse-root",
-        help=r"reuse an explicit native Windows workset below F:\.cache",
-    )
     parser.add_argument(
         "--yolo",
         action="store_true",
@@ -4645,7 +4699,6 @@ def main(argv: list[str]) -> int:
             receipt_dir=receipt_dir,
             telemetry_level=args.telemetry_level,
             path_evidence=path_evidence,
-            windows_reuse_root=args.windows_reuse_root,
             yolo=args.yolo,
         )
         write_plan_receipt(plan, repo_root)

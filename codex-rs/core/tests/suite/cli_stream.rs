@@ -3,19 +3,27 @@ use codex_git_utils::collect_git_info;
 use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
 use codex_login::CODEX_API_KEY_ENV_VAR;
 use codex_protocol::protocol::GitInfo;
+#[cfg(windows)]
+use codex_utils_pty::JobObject;
 use core_test_support::fs_wait;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
-use std::io;
+use std::io::Read;
+use std::io::{self};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
+use std::process::Child;
 use std::process::Command;
+use std::process::ExitStatus;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wiremock::Mock;
@@ -88,58 +96,215 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
     cmd
 }
 
-struct ChildProcessCleanupGuard(u32);
+struct ChildProcessCleanupGuard {
+    #[cfg(unix)]
+    process_group_id: Option<u32>,
+    #[cfg(windows)]
+    job: Option<JobObject>,
+}
 
-impl Drop for ChildProcessCleanupGuard {
-    fn drop(&mut self) {
+#[derive(Clone, Copy, Debug)]
+enum CliCommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+enum CliCommandEvent {
+    OutputClosed(CliCommandOutputStream),
+    OutputError(CliCommandOutputStream, io::Error),
+    Exited(io::Result<ExitStatus>),
+}
+
+impl ChildProcessCleanupGuard {
+    fn terminate(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            let _ = codex_utils_pty::process_group::kill_process_group(self.0);
+            if let Some(process_group_id) = self.process_group_id.take() {
+                let _ = codex_utils_pty::process_group::kill_process_group(process_group_id);
+            }
         }
 
         #[cfg(windows)]
         {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &self.0.to_string(), "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Some(job) = self.job.take() {
+                job.terminate()?;
+            }
         }
 
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = self.0;
+            let _ = self;
         }
+
+        Ok(())
     }
 }
 
-// Use this for new `codex exec` subprocess tests in this file. These commands
-// can spawn shell/Python grandchildren, so the timeout path must reap the whole
-// process group instead of only the direct CLI child.
-fn run_cli_command(command: &mut Command) -> io::Result<Output> {
-    #[cfg(unix)]
-    command.process_group(0);
+impl Drop for ChildProcessCleanupGuard {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
 
+#[cfg(unix)]
+fn spawn_cli_command(command: &mut Command) -> io::Result<(Child, ChildProcessCleanupGuard)> {
+    command.process_group(0);
+    let child = command.spawn()?;
+    let process_group_id = child.id();
+    Ok((
+        child,
+        ChildProcessCleanupGuard {
+            process_group_id: Some(process_group_id),
+        },
+    ))
+}
+
+#[cfg(windows)]
+fn spawn_cli_command(command: &mut Command) -> io::Result<(Child, ChildProcessCleanupGuard)> {
+    let job = JobObject::create()?;
+    let child = job.spawn_contained_std(command)?;
+    Ok((child, ChildProcessCleanupGuard { job: Some(job) }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn spawn_cli_command(command: &mut Command) -> io::Result<(Child, ChildProcessCleanupGuard)> {
+    let child = command.spawn()?;
+    Ok((child, ChildProcessCleanupGuard {}))
+}
+
+// Use this for new `codex exec` subprocess tests in this file. These commands can spawn shell/Python grandchildren, so containment must release inherited handles before output EOF waits.
+fn run_cli_command(command: &mut Command) -> io::Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = command.spawn()?;
-    let _cleanup = ChildProcessCleanupGuard(child.id());
-    let (sender, receiver) = mpsc::sync_channel(1);
+    let (mut child, mut cleanup) = spawn_cli_command(command)?;
+    let child_pid = child.id();
+    let (sender, receiver) = mpsc::channel();
+    let spawn_output_reader =
+        |reader: Box<dyn Read + Send>, stream, output: Arc<Mutex<Vec<u8>>>| {
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let mut reader = reader;
+                let mut buffer = [0; 4096];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => {
+                            let _ = sender.send(CliCommandEvent::OutputClosed(stream));
+                            break;
+                        }
+                        Ok(read) => {
+                            output
+                                .lock()
+                                .expect("output collector must not be poisoned")
+                                .extend_from_slice(&buffer[..read]);
+                        }
+                        Err(error) => {
+                            let _ = sender.send(CliCommandEvent::OutputError(stream, error));
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let _stdout_reader = spawn_output_reader(
+        Box::new(child.stdout.take().expect("stdout is piped")),
+        CliCommandOutputStream::Stdout,
+        Arc::clone(&stdout),
+    );
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let _stderr_reader = spawn_output_reader(
+        Box::new(child.stderr.take().expect("stderr is piped")),
+        CliCommandOutputStream::Stderr,
+        Arc::clone(&stderr),
+    );
+    let waiter_sender = sender.clone();
     let _waiter = thread::spawn(move || {
-        let _ = sender.send(child.wait_with_output());
+        let _ = waiter_sender.send(CliCommandEvent::Exited(child.wait()));
     });
+    drop(sender);
 
-    match receiver.recv_timeout(CLI_TIMEOUT) {
-        Ok(output) => output,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"))
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut exit_status = None;
+
+    loop {
+        if let Some(status) = exit_status
+            && stdout_closed
+            && stderr_closed
+        {
+            return Ok(Output {
+                status,
+                stdout: std::mem::take(
+                    &mut *stdout
+                        .lock()
+                        .expect("stdout collector must not be poisoned"),
+                ),
+                stderr: std::mem::take(
+                    &mut *stderr
+                        .lock()
+                        .expect("stderr collector must not be poisoned"),
+                ),
+            });
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::other("process output reader thread exited"))
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(CliCommandEvent::OutputClosed(CliCommandOutputStream::Stdout)) => {
+                stdout_closed = true;
+            }
+            Ok(CliCommandEvent::OutputClosed(CliCommandOutputStream::Stderr)) => {
+                stderr_closed = true;
+            }
+            Ok(CliCommandEvent::OutputError(stream, error)) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to read {stream:?} from CLI process: {error}"),
+                ));
+            }
+            Ok(CliCommandEvent::Exited(Ok(status))) => {
+                cleanup.terminate()?;
+                exit_status = Some(status);
+            }
+            Ok(CliCommandEvent::Exited(Err(error))) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let child_state = match exit_status {
+                    Some(status) => format!("exited with {status}"),
+                    None => "still running".to_string(),
+                };
+                let stdout_state = if stdout_closed {
+                    "closed"
+                } else {
+                    "awaiting EOF"
+                };
+                let stderr_state = if stderr_closed {
+                    "closed"
+                } else {
+                    "awaiting EOF"
+                };
+                let stdout = stdout
+                    .lock()
+                    .expect("stdout collector must not be poisoned");
+                let stderr = stderr
+                    .lock()
+                    .expect("stderr collector must not be poisoned");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "CLI process timed out after {CLI_TIMEOUT:?} (pid {child_pid}; direct child {child_state}; stdout {stdout_state}; stderr {stderr_state})\n--- stdout captured before timeout ---\n{}\n--- stderr captured before timeout ---\n{}",
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr),
+                    ),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other(format!(
+                    "CLI process readers disconnected before completion (pid {child_pid}; stdout_closed={stdout_closed}; stderr_closed={stderr_closed}; exit_status={exit_status:?})"
+                )));
+            }
         }
     }
 }

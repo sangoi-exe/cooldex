@@ -360,14 +360,11 @@ class CargoValidateTests(unittest.TestCase):
             config["commands"] = {"fixture": command}
         return config
 
-    def windows_runtime_manifest(
-        self, planner: object, *, reuse_run_root: str | None = None
-    ) -> dict[str, object]:
+    def windows_runtime_manifest(self, planner: object) -> dict[str, object]:
         return planner.project_windows_runtime(
             self.manifest_config(),
             self.repo_root,
             environ={"WSL_DISTRO_NAME": "cargo-validate-test-distro"},
-            reuse_run_root=reuse_run_root,
         )
 
     def windows_workspace_aggregate_argv(self) -> list[str]:
@@ -406,8 +403,6 @@ class CargoValidateTests(unittest.TestCase):
         planner: object,
         commands: list[object],
         receipt_dir: Path | None,
-        *,
-        reuse_run_root: str | None = None,
     ) -> object:
         return planner.Plan(
             action="verify",
@@ -423,9 +418,7 @@ class CargoValidateTests(unittest.TestCase):
             receipt_dir=receipt_dir,
             telemetry_level="full",
             candidate_identity={"head": None, "merge_head": None, "index_tree": None},
-            windows_runtime=self.windows_runtime_manifest(
-                planner, reuse_run_root=reuse_run_root
-            ),
+            windows_runtime=self.windows_runtime_manifest(planner),
         )
 
     def write_windows_manifest_fixture(self, planner: object, plan: object) -> Path:
@@ -2718,13 +2711,26 @@ class CargoValidateTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                **self.windows_runtime_config(),
+                **{
+                    key: value
+                    for key, value in self.windows_runtime_config().items()
+                    if key
+                    not in {
+                        "minimum_free_disk_gib",
+                        "minimum_available_memory_gib",
+                    }
+                },
                 "resource_contract": {
                     "resource_profile": "windows_nextest",
+                    "cold_minimum_free_disk_gib": 120,
+                    "warm_minimum_free_disk_gib": windows_profile["reserve_free_gib"],
+                    "minimum_available_memory_gib": 30,
                     "cargo_build_jobs": windows_profile["cargo_jobs_max"],
                     "nextest_test_threads": windows_profile["test_threads"],
+                    "monitor": windows_profile["monitor"],
+                    "abort_free_gib": windows_profile["abort_free_gib"],
+                    "abort_free_pct": windows_profile["abort_free_pct"],
                 },
-                "reuse_run_root": None,
                 "source_materialization": {
                     "posix_repo_root": str(self.repo_root.resolve()),
                     "wsl_distro_name": "cargo-validate-test-distro",
@@ -2747,107 +2753,57 @@ class CargoValidateTests(unittest.TestCase):
             json.loads((receipt_dir / "last-plan.json").read_text())["windows_runtime"],
         )
 
-    def test_windows_reuse_root_projects_profile_reserve_and_plan_identity(
-        self,
-    ) -> None:
-        planner = load_planner_module()
-        production_config = planner.load_config(PRODUCTION_CONFIG)
-        windows_profile = production_config["resource_profiles"]["windows_nextest"]
-        reuse_run_root = r"F:\.cache\cw\reuse-plan"
-        wsl_distro_name = os.environ.get(
-            "WSL_DISTRO_NAME", "cargo-validate-test-distro"
-        )
-        cold_runtime = planner.project_windows_runtime(
-            production_config,
-            self.repo_root,
-            environ={"WSL_DISTRO_NAME": wsl_distro_name},
-        )
-        reused_runtime = planner.project_windows_runtime(
-            production_config,
-            self.repo_root,
-            environ={"WSL_DISTRO_NAME": wsl_distro_name},
-            reuse_run_root=reuse_run_root,
-        )
-
-        self.assertIsNone(cold_runtime["reuse_run_root"])
-        self.assertEqual(120, cold_runtime["minimum_free_disk_gib"])
-        self.assertEqual(30, cold_runtime["minimum_available_memory_gib"])
-        self.assertEqual(reuse_run_root, reused_runtime["reuse_run_root"])
-        self.assertEqual(
-            windows_profile["reserve_free_gib"], reused_runtime["minimum_free_disk_gib"]
-        )
-        self.assertEqual(30, reused_runtime["minimum_available_memory_gib"])
-        self.assertEqual(
-            {
-                "resource_profile": "windows_nextest",
-                "cargo_build_jobs": 16,
-                "nextest_test_threads": 8,
-            },
-            reused_runtime["resource_contract"],
-        )
-
-        cold_plan = self.windows_verification_plan(
-            planner, [self.windows_aggregate_command(planner)], None
-        )
-        receipt_dir = self.repo_root / "windows-reuse-runtime-receipts"
-        reused_plan = self.windows_verification_plan(
-            planner,
-            [self.windows_aggregate_command(planner)],
-            receipt_dir,
-            reuse_run_root=reuse_run_root,
-        )
-        self.assertNotEqual(
-            planner.plan_resume_id(cold_plan, "tooling"),
-            planner.plan_resume_id(reused_plan, "tooling"),
-        )
-        self.assertNotEqual(
-            planner.plan_input_digest(cold_plan, self.repo_root),
-            planner.plan_input_digest(reused_plan, self.repo_root),
-        )
-        planner.write_plan_receipt(reused_plan, self.repo_root)
-        self.assertEqual(
-            reused_plan.windows_runtime,
-            json.loads((receipt_dir / "last-plan.json").read_text())["windows_runtime"],
-        )
-
-        plan = self.plan_json(
+    def test_windows_reuse_root_cli_and_manifest_field_are_rejected(self) -> None:
+        process = self.run_planner(
+            "plan",
+            "--json",
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
             "--file",
             "scripts/cargo-validate.py",
             "--mode",
             "full",
             "--windows-reuse-root",
-            reuse_run_root,
+            r"F:\.cache\cw\workset",
+            check=False,
         )
-        self.assertEqual(reused_runtime, plan["windows_runtime"])
-        self.assertIn(self.windows_workspace_aggregate_argv(), self.command_lines(plan))
+        self.assertEqual(2, process.returncode)
+        self.assertIn("unrecognized arguments: --windows-reuse-root", process.stderr)
 
-    def test_windows_reuse_root_requires_native_windows_command(self) -> None:
-        reuse_run_root = r"F:\.cache\cw\reuse-plan"
-        for action, mode in (("plan", "standard"), ("prep-plan", "full")):
-            with self.subTest(action=action, mode=mode):
-                process = self.run_planner(
-                    action,
-                    "--json",
-                    "--no-receipt",
-                    "--repo-root",
-                    str(self.repo_root),
-                    "--metadata-json",
-                    str(self.metadata_path),
-                    "--config",
-                    str(PRODUCTION_CONFIG),
-                    "--file",
-                    "scripts/cargo-validate.py",
-                    "--mode",
-                    mode,
-                    "--windows-reuse-root",
-                    reuse_run_root,
-                    check=False,
-                )
-                self.assertEqual(2, process.returncode)
-                self.assertIn(
-                    "--windows-reuse-root requires a native Windows command",
-                    process.stderr,
-                )
+        planner = load_planner_module()
+        plan = self.windows_verification_plan(
+            planner, [self.windows_aggregate_command(planner)], None
+        )
+        stale_runtime = json.loads(json.dumps(plan.windows_runtime))
+        stale_runtime["reuse_run_root"] = r"F:\.cache\cw\workset"
+        with self.assertRaises(planner.PlannerError) as context:
+            planner.validate_windows_plan_runtime(
+                replace(plan, windows_runtime=stale_runtime), self.repo_root
+            )
+        self.assertIn("unknown keys: reuse_run_root", str(context.exception))
+
+    def test_windows_runtime_manifest_rejects_abort_percentage_above_100(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        plan = self.windows_verification_plan(
+            planner, [self.windows_aggregate_command(planner)], None
+        )
+        invalid_runtime = json.loads(json.dumps(plan.windows_runtime))
+        invalid_runtime["resource_contract"]["abort_free_pct"] = 101
+        with self.assertRaises(planner.PlannerError) as context:
+            planner.validate_windows_plan_runtime(
+                replace(plan, windows_runtime=invalid_runtime), self.repo_root
+            )
+        self.assertIn(
+            "resource_contract.abort_free_pct must not exceed 100",
+            str(context.exception),
+        )
 
     def test_yolo_requires_a_native_windows_validation_plan(self) -> None:
         for action in ("prep-plan", "prep"):
@@ -2921,12 +2877,13 @@ class CargoValidateTests(unittest.TestCase):
             "--file", "scripts/cargo-validate.py", "--mode", "full", "--yolo"
         )
         self.assertIn("yolo", rendered["flags"])
-        self.assertTrue(
-            any(
-                "--yolo bypasses only native Windows RAM and disk" in warning
-                for warning in rendered["warnings"]
-            )
+        warning = next(
+            warning
+            for warning in rendered["warnings"]
+            if warning.startswith("--yolo bypasses only native Windows RAM and disk")
         )
+        self.assertIn("does not disable the native runtime disk abort", warning)
+        self.assertIn("automatic cleanup", warning)
 
     def test_normal_runs_do_not_reuse_yolo_results(self) -> None:
         planner = load_planner_module()
@@ -3024,19 +2981,6 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual("skipped", normal_only_failed_entry["coverage"])
         self.assertFalse(pwsh_argv_path.exists())
 
-    def test_windows_reuse_root_requires_an_explicit_native_workset_path(self) -> None:
-        planner = load_planner_module()
-        production_config = planner.load_config(PRODUCTION_CONFIG)
-        for reuse_run_root in (r"F:\.cache", "/home/lucas/workset"):
-            with self.subTest(reuse_run_root=reuse_run_root):
-                with self.assertRaises(planner.PlannerError):
-                    planner.project_windows_runtime(
-                        production_config,
-                        self.repo_root,
-                        environ={"WSL_DISTRO_NAME": "cargo-validate-test-distro"},
-                        reuse_run_root=reuse_run_root,
-                    )
-
     def test_windows_runtime_changes_bind_plan_identities(self) -> None:
         planner = load_planner_module()
         runtime = self.windows_runtime_manifest(planner)
@@ -3051,7 +2995,6 @@ class CargoValidateTests(unittest.TestCase):
         for field_name, value in (
             ("nextest_version", "0.9.104"),
             ("workflow_namespace", "cw-next"),
-            ("minimum_free_disk_gib", 121),
         ):
             with self.subTest(field_name=field_name):
                 changed_runtime = json.loads(json.dumps(runtime))
@@ -3067,6 +3010,17 @@ class CargoValidateTests(unittest.TestCase):
                 )
         changed_runtime = json.loads(json.dumps(runtime))
         changed_runtime["resource_contract"]["cargo_build_jobs"] += 1
+        changed_plan = replace(plan, windows_runtime=changed_runtime)
+        self.assertNotEqual(
+            base_resume_id,
+            planner.plan_resume_id(changed_plan, "tooling"),
+        )
+        self.assertNotEqual(
+            base_input_digest,
+            planner.plan_input_digest(changed_plan, self.repo_root),
+        )
+        changed_runtime = json.loads(json.dumps(runtime))
+        changed_runtime["resource_contract"]["cold_minimum_free_disk_gib"] += 1
         changed_plan = replace(plan, windows_runtime=changed_runtime)
         self.assertNotEqual(
             base_resume_id,
@@ -3131,6 +3085,21 @@ class CargoValidateTests(unittest.TestCase):
                 with self.assertRaises(planner.PlannerError):
                     planner.validate_config(invalid_config, [], self.repo_root)
 
+        profile_cases = {
+            "warm disk floor": ("reserve_free_gib", 4),
+            "runtime monitor": ("monitor", False),
+            "runtime abort disk threshold": ("abort_free_gib", 0),
+            "runtime abort percentage": ("abort_free_pct", 101),
+        }
+        for label, (field_name, value) in profile_cases.items():
+            with self.subTest(label=label):
+                invalid_config = json.loads(json.dumps(valid_config))
+                invalid_config["resource_profiles"]["windows_nextest"][field_name] = (
+                    value
+                )
+                with self.assertRaises(planner.PlannerError):
+                    planner.validate_config(invalid_config, [], self.repo_root)
+
     def test_windows_runtime_accepts_coherent_toml_pin_and_resource_changes(
         self,
     ) -> None:
@@ -3163,8 +3132,12 @@ class CargoValidateTests(unittest.TestCase):
         profile = config["resource_profiles"]["windows_nextest"]
         cargo_build_jobs = int(profile["cargo_jobs_max"]) + 1
         nextest_test_threads = int(profile["test_threads"]) + 1
-        reuse_reserve_free_gib = int(profile["reserve_free_gib"]) + 1
-        profile["reserve_free_gib"] = reuse_reserve_free_gib
+        warm_minimum_free_disk_gib = int(profile["reserve_free_gib"]) + 1
+        abort_free_gib = int(profile["abort_free_gib"]) + 1
+        abort_free_pct = 100
+        profile["reserve_free_gib"] = warm_minimum_free_disk_gib
+        profile["abort_free_gib"] = abort_free_gib
+        profile["abort_free_pct"] = abort_free_pct
         for field_name in (
             "cargo_jobs_min",
             "cargo_jobs_max",
@@ -3184,18 +3157,17 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(
             {
                 "resource_profile": "windows_nextest",
+                "cold_minimum_free_disk_gib": runtime["minimum_free_disk_gib"],
+                "warm_minimum_free_disk_gib": warm_minimum_free_disk_gib,
+                "minimum_available_memory_gib": runtime["minimum_available_memory_gib"],
                 "cargo_build_jobs": cargo_build_jobs,
                 "nextest_test_threads": nextest_test_threads,
+                "monitor": True,
+                "abort_free_gib": abort_free_gib,
+                "abort_free_pct": abort_free_pct,
             },
             projected["resource_contract"],
         )
-        reused = planner.project_windows_runtime(
-            config,
-            self.repo_root,
-            environ={"WSL_DISTRO_NAME": "cargo-validate-test-distro"},
-            reuse_run_root=r"F:\.cache\cw\reuse-plan",
-        )
-        self.assertEqual(reuse_reserve_free_gib, reused["minimum_free_disk_gib"])
 
     def test_windows_runtime_v8_version_must_match_cargo_lock(self) -> None:
         planner = load_planner_module()
@@ -3334,11 +3306,22 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(
             {
                 "resource_profile": "windows_nextest",
+                "cold_minimum_free_disk_gib": production_config["windows_runtime"][
+                    "minimum_free_disk_gib"
+                ],
+                "warm_minimum_free_disk_gib": profile["reserve_free_gib"],
+                "minimum_available_memory_gib": production_config["windows_runtime"][
+                    "minimum_available_memory_gib"
+                ],
                 "cargo_build_jobs": profile["cargo_jobs_max"],
                 "nextest_test_threads": profile["test_threads"],
+                "monitor": profile["monitor"],
+                "abort_free_gib": profile["abort_free_gib"],
+                "abort_free_pct": profile["abort_free_pct"],
             },
             planner.windows_resource_contract_from_config(
                 production_config,
+                production_config["windows_runtime"],
                 "cargo-validation.toml [resource_profiles.windows_nextest]",
             ),
         )
@@ -3686,6 +3669,7 @@ class CargoValidateTests(unittest.TestCase):
         files = (
             "codex-rs/core/Cargo.toml",
             "codex-rs/uds/Cargo.toml",
+            "codex-rs/linux-sandbox/Cargo.toml",
             "codex-rs/shell-escalation/Cargo.toml",
         )
         file_args = tuple(
@@ -3698,8 +3682,17 @@ class CargoValidateTests(unittest.TestCase):
         commands_by_mode = {
             mode: self.command_lines(plan) for mode, plan in plans.items()
         }
-        packages = ("codex-core", "codex-uds", "codex-shell-escalation")
-        wsl_runtime_packages = {"codex-uds", "codex-shell-escalation"}
+        packages = (
+            "codex-core",
+            "codex-uds",
+            "codex-linux-sandbox",
+            "codex-shell-escalation",
+        )
+        wsl_runtime_packages = {
+            "codex-uds",
+            "codex-linux-sandbox",
+            "codex-shell-escalation",
+        }
 
         for plan in plans.values():
             self.assertNotIn("wsl_runtime_packages", plan)
@@ -3754,7 +3747,14 @@ class CargoValidateTests(unittest.TestCase):
                     else self.assertNotIn
                 )
                 assertion(
-                    ["./scripts/cargo-guard.sh", "cargo", "test", "-p", package],
+                    [
+                        "./scripts/cargo-guard.sh",
+                        "cargo",
+                        "test",
+                        "-p",
+                        package,
+                        "--no-fail-fast",
+                    ],
                     full_commands,
                 )
 
@@ -3778,7 +3778,14 @@ class CargoValidateTests(unittest.TestCase):
                         package,
                         "--no-run",
                     ],
-                    ["./scripts/cargo-guard.sh", "cargo", "test", "-p", package],
+                    [
+                        "./scripts/cargo-guard.sh",
+                        "cargo",
+                        "test",
+                        "-p",
+                        package,
+                        "--no-fail-fast",
+                    ],
                 )
                 for argv in test_preparation:
                     with self.subTest(mode=mode, package=package, argv=argv):
@@ -3808,7 +3815,14 @@ class CargoValidateTests(unittest.TestCase):
                     package,
                     "--no-run",
                 ],
-                ["./scripts/cargo-guard.sh", "cargo", "test", "-p", package],
+                [
+                    "./scripts/cargo-guard.sh",
+                    "cargo",
+                    "test",
+                    "-p",
+                    package,
+                    "--no-fail-fast",
+                ],
             )
             for argv in test_preparation:
                 with self.subTest(mode="quick", package=package, argv=argv):
@@ -3963,8 +3977,9 @@ class CargoValidateTests(unittest.TestCase):
             self.assertEqual(command.classification, entry["classification"])
             self.assertEqual(command.artifact_policy, entry["artifact_policy"])
         summary = json.loads((receipt_dir / "last-run-summary.json").read_text())
+        self.assertEqual("full", summary["coverage"])
         self.assertEqual(2, summary["excluded_count"])
-        self.assertEqual(4, summary["covered_count"])
+        self.assertEqual(2, summary["covered_count"])
 
     def test_windows_executor_setup_and_summary_failures_fail_closed(self) -> None:
         planner = load_planner_module()
@@ -4289,6 +4304,80 @@ class CargoValidateTests(unittest.TestCase):
                 7, planner.verify_plan(keep_going_plan, self.repo_root, keep_going=True)
             )
         self.assertEqual("ran", wsl_log_path.read_text())
+
+        completion_unknown_receipt_dir = (
+            self.repo_root / "windows-completion-unknown-receipts"
+        )
+        completion_unknown_plan = self.windows_verification_plan(
+            planner,
+            [self.windows_aggregate_command(planner), trailing_wsl_command],
+            completion_unknown_receipt_dir,
+        )
+        self.write_windows_manifest_fixture(planner, completion_unknown_plan)
+        self.write_windows_executor_tools(summary_line="not-json")
+        wsl_log_path.unlink(missing_ok=True)
+        with (
+            mock.patch.object(
+                planner.shutil,
+                "which",
+                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+            ),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
+        ):
+            self.assertEqual(
+                2,
+                planner.verify_plan(
+                    completion_unknown_plan, self.repo_root, keep_going=True
+                ),
+            )
+        self.assertFalse(wsl_log_path.exists())
+        completion_unknown_entries = [
+            json.loads(line)
+            for line in (completion_unknown_receipt_dir / "last-run.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertIn(
+            "invalid Windows helper summary",
+            completion_unknown_entries[0]["windows_helper_summary_error"],
+        )
+        self.assertEqual(
+            "not-run-after-failure", completion_unknown_entries[1]["coverage_source"]
+        )
+
+        missing_completion_receipt_dir = (
+            self.repo_root / "windows-missing-completion-receipts"
+        )
+        missing_completion_plan = self.windows_verification_plan(
+            planner,
+            [self.windows_aggregate_command(planner), trailing_wsl_command],
+            missing_completion_receipt_dir,
+        )
+        self.write_windows_manifest_fixture(planner, missing_completion_plan)
+        wsl_log_path.unlink(missing_ok=True)
+        with mock.patch.object(planner.shutil, "which", return_value=None):
+            self.assertEqual(
+                2,
+                planner.verify_plan(
+                    missing_completion_plan, self.repo_root, keep_going=True
+                ),
+            )
+        self.assertFalse(wsl_log_path.exists())
+        missing_completion_entries = [
+            json.loads(line)
+            for line in (missing_completion_receipt_dir / "last-run.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertIn(
+            "requires PowerShell 7",
+            missing_completion_entries[0]["windows_executor_error"],
+        )
+        self.assertEqual(
+            "not-run-after-failure", missing_completion_entries[1]["coverage_source"]
+        )
 
         from_index_receipt_dir = self.repo_root / "windows-from-index-receipts"
         from_index_plan = self.windows_verification_plan(
@@ -4786,6 +4875,7 @@ class CargoValidateTests(unittest.TestCase):
     def test_final_sync_durable_path_rules_use_exact_existing_owners(self) -> None:
         paths = (
             "AGENTS.md",
+            "scripts/AGENTS.md",
             ".github/workflows/rust-release-prepare.yml",
             "scripts/check-module-bazel-lock.sh",
             "sdk/python/scripts/update_sdk_artifacts.py",
@@ -4795,7 +4885,7 @@ class CargoValidateTests(unittest.TestCase):
         )
         file_args = [argument for path in paths for argument in ("--file", path)]
 
-        for path in (paths[0], paths[1], paths[-1]):
+        for path in (paths[0], paths[1], paths[2], paths[-1]):
             with self.subTest(path=path):
                 classification_only_plan = self.plan_json(
                     "--file", path, "--mode", "standard"
@@ -4803,7 +4893,7 @@ class CargoValidateTests(unittest.TestCase):
                 self.assertEqual([path], classification_only_plan["changed_files"])
                 self.assertEqual([], self.command_lines(classification_only_plan))
 
-        schema_paths = paths[3:6]
+        schema_paths = paths[4:7]
         schema_file_args = [
             argument for path in schema_paths for argument in ("--file", path)
         ]
@@ -4813,8 +4903,8 @@ class CargoValidateTests(unittest.TestCase):
             [["just", "write-app-server-schema"]], self.command_lines(prep_plan)
         )
 
-        bazel_lock_plan = self.plan_json("--file", paths[2], "--mode", "standard")
-        self.assertEqual([paths[2]], bazel_lock_plan["changed_files"])
+        bazel_lock_plan = self.plan_json("--file", paths[3], "--mode", "standard")
+        self.assertEqual([paths[3]], bazel_lock_plan["changed_files"])
         self.assertEqual(
             [["just", "bazel-lock-check"]], self.command_lines(bazel_lock_plan)
         )
@@ -6731,6 +6821,84 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(
             ["cmd-01", "cmd-02", "cmd-01", "cmd-02"],
             command_log.read_text().splitlines(),
+        )
+
+    def test_verify_rejects_terminal_candidate_input_and_tooling_identity_drift(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        fixture_path = self.repo_root / "fixture.txt"
+        tooling_path = self.repo_root / "scripts" / "cargo-guard.sh"
+        drift_stub_path = self.repo_root / "identity-drift-stub.py"
+        receipt_dir = self.repo_root / "identity-drift-receipts"
+        fixture_path.write_text("initial fixture\n")
+        tooling_path.parent.mkdir(parents=True, exist_ok=True)
+        tooling_path.write_text("initial validation tooling\n")
+        drift_stub_path.write_text(
+            "import subprocess\n"
+            "from pathlib import Path\n"
+            f"repo_root = Path({str(self.repo_root)!r})\n"
+            "(repo_root / 'fixture.txt').write_text('changed fixture\\n')\n"
+            "(repo_root / 'scripts' / 'cargo-guard.sh').write_text('changed validation tooling\\n')\n"
+            "subprocess.run(['git', 'add', 'fixture.txt'], cwd=repo_root, check=True)\n"
+        )
+        self.init_git_repo()
+        self.commit_all("identity drift fixture")
+
+        plan = planner.Plan(
+            action="verify",
+            stage="validation",
+            mode="standard",
+            files=["fixture.txt"],
+            selected_packages=[],
+            selected_surfaces=[],
+            flags=[],
+            warnings=[],
+            commands=[
+                planner.CommandEntry(
+                    argv=(sys.executable, str(drift_stub_path)),
+                    reason="terminal identity drift fixture",
+                )
+            ],
+            manual=[],
+            receipt_dir=receipt_dir,
+            telemetry_level="full",
+            candidate_identity=planner.git_candidate_identity(self.repo_root),
+        )
+        initial_input_digest = planner.plan_input_digest(plan, self.repo_root)
+        initial_tooling_digest = planner.validation_tooling_digest(self.repo_root)
+
+        self.assertEqual(2, planner.verify_plan(plan, self.repo_root, keep_going=False))
+
+        summary = json.loads((receipt_dir / "last-run-summary.json").read_text())
+        self.assertEqual("partial", summary["coverage"])
+        self.assertEqual(2, summary["status"])
+        self.assertEqual(initial_input_digest, summary["input_digest"])
+        self.assertEqual(initial_tooling_digest, summary["validation_tooling_digest"])
+        identity_drift = summary["identity_drift"]
+        self.assertEqual(
+            {"candidate_identity", "input_digest", "validation_tooling_digest"},
+            set(identity_drift),
+        )
+        self.assertEqual(
+            plan.candidate_identity, identity_drift["candidate_identity"]["planned"]
+        )
+        self.assertNotEqual(
+            plan.candidate_identity, identity_drift["candidate_identity"]["observed"]
+        )
+        self.assertEqual(
+            initial_input_digest, identity_drift["input_digest"]["planned"]
+        )
+        self.assertNotEqual(
+            initial_input_digest, identity_drift["input_digest"]["observed"]
+        )
+        self.assertEqual(
+            initial_tooling_digest,
+            identity_drift["validation_tooling_digest"]["planned"],
+        )
+        self.assertNotEqual(
+            initial_tooling_digest,
+            identity_drift["validation_tooling_digest"]["observed"],
         )
 
     def test_verify_from_index_is_partial_and_does_not_reuse_full_summary(self) -> None:

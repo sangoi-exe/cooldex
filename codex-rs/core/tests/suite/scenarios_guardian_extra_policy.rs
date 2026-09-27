@@ -94,10 +94,7 @@ guardian_extra_policy = "Draft reminders without sending them."
         .iter()
         .find(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .context("Guardian reviewer request")?;
-    let reviewer_text = reviewer
-        .message_input_texts("developer")
-        .join("\n")
-        .replace("\r\n", "\n");
+    let reviewer_text = reviewer.instructions_text().replace("\r\n", "\n");
     assert!(
         reviewer_text.contains(
             "# Security Policy\nKeep workspace data private.\n\nDraft reminders without sending them.\n\n# Investigation Guidelines"

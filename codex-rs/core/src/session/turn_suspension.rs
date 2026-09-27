@@ -11,8 +11,8 @@ use std::time::Duration;
 use tracing::warn;
 
 // Merge-safety anchor: suspension flushes durable history, waits for compaction/recovery live
-// publication before retirement, cancels the retired task under the permit, and leaves forced
-// shutdown outside the permit.
+// publication before retirement, and only takes a still-running slot; terminal finalization
+// retains event-delivery ownership of a finishing turn. Forced shutdown stays outside the permit.
 pub(super) async fn suspend_turn_and_shutdown(
     session: &Arc<Session>,
     submission_id: String,
@@ -20,10 +20,13 @@ pub(super) async fn suspend_turn_and_shutdown(
     {
         let _persistence_guard = session.acquire_thread_settings_persistence().await;
         let active = session.active_turn.lock().await;
-        let Some(task) = active
-            .as_ref()
-            .and_then(|active_turn| active_turn.task.as_ref())
-        else {
+        let Some(active_turn) = active.as_ref() else {
+            return Ok(SuspendTurnOutcome::NotActive);
+        };
+        if active_turn.finishing {
+            return Ok(SuspendTurnOutcome::NotActive);
+        }
+        let Some(task) = active_turn.task.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
         };
         if task.kind != TaskKind::Regular {
@@ -61,6 +64,9 @@ pub(super) async fn suspend_turn_and_shutdown(
         let Some(active_turn) = active.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
         };
+        if active_turn.finishing {
+            return Ok(SuspendTurnOutcome::NotActive);
+        }
         let Some(task) = active_turn.task.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
         };

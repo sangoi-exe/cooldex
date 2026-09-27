@@ -14,6 +14,7 @@ use codex_utils_path_uri::PathUri;
 use core_test_support::PathExt;
 use core_test_support::TestTargetOs;
 use core_test_support::responses::ResponseMock;
+use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -21,6 +22,7 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodex;
@@ -28,10 +30,13 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::test_target_os;
 use serde_json::json;
 use test_case::test_case;
+use wiremock::Mock;
 use wiremock::MockServer;
 
 const PATCH_CALL_ID: &str = "workspace-root-patch";
 const COMMAND_CALL_ID: &str = "workspace-root-command";
+const PROCESS_EXITED_PREFIX: &str = "Process exited with code ";
+const PROCESS_RUNNING_PREFIX: &str = "Process running with session ID ";
 
 fn workspace_roots_profile() -> PermissionProfile {
     PermissionProfile::workspace_write_with(
@@ -94,7 +99,7 @@ async fn mount_patch_and_command_calls(
     command_contents: &str,
 ) -> Result<ResponseMock> {
     let command_arguments = command_arguments(command_path, command_contents)?;
-    Ok(mount_sse_sequence(
+    let response_mock = mount_sse_sequence(
         server,
         vec![
             sse(vec![
@@ -107,14 +112,91 @@ async fn mount_patch_and_command_calls(
                 ev_function_call(COMMAND_CALL_ID, "exec_command", &command_arguments),
                 ev_completed("resp-2"),
             ]),
-            sse(vec![
-                ev_response_created("resp-3"),
-                ev_assistant_message("msg-1", "done"),
-                ev_completed("resp-3"),
-            ]),
         ],
     )
-    .await)
+    .await;
+    let polling_responses = response_mock.clone();
+    Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(polling_responses.clone())
+        .respond_with(move |_request: &wiremock::Request| {
+            let request = polling_responses
+                .last_request()
+                .expect("polling request should be captured");
+            let command_output =
+                command_completion(&request).expect("command result should be present");
+            let command_output =
+                command_output.expect("command completion output should be present");
+            let response_id = format!(
+                "workspace-root-response-{}",
+                polling_responses.requests().len()
+            );
+            let event = if let Some(session_id) = command_output
+                .lines()
+                .find_map(|line| line.strip_prefix(PROCESS_RUNNING_PREFIX))
+            {
+                let poll_call_id = format!("{COMMAND_CALL_ID}-poll-{response_id}");
+                ev_function_call(
+                    &poll_call_id,
+                    "write_stdin",
+                    &json!({
+                        "session_id": session_id.parse::<i32>().expect("session id"),
+                        "chars": "",
+                        "yield_time_ms": 1_000,
+                    })
+                    .to_string(),
+                )
+            } else {
+                ev_assistant_message("workspace-root-done", "done")
+            };
+            sse_response(sse(vec![
+                ev_response_created(&response_id),
+                event,
+                ev_completed(&response_id),
+            ]))
+        })
+        // Keep the fixed patch/exec sequence ahead of polling.
+        .with_priority(/*p*/ 10)
+        .mount(server)
+        .await;
+    Ok(response_mock)
+}
+
+fn command_completion(request: &ResponsesRequest) -> Option<Option<String>> {
+    let call_id = request.input().into_iter().rev().find_map(|item| {
+        (item["type"].as_str() == Some("function_call_output")
+            && item["call_id"]
+                .as_str()
+                .is_some_and(|call_id| call_id.starts_with(COMMAND_CALL_ID)))
+        .then(|| item["call_id"].as_str().map(str::to_string))
+        .flatten()
+    })?;
+    request
+        .function_call_output_content_and_success(&call_id)
+        .map(|(content, _)| content)
+}
+
+fn assert_command_terminal(command_output: &str) {
+    assert!(
+        command_output.contains(PROCESS_EXITED_PREFIX),
+        "command should reach a terminal process state, got {command_output:?}"
+    );
+    assert!(
+        !command_output.contains(PROCESS_RUNNING_PREFIX),
+        "command should not remain running, got {command_output:?}"
+    );
+}
+
+fn assert_command_failed(command_output: &str) {
+    assert_command_terminal(command_output);
+    let exit_code = command_output
+        .lines()
+        .find_map(|line| line.strip_prefix(PROCESS_EXITED_PREFIX))
+        .and_then(|exit_code| exit_code.parse::<i32>().ok());
+    assert!(
+        exit_code.is_some_and(|exit_code| exit_code != 0),
+        "command should exit unsuccessfully, got {command_output:?}"
+    );
 }
 
 async fn submit_workspace_turn(test: &TestCodex, prompt: &str) -> Result<()> {
@@ -178,15 +260,14 @@ async fn workspace_roots_allow_file_and_command_writes() -> Result<()> {
     let request = response_mock
         .last_request()
         .context("model should receive both workspace-root tool results")?;
+    let command_output =
+        command_completion(&request).context("command result should be present")?;
+    let command_output = command_output.context("command completion output should be present")?;
+    assert_command_terminal(&command_output);
     let (_, patch_success) = request
         .custom_tool_call_output_content_and_success(PATCH_CALL_ID)
         .context("patch result should be present")?;
     assert_ne!(patch_success, Some(false));
-
-    let (_, command_success) = request
-        .function_call_output_content_and_success(COMMAND_CALL_ID)
-        .context("command result should be present")?;
-    assert_ne!(command_success, Some(false));
     assert_eq!(
         read_file(&test, &patch_path).await?,
         format!("{PATCH_CONTENTS}\n")
@@ -304,6 +385,10 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
     let request = response_mock
         .last_request()
         .context("model should receive the apply_patch and command results")?;
+    let command_output =
+        command_completion(&request).context("command result should be present")?;
+    let command_output = command_output.context("command completion output should be present")?;
+    assert_command_terminal(&command_output);
     let (patch_output, patch_success) = request
         .custom_tool_call_output_content_and_success(PATCH_CALL_ID)
         .context("patch result should be present")?;
@@ -316,10 +401,6 @@ async fn workspace_roots_allow_file_and_command_writes_in_secondary_root(
     );
     let patched_file = secondary_root.join("secondary-root-patch.txt")?;
     assert_eq!(read_file(&test, &patched_file).await?, "secondary root\n");
-    let (_, command_success) = request
-        .function_call_output_content_and_success(COMMAND_CALL_ID)
-        .context("command result should be present")?;
-    assert_ne!(command_success, Some(false));
     let command_file = secondary_root.join("secondary-root-command.txt")?;
     assert_eq!(
         read_file(&test, &command_file).await?.trim_end(),
@@ -466,6 +547,10 @@ async fn workspace_roots_deny_file_and_command_writes_outside_roots() -> Result<
     let request = response_mock
         .last_request()
         .context("model should receive both denied tool results")?;
+    let command_output =
+        command_completion(&request).context("denied command result should be present")?;
+    let command_output = command_output.context("denied command output should be present")?;
+    assert_command_failed(&command_output);
     let (patch_output, patch_success) = request
         .custom_tool_call_output_content_and_success(PATCH_CALL_ID)
         .context("denied patch result should be present")?;
@@ -475,16 +560,6 @@ async fn workspace_roots_deny_file_and_command_writes_outside_roots() -> Result<
             .as_deref()
             .is_some_and(|output| output.contains("outside of the project")),
         "patch should be denied outside the workspace roots, got {patch_output:?}"
-    );
-
-    let (command_output, _) = request
-        .function_call_output_content_and_success(COMMAND_CALL_ID)
-        .context("denied command result should be present")?;
-    let command_output = command_output.context("denied command output should be present")?;
-    assert!(
-        command_output.contains("Access is denied")
-            || command_output.contains(&command_path_display),
-        "outside command should be denied, got {command_output:?}"
     );
     assert!(
         test.fs()

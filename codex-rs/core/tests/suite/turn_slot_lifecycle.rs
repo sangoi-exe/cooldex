@@ -1,15 +1,34 @@
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use codex_core::config::Config;
-use codex_extension_api::ExtensionFuture;
-use codex_extension_api::ExtensionRegistryBuilder;
-use codex_extension_api::TurnLifecycleContributor;
-use codex_extension_api::TurnStopInput;
+use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::RolloutItem;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::ArchiveThreadParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::DeleteThreadParams;
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ListThreadsParams;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadByRolloutPathParams;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::StoredThread;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadPage;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreFuture;
+use codex_thread_store::UpdateThreadMetadataParams;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -21,29 +40,111 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::from_slice;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
-struct BlockFirstTurnStop {
-    blocked: AtomicBool,
-    entered_tx: async_channel::Sender<()>,
-    release_rx: async_channel::Receiver<()>,
+struct PendingAppend {
+    params: AppendThreadItemsParams,
+    complete: oneshot::Sender<()>,
 }
 
-impl TurnLifecycleContributor for BlockFirstTurnStop {
-    fn on_turn_stop<'a>(&'a self, _input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
+struct GatedAppendStore {
+    inner: InMemoryThreadStore,
+    armed: AtomicBool,
+    pending_appends: mpsc::UnboundedSender<PendingAppend>,
+}
+
+macro_rules! delegate_store_methods {
+    ($(fn $name:ident($param:ident: $params:ty) -> $result:ty;)*) => {
+        $(fn $name(&self, $param: $params) -> ThreadStoreFuture<'_, $result> {
+            ThreadStore::$name(&self.inner, $param)
+        })*
+    };
+}
+
+impl ThreadStore for GatedAppendStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    delegate_store_methods! {
+        fn create_thread(params: CreateThreadParams) -> ();
+        fn resume_thread(params: ResumeThreadParams) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: LoadThreadHistoryParams) -> StoredThreadHistory;
+        fn read_thread(params: ReadThreadParams) -> StoredThread;
+        fn read_thread_by_rollout_path(params: ReadThreadByRolloutPathParams) -> StoredThread;
+        fn list_threads(params: ListThreadsParams) -> ThreadPage;
+        fn archive_thread(params: ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: ArchiveThreadParams) -> StoredThread;
+        fn delete_thread(params: DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+
+    fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            if self.blocked.swap(true, Ordering::SeqCst) {
-                return;
+            if is_deferred_mailbox_append(&params) && self.armed.swap(false, Ordering::SeqCst) {
+                let (complete, completed) = oneshot::channel();
+                self.pending_appends
+                    .send(PendingAppend {
+                        params: params.clone(),
+                        complete,
+                    })
+                    .expect("append receiver should remain open");
+                completed.await.expect("test should complete append");
             }
-            self.entered_tx
-                .send(())
-                .await
-                .expect("turn-stop observer should remain open");
-            self.release_rx
-                .recv()
-                .await
-                .expect("turn-stop hook should be released");
+            self.inner.append_items(params).await
         })
     }
+
+    fn update_thread_metadata(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
+        self.inner.update_thread_metadata(params)
+    }
+
+    fn record_thread_metadata(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { self.inner.update_thread_metadata(params).await.map(|_| ()) })
+    }
+
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        context: PersistContext,
+    ) -> ThreadStoreFuture<'_, ()> {
+        self.inner.persist_thread(thread_id, context)
+    }
+}
+
+fn is_late_mailbox_response_item(item: &RolloutItem) -> bool {
+    matches!(
+        item,
+        RolloutItem::ResponseItem(envelope)
+            if matches!(
+                &envelope.item,
+                ResponseItem::AgentMessage { content, .. }
+                    if content.iter().any(|item| matches!(
+                        item,
+                        AgentMessageInputContent::InputText { text } if text == "late mailbox input"
+                    ))
+            )
+    )
+}
+
+fn is_deferred_mailbox_append(params: &AppendThreadItemsParams) -> bool {
+    params.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::InterAgentCommunicationMetadata {
+                trigger_turn: false
+            }
+        )
+    }) && params.items.iter().any(is_late_mailbox_response_item)
 }
 
 fn chunk(event: Value) -> StreamingSseChunk {
@@ -89,22 +190,28 @@ async fn submit_user_input(codex: &codex_core::CodexThread, text: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
-    let (stop_entered_tx, stop_entered_rx) = async_channel::bounded(1);
-    let (stop_release_tx, stop_release_rx) = async_channel::bounded(1);
-    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    extensions.turn_lifecycle_contributor(Arc::new(BlockFirstTurnStop {
-        blocked: AtomicBool::new(false),
-        entered_tx: stop_entered_tx,
-        release_rx: stop_release_rx,
-    }));
+    let (first_complete, first_completion) = oneshot::channel();
     let (server, _completions) = start_streaming_sse_server(vec![
-        response_chunks("resp-first", "msg-first", "first answer"),
+        vec![
+            chunk(ev_response_created("resp-first")),
+            chunk(ev_assistant_message("msg-first", "first answer")),
+            StreamingSseChunk {
+                gate: Some(first_completion),
+                body: sse(vec![ev_completed("resp-first")]),
+            },
+        ],
         response_chunks("resp-second", "msg-second", "second answer"),
     ])
     .await;
+    let (pending_appends, mut append_requests) = mpsc::unbounded_channel();
+    let store = Arc::new(GatedAppendStore {
+        inner: InMemoryThreadStore::default(),
+        armed: AtomicBool::new(false),
+        pending_appends,
+    });
     let codex = test_codex()
         .with_model("gpt-5.4")
-        .with_extensions(Arc::new(extensions.build()))
+        .with_thread_store(store.clone())
         .build_with_streaming_server(&server)
         .await
         .expect("build streaming Codex test session")
@@ -118,10 +225,33 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
         )
     })
     .await;
-    tokio::time::timeout(Duration::from_secs(2), stop_entered_rx.recv())
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "late mailbox input".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            start_options: Default::default(),
+        })
         .await
-        .expect("first turn should enter terminal transition")
-        .expect("turn-stop observer should remain open");
+        .expect("submit queue-only mailbox input");
+    store.armed.store(true, Ordering::SeqCst);
+    first_complete
+        .send(())
+        .expect("first response completion should remain gated");
+    // Completion persists deferred mailbox mail after the active slot enters terminal
+    // finalization, before terminal lifecycle delivery can emit TurnComplete.
+    let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
+        .await
+        .expect("terminal transition should persist queued mail")
+        .expect("append observer should remain open");
+    assert!(
+        is_deferred_mailbox_append(&pending_append.params),
+        "gate must pause the deferred queue-only mailbox append"
+    );
 
     let second_submit = tokio::spawn({
         let codex = Arc::clone(&codex);
@@ -139,10 +269,10 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
         "fresh submit must not start while the prior turn is transitioning"
     );
 
-    stop_release_tx
+    pending_append
+        .complete
         .send(())
-        .await
-        .expect("turn-stop hook should still be waiting");
+        .expect("terminal append should still be waiting");
     second_submit
         .await
         .expect("second submit task should finish after the transition");
@@ -188,6 +318,50 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
         message_input_texts(&second_request, "user")
             .iter()
             .filter(|text| text.as_str() == "second prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        second_request["input"]
+            .as_array()
+            .expect("second request input")
+            .iter()
+            .filter(|item| {
+                item["type"] == "agent_message"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|content| {
+                            content["type"] == "input_text"
+                                && content["text"] == "late mailbox input"
+                        })
+                    })
+            })
+            .count(),
+        1
+    );
+    let history = codex
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load thread history");
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_late_mailbox_response_item(item))
+            .count(),
+        1
+    );
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::InterAgentCommunicationMetadata {
+                        trigger_turn: false
+                    }
+                )
+            })
             .count(),
         1
     );

@@ -460,6 +460,7 @@ mod tests {
             post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         });
         let second = RolloutItem::Compacted(CompactedItem {
             message: "second".to_string(),
@@ -474,6 +475,7 @@ mod tests {
             post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         });
         store
             .append_items(AppendThreadItemsParams {
@@ -543,6 +545,7 @@ mod tests {
             post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         });
 
         live_thread
@@ -598,6 +601,7 @@ mod tests {
             post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         });
 
         live_thread
@@ -640,6 +644,7 @@ mod tests {
             post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         });
 
         live_thread

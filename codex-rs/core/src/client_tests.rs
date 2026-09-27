@@ -894,8 +894,10 @@ fn test_session_telemetry() -> SessionTelemetry {
 #[test]
 fn prompt_max_output_tokens_is_propagated_and_participates_in_websocket_reuse() {
     let client = test_model_client(SessionSource::Cli);
-    let mut prompt = Prompt::default();
-    prompt.max_output_tokens = Some(128);
+    let prompt = Prompt {
+        max_output_tokens: Some(128),
+        ..Default::default()
+    };
     let responses_metadata = test_responses_metadata_for_client(
         &client,
         /*turn_id*/ None,
@@ -911,6 +913,7 @@ fn prompt_max_output_tokens_is_propagated_and_participates_in_websocket_reuse() 
             codex_protocol::config_types::ReasoningSummary::None,
             /*service_tier*/ None,
             &responses_metadata,
+            /*include_internal*/ false,
         )
         .expect("build responses request");
 
@@ -980,6 +983,7 @@ fn maintenance_session_keeps_websocket_and_turn_state_isolated() {
                 /*parent_thread_id*/ None,
                 TestCodexResponsesRequestKind::Turn,
             ),
+            /*include_internal*/ false,
         )
         .expect("build cached responses request");
     {

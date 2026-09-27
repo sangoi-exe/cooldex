@@ -6,6 +6,8 @@ use crate::TerminalSize;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
 use std::collections::HashMap;
+use std::io::BufRead as _;
+use std::io::Read as _;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::OwnedHandle;
@@ -238,6 +240,59 @@ async fn contained_spawn_owns_immediate_descendant() -> anyhow::Result<()> {
 
     job.terminate()?;
     tokio::time::timeout(Duration::from_secs(10), root.wait()).await??;
+    Ok(())
+}
+
+#[test]
+fn contained_std_spawn_releases_inherited_pipes_after_root_exit() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping Windows standard contained-spawn test");
+        return Ok(());
+    };
+
+    let mut command = std::process::Command::new(python);
+    command
+        .args([
+            "-u",
+            "-c",
+            "import subprocess,sys,time; subprocess.Popen([sys.executable,'-u','-c','import time; time.sleep(60)']); print('__CODEX_CHILD_READY__',flush=True)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let job = crate::JobObject::create()?;
+    let mut root = job.spawn_contained_std(&mut command)?;
+    let stdout = root
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing contained standard process stdout"))?;
+    let mut stdout = std::io::BufReader::new(stdout);
+    let mut ready = String::new();
+    stdout.read_line(&mut ready)?;
+    assert_eq!(ready.trim(), READY_MARKER);
+    assert!(
+        root.wait()?.success(),
+        "contained standard root did not exit normally"
+    );
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut trailing_output = String::new();
+        let _ = sender.send(stdout.read_to_string(&mut trailing_output));
+    });
+    job.terminate()?;
+    let read_result = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "contained standard descendant retained inherited stdout after cleanup: {error}"
+            )
+        })?;
+    reader
+        .join()
+        .expect("contained standard stdout reader must not panic");
+    read_result?;
     Ok(())
 }
 

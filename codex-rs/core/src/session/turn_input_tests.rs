@@ -353,7 +353,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
         }
     );
     assert_eq!(session.thread_settings_snapshot().await, desired_settings);
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
 
     session
         .update_settings(SessionSettingsUpdate {
@@ -382,7 +382,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
         CodexErrorDetails::InvalidRequest(_)
     ));
     assert_eq!(session.thread_settings_snapshot().await, desired_settings);
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
     assert_eq!(
         Vec::<TurnInput>::new(),
         session
@@ -628,7 +628,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
             .expect("automatic admission should return a typed rejection");
         assert!(outcome.is_none());
         assert_eq!(session.thread_settings_snapshot().await, desired_settings);
-        assert!(session.active_turn.lock().await.is_idle());
+        assert!(session.active_turn.lock().await.is_none());
         assert_eq!(
             session.services.turn_environments.selections(),
             original_environments
@@ -729,7 +729,7 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
         }]
     );
     assert_eq!(session.thread_settings_snapshot().await, desired_settings);
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
     assert_eq!(
         session
             .input_queue
@@ -802,7 +802,7 @@ async fn start_only_rejects_empty_user_input_in_plan_mode() {
         },
         submission
     );
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -840,7 +840,7 @@ async fn start_only_rejects_pending_trigger_turn_without_injecting() {
         },
         submission
     );
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
     assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
     assert_eq!(session.collaboration_mode().await.mode, ModeKind::Plan);
 }

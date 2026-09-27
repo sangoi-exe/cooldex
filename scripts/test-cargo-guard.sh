@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Merge-safety anchor: this harness protects the cargo-guard shell contract without invoking real Cargo.
+# Merge-safety anchor: this harness protects the cargo-guard shell contract, including workflow admission, without invoking real Cargo.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "${REPO_ROOT}"
@@ -20,6 +20,7 @@ trap cleanup EXIT INT TERM HUP
 
 FAKE_BIN="${TMP_ROOT}/bin"
 mkdir -p -- "${FAKE_BIN}"
+REAL_PYTHON3="$(command -v python3)"
 
 cat >"${FAKE_BIN}/cargo" <<'EOF_FAKE_CARGO'
 #!/usr/bin/env bash
@@ -90,6 +91,13 @@ case "${subcommand}" in
             telemetry_parent="$(dirname -- "${CARGO_GUARD_TELEMETRY_PATH}")"
             rm -rf -- "${telemetry_parent}"
             : >"${telemetry_parent}"
+        fi
+        if [[ "${FAKE_CARGO_NESTED_GUARD:-0}" == "1" ]]; then
+            nested_guard_path="${FAKE_CARGO_GUARD_PATH:?FAKE_CARGO_GUARD_PATH is required}"
+            nested_output="${FAKE_CARGO_NESTED_OUTPUT:?FAKE_CARGO_NESTED_OUTPUT is required}"
+            if ! FAKE_CARGO_NESTED_GUARD=0 "${nested_guard_path}" cargo check -p codex-protocol >"${nested_output}" 2>&1; then
+                exit 86
+            fi
         fi
         if [[ -n "${FAKE_CARGO_COMMAND_SLEEP:-}" ]]; then
             sleep "${FAKE_CARGO_COMMAND_SLEEP}"
@@ -171,9 +179,25 @@ printf '%s\n' "${FAKE_NPROC_VALUE:-28}"
 EOF_FAKE_NPROC
 
 chmod +x "${FAKE_BIN}/cargo" "${FAKE_BIN}/df" "${FAKE_BIN}/stat" "${FAKE_BIN}/ps" "${FAKE_BIN}/nproc"
-export PATH="${FAKE_BIN}:${PATH}"
+cat >"${FAKE_BIN}/python3" <<'EOF_FAKE_PYTHON3'
+#!/usr/bin/env bash
+set -euo pipefail
 
-for fake_command in cargo df stat ps nproc; do
+if [[ "${FAKE_PYTHON_PLANNER_MODE:-}" == "nested" && "${1:-}" == "${FAKE_CARGO_VALIDATE_PATH:-}" ]]; then
+    nested_output="${FAKE_PYTHON_PLANNER_NESTED_OUTPUT:?FAKE_PYTHON_PLANNER_NESTED_OUTPUT is required}"
+    if ! bash -c 'fd="${CARGO_GUARD_WORKFLOW_ADMISSION_FD:?CARGO_GUARD_WORKFLOW_ADMISSION_FD is required}"; eval "exec ${fd}>&-"; exec "${FAKE_CARGO_GUARD_PATH:?FAKE_CARGO_GUARD_PATH is required}" cargo check -p codex-protocol' >"${nested_output}" 2>&1; then
+        exit 86
+    fi
+    exit 0
+fi
+
+exec "${REAL_PYTHON3:?REAL_PYTHON3 is required}" "$@"
+EOF_FAKE_PYTHON3
+chmod +x "${FAKE_BIN}/python3"
+export PATH="${FAKE_BIN}:${PATH}"
+export REAL_PYTHON3
+
+for fake_command in cargo df stat ps nproc python3; do
     if [[ "$(command -v "${fake_command}")" != "${FAKE_BIN}/${fake_command}" ]]; then
         echo "fake ${fake_command} is not first in PATH" >&2
         exit 1
@@ -188,6 +212,7 @@ CURRENT_BUILD_DIR=""
 CURRENT_SEQUENCE_FILE=""
 CURRENT_MEMINFO=""
 CURRENT_HISTORY=""
+CURRENT_HOME=""
 
 fail() {
     echo "[test-cargo-guard][FAIL] $*" >&2
@@ -214,6 +239,7 @@ begin_case() {
     CURRENT_SEQUENCE_FILE="${case_dir}/df-sequence"
     CURRENT_MEMINFO="${case_dir}/meminfo"
     CURRENT_HISTORY="${case_dir}/history.jsonl"
+    CURRENT_HOME="${case_dir}/home"
     : >"${CURRENT_LOG}"
     : >"${CURRENT_OUT}"
     : >"${CURRENT_SEQUENCE_FILE}"
@@ -229,7 +255,12 @@ begin_case() {
     export FAKE_NPROC_VALUE=28
     export CARGO_GUARD_MEMINFO_PATH="${CURRENT_MEMINFO}"
     export CARGO_GUARD_HISTORY_PATH="${CURRENT_HISTORY}"
+    export FAKE_CARGO_GUARD_PATH="${REPO_ROOT}/scripts/cargo-guard.sh"
+    export FAKE_CARGO_VALIDATE_PATH="${REPO_ROOT}/scripts/cargo-validate.py"
+    export HOME="${CURRENT_HOME}"
     unset FAKE_CARGO_COMMAND_STATUS FAKE_CARGO_COMMAND_SLEEP FAKE_CARGO_CLEAN_STATUS FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE FAKE_CARGO_BREAK_TELEMETRY_AFTER_START
+    unset FAKE_CARGO_NESTED_GUARD FAKE_CARGO_NESTED_OUTPUT
+    unset FAKE_PYTHON_PLANNER_MODE FAKE_PYTHON_PLANNER_NESTED_OUTPUT
     unset FAKE_PS_FORCE_BAD_PGID FAKE_PS_FAIL_PROCESS_LIST
     unset FAKE_CARGO_DESCENDANT_FILE FAKE_PS_PGID_SEQUENCE_FILE FAKE_PS_PROCESS_LIST_FILE
     unset RUST_MIN_STACK RUST_TEST_THREADS NEXTEST_TEST_THREADS CARGO_BUILD_JOBS CARGO_TARGET_DIR CARGO_GUARD_RESOURCE_PROFILE NEXTEST_PROFILE
@@ -240,6 +271,7 @@ begin_case() {
     unset CARGO_GUARD_METRICS_PATH CARGO_GUARD_COMMAND_FINGERPRINT
     unset CARGO_GUARD_TELEMETRY_LEVEL CARGO_GUARD_TELEMETRY_PATH
     unset CARGO_GUARD_NPROC_CMD
+    unset CARGO_GUARD_WORKFLOW_ADMISSION_FD CARGO_GUARD_WORKFLOW_ADMISSION_OWNER_PID CARGO_GUARD_WORKFLOW_ADMISSION_LOCK_PATH
 }
 
 set_df_sequence() {
@@ -416,6 +448,26 @@ wait_for_file() {
     fail "timed out waiting for ${file}"
 }
 
+wait_for_pattern() {
+    local file="$1"
+    local pattern="$2"
+    local attempt
+    for attempt in $(seq 1 100); do
+        if grep -Eq -- "${pattern}" "${file}"; then
+            return
+        fi
+        sleep 0.05
+    done
+    fail "timed out waiting for ${file} to contain ${pattern}"
+}
+
+assert_path_absent() {
+    local path="$1"
+    if [[ -e "${path}" ]]; then
+        fail "expected path to be absent: ${path}"
+    fi
+}
+
 begin_case
 expect_ok --help
 assert_file_contains "${CURRENT_OUT}" '--range BASE[.][.]HEAD'
@@ -459,6 +511,55 @@ assert payload["telemetry_level"] == "full"
 assert payload["changed_files"] == ["justfile"]
 assert any(command["argv"] == ["just", "--summary"] for command in payload["commands"])
 PY
+assert_file_empty "${CURRENT_LOG}"
+assert_path_absent "${HOME}/.cache/codex/cw/cargo-guard-execution.lock"
+
+begin_case
+export FAKE_CARGO_NESTED_GUARD=1
+export FAKE_CARGO_NESTED_OUTPUT="${TMP_ROOT}/nested-guard.log"
+expect_ok cargo check -p codex-core
+assert_file_contains "${FAKE_CARGO_NESTED_OUTPUT}" 'workflow admission reused by nested guarded command'
+assert_file_contains "${CURRENT_LOG}" 'args=check -p codex-core '
+assert_file_contains "${CURRENT_LOG}" 'args=check -p codex-protocol '
+
+begin_case
+export FAKE_PYTHON_PLANNER_MODE=nested
+export FAKE_PYTHON_PLANNER_NESTED_OUTPUT="${TMP_ROOT}/verify-nested-guard.log"
+expect_ok verify --file scripts/cargo-guard.sh --mode standard --no-receipt
+assert_file_contains "${FAKE_PYTHON_PLANNER_NESTED_OUTPUT}" 'workflow admission reused by nested guarded command'
+assert_file_contains "${CURRENT_LOG}" 'args=check -p codex-protocol '
+
+begin_case
+first_output="${CURRENT_OUT}"
+first_log="${CURRENT_LOG}"
+export FAKE_CARGO_COMMAND_SLEEP=3
+./scripts/cargo-guard.sh cargo check -p codex-core >"${first_output}" 2>&1 &
+first_guard_pid="$!"
+EXTRA_PIDS+=("${first_guard_pid}")
+wait_for_pattern "${first_log}" 'args=check -p codex-core '
+planner_output="${TMP_ROOT}/plan-during-admission.out"
+if ! ./scripts/cargo-guard.sh plan --file justfile --mode standard --json --no-receipt --config "${json_config}" --metadata-json "${json_metadata}" >"${planner_output}" 2>&1; then
+    fail "expected read-only plan to remain unblocked by workflow admission"
+fi
+assert_file_contains "${planner_output}" '"action": "plan"'
+second_output="${TMP_ROOT}/concurrent-guard.out"
+second_log="${TMP_ROOT}/concurrent-guard.log"
+: >"${second_log}"
+if env HOME="${HOME}" FAKE_CARGO_LOG="${second_log}" FAKE_CARGO_TARGET_DIR_JSON="${TMP_ROOT}/concurrent-target" FAKE_CARGO_BUILD_DIR_JSON="${TMP_ROOT}/concurrent-target" FAKE_DF_DEFAULT_GIB="${FAKE_DF_DEFAULT_GIB}" FAKE_DF_TOTAL_GIB="${FAKE_DF_TOTAL_GIB}" FAKE_DF_SEQUENCE_FILE="${CURRENT_SEQUENCE_FILE}" FAKE_STAT_TARGET_PATH="${TMP_ROOT}/concurrent-target" FAKE_NPROC_VALUE="${FAKE_NPROC_VALUE}" CARGO_GUARD_MEMINFO_PATH="${CURRENT_MEMINFO}" CARGO_GUARD_HISTORY_PATH="${TMP_ROOT}/concurrent-history.jsonl" PATH="${PATH}" ./scripts/cargo-guard.sh cargo check -p codex-protocol >"${second_output}" 2>&1; then
+    fail "expected concurrently admitted guard to fail"
+fi
+assert_file_contains "${second_output}" 'another supported guarded Cargo/Nextest execution is already admitted'
+assert_file_empty "${second_log}"
+if ! wait "${first_guard_pid}"; then
+    fail "expected first admitted guard to succeed"
+fi
+
+begin_case
+export CARGO_GUARD_WORKFLOW_ADMISSION_FD=999
+export CARGO_GUARD_WORKFLOW_ADMISSION_OWNER_PID="$$"
+export CARGO_GUARD_WORKFLOW_ADMISSION_LOCK_PATH="${HOME}/.cache/codex/cw/cargo-guard-execution.lock"
+expect_fail cargo check -p codex-core
+assert_file_contains "${CURRENT_OUT}" 'received invalid inherited workflow admission'
 assert_file_empty "${CURRENT_LOG}"
 
 begin_case

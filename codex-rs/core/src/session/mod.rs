@@ -2096,7 +2096,9 @@ impl Session {
                 text: configuration.base_instructions.clone(),
                 provenance: state.base_instructions_provenance.clone(),
             },
-            configuration.developer_instructions.clone(),
+            thread_settings
+                .developer_instructions
+                .expect("fresh V2 identity snapshot must capture developer instructions"),
             thread_settings.service_tier.clone(),
             Some(
                 thread_settings
@@ -2125,14 +2127,66 @@ impl Session {
         )
     }
 
-    /// Freezes the invoking step's typed full-history usage hint with the parent birth identity.
+    // Merge-safety anchor: full-history V2 children freeze the invoking step's effective model
+    // identity while retaining the durable parent birth binding.
+    /// Freezes the invoking step's complete identity with the parent birth binding.
+    #[expect(
+        clippy::expect_used,
+        reason = "full-history V2 identity snapshots must fail loud if required birth-identity fields are absent"
+    )]
     pub(crate) async fn full_history_agent_identity_snapshot(
         &self,
         step_context: &StepContext,
     ) -> AgentIdentitySnapshot {
-        self.agent_identity_snapshot().await.for_full_history(
-            multi_agents::usage_hint_text_for_identity_snapshot(step_context),
+        let state = self.state.lock().await;
+        let configuration = &state.session_configuration;
+        let thread_settings = configuration.thread_settings_snapshot(&configuration.environments);
+        AgentIdentitySnapshot::capture(
+            configuration.session_source.get_agent_role(),
+            thread_settings.model_provider_id.clone(),
+            configuration
+                .original_config_do_not_use
+                .model_provider
+                .clone(),
+            step_context.settings.model_info.slug.clone(),
+            step_context.settings.effective_reasoning_effort(),
+            Some(step_context.settings.reasoning_summary),
+            BaseInstructions {
+                text: configuration.base_instructions.clone(),
+                provenance: state.base_instructions_provenance.clone(),
+            },
+            thread_settings
+                .developer_instructions
+                .expect("full-history V2 identity snapshot must capture developer instructions"),
+            step_context.settings.service_tier.clone(),
+            Some(
+                thread_settings
+                    .shell_tool_enabled
+                    .expect("full-history V2 identity snapshot must capture shell-tool state"),
+            ),
+            thread_settings
+                .agent_role_feature_opt_outs
+                .expect("full-history V2 identity snapshot must capture role feature opt-outs"),
+            thread_settings
+                .agent_role_skill_restrictions
+                .expect("full-history V2 identity snapshot must capture role skill restrictions"),
+            thread_settings
+                .model_context_window
+                .expect("full-history V2 identity snapshot must capture model context window"),
+            thread_settings
+                .model_auto_compact_token_limit
+                .expect("full-history V2 identity snapshot must capture auto-compaction limit"),
+            thread_settings.model_auto_compact_token_limit_scope.expect(
+                "full-history V2 identity snapshot must capture auto-compaction limit scope",
+            ),
+            configuration
+                .original_config_do_not_use
+                .agent_usage_hint_binding
+                .clone(),
         )
+        .for_full_history(multi_agents::usage_hint_text_for_identity_snapshot(
+            step_context,
+        ))
     }
 
     pub(crate) async fn restorable_thread_settings(&self) -> CodexThreadSettingsOverrides {
@@ -3958,10 +4012,14 @@ impl Session {
                 self.services.turn_environments.snapshot(),
             )
         };
-        if matches!(
-            turn_context.session_source,
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-        ) {
+        // Merge-safety anchor: V2 thread-spawn children retain their resolved birth identity;
+        // only legacy child requests inherit the root's current routing tier.
+        if turn_context.multi_agent_version != MultiAgentVersion::V2
+            && matches!(
+                turn_context.session_source,
+                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+            )
+        {
             let root_service_tier = self.services.agent_control.root_service_tier();
             if settings.selected().service_tier != root_service_tier {
                 let mut selected = settings.selected().clone();
@@ -5395,96 +5453,110 @@ impl Session {
             SubmittedTurnInput::UserInput { content, .. } => content.clone(),
             _ => Vec::new(),
         };
-        let active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(retained_input));
-        };
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(retained_input));
-        };
-        let active_turn_id = active_task.turn_context.sub_id.clone();
-        if let Some(expected_turn_id) = expected_turn_id
-            && expected_turn_id != active_turn_id
-        {
-            return Err(SteerInputError::ExpectedTurnMismatch {
-                expected: expected_turn_id.to_string(),
-                actual: active_turn_id,
-            });
-        }
-        match active_task.kind {
-            crate::state::TaskKind::Regular => {}
-            crate::state::TaskKind::Review => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Review,
-                });
+        loop {
+            let active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_ref() else {
+                return Err(SteerInputError::NoActiveTurn(retained_input));
+            };
+            let Some(active_task) = active_turn.task.as_ref() else {
+                return Err(SteerInputError::NoActiveTurn(retained_input));
+            };
+            // Merge-safety anchor: terminal slots remain non-admittable until their task
+            // notifies retirement, so a fresh input cannot overtake the terminal event.
+            if active_turn.finishing {
+                let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
+                let _ = done.as_mut().enable();
+                drop(active);
+                done.await;
+                continue;
             }
-            crate::state::TaskKind::Compact => {
-                return Err(SteerInputError::ActiveTurnNotSteerable {
-                    turn_kind: NonSteerableTurnKind::Compact,
-                });
-            }
-        }
-        if matches!(input, SubmittedTurnInput::UserInput { content, .. } if content.is_empty()) {
-            return Err(SteerInputError::EmptyInput);
-        }
-        if let Some(required_schema) = required_final_output_json_schema
-            && active_task.turn_context.final_output_json_schema.as_ref() != Some(required_schema)
-        {
-            return Err(SteerInputError::ActiveTurnOutputSchemaMismatch);
-        }
-        let (turn_input, client_user_message_id) = match input {
-            SubmittedTurnInput::UserInput { content, client_id } => {
-                active_task
-                    .turn_context
-                    .session_telemetry
-                    .user_prompt(content);
-                let client_id = client_id.clone();
-                (
-                    TurnInput::UserInput {
-                        content: std::mem::take(content),
-                        client_id: client_id.clone(),
-                        acceptance_order: self.reserve_user_input_order().await,
-                    },
-                    client_id,
-                )
-            }
-            SubmittedTurnInput::ResponseItem(item)
-                if matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) =>
+            let active_turn_id = active_task.turn_context.sub_id.clone();
+            if let Some(expected_turn_id) = expected_turn_id
+                && expected_turn_id != active_turn_id
             {
-                let mut item = item.clone();
-                Self::assign_missing_response_item_id(&mut item);
-                (
-                    TurnInput::FunctionCallOutput(ResponseItemEnvelope::new(item)),
-                    None,
-                )
+                return Err(SteerInputError::ExpectedTurnMismatch {
+                    expected: expected_turn_id.to_string(),
+                    actual: active_turn_id,
+                });
             }
-            _ => return Err(SteerInputError::EmptyInput),
-        };
-        if active_task
-            .turn_context
-            .turn_metadata_state
-            .root_turn_id()
-            .is_none()
-            && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
-        {
-            active_task
+            match active_task.kind {
+                crate::state::TaskKind::Regular => {}
+                crate::state::TaskKind::Review => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Review,
+                    });
+                }
+                crate::state::TaskKind::Compact => {
+                    return Err(SteerInputError::ActiveTurnNotSteerable {
+                        turn_kind: NonSteerableTurnKind::Compact,
+                    });
+                }
+            }
+            if matches!(input, SubmittedTurnInput::UserInput { content, .. } if content.is_empty())
+            {
+                return Err(SteerInputError::EmptyInput);
+            }
+            if let Some(required_schema) = required_final_output_json_schema
+                && active_task.turn_context.final_output_json_schema.as_ref()
+                    != Some(required_schema)
+            {
+                return Err(SteerInputError::ActiveTurnOutputSchemaMismatch);
+            }
+            let (turn_input, client_user_message_id) = match input {
+                SubmittedTurnInput::UserInput { content, client_id } => {
+                    active_task
+                        .turn_context
+                        .session_telemetry
+                        .user_prompt(content);
+                    let client_id = client_id.clone();
+                    (
+                        TurnInput::UserInput {
+                            content: std::mem::take(content),
+                            client_id: client_id.clone(),
+                            acceptance_order: self.reserve_user_input_order().await,
+                        },
+                        client_id,
+                    )
+                }
+                SubmittedTurnInput::ResponseItem(item)
+                    if matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) =>
+                {
+                    let mut item = item.clone();
+                    Self::assign_missing_response_item_id(&mut item);
+                    (
+                        TurnInput::FunctionCallOutput(ResponseItemEnvelope::new(item)),
+                        None,
+                    )
+                }
+                _ => return Err(SteerInputError::EmptyInput),
+            };
+            if active_task
                 .turn_context
                 .turn_metadata_state
-                .set_root_turn_id(incoming_root_turn_id);
+                .root_turn_id()
+                .is_none()
+                && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
+            {
+                active_task
+                    .turn_context
+                    .turn_metadata_state
+                    .set_root_turn_id(incoming_root_turn_id);
+            }
+            let active_turn_context = Arc::clone(&active_task.turn_context);
+            let turn_state = Arc::clone(&active_turn.turn_state);
+            drop(active);
+            return self
+                .queue_turn_input(
+                    active_turn_context,
+                    turn_state,
+                    turn_input,
+                    additional_context,
+                    client_user_message_id,
+                    responsesapi_client_metadata,
+                    retained_input,
+                )
+                .await;
         }
-        let active_turn_context = Arc::clone(&active_task.turn_context);
-        let turn_state = Arc::clone(&active_turn.turn_state);
-        drop(active);
-        self.queue_turn_input(
-            active_turn_context,
-            turn_state,
-            turn_input,
-            additional_context,
-            client_user_message_id,
-            responsesapi_client_metadata,
-            retained_input,
-        )
-        .await
     }
 
     #[expect(
@@ -5510,11 +5582,23 @@ impl Session {
             state.additional_context.merge(additional_context)
         };
         let active = self.active_turn.lock().await;
+        if let Some(active_task) = active
+            .as_ref()
+            .filter(|active_turn| active_turn.finishing)
+            .and_then(|active_turn| active_turn.task.as_ref())
+        {
+            let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
+            let _ = done.as_mut().enable();
+            drop(active);
+            done.await;
+            return Err(SteerInputError::NoActiveTurn(retained_input));
+        }
         if !active.as_ref().is_some_and(|active_turn| {
-            active_turn.task.as_ref().is_some_and(|task| {
-                Arc::ptr_eq(&task.turn_context, &active_turn_context)
-                    && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
+            !active_turn.finishing
+                && active_turn.task.as_ref().is_some_and(|task| {
+                    Arc::ptr_eq(&task.turn_context, &active_turn_context)
+                        && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+                })
         }) {
             return Err(SteerInputError::NoActiveTurn(retained_input));
         }

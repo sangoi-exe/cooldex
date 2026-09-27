@@ -3839,6 +3839,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::RealtimeItem(_)
+        | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::EventMsg(_) => None,
     });
     let persisted_item = persisted_item.expect("forked response item should be persisted");
@@ -4553,6 +4554,7 @@ async fn open_thread_persistence(session: &mut Session) -> PathBuf {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
@@ -5608,7 +5610,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
     assert_ne!(committed, restored);
     drop(refresh_guard);
     update.await.expect("accepted settings update");
-    checkpoint.await;
+    checkpoint.await.expect("install compaction checkpoint");
     settings_checkpoint
         .await
         .expect("checkpoint current settings");
@@ -5713,7 +5715,8 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
                 reviewer_compaction_hash: None,
             },
         )
-        .await;
+        .await
+        .expect("install compacted history");
     session
         .flush_rollout()
         .await
@@ -5817,7 +5820,8 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
                     reviewer_compaction_hash: None,
                 },
             )
-            .await;
+            .await
+            .expect("install compaction checkpoint");
     }
 
     session.flush_rollout().await.expect("flush checkpoints");
@@ -6589,6 +6593,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        pending_user_message_admissions: Default::default(),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -8261,6 +8266,7 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
@@ -8375,6 +8381,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
@@ -8859,6 +8866,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         realtime_history: None,
         active_turn: Mutex::new(None),
+        pending_user_message_admissions: Default::default(),
         async_hook_results,
         input_queue: super::input_queue::InputQueue::new(),
         services,
@@ -10791,8 +10799,13 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
         world_state: Arc::clone(&world_a),
         step_context: Arc::clone(&step_a),
     };
-    let (initial_a, _) =
-        crate::compact::build_compaction_initial_context(&session, &retained).await;
+    let auto_compact_window_ids = session.state.lock().await.auto_compact_window_ids();
+    let (initial_a, _) = crate::compact::build_compaction_initial_context(
+        &session,
+        &retained,
+        auto_compact_window_ids,
+    )
+    .await;
 
     let mut selected_b = step_a.settings.selected().clone();
     selected_b.collaboration_mode.settings.model = "model-b".to_string();
@@ -10821,8 +10834,12 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
         .build_initial_context_with_world_state(&step_b, &world_b)
         .await;
     let turn_contributions_b = session.build_turn_context_contribution_items(&step_b).await;
-    let (restored_a, restored_world) =
-        crate::compact::build_compaction_initial_context(&session, &retained).await;
+    let (restored_a, restored_world) = crate::compact::build_compaction_initial_context(
+        &session,
+        &retained,
+        auto_compact_window_ids,
+    )
+    .await;
 
     assert_eq!(restored_a, initial_a);
     assert!(Arc::ptr_eq(restored_world.as_ref().unwrap(), &world_a));
@@ -11209,6 +11226,7 @@ async fn attach_test_thread_store(session: &mut Session, thread_store: Arc<dyn T
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            agent_usage_hint_binding: config.agent_usage_hint_binding.clone(),
             history_mode: Default::default(),
             subagent_history_start_ordinal: None,
             history_base: None,
@@ -12219,6 +12237,7 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
     };
     let requests = responses::mount_response_sequence(&server, replies).await;
     let mut client_session = session.services.model_client.new_session();
+    let cancellation_token = CancellationToken::new();
     crate::compact_remote_v2::run_inline_remote_auto_compact_task(
         Arc::clone(&session),
         Arc::clone(&primary),
@@ -12227,6 +12246,7 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
         InitialContextInjection::DoNotInject,
         CompactionReason::ModelDownshift,
         CompactionPhase::PreTurn,
+        &cancellation_token,
     )
     .await
     .expect("compaction succeeds");
@@ -12471,6 +12491,74 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
     // 2. Terminal-event flush after TurnComplete is appended.
     let calls = wait_for_flush_count(&store, /*expected_flushes*/ 2).await;
     assert_eq!(2, calls.flush_thread);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_task_cancellation_retires_the_active_slot() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    let (cancellation_token, done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|active_turn| active_turn.task.as_ref())
+            .expect("started task should remain active");
+        let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+        let _ = done.as_mut().enable();
+        (task.cancellation_token.clone(), done)
+    };
+
+    cancellation_token.cancel();
+
+    recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+    done.await;
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_finalization_rejects_direct_interruption_and_suspension() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    {
+        let mut active = session.active_turn.lock().await;
+        active
+            .as_mut()
+            .expect("started task should retain an active turn")
+            .finishing = true;
+    }
+
+    let (reply, response) = tokio::sync::oneshot::channel();
+    session
+        .interrupt_turn_if_no_pending_input(&turn_context.sub_id, reply)
+        .await;
+    assert!(
+        !response
+            .await
+            .expect("interruption response should be sent")
+    );
+    assert_eq!(
+        super::turn_suspension::suspend_turn_and_shutdown(
+            &session,
+            "suspend-terminal-finalization".to_string(),
+        )
+        .await
+        .expect("terminal finalization should not fail suspension admission"),
+        codex_protocol::turn_input::SuspendTurnOutcome::NotActive
+    );
+    assert_eq!(
+        active_task_id(session.as_ref()).await,
+        Some(turn_context.sub_id.clone())
+    );
+
+    {
+        let mut active = session.active_turn.lock().await;
+        active
+            .as_mut()
+            .expect("finishing turn should retain its task through terminal delivery")
+            .finishing = false;
+    }
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    recv_terminal_event(&events, TerminalEventKind::TurnAborted).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

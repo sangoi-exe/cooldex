@@ -34,12 +34,8 @@
 codex-voice-host validation is deliberately excluded through the TOML selection policy
 and planner warnings retain the unvalidated limitation. -->
 - `defaults.validation_excluded_packages` in `cargo-validation.toml` excludes only `codex-voice-host` from package-derived WSL validation rungs and native selected-package and full workspace aggregates; retain its explicit path classification and plan warning, and do not treat this validation exclusion as source removal or product proof.
-- `cargo-validate.py` owns parsing and frozen-manifest projection of explicit
-  `--windows-reuse-root` and native-Windows-only `--yolo`; `cargo-validate-windows.ps1`
-  owns selected-root compatibility and source checks, in-place synchronization, fresh run
-  paths, the native test-child environment, and the recorded resource-floor bypass. Root
-  `AGENTS.md` owns the operator-facing cold/reuse, override, and validation-result-reuse
-  rules.
+- `cargo-guard.sh` owns one workflow admission across native execution and nested guarded WSL commands.
+- `cargo-validate.py` owns frozen-manifest projection of the native-Windows resource contract and native-Windows-only `--yolo`; `cargo-validate-windows.ps1` owns the canonical `F:\.cache\cw\workset` lifecycle, source checks and in-place synchronization, fresh execution paths, the native test-child environment, runtime disk abort, and the recorded resource-floor bypass. Root `AGENTS.md` owns the operator-facing cold/reuse, override, cleanup, and validation-result-reuse rules.
 - Native Windows Cargo/Nextest is valid only through the WSL guard, frozen manifest, and
   checked-in PowerShell executor. Direct Windows Cargo/Nextest and the former Windows
   `just test` route are invalid.
@@ -50,18 +46,14 @@ and planner warnings retain the unvalidated limitation. -->
   cleanup; a bounded diagnostic need not be checked in. Installation, destructive actions,
   and privileged work retain their separate authorization boundaries.
 - For a direct WSL-to-PowerShell diagnostic, resolve an available `pwsh.exe` or `pwsh` first and quote PowerShell source so Bash cannot expand `$...` expressions, such as by passing the PowerShell program in Bash single quotes. Do not hardcode an installation path or add a wrapper or install path; this remains a bounded diagnostic and does not create a direct native Cargo/Nextest route.
-- Windows-created mutable candidate, target, Cargo/Rustup, temporary, cache, staging, log,
-  and evidence state must remain below literal `F:\.cache`; C: toolchains are read-only
-  inputs, and WSL must not write directly to `/mnt/f`.
+- Every native validation uses the one canonical reusable workset at `F:\.cache\cw\workset`. Its persistent candidate, target, Cargo/Rustup homes, helper, tool, and compatible cache state remain in place; each execution creates fresh evidence and short temporary paths below literal `F:\.cache`. Missing, residual, corrupt, source-mismatched, or tool-incompatible canonical state fails loud. Validation never chooses another root, falls back to cold preparation, or deletes or prunes the cache. C: toolchains are read-only inputs, and WSL must not write directly to `/mnt/f`.
+- The canonical workset co-locates the Cargo target directory and Cargo intermediate build directory at its canonical target root. A rejected cold admission may retain only its non-reparse run-evidence shape and retry without cleanup; any other residual state without the canonical workset fails loud.
 - `Invoke-ApprovedCommand` in `cargo-validate-windows.ps1` owns the native Python
   prerequisite, child-only PATH/`true.exe`/color/stack settings, and run-local bytecode
   cache. Root `AGENTS.md` owns the corresponding operator contract.
 <!-- Merge-safety anchor: the literal-root cleanup authority treats admitted nested
 junctions as leaf entries and never traverses or deletes through their targets. -->
-- `clear-windows-build-cache.ps1` is the only Windows cache cleanup path: preflight is the
-  default, `-Delete` requires proven WSL/Windows quiescence, and it may delete only captured
-  direct children of literal `F:\.cache` while preserving the root, removing admitted nested
-  junctions as leaf entries, and emitting JSON outside it.
+- `clear-windows-build-cache.ps1` is the only Windows cache cleanup path and is operator-authorized destructive cleanup only: validation never invokes it. Preflight is the default, `-Delete` requires proven WSL/Windows quiescence, and it may delete only captured direct children of literal `F:\.cache` while preserving the root, removing admitted nested junctions as leaf entries, and emitting JSON outside it.
 - The standalone installer's default GitHub Release repository is
   `sangoi-exe/cooldex`. The `releases.openai.com` source remains an explicit
   opt-in path; keep its upstream URLs and behavior separate from the Cooldex

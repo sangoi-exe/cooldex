@@ -33,6 +33,9 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    /// Merge-safety anchor: terminal finalization retains the task slot through event delivery;
+    /// exact replacement retirement stays distinct from direct interruption and cancellation.
+    pub(crate) finishing: bool,
     /// A start admitted before asynchronous preparation finishes. The ActiveTurn owner verifies
     /// this ID before task installation so cancellation cannot admit a stale task.
     pub(crate) reserved_turn_id: Option<String>,
@@ -68,6 +71,7 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            finishing: false,
             reserved_turn_id: None,
             input_persisted: None,
         }

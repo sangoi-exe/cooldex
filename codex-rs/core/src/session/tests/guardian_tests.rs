@@ -658,9 +658,10 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let active_turn = crate::state::ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&active_turn.turn_state);
-    *session.active_turn.lock().await = Some(active_turn);
+    let originating_turn_state = session
+        .reserve_turn_start(&turn_context_raw.sub_id)
+        .await
+        .expect("strict auto review fixture should reserve its active turn");
     session
         .record_granted_request_permissions_for_turn(
             &RequestPermissionsResponse {
@@ -715,16 +716,19 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
-    session
-        .start_task(
-            Arc::clone(&turn_context),
-            Vec::new(),
-            super::NeverEndingTask {
-                kind: crate::state::TaskKind::Regular,
-                listen_to_cancellation_token: true,
-            },
-        )
-        .await;
+    assert!(
+        session
+            .start_task(
+                Arc::clone(&turn_context),
+                Vec::new(),
+                super::NeverEndingTask {
+                    kind: crate::state::TaskKind::Regular,
+                    listen_to_cancellation_token: true,
+                },
+            )
+            .await,
+        "strict auto review fixture should admit its reserved active turn"
+    );
 
     let handler = crate::tools::handlers::ExecCommandHandler::default();
     #[allow(deprecated)]
@@ -1121,10 +1125,14 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
         world_state,
         step_context,
     };
+    let auto_compact_window_ids = session.state.lock().await.auto_compact_window_ids();
 
-    let (refreshed, _) =
-        crate::compact::build_compaction_initial_context(&session, &initial_context_injection)
-            .await;
+    let (refreshed, _) = crate::compact::build_compaction_initial_context(
+        &session,
+        &initial_context_injection,
+        auto_compact_window_ids,
+    )
+    .await;
 
     let developer_messages = refreshed
         .iter()

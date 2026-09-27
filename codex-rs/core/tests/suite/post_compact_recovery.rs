@@ -1,23 +1,48 @@
 use super::compact::COMPACT_WARNING_MESSAGE;
+use std::any::Any;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
+use codex_core::config::Constrained;
 use codex_features::Feature;
 use codex_history::HandoffPreparation;
 use codex_history::PostCompactRecoveryPayloadKind;
 use codex_history::RolloutItem;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::AppendThreadItemsParams;
+use codex_thread_store::ArchiveThreadParams;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::DeleteThreadParams;
+use codex_thread_store::InMemoryThreadStore;
+use codex_thread_store::ListThreadsParams;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::PersistContext;
+use codex_thread_store::ReadThreadByRolloutPathParams;
+use codex_thread_store::ReadThreadParams;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::StoredThread;
+use codex_thread_store::StoredThreadHistory;
+use codex_thread_store::ThreadPage;
+use codex_thread_store::ThreadStore;
+use codex_thread_store::ThreadStoreError;
+use codex_thread_store::ThreadStoreFuture;
+use codex_thread_store::UpdateThreadMetadataParams;
 use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
@@ -245,6 +270,188 @@ async fn wait_for_blocked_recovery_terminal_error(codex: &codex_core::CodexThrea
         unreachable!("predicate guarantees a turn complete event");
     };
     assert_eq!(completed.error.as_ref(), Some(&error));
+}
+
+async fn wait_for_recovery_interrupt_event<F>(
+    codex: &codex_core::CodexThread,
+    expectation: &str,
+    mut predicate: F,
+) -> EventMsg
+where
+    F: FnMut(&EventMsg) -> bool,
+{
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), codex.next_event())
+            .await
+            .unwrap_or_else(|_| panic!("timeout waiting for {expectation}"))
+            .unwrap_or_else(|error| {
+                panic!("event stream ended while waiting for {expectation}: {error}")
+            });
+        if predicate(&event.msg) {
+            return event.msg;
+        }
+        match event.msg {
+            EventMsg::Error(error) => {
+                panic!("unexpected Error while waiting for {expectation}: {error:?}")
+            }
+            EventMsg::TurnAborted(aborted) => {
+                panic!("unexpected TurnAborted while waiting for {expectation}: {aborted:?}")
+            }
+            EventMsg::TurnComplete(completed) => {
+                panic!("unexpected TurnComplete while waiting for {expectation}: {completed:?}")
+            }
+            _ => {}
+        }
+    }
+}
+
+struct PendingRecoveryProofAppend {
+    entered: oneshot::Sender<()>,
+    failure: oneshot::Receiver<ThreadStoreError>,
+    release: oneshot::Receiver<()>,
+}
+
+struct RecoveryProofAppendGate {
+    entered: oneshot::Receiver<()>,
+    failure: Option<oneshot::Sender<ThreadStoreError>>,
+    release: oneshot::Sender<()>,
+}
+
+impl RecoveryProofAppendGate {
+    async fn wait_until_entered(&mut self) {
+        tokio::time::timeout(Duration::from_secs(10), &mut self.entered)
+            .await
+            .expect("post-compact recovery proof append should start")
+            .expect("post-compact recovery proof append gate sender should remain open");
+    }
+
+    fn establish_failure(&mut self) {
+        self.failure
+            .take()
+            .expect("recovery proof append gate should establish one failure")
+            .send(ThreadStoreError::Internal {
+                message: "injected post-compact recovery proof append failure".to_string(),
+            })
+            .expect("recovery proof append should remain blocked until release");
+    }
+
+    fn release(self) {
+        self.release
+            .send(())
+            .expect("recovery proof append should remain blocked until release");
+    }
+}
+
+struct GatedRecoveryProofStore {
+    inner: InMemoryThreadStore,
+    recovery_proof_append: Mutex<Option<PendingRecoveryProofAppend>>,
+}
+
+impl GatedRecoveryProofStore {
+    fn gate_next_recovery_proof_append(&self) -> RecoveryProofAppendGate {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (failure_tx, failure_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut gate = self
+            .recovery_proof_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            gate.replace(PendingRecoveryProofAppend {
+                entered: entered_tx,
+                failure: failure_rx,
+                release: release_rx,
+            })
+            .is_none(),
+            "only one recovery proof append gate may be armed at a time"
+        );
+        RecoveryProofAppendGate {
+            entered: entered_rx,
+            failure: Some(failure_tx),
+            release: release_tx,
+        }
+    }
+}
+
+macro_rules! delegate_recovery_proof_store_methods {
+    ($(fn $name:ident($param:ident: $params:ty) -> $result:ty;)*) => {
+        $(fn $name(&self, $param: $params) -> ThreadStoreFuture<'_, $result> {
+            ThreadStore::$name(&self.inner, $param)
+        })*
+    };
+}
+
+impl ThreadStore for GatedRecoveryProofStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    delegate_recovery_proof_store_methods! {
+        fn create_thread(params: CreateThreadParams) -> ();
+        fn resume_thread(params: ResumeThreadParams) -> ();
+        fn discard_thread(thread_id: ThreadId) -> ();
+        fn load_history(params: LoadThreadHistoryParams) -> StoredThreadHistory;
+        fn read_thread(params: ReadThreadParams) -> StoredThread;
+        fn read_thread_by_rollout_path(params: ReadThreadByRolloutPathParams) -> StoredThread;
+        fn list_threads(params: ListThreadsParams) -> ThreadPage;
+        fn archive_thread(params: ArchiveThreadParams) -> ();
+        fn unarchive_thread(params: ArchiveThreadParams) -> StoredThread;
+        fn delete_thread(params: DeleteThreadParams) -> ();
+        fn flush_thread(thread_id: ThreadId) -> ();
+        fn shutdown_thread(thread_id: ThreadId) -> ();
+    }
+
+    fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let gate = params
+                .items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+                .then(|| {
+                    self.recovery_proof_append
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                })
+                .flatten();
+            if let Some(gate) = gate {
+                gate.entered
+                    .send(())
+                    .expect("test should observe the recovery proof append");
+                let failure = gate
+                    .failure
+                    .await
+                    .expect("test should establish the recovery proof append failure");
+                gate.release
+                    .await
+                    .expect("test should release the recovery proof append");
+                return Err(failure);
+            }
+            self.inner.append_items(params).await
+        })
+    }
+
+    fn update_thread_metadata(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, Option<StoredThread>> {
+        self.inner.update_thread_metadata(params)
+    }
+
+    fn record_thread_metadata(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move { self.inner.update_thread_metadata(params).await.map(|_| ()) })
+    }
+
+    fn persist_thread(
+        &self,
+        thread_id: ThreadId,
+        context: PersistContext,
+    ) -> ThreadStoreFuture<'_, ()> {
+        self.inner.persist_thread(thread_id, context)
+    }
 }
 
 async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
@@ -591,38 +798,81 @@ async fn post_compact_recovery_completion_before_blocking_tool_interrupt_remains
         config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
         config.model_provider.request_max_retries = Some(0);
         config.model_provider.stream_max_retries = Some(0);
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)
+            .expect("blocking recovery fixture should allow direct command execution");
     });
     let test = builder.build(&server).await?;
     let rollout_path = test_rollout_path(&test);
 
     seed_and_compact(&test.codex).await?;
     test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ExecCommandBegin(_))
-    })
-    .await;
-
-    let application_items_before_interrupt = read_rollout_items(&rollout_path)
-        .into_iter()
-        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
-        .count();
+    let mut saw_exec_command_begin = false;
+    let mut saw_recovery_response_completed = false;
+    while !saw_exec_command_begin || !saw_recovery_response_completed {
+        let expectation = match (saw_exec_command_begin, saw_recovery_response_completed) {
+            (false, false) => {
+                "ExecCommandBegin or RawResponseCompleted for the recovery-tool-response"
+            }
+            (true, false) => "RawResponseCompleted for the recovery-tool-response",
+            (false, true) => "ExecCommandBegin for the blocking recovery tool",
+            (true, true) => {
+                unreachable!("loop condition requires a pending recovery interrupt event")
+            }
+        };
+        let event =
+            wait_for_recovery_interrupt_event(&test.codex, expectation, |event| match event {
+                EventMsg::ExecCommandBegin(_) => true,
+                EventMsg::RawResponseCompleted(completed) => {
+                    completed.response_id == "recovery-tool-response"
+                }
+                _ => false,
+            })
+            .await;
+        match event {
+            EventMsg::ExecCommandBegin(_) => saw_exec_command_begin = true,
+            EventMsg::RawResponseCompleted(completed) => {
+                assert_eq!(completed.response_id, "recovery-tool-response");
+                saw_recovery_response_completed = true;
+            }
+            other => unreachable!("recovery interrupt wait returned unexpected event: {other:?}"),
+        }
+    }
     assert_eq!(requests.requests().len(), 3);
 
     test.codex.submit(Op::Interrupt).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnAborted(_))
-    })
+    wait_for_recovery_interrupt_event(
+        &test.codex,
+        "TurnAborted after interrupting the blocking recovery tool",
+        |event| matches!(event, EventMsg::TurnAborted(_)),
+    )
     .await;
+    test.codex.flush_rollout().await?;
+    let application_items_after_interrupt = read_rollout_items(&rollout_path)
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::PostCompactRecoveryApplied(_)))
+        .count();
     test.codex.submit(Op::CleanBackgroundTerminals).await?;
 
     assert_eq!(
-        application_items_before_interrupt, 1,
+        application_items_after_interrupt, 1,
         "the accepted response must write one proof before the blocking tool is interrupted"
     );
     test.codex
         .start_or_steer_turn(user_turn(AFTER_RECOVERY_USER))
         .await?;
-    wait_for_successful_turn_complete(&test.codex).await;
+    let EventMsg::TurnComplete(completed) = wait_for_recovery_interrupt_event(
+        &test.codex,
+        "successful TurnComplete after the interrupted recovery tool",
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+    )
+    .await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error, None);
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 4);
@@ -688,52 +938,64 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
         ],
     ])
     .await;
-    let mut builder = test_codex().with_config(|config| {
-        config.model_provider.name = "OpenAI-compatible test provider".to_string();
-        config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-        config.model_provider.request_max_retries = Some(0);
-        config.model_provider.stream_max_retries = Some(0);
-        config
-            .features
-            .enable(Feature::DefaultModeRequestUserInput)
-            .expect("enable request_user_input in Default mode");
+    let store = Arc::new(GatedRecoveryProofStore {
+        inner: InMemoryThreadStore::default(),
+        recovery_proof_append: Mutex::new(None),
     });
+    let mut builder = test_codex()
+        .with_thread_store(store.clone())
+        .with_config(|config| {
+            config.model_provider.name = "OpenAI-compatible test provider".to_string();
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .expect("enable request_user_input in Default mode");
+        });
     let test = builder.build_with_streaming_server(&server).await?;
 
     seed_and_compact(&test.codex).await?;
+    let mut recovery_proof_append = store.gate_next_recovery_proof_append();
     test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::RequestUserInput(_))
-    })
+    wait_for_recovery_interrupt_event(
+        &test.codex,
+        "RequestUserInput from the blocking recovery tool",
+        |event| matches!(event, EventMsg::RequestUserInput(_)),
+    )
     .await;
-    test.thread_store
-        .shutdown_thread(test.session_configured.thread_id)
-        .await?;
-
     release_completed_tx
         .send(())
         .expect("release the completed recovery response");
-    wait_for_event(&test.codex, |event| {
-        matches!(
-            event,
-            EventMsg::RawResponseCompleted(completed)
-                if completed.response_id == "recovery-tool-response"
-        )
-    })
+    wait_for_recovery_interrupt_event(
+        &test.codex,
+        "RawResponseCompleted for the released recovery-tool-response",
+        |event| {
+            matches!(
+                event,
+                EventMsg::RawResponseCompleted(completed)
+                    if completed.response_id == "recovery-tool-response"
+            )
+        },
+    )
     .await;
-    // RawResponseCompleted is emitted immediately before recovery acknowledgement. Yield once so
-    // the sampling task enters its already-started tool drain after the injected write failure.
-    tokio::task::yield_now().await;
+    recovery_proof_append.wait_until_entered().await;
+    recovery_proof_append.establish_failure();
     test.codex.submit(Op::Interrupt).await?;
+    recovery_proof_append.release();
 
-    let terminal = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::Error(_) | EventMsg::TurnAborted(_))
-    })
-    .await;
-    let EventMsg::Error(error) = terminal else {
-        panic!(
-            "the recovery persistence failure must win over a later interrupt, got {terminal:?}"
-        );
+    let error = match wait_for_recovery_interrupt_event(
+        &test.codex,
+        "fatal Error after interrupting the blocking tool with a recovery-proof write failure",
+        |event| matches!(event, EventMsg::Error(_)),
+    )
+    .await
+    {
+        EventMsg::Error(error) => error,
+        event => panic!(
+            "the recovery persistence failure must win over a later interrupt, got {event:?}"
+        ),
     };
     assert!(
         error
@@ -741,9 +1003,11 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
             .starts_with("Fatal error: failed to persist post-compact recovery application proof:"),
         "the recovery persistence failure, not TurnAborted, must reach the terminal error path: {error:?}"
     );
-    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    let EventMsg::TurnComplete(completed) = wait_for_recovery_interrupt_event(
+        &test.codex,
+        "TurnComplete carrying the recovery persistence failure",
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+    )
     .await
     else {
         unreachable!("predicate guarantees a turn complete event");

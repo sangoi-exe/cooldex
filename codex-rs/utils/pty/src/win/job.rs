@@ -3,6 +3,9 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::os::windows::io::RawHandle;
+use std::os::windows::process::CommandExt as _;
+use std::process::Child as StdChild;
+use std::process::Command as StdCommand;
 use std::sync::Mutex;
 use tokio::process::Child;
 use tokio::process::Command;
@@ -106,6 +109,19 @@ impl JobObject {
         Ok(())
     }
 
+    fn resume_process(process_handle: RawHandle) -> io::Result<()> {
+        let status = unsafe { NtResumeProcess(process_handle.cast()) };
+        if !NT_SUCCESS(status) {
+            unsafe {
+                TerminateProcess(process_handle.cast(), /*uExitCode*/ 1)
+            };
+            return Err(io::Error::other(format!(
+                "failed to resume contained process: NTSTATUS {status:#x}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Assigns a running process to this job.
     ///
     /// Assignment is not retroactive: descendants created before this call
@@ -173,14 +189,21 @@ impl JobObject {
             .raw_handle()
             .ok_or_else(|| io::Error::other("missing child process handle"))?;
         self.assign_process(process_handle)?;
+        Self::resume_process(process_handle)?;
+        Ok(child)
+    }
 
-        let status = unsafe { NtResumeProcess(process_handle.cast()) };
-        if !NT_SUCCESS(status) {
-            return Err(io::Error::other(format!(
-                "failed to resume contained process: NTSTATUS {status:#x}"
-            )));
+    // Merge-safety anchor: synchronous std-process callers must assign the suspended root to this Job Object before it can create descendants that retain inherited handles.
+    /// Starts a standard-library process only after assigning it to this Job Object.
+    pub fn spawn_contained_std(&self, command: &mut StdCommand) -> io::Result<StdChild> {
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn()?;
+        let process_handle = child.as_raw_handle();
+        if let Err(error) = self.assign_process(process_handle) {
+            let _ = child.kill();
+            return Err(error);
         }
-
+        Self::resume_process(process_handle)?;
         Ok(child)
     }
 

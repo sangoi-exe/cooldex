@@ -14,7 +14,7 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use super::tests::claimed_turn_slot;
+use super::tests::active_turn_for_tests;
 use super::tests::make_session_and_context_with_rx;
 use crate::session::step_context::StepContext;
 
@@ -35,7 +35,7 @@ async fn wait_until_released(pause_state: &mut watch::Receiver<bool>) {
 #[tokio::test]
 async fn command_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let mut pause_state = session.subscribe_elicitation_pause_state();
     #[allow(deprecated)]
     let cwd = turn_context.cwd.clone();
@@ -87,7 +87,7 @@ async fn command_approval_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn patch_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({
@@ -118,7 +118,7 @@ async fn patch_approval_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn permission_request_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({
@@ -165,7 +165,7 @@ async fn permission_request_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn request_user_input_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Merge-safety anchor: all workspace build-like Cargo execution must stay behind this wrapper so
-# disk-resource profiles, receipt-safe validation, target-dir discovery, and process-group cleanup stay centralized.
+# workflow admission, disk-resource profiles, receipt-safe validation, target-dir discovery, and process-group cleanup stay centralized.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -32,6 +32,8 @@ telemetry_sample_seq=0
 telemetry_error_count=0
 telemetry_init_failed=0
 telemetry_error_file=""
+workflow_admission_lock_path=""
+workflow_admission_fd=""
 
 log() {
     local level="$1"
@@ -99,6 +101,148 @@ require_command() {
         log error "required command not found: ${command_name}"
         exit 1
     fi
+}
+
+workflow_admission_marker_present() {
+    [[ -n "${CARGO_GUARD_WORKFLOW_ADMISSION_FD+x}" || -n "${CARGO_GUARD_WORKFLOW_ADMISSION_OWNER_PID+x}" || -n "${CARGO_GUARD_WORKFLOW_ADMISSION_LOCK_PATH+x}" ]]
+}
+
+resolve_workflow_admission_lock_path() {
+    if [[ -z "${HOME:-}" ]]; then
+        log error "HOME is required for workflow admission"
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log error "required command not found: python3"
+        return 1
+    fi
+
+    local workflow_namespace
+    if ! workflow_namespace="$(
+        python3 - "${SCRIPT_DIR}/cargo-validation.toml" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+try:
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+except Exception as error:
+    print(f"failed to read {config_path}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+
+runtime = config.get("windows_runtime")
+if not isinstance(runtime, dict):
+    print(f"{config_path} must define [windows_runtime]", file=sys.stderr)
+    raise SystemExit(2)
+namespace = runtime.get("workflow_namespace")
+if not isinstance(namespace, str):
+    print(f"{config_path} [windows_runtime].workflow_namespace must be a string", file=sys.stderr)
+    raise SystemExit(2)
+print(namespace)
+PY
+    )"; then
+        log error "failed to resolve workflow admission namespace"
+        return 1
+    fi
+    if ! [[ "${workflow_namespace}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        log error "workflow admission namespace is unsafe: ${workflow_namespace}"
+        return 1
+    fi
+    workflow_admission_lock_path="$(realpath -m -- "${HOME}/.cache/codex/${workflow_namespace}/cargo-guard-execution.lock")"
+}
+
+workflow_admission_owner_is_ancestor() {
+    local owner_pid="$1"
+    local current_pid="$$"
+    local stat_line state parent_pid
+    while [[ "${current_pid}" =~ ^[0-9]+$ && "${current_pid}" != "0" ]]; do
+        if [[ "${current_pid}" == "${owner_pid}" ]]; then
+            [[ "${current_pid}" != "$$" ]]
+            return
+        fi
+        if ! IFS= read -r stat_line <"/proc/${current_pid}/stat"; then
+            return 1
+        fi
+        stat_line="${stat_line#*) }"
+        read -r state parent_pid _ <<<"${stat_line}"
+        current_pid="${parent_pid:-}"
+    done
+    return 1
+}
+
+workflow_admission_is_inherited() {
+    local owner_fd="${CARGO_GUARD_WORKFLOW_ADMISSION_FD:-}"
+    local owner_pid="${CARGO_GUARD_WORKFLOW_ADMISSION_OWNER_PID:-}"
+    local owner_lock_path="${CARGO_GUARD_WORKFLOW_ADMISSION_LOCK_PATH:-}"
+    if ! [[ "${owner_fd}" =~ ^[0-9]+$ && "${owner_pid}" =~ ^[0-9]+$ ]] || [[ -z "${owner_lock_path}" || "${owner_pid}" == "$$" || "${owner_lock_path}" != "${workflow_admission_lock_path}" ]]; then
+        return 1
+    fi
+    if ! workflow_admission_owner_is_ancestor "${owner_pid}"; then
+        return 1
+    fi
+
+    local owner_fd_path
+    if ! owner_fd_path="$(readlink -f -- "/proc/${owner_pid}/fd/${owner_fd}")" || [[ "${owner_fd_path}" != "${workflow_admission_lock_path}" ]]; then
+        return 1
+    fi
+
+    local probe_fd probe_status
+    if ! exec {probe_fd}>>"${workflow_admission_lock_path}"; then
+        return 1
+    fi
+    if flock -n "${probe_fd}"; then
+        probe_status=0
+    else
+        probe_status=$?
+    fi
+    exec {probe_fd}>&-
+    [[ "${probe_status}" == "1" ]]
+}
+
+enter_workflow_admission() {
+    if ! resolve_workflow_admission_lock_path; then
+        return 1
+    fi
+    if workflow_admission_marker_present; then
+        if workflow_admission_is_inherited; then
+            log info "workflow admission reused by nested guarded command: ${workflow_admission_lock_path}"
+            return 0
+        fi
+        log error "received invalid inherited workflow admission; refusing Cargo/Nextest execution"
+        return 1
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        log error "required command not found: flock"
+        return 1
+    fi
+
+    if ! mkdir -p -- "${workflow_admission_lock_path%/*}"; then
+        log error "failed to create workflow admission directory: ${workflow_admission_lock_path%/*}"
+        return 1
+    fi
+    if ! exec {workflow_admission_fd}>>"${workflow_admission_lock_path}"; then
+        log error "failed to open workflow admission lock: ${workflow_admission_lock_path}"
+        return 1
+    fi
+    if ! flock -n "${workflow_admission_fd}"; then
+        log error "another supported guarded Cargo/Nextest execution is already admitted: ${workflow_admission_lock_path}"
+        return 1
+    fi
+    export CARGO_GUARD_WORKFLOW_ADMISSION_FD="${workflow_admission_fd}"
+    export CARGO_GUARD_WORKFLOW_ADMISSION_OWNER_PID="$$"
+    export CARGO_GUARD_WORKFLOW_ADMISSION_LOCK_PATH="${workflow_admission_lock_path}"
+    log info "workflow admission acquired: ${workflow_admission_lock_path}"
+}
+
+planner_action_requests_help() {
+    local arg
+    for arg in "$@"; do
+        if [[ "${arg}" == "--help" || "${arg}" == "-h" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 set_profile_default() {
@@ -1985,6 +2129,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 fi
 
 if [[ "${1:-}" == "plan" || "${1:-}" == "verify" || "${1:-}" == "prep-plan" || "${1:-}" == "prep" ]]; then
+    if [[ "${1}" == "verify" || "${1}" == "prep" ]] && ! planner_action_requests_help "$@"; then
+        enter_workflow_admission || exit 1
+    fi
     exec python3 "${SCRIPT_DIR}/cargo-validate.py" "$@"
 fi
 
@@ -2359,6 +2506,8 @@ if [[ -n "${explicit_config_jobs_error}" ]]; then
     log error "${explicit_config_jobs_error}"
     exit 2
 fi
+
+enter_workflow_admission || exit 1
 
 canonical_guard_argv=("./scripts/cargo-guard.sh" "cargo" "${original_cargo_args[@]}")
 job_contract_digest="$(compute_job_contract_digest)"

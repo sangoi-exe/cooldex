@@ -439,7 +439,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
             value
         })
         .collect::<Vec<_>>();
-    let mut next_order = if thread_context_enabled { 6_u64 } else { 0 };
+    let next_order = if thread_context_enabled { 6_u64 } else { 0 };
     let mut expected = json!({
         "user_messages": user_messages, "user_messages_incomplete": false,
         "verified_answers": ordered_answers, "incomplete": false, "next_order": next_order,
@@ -470,9 +470,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
             serde_json::Value::Null
         }
     );
-    // Each local compaction records one assistant summary in the shared sequence.
-    next_order += u64::from(thread_context_enabled);
-    expected["next_order"] = json!(next_order);
+    // The compaction summary is operation-local and does not consume retained-context order.
     assert_eq!(
         serde_json::to_value(compact_and_assert_answers(&test, &thread, &answers).await?)?,
         expected
@@ -633,7 +631,7 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
         Some(&expected)
     );
     // The excerpt must survive another compaction and resume after the backup is gone.
-    expected.reserve_order(); // The compactor's assistant summary consumes a position.
+    // The compaction summary is operation-local, so retained-context order is unchanged.
     assert_eq!(
         compact_and_assert_answers(&test, &resumed, &[]).await?,
         expected
@@ -1064,9 +1062,45 @@ async fn forked_parent_instructions_do_not_become_local_authorization(
     })
     .await;
     let child = test.thread_manager.get_thread(created.try_recv()?).await?;
-    tokio::time::timeout(Duration::from_secs(30), child_gate.entered.notified())
-        .await
-        .context("child did not reach the paused tool call")?;
+    // Drain the child-only event stream while its tool lifecycle hook is paused so an early
+    // failure reports its live error or terminal status instead of only timing out at the gate.
+    let child_paused: Result<()> = match tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                _ = child_gate.entered.notified() => break Ok(()),
+                event = child.next_event() => match event?.msg {
+                    EventMsg::Error(error) => {
+                        anyhow::bail!(
+                            "child failed before the paused tool call: {}",
+                            error.message
+                        );
+                    }
+                    EventMsg::TurnAborted(aborted) => {
+                        anyhow::bail!("child aborted before the paused tool call: {aborted:?}");
+                    }
+                    EventMsg::TurnComplete(completed) => {
+                        if let Some(error) = &completed.error {
+                            anyhow::bail!(
+                                "child completed with an error before the paused tool call: {}",
+                                error.message
+                            );
+                        }
+                        anyhow::bail!("child completed before the paused tool call: {completed:?}");
+                    }
+                    _ => {}
+                },
+            }
+        }
+    })
+    .await
+    {
+        Ok(child_paused) => child_paused,
+        Err(_) => anyhow::bail!(
+            "child did not reach the paused tool call; current status: {:?}",
+            child.agent_status().await
+        ),
+    };
+    child_paused?;
     let child_id = child.startup_metadata().thread_id.to_string();
     let requests = child_requests.requests();
     let child_request = requests
@@ -1264,7 +1298,28 @@ async fn retained_answers_cross_real_session_boundaries(
         .await?;
     wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let child = test.thread_manager.get_thread(created.try_recv()?).await?;
-    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    // Surface an early child failure before the sequence fixture reports only its request count.
+    let child_terminal = wait_for_event(&child, |event| {
+        matches!(
+            event,
+            EventMsg::Error(_) | EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    match child_terminal {
+        EventMsg::Error(error) => {
+            anyhow::bail!("child failed before initial completion: {}", error.message);
+        }
+        EventMsg::TurnAborted(aborted) => {
+            anyhow::bail!("child aborted before initial completion: {aborted:?}");
+        }
+        EventMsg::TurnComplete(completed) => {
+            if let Some(error) = &completed.error {
+                anyhow::bail!("child completed with an error: {}", error.message);
+            }
+        }
+        _ => unreachable!("terminal-event predicate matched a different event"),
+    }
     child.flush_rollout().await?;
     let child_history = load_context(&test, &child).await?;
     assert!(

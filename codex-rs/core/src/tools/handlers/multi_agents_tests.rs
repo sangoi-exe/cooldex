@@ -710,12 +710,14 @@ async fn multi_agent_v2_full_history_child_matches_parent_identity() {
         task_name: String,
     }
 
-    let (mut session, turn) = make_session_and_context().await;
+    let (_session, turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.base_instructions = Some("custom parent base instructions".to_string());
+    config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
     config.multi_agent_v2.root_agent_usage_hint_text =
         Some("public parent root guidance".to_string());
     config.multi_agent_v2.subagent_usage_hint_text =
@@ -727,11 +729,13 @@ async fn multi_agent_v2_full_history_child_matches_parent_identity() {
         .start_thread(StartThreadOptions::new(config))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let session = Arc::new(session);
+    let session = Arc::clone(&root.thread.session);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
+    assert_eq!(
+        session.get_base_instructions().await.provenance,
+        Some(BaseInstructionsProvenance::Custom)
+    );
     let expected_identity = session
         .full_history_agent_identity_snapshot(step_context.as_ref())
         .await;
@@ -779,12 +783,14 @@ async fn multi_agent_v2_full_history_bypasses_unresolvable_child_defaults() {
         task_name: String,
     }
 
-    let (mut session, mut turn) = make_session_and_context().await;
+    let (_session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();
     config
         .features
         .enable(Feature::MultiAgentV2)
         .expect("test config should allow feature update");
+    config.base_instructions = Some("custom parent base instructions".to_string());
+    config.base_instructions_provenance = Some(BaseInstructionsProvenance::Custom);
     config.agent_default_subagent_model = Some("unresolvable-child-model".to_string());
     config.agent_default_subagent_reasoning_effort = Some(ReasoningEffort::Custom(
         "unresolvable-child-effort".to_string(),
@@ -795,11 +801,13 @@ async fn multi_agent_v2_full_history_bypasses_unresolvable_child_defaults() {
         .start_thread(StartThreadOptions::new(config))
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
-    session.thread_id = root.thread_id;
-    let session = Arc::new(session);
+    let session = Arc::clone(&root.thread.session);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
+    assert_eq!(
+        session.get_base_instructions().await.provenance,
+        Some(BaseInstructionsProvenance::Custom)
+    );
     let expected_identity = session
         .full_history_agent_identity_snapshot(step_context.as_ref())
         .await;
@@ -1311,7 +1319,7 @@ async fn multi_agent_v2_full_history_fork_inherits_effective_parent_service_tier
         .config_snapshot()
         .await;
 
-    assert_eq!(snapshot.service_tier, None);
+    assert_eq!(snapshot.service_tier, Some("priority".to_string()));
 }
 
 #[tokio::test]

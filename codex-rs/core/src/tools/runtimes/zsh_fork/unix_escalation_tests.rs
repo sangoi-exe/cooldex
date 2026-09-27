@@ -602,7 +602,7 @@ async fn execve_permission_request_hook_short_circuits_prompt() -> anyhow::Resul
             cancellation_token: tokio_util::sync::CancellationToken,
         ) -> crate::tasks::SessionTaskResult {
             cancellation_token.cancelled().await;
-            Ok(crate::tasks::SessionTaskOutput::default())
+            Ok(None)
         }
     }
 

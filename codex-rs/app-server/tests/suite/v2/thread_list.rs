@@ -40,6 +40,7 @@ use codex_git_utils::GitSha;
 use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EventMsg;
@@ -1403,7 +1404,10 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
         };
         let source = SessionSource::from(session_meta.meta.source.clone());
         let settings = if version == Some(MultiAgentVersion::V2) {
-            session_meta.meta.base_instructions = Some(BaseInstructions::default());
+            session_meta.meta.base_instructions = Some(BaseInstructions {
+                provenance: Some(BaseInstructionsProvenance::Custom),
+                ..Default::default()
+            });
             session_meta.meta.agent_usage_hint_binding = Some(AgentUsageHintBinding::Resolve);
             Some(serde_json::from_value::<ThreadSettingsAppliedEvent>(
                 json!({
@@ -1419,7 +1423,20 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
                             "mode": "default",
                             "settings": { "model": "mock-model" },
                         },
+                        "developer_instructions": null,
                         "shell_tool_enabled": true,
+                        "agent_role_feature_opt_outs": [
+                            "memory_tool",
+                            "request_permissions_tool",
+                        ],
+                        "agent_role_skill_restrictions": {
+                            "bundled_skills_disabled": false,
+                            "skill_instructions_disabled": false,
+                            "disabled_skills": [],
+                        },
+                        "model_context_window": null,
+                        "model_auto_compact_token_limit": null,
+                        "model_auto_compact_token_limit_scope": "total",
                     },
                 }),
             )?)

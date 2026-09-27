@@ -24,6 +24,10 @@ impl SessionTask for CompactTask {
         TaskKind::Compact
     }
 
+    fn consumes_mailbox_input(&self) -> bool {
+        false
+    }
+
     fn span_name(&self) -> &'static str {
         "session_task.compact"
     }

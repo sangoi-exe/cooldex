@@ -1,11 +1,17 @@
 use anyhow::Context;
 use anyhow::Result;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_protocol::AgentPath;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -25,9 +31,13 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 #[path = "multi_agent_restore_tests.rs"]
 mod restore_tests;
@@ -52,11 +62,15 @@ const SIBLING_TASK: &str = "inspect the release lifecycle";
 const SIBLING_FOLLOWUP_PROMPT: &str = "continue the surviving worker";
 const SIBLING_FOLLOWUP_TASK: &str = "verify the surviving worker";
 const INTERRUPT_PROMPT: &str = "release the interrupted worker";
+const TERMINAL_TRIGGER_MESSAGE: &str = "trigger mail after terminal delivery";
+const TERMINAL_TRIGGER_PARENT_TURN: &str = "terminal-trigger-parent";
+const TERMINAL_TRIGGER_ROOT_TURN: &str = "terminal-trigger-root";
 const SIBLING_NAME: &str = "survivor";
 const ROLE_NAME: &str = "durable_worker";
 const ROLE_MODEL: &str = "gpt-5.6-sol";
 const ROLE_MODEL_PROVIDER_ID: &str = "openai";
 const ROLE_DEVELOPER_INSTRUCTIONS: &str = "Keep the durable worker role configuration.";
+const MUTATED_ROLE_DEVELOPER_INSTRUCTIONS: &str = "Use mutated role instructions.";
 const SUBAGENT_DEVELOPER_INSTRUCTIONS: &str = "Use the default durable worker instructions.";
 
 fn decoded_body(request: &wiremock::Request) -> Option<Vec<u8>> {
@@ -97,6 +111,47 @@ fn request_has_input_type(request: &wiremock::Request, input_type: &str) -> bool
                 .iter()
                 .any(|item| item.get("type").and_then(Value::as_str) == Some(input_type))
         })
+}
+
+fn value_contains_text(value: &Value, text: &str) -> bool {
+    match value {
+        Value::String(value) => value.contains(text),
+        Value::Array(values) => values.iter().any(|value| value_contains_text(value, text)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_text(value, text)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+struct GatedSseResponder {
+    response: wiremock::ResponseTemplate,
+    request_body: Arc<Mutex<Option<Value>>>,
+    entered: mpsc::Sender<()>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl wiremock::Respond for GatedSseResponder {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let request_body = decoded_body(request)
+            .and_then(|body| serde_json::from_slice(&body).ok())
+            .expect("child compaction request should be JSON");
+        *self
+            .request_body
+            .lock()
+            .expect("child compaction request body lock") = Some(request_body);
+        self.entered
+            .send(())
+            .expect("child compaction should enter the response gate");
+        self.release
+            .lock()
+            .expect("child compaction response gate lock")
+            .take()
+            .expect("child compaction response gate should release once")
+            .recv()
+            .expect("child compaction response should be released");
+        self.response.clone()
+    }
 }
 
 async fn mount_root_collaboration_call(
@@ -222,12 +277,21 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
         sse(vec![ev_completed("resp-parent-turn-assistant")]),
     )
     .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL) && body_contains(request, "later child user")
+        },
+        sse(vec![ev_completed("resp-worker-later-user")]),
+    )
+    .await;
     // The grandchild's completion can arrive during the worker's completion response,
     // causing one more sampling request to drain that message before the turn ends.
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/v1/responses"))
         .and(|request: &wiremock::Request| {
             !body_contains(request, FOLLOWUP_TASK)
+                && !request_has_input_type(request, "compaction_trigger")
                 && decoded_body(request)
                     .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
                     .is_some_and(|body| {
@@ -345,15 +409,53 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
             PermissionProfile::Disabled,
         )
     );
-
-    // Exercise the real paginated compactor after later user input; cold reload must retain the
-    // role developer identity from the resulting replacement history.
-    mount_sse_once_match(
+    // The real paginated compactor must remain admissible when its consumer submits it immediately
+    // after observing the preceding TurnComplete.
+    let (compaction_entered, compaction_entered_receiver) = mpsc::channel();
+    let (release_compaction, compaction_release_receiver) = mpsc::channel();
+    let child_compaction_body = Arc::new(Mutex::new(None));
+    let child_thread_id_for_compaction = worker_thread_id;
+    let child_compaction_body_for_response = Arc::clone(&child_compaction_body);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(move |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL)
+                && request_has_input_type(request, "compaction_trigger")
+                && request.body_json::<Value>().is_ok_and(|body| {
+                    body["client_metadata"]["thread_id"] == json!(child_thread_id_for_compaction)
+                })
+        })
+        .respond_with(GatedSseResponder {
+            response: sse_response(sse(vec![
+                json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "compaction",
+                        "encrypted_content": "DURABLE_CHILD_COMPACTION_SUMMARY",
+                    }
+                }),
+                ev_completed("resp-worker-compact"),
+            ])),
+            request_body: child_compaction_body_for_response,
+            entered: compaction_entered,
+            release: Mutex::new(Some(compaction_release_receiver)),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let child_thread_id_for_terminal_trigger = worker_thread_id;
+    let terminal_trigger_request = mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| {
-            request_has_model(request, ROLE_MODEL) && body_contains(request, "later child user")
+        move |request: &wiremock::Request| {
+            request_has_model(request, ROLE_MODEL)
+                && request_has_input_type(request, "agent_message")
+                && body_contains(request, TERMINAL_TRIGGER_MESSAGE)
+                && request.body_json::<Value>().is_ok_and(|body| {
+                    body["client_metadata"]["thread_id"]
+                        == json!(child_thread_id_for_terminal_trigger)
+                })
         },
-        sse(vec![ev_completed("resp-worker-later-user")]),
+        sse(vec![ev_completed("resp-worker-terminal-trigger")]),
     )
     .await;
     worker_thread
@@ -366,35 +468,86 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-
-    let child_thread_id_for_compaction = worker_thread_id;
-    let child_compaction = mount_sse_once_match(
-        &server,
-        move |request: &wiremock::Request| {
-            request_has_model(request, ROLE_MODEL)
-                && request_has_input_type(request, "compaction_trigger")
-                && request.body_json::<Value>().is_ok_and(|body| {
-                    body["client_metadata"]["thread_id"] == json!(child_thread_id_for_compaction)
-                })
-        },
-        sse(vec![
-            json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "compaction",
-                    "encrypted_content": "DURABLE_CHILD_COMPACTION_SUMMARY",
-                }
-            }),
-            ev_completed("resp-worker-compact"),
-        ]),
-    )
-    .await;
     worker_thread.submit(Op::Compact).await?;
-    wait_for_event(worker_thread.as_ref(), |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-    child_compaction.single_request();
+    let compaction_entry = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || compaction_entered_receiver.recv()),
+    )
+    .await
+    .context("timed out waiting for child compaction response gate")??;
+    compaction_entry.context("child compaction response gate closed before admission")?;
+    worker_thread
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root().join("worker").expect("valid worker path"),
+                Vec::new(),
+                TERMINAL_TRIGGER_MESSAGE.to_string(),
+                /*trigger_turn*/ true,
+            ),
+            start_options: TurnStartOptions {
+                parent_turn_id: Some(TERMINAL_TRIGGER_PARENT_TURN.to_string()),
+                root_turn_id: Some(TERMINAL_TRIGGER_ROOT_TURN.to_string()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert!(
+        terminal_trigger_request.requests().is_empty(),
+        "trigger mail must remain queued while the child compaction response is held",
+    );
+    release_compaction
+        .send(())
+        .expect("release child compaction response");
+    let EventMsg::TurnComplete(compaction_completed) =
+        wait_for_event(worker_thread.as_ref(), |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await
+    else {
+        unreachable!("event predicate guarantees compaction completion")
+    };
+    let EventMsg::TurnComplete(terminal_trigger_completed) =
+        wait_for_event(worker_thread.as_ref(), |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await
+    else {
+        unreachable!("event predicate guarantees terminal trigger completion")
+    };
+    assert_ne!(
+        compaction_completed.turn_id,
+        terminal_trigger_completed.turn_id
+    );
+    assert!(
+        !child_compaction_body
+            .lock()
+            .expect("child compaction request body lock")
+            .as_ref()
+            .expect("captured child compaction request body")
+            .to_string()
+            .contains(TERMINAL_TRIGGER_MESSAGE)
+    );
+    let terminal_trigger_body = terminal_trigger_request.single_request().body_json();
+    assert_eq!(
+        terminal_trigger_body["input"]
+            .as_array()
+            .expect("terminal trigger request input")
+            .iter()
+            .filter(|item| {
+                item["type"] == "agent_message"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|content| {
+                            content["type"] == "input_text"
+                                && content["text"] == TERMINAL_TRIGGER_MESSAGE
+                        })
+                    })
+            })
+            .count(),
+        1
+    );
+    assert_parent_turn(&terminal_trigger_body, Some(TERMINAL_TRIGGER_PARENT_TURN))?;
+    assert_root_turn(&terminal_trigger_body, Some(TERMINAL_TRIGGER_ROOT_TURN))?;
 
     // Merge-safety anchor: flush the worker while it is still resident before sibling
     // creation can evict it at the configured thread capacity; retain the later sibling/root
@@ -402,6 +555,58 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
     worker_thread.flush_rollout().await.with_context(|| {
         format!("failed to flush worker thread {worker_thread_id} rollout before sibling spawn")
     })?;
+    let worker_history = worker_thread
+        .load_history(/*include_archived*/ false)
+        .await?;
+    let persisted_developer_instructions = worker_history
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) => {
+                Some(event.thread_settings.developer_instructions.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_developer_instructions.last(),
+        Some(&Some(Some(ROLE_DEVELOPER_INSTRUCTIONS.to_string()))),
+        "the latest worker settings snapshot must preserve the role developer instructions"
+    );
+    let compaction_completion_index = worker_history
+        .items
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
+                    if event.turn_id == compaction_completed.turn_id
+            )
+        })
+        .expect("persisted compact completion");
+    let terminal_trigger_indices = worker_history
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(envelope)
+                    if matches!(
+                        &envelope.item,
+                        ResponseItem::AgentMessage { content, .. }
+                            if content.iter().any(|item| matches!(
+                                item,
+                                AgentMessageInputContent::InputText { text }
+                                    if text == TERMINAL_TRIGGER_MESSAGE
+                            ))
+                    )
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_trigger_indices.len(), 1);
+    assert!(terminal_trigger_indices[0] > compaction_completion_index);
 
     let sibling_spawn_args = serde_json::to_string(&json!({
         "message": SIBLING_TASK,
@@ -477,21 +682,35 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
         ]),
     )
     .await;
-    let followup_child_request = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| {
+    let (followup_entered, followup_entered_receiver) = mpsc::channel();
+    let (release_followup, followup_release_receiver) = mpsc::channel();
+    let followup_child_thread_id = worker_thread_id;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(move |request: &wiremock::Request| {
             request_has_model(request, ROLE_MODEL)
                 && request_has_input_type(request, "agent_message")
                 && body_contains(request, FOLLOWUP_TASK)
                 && body_contains(request, QUEUED_MESSAGE)
-        },
-        sse(vec![
-            ev_response_created("resp-worker-2"),
-            ev_assistant_message("msg-worker-2", "follow-up complete"),
-            ev_completed("resp-worker-2"),
-        ]),
-    )
-    .await;
+                && decoded_body(request)
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                    .is_some_and(|body| {
+                        body["client_metadata"]["thread_id"] == json!(followup_child_thread_id)
+                    })
+        })
+        .respond_with(GatedSseResponder {
+            response: sse_response(sse(vec![
+                ev_response_created("resp-worker-2"),
+                ev_assistant_message("msg-worker-2", "follow-up complete"),
+                ev_completed("resp-worker-2"),
+            ])),
+            request_body: Arc::new(Mutex::new(None)),
+            entered: followup_entered,
+            release: Mutex::new(Some(followup_release_receiver)),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
@@ -558,7 +777,7 @@ async fn cold_root_resume_restores_agent_identity_after_real_child_compaction() 
         format!(
             r#"model = "{ROLE_MODEL}"
 model_reasoning_effort = "high"
-developer_instructions = "{ROLE_DEVELOPER_INSTRUCTIONS}"
+developer_instructions = "{MUTATED_ROLE_DEVELOPER_INSTRUCTIONS}"
 model_provider = "{ROLE_MODEL_PROVIDER_ID}"
 openai_base_url = "{redirected_base_url}"
 "#
@@ -592,17 +811,53 @@ openai_base_url = "{redirected_base_url}"
         resumed.codex.config().await.model_provider,
         "cold reload must preserve the parent's complete model provider",
     );
-    resumed.submit_turn(FOLLOWUP_PROMPT).await?;
+    assert_eq!(
+        reloaded_worker
+            .config()
+            .await
+            .developer_instructions
+            .as_deref(),
+        Some(ROLE_DEVELOPER_INSTRUCTIONS),
+        "cold reload must restore the persisted role developer instructions",
+    );
+    assert_eq!(
+        reloaded_worker
+            .config()
+            .await
+            .permissions
+            .permission_profile()
+            .clone(),
+        PermissionProfile::Disabled,
+        "cold reload must restore the persisted birth permission profile",
+    );
+    let root_followup = resumed.submit_turn(FOLLOWUP_PROMPT);
+    tokio::pin!(root_followup);
+    let followup_gate = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || followup_entered_receiver.recv()),
+    );
+    tokio::pin!(followup_gate);
+    let (root_followup_result, followup_gate_result) = tokio::select! {
+        result = &mut root_followup => (Some(result), None),
+        result = &mut followup_gate => (None, Some(result)),
+    };
+    let followup_entry = match followup_gate_result {
+        Some(result) => result,
+        None => followup_gate.await,
+    }
+    .context("timed out waiting for resumed child follow-up response gate")??;
+    followup_entry.context("resumed child follow-up response gate closed before admission")?;
+    release_followup
+        .send(())
+        .expect("release resumed child follow-up response");
+    match root_followup_result {
+        Some(result) => result?,
+        None => root_followup.await?,
+    }
     wait_for_event(reloaded_worker.as_ref(), |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    assert!(followup_child_request.requests().iter().any(|request| {
-        request.body_contains_text(FOLLOWUP_TASK)
-            && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)
-            && request.body_contains_text("<permission_profile type=\"disabled\">")
-            && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
-    }));
     // The worker is loaded again, while its alphabetically earlier sibling remains unloaded.
     mount_sse_once(
         &server,
@@ -634,10 +889,12 @@ openai_base_url = "{redirected_base_url}"
         .received_requests()
         .await
         .expect("captured response requests");
-    assert!(!followup_child_request.requests().iter().any(|request| {
-        request.body_json()["client_metadata"]["thread_id"] == json!(worker_thread_id)
-            && request.body_contains_text(QUEUED_MESSAGE)
-            && !request.body_contains_text(FOLLOWUP_TASK)
+    assert!(!requests.iter().any(|request| {
+        decoded_body(request)
+            .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+            .is_some_and(|body| body["client_metadata"]["thread_id"] == json!(worker_thread_id))
+            && body_contains(request, QUEUED_MESSAGE)
+            && !body_contains(request, FOLLOWUP_TASK)
     }));
     let body_for = |text: &str, thread: codex_protocol::ThreadId| {
         requests
@@ -655,6 +912,23 @@ openai_base_url = "{redirected_base_url}"
     let followup_root = body_for(FOLLOWUP_PROMPT, root_thread_id);
     let initial_child = body_for(INITIAL_TASK, worker_thread_id);
     let followup_child = body_for(FOLLOWUP_TASK, worker_thread_id);
+    let followup_has_queue = value_contains_text(&followup_child, QUEUED_MESSAGE);
+    let followup_has_original_role =
+        value_contains_text(&followup_child, ROLE_DEVELOPER_INSTRUCTIONS);
+    let followup_has_birth_permission =
+        value_contains_text(&followup_child, "<permission_profile type=\"disabled\">");
+    let followup_has_default_role =
+        value_contains_text(&followup_child, SUBAGENT_DEVELOPER_INSTRUCTIONS);
+    let followup_has_mutated_role =
+        value_contains_text(&followup_child, MUTATED_ROLE_DEVELOPER_INSTRUCTIONS);
+    assert!(
+        followup_has_queue
+            && followup_has_original_role
+            && followup_has_birth_permission
+            && !followup_has_default_role
+            && !followup_has_mutated_role,
+        "resumed child follow-up identity: queue={followup_has_queue}, original_role={followup_has_original_role}, birth_permission={followup_has_birth_permission}, default_role={followup_has_default_role}, mutated_role={followup_has_mutated_role}"
+    );
     let roster = queue_root["input"]
         .as_array()
         .into_iter()

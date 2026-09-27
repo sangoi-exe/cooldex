@@ -307,6 +307,7 @@ fn settings_snapshot(
                 developer_instructions: None,
             },
         },
+        developer_instructions: Some(None),
         disabled_plugin_ids: Vec::new(),
         shell_tool_enabled,
         agent_role_feature_opt_outs: Some(Vec::new()),

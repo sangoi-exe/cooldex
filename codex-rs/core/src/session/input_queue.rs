@@ -188,6 +188,23 @@ impl InputQueue {
         (items, start_options)
     }
 
+    /// Merge-safety anchor: terminal finalization drains only the FIFO prefix that cannot
+    /// schedule the next turn on its own.
+    ///
+    /// The first trigger-turn mail and every later mail stay queued together so the normal
+    /// next-turn drain retains their delivery order and start provenance.
+    pub(crate) async fn drain_queue_only_mailbox_input_prefix(&self) -> Vec<TurnInput> {
+        let mut pending_mails = self.mailbox_pending_mails.lock().await;
+        let queue_only_prefix_len = pending_mails
+            .iter()
+            .position(|mail| mail.communication.trigger_turn)
+            .unwrap_or(pending_mails.len());
+        pending_mails
+            .drain(..queue_only_prefix_len)
+            .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
+            .collect()
+    }
+
     pub(crate) async fn turn_state_for_sub_id(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
@@ -580,6 +597,63 @@ mod tests {
             ]
         );
         assert!(!input_queue.has_pending_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn input_queue_drains_only_queue_only_mail_prefix() {
+        let input_queue = InputQueue::new();
+        let queue_only_before_trigger = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "queue-only before trigger",
+            /*trigger_turn*/ false,
+        );
+        let trigger_turn = make_mail(
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            AgentPath::root(),
+            "trigger turn",
+            /*trigger_turn*/ true,
+        );
+        let queue_only_after_trigger = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "queue-only after trigger",
+            /*trigger_turn*/ false,
+        );
+
+        input_queue
+            .enqueue_mailbox_communication(queue_only_before_trigger.clone(), Default::default())
+            .await;
+        input_queue
+            .enqueue_mailbox_communication(
+                trigger_turn.clone(),
+                TurnStartOptions {
+                    parent_turn_id: Some("parent-turn".to_string()),
+                    root_turn_id: Some("root-turn".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        input_queue
+            .enqueue_mailbox_communication(queue_only_after_trigger.clone(), Default::default())
+            .await;
+
+        assert_eq!(
+            input_queue.drain_queue_only_mailbox_input_prefix().await,
+            vec![TurnInput::InterAgentCommunication(
+                queue_only_before_trigger
+            )],
+        );
+        let (remaining_input, start_options) = input_queue.drain_mailbox_input_items().await;
+        assert_eq!(
+            remaining_input,
+            vec![
+                TurnInput::InterAgentCommunication(trigger_turn),
+                TurnInput::InterAgentCommunication(queue_only_after_trigger),
+            ],
+        );
+        assert_eq!(start_options.parent_turn_id.as_deref(), Some("parent-turn"));
+        assert_eq!(start_options.root_turn_id.as_deref(), Some("root-turn"));
     }
 
     #[tokio::test]

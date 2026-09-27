@@ -15,11 +15,21 @@ $script:Runtime = $null
 $script:TestOnlyFakeCargoOptIn = "CARGO_VALIDATE_WINDOWS_TEST_ONLY_FAKE_CARGO"
 $script:TestOnlyPreflightFixtureOptIn = "CARGO_VALIDATE_WINDOWS_TEST_ONLY_PREFLIGHT_FIXTURES"
 $script:TestOnlyFakeCreateIgnoredFile = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_IGNORED"
+$script:TestOnlyFakeCreateUntrackedFile = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_UNTRACKED"
+$script:TestOnlyFakeCreateInstaPending = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CREATE_INSTA_PENDING"
+$script:TestOnlyFakeLongRunning = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_LONG_RUNNING"
+$script:TestOnlyFakeRootExitsFirst = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_ROOT_EXITS_FIRST"
+$script:TestOnlyFakeImmediateDescendant = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_IMMEDIATE_DESCENDANT"
+$script:TestOnlyFakeContainmentTerminateFailure = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_CONTAINMENT_TERMINATE_FAILURE"
+$script:TestOnlyFakeWaitForReadiness = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_WAIT_FOR_READINESS"
+$script:TestOnlyFakeSuppressReadiness = "CARGO_VALIDATE_WINDOWS_TEST_FAKE_SUPPRESS_READINESS"
+$script:TestOnlyPathOwnership = "CARGO_VALIDATE_WINDOWS_TEST_PATH_OWNERSHIP"
 $script:TestOnlyBootstrapFixtureOptIn = "CARGO_VALIDATE_WINDOWS_TEST_ONLY_BOOTSTRAP_FIXTURES"
 $script:NativeMutexName = "Local\Cooldex.WindowsBuildCacheCleanup.v1"
 $script:NativeMutex = $null
 $script:NativeMutexHeld = $false
 $script:NativeGit = $null
+$script:NativePython = $null
 $script:DirectToolchain = $null
 $script:Bootstrap = $null
 $script:GitEnvironment = $null
@@ -35,6 +45,7 @@ $script:LivePreflightChecks = [System.Collections.Generic.List[object]]::new()
 $script:ExitCode = 1
 $script:Status = "preflight-failed"
 $script:Failure = $null
+$script:CurrentCommandExitCode = $null
 
 function Fail-Manifest {
     param([string]$Message)
@@ -353,29 +364,6 @@ function Get-SafeWorkflowNamespace {
     return $namespace
 }
 
-function Get-ReuseRunRoot {
-    param(
-        [object]$Value,
-        [string]$CacheRoot,
-        [string]$Name
-    )
-
-    if ($null -eq $Value) {
-        return $null
-    }
-    $path = Get-RequiredString $Value $Name
-    $fullPath = [System.IO.Path]::GetFullPath($path)
-    $prefix = "$CacheRoot\"
-    if (
-        -not [System.IO.Path]::IsPathFullyQualified($fullPath) -or
-        $fullPath.Equals($CacheRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-        -not $fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
-    ) {
-        Fail-Manifest "$Name must be an absolute working-set root below literal $CacheRoot"
-    }
-    return $fullPath
-}
-
 function Get-WindowsRuntime {
     param([System.Collections.IDictionary]$ManifestData)
 
@@ -383,9 +371,6 @@ function Get-WindowsRuntime {
     $expected = @(
         "cache_root",
         "workflow_namespace",
-        "reuse_run_root",
-        "minimum_free_disk_gib",
-        "minimum_available_memory_gib",
         "target",
         "rust_toolchain",
         "nextest_version",
@@ -406,18 +391,6 @@ function Get-WindowsRuntime {
         Fail-Manifest "windows_runtime.cache_root must be literal F:\.cache"
     }
     $namespace = Get-SafeWorkflowNamespace $runtime["workflow_namespace"] "windows_runtime.workflow_namespace"
-    $reuseRunRoot = Get-ReuseRunRoot $runtime["reuse_run_root"] $cacheRoot "windows_runtime.reuse_run_root"
-
-    $minimumFreeDisk = Get-RequiredPositiveInt $runtime["minimum_free_disk_gib"] "windows_runtime.minimum_free_disk_gib"
-    $minimumDiskFloor = if ($null -eq $reuseRunRoot) { 120 } else { 1 }
-    if ($minimumFreeDisk -lt $minimumDiskFloor) {
-        $route = if ($null -eq $reuseRunRoot) { "cold" } else { "reused" }
-        Fail-Manifest "windows_runtime.minimum_free_disk_gib must be at least $minimumDiskFloor for the $route route"
-    }
-    $minimumMemory = Get-RequiredPositiveInt $runtime["minimum_available_memory_gib"] "windows_runtime.minimum_available_memory_gib"
-    if ($minimumMemory -lt 30) {
-        Fail-Manifest "windows_runtime.minimum_available_memory_gib must be at least 30"
-    }
 
     $target = Get-RequiredString $runtime["target"] "windows_runtime.target"
     if ($target -cne "x86_64-pc-windows-msvc") {
@@ -440,15 +413,41 @@ function Get-WindowsRuntime {
     }
 
     $resource = Get-RequiredMap $runtime["resource_contract"] "windows_runtime.resource_contract"
-    Assert-ExactKeys $resource @("resource_profile", "cargo_build_jobs", "nextest_test_threads") "windows_runtime.resource_contract"
+    Assert-ExactKeys $resource @("resource_profile", "cold_minimum_free_disk_gib", "warm_minimum_free_disk_gib", "minimum_available_memory_gib", "cargo_build_jobs", "nextest_test_threads", "monitor", "abort_free_gib", "abort_free_pct") "windows_runtime.resource_contract"
     $resourceProfile = Get-RequiredString $resource["resource_profile"] "windows_runtime.resource_contract.resource_profile"
     if ($resourceProfile -cne "windows_nextest") {
         Fail-Manifest "windows_runtime.resource_contract.resource_profile must be windows_nextest"
     }
+    $coldMinimumFreeDisk = Get-RequiredPositiveInt $resource["cold_minimum_free_disk_gib"] "windows_runtime.resource_contract.cold_minimum_free_disk_gib"
+    if ($coldMinimumFreeDisk -lt 120) {
+        Fail-Manifest "windows_runtime.resource_contract.cold_minimum_free_disk_gib must be at least 120"
+    }
+    $warmMinimumFreeDisk = Get-RequiredPositiveInt $resource["warm_minimum_free_disk_gib"] "windows_runtime.resource_contract.warm_minimum_free_disk_gib"
+    if ($warmMinimumFreeDisk -lt 5) {
+        Fail-Manifest "windows_runtime.resource_contract.warm_minimum_free_disk_gib must be at least 5"
+    }
+    $minimumMemory = Get-RequiredPositiveInt $resource["minimum_available_memory_gib"] "windows_runtime.resource_contract.minimum_available_memory_gib"
+    if ($minimumMemory -lt 30) {
+        Fail-Manifest "windows_runtime.resource_contract.minimum_available_memory_gib must be at least 30"
+    }
+    if ($resource["monitor"] -isnot [bool] -or -not $resource["monitor"]) {
+        Fail-Manifest "windows_runtime.resource_contract.monitor must be true"
+    }
+    $abortFreeGib = Get-RequiredPositiveInt $resource["abort_free_gib"] "windows_runtime.resource_contract.abort_free_gib"
+    $abortFreePct = Get-RequiredPositiveInt $resource["abort_free_pct"] "windows_runtime.resource_contract.abort_free_pct" -AllowZero
+    if ($abortFreePct -gt 100) {
+        Fail-Manifest "windows_runtime.resource_contract.abort_free_pct must not exceed 100"
+    }
     $resourceContract = [ordered]@{
         resource_profile = $resourceProfile
+        cold_minimum_free_disk_gib = $coldMinimumFreeDisk
+        warm_minimum_free_disk_gib = $warmMinimumFreeDisk
+        minimum_available_memory_gib = $minimumMemory
         cargo_build_jobs = Get-RequiredPositiveInt $resource["cargo_build_jobs"] "windows_runtime.resource_contract.cargo_build_jobs"
         nextest_test_threads = Get-RequiredPositiveInt $resource["nextest_test_threads"] "windows_runtime.resource_contract.nextest_test_threads"
+        monitor = $true
+        abort_free_gib = $abortFreeGib
+        abort_free_pct = $abortFreePct
     }
 
     $source = Get-RequiredMap $runtime["source_materialization"] "windows_runtime.source_materialization"
@@ -461,9 +460,6 @@ function Get-WindowsRuntime {
     return [pscustomobject]@{
         cache_root = $cacheRoot
         workflow_namespace = $namespace
-        reuse_run_root = $reuseRunRoot
-        minimum_free_disk_gib = $minimumFreeDisk
-        minimum_available_memory_gib = $minimumMemory
         target = $target
         rust_toolchain = $toolchain
         nextest_version = [string]$runtime["nextest_version"]
@@ -484,71 +480,203 @@ function Get-WindowsRuntime {
     }
 }
 
+function Test-OperatorClearedCacheRoot {
+    param([pscustomobject]$TestFixture)
+
+    if ($null -ne $TestFixture) {
+        return $TestFixture.cache_root_state -eq "cleared"
+    }
+    if (-not (Test-Path -LiteralPath $script:CacheRoot)) {
+        return $true
+    }
+    return @(Get-ChildItem -LiteralPath $script:CacheRoot -Force).Count -eq 0
+}
+
+function Test-EvidenceOnlyColdRetryState {
+    param(
+        [string]$ExecutorRoot,
+        [pscustomobject]$TestFixture
+    )
+
+    if (-not (Test-Path -LiteralPath $ExecutorRoot)) {
+        return $false
+    }
+    if ($null -eq $TestFixture) {
+        $cacheEntries = @(Get-ChildItem -LiteralPath $script:CacheRoot -Force)
+        if ($cacheEntries.Count -ne 1 -or -not $cacheEntries[0].FullName.Equals($ExecutorRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    $executor = Get-Item -LiteralPath $ExecutorRoot -Force
+    if ($executor -isnot [System.IO.DirectoryInfo] -or ($executor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $false
+    }
+    $entries = @(Get-ChildItem -LiteralPath $ExecutorRoot -Force)
+    if ($entries.Count -ne 1 -or -not $entries[0].Name.Equals("r", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+    $runs = $entries[0]
+    if ($runs -isnot [System.IO.DirectoryInfo] -or ($runs.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $false
+    }
+    foreach ($run in @(Get-ChildItem -LiteralPath $runs.FullName -Force)) {
+        if ($run -isnot [System.IO.DirectoryInfo] -or ($run.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        $runEntries = @(Get-ChildItem -LiteralPath $run.FullName -Force)
+        if ($runEntries.Count -ne 1 -or -not $runEntries[0].Name.Equals("e", [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        if ($runEntries[0] -isnot [System.IO.DirectoryInfo] -or ($runEntries[0].Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function New-RunPaths {
     param(
         [string]$Namespace,
-        [object]$ReuseRunRoot
+        [pscustomobject]$TestFixture,
+        [pscustomobject]$PathOwnership
     )
 
     $Namespace = Get-SafeWorkflowNamespace $Namespace "windows_runtime.workflow_namespace"
     $runId = "{0}-{1}" -f [DateTime]::UtcNow.ToString("yyyyMMddHHmmssfff"), [Guid]::NewGuid().ToString("N")
-    $tempLeaf = "p$([Guid]::NewGuid().ToString('N'))"
+    $tempLeaf = if ($null -eq $PathOwnership) { "p$([Guid]::NewGuid().ToString('N'))" } else { $PathOwnership.temp_leaf }
     $executorRoot = Join-Path $script:CacheRoot $Namespace
     $runContainer = Join-Path $executorRoot "r"
     $executionRoot = Join-Path $runContainer $runId
-    $isReuse = $null -ne $ReuseRunRoot
-    $workingSetRoot = if ($isReuse) {
-        Assert-RunPath $ReuseRunRoot
-    } else {
-        Assert-RunPath $executionRoot
-    }
+    $workingSetRoot = Assert-RunPath (Join-Path $executorRoot "workset")
+    $cacheMode = if (Test-Path -LiteralPath $workingSetRoot) { "warm" } else { "cold" }
+    $targetDir = Join-Path $workingSetRoot "target"
     $paths = [ordered]@{
         cache_root = $script:CacheRoot
         executor_root = $executorRoot
+        workset_root = $workingSetRoot
         run_root = $workingSetRoot
+        execution_root = $executionRoot
         evidence_dir = (Join-Path $executionRoot "e")
         temp_dir = (Join-Path $script:CacheRoot $tempLeaf)
-        target_dir = (Join-Path $workingSetRoot "target")
+        target_dir = $targetDir
+        build_dir = $targetDir
         cargo_home = (Join-Path $workingSetRoot "cargo")
         rustup_home = (Join-Path $workingSetRoot "rustup")
         candidate_root = (Join-Path $workingSetRoot "candidate")
         helper_state = (Join-Path $workingSetRoot "helper")
         tool_staging = (Join-Path $workingSetRoot "tools")
         v8_cache = (Join-Path $workingSetRoot "v8")
+        cache_state_path = (Join-Path $workingSetRoot "cache-state.json")
+        cache_mode = $cacheMode
     }
 
-    foreach ($ancestor in @("F:\", $script:CacheRoot, $executorRoot, $runContainer)) {
+    foreach ($ancestor in @("F:\", $script:CacheRoot)) {
         Assert-FixedCacheAncestorIsNotReparsePoint $ancestor
     }
-    if ($isReuse) {
-        if (-not (Test-Path -LiteralPath $workingSetRoot)) {
-            Fail-Manifest "selected reuse working-set root does not exist: $workingSetRoot"
+    if ($cacheMode -eq "warm") {
+        Assert-ReusablePersistentWorksetPaths ([pscustomobject]$paths)
+    } else {
+        $evidenceOnlyRetry = Test-EvidenceOnlyColdRetryState $executorRoot $TestFixture
+        if (-not (Test-OperatorClearedCacheRoot $TestFixture) -and -not $evidenceOnlyRetry) {
+            Fail-Manifest "canonical workset is absent but F:\.cache is not operator-cleared; no cold fallback is permitted"
         }
-        $workingSetItem = Get-Item -LiteralPath $workingSetRoot -Force
-        if (
-            $workingSetItem -isnot [System.IO.DirectoryInfo] -or
-            ($workingSetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        ) {
-            Fail-Manifest "selected reuse working-set root must be a non-reparse directory: $workingSetRoot"
+        if ((Test-Path -LiteralPath $executorRoot) -and -not $evidenceOnlyRetry) {
+            Fail-Manifest "canonical workset is absent but its workflow namespace contains residual state: $executorRoot"
+        }
+        # A cold rejection may retain only fresh run evidence. The
+        # persistent workset is created after resource and prerequisite admission.
+        $null = [System.IO.Directory]::CreateDirectory($executorRoot)
+        Assert-FixedCacheAncestorIsNotReparsePoint $executorRoot
+        if ($null -ne $PathOwnership -and $PathOwnership.path_creation_failure -eq "after-workset-root") {
+            Fail-Manifest "test-only fixture path creation failed after executor namespace initialization"
         }
     }
-    foreach ($path in @($executionRoot, $paths.evidence_dir, $paths.temp_dir)) {
+    $null = [System.IO.Directory]::CreateDirectory($runContainer)
+    Assert-FixedCacheAncestorIsNotReparsePoint $runContainer
+    $freshPaths = @($executionRoot, $paths.evidence_dir)
+    if ($cacheMode -eq "warm") {
+        $freshPaths += $paths.temp_dir
+    }
+    foreach ($path in $freshPaths) {
         $resolved = Assert-RunPath ([string]$path)
         if (Test-Path -LiteralPath $resolved) {
             Fail-Manifest "fresh execution path already exists: $resolved"
         }
         $null = [System.IO.Directory]::CreateDirectory($resolved)
     }
-    if (-not $isReuse) {
-        foreach ($name in @("target_dir", "cargo_home", "rustup_home", "helper_state", "tool_staging", "v8_cache")) {
-            $resolved = Assert-RunPath ([string]$paths[$name])
-            $null = [System.IO.Directory]::CreateDirectory($resolved)
-        }
-    }
-    foreach ($name in @("executor_root", "run_root", "evidence_dir", "temp_dir", "target_dir", "cargo_home", "rustup_home", "candidate_root", "helper_state", "tool_staging", "v8_cache")) {
+    foreach ($name in @("executor_root", "workset_root", "run_root", "execution_root", "evidence_dir", "temp_dir", "target_dir", "build_dir", "cargo_home", "rustup_home", "candidate_root", "helper_state", "tool_staging", "v8_cache", "cache_state_path")) {
         $paths[$name] = Assert-RunPath ([string]$paths[$name])
     }
     return [pscustomobject]$paths
+}
+
+function Assert-ReparseFreePersistentPath {
+    param(
+        [string]$Path,
+        [bool]$Directory,
+        [string]$Name
+    )
+
+    $fullPath = Assert-RunPath $Path
+    $cacheRoot = Assert-RunPath $script:CacheRoot
+    if (-not $fullPath.StartsWith("$cacheRoot\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        Fail-Manifest "$Name must resolve below literal $cacheRoot"
+    }
+    $current = $cacheRoot
+    $relative = $fullPath.Substring($cacheRoot.Length).TrimStart([char]'\')
+    foreach ($segment in $relative.Split([char[]]@('\'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        $current = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $current)) {
+            Fail-Manifest "$Name is missing from the canonical reusable workset: $current"
+        }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail-Manifest "$Name contains a reparse point: $current"
+        }
+    }
+    $item = Get-Item -LiteralPath $fullPath -Force
+    if (($Directory -and $item -isnot [System.IO.DirectoryInfo]) -or ((-not $Directory) -and $item -isnot [System.IO.FileInfo])) {
+        Fail-Manifest "$Name has an unexpected persistent path type: $fullPath"
+    }
+}
+
+function Assert-ReusablePersistentWorksetPaths {
+    param([pscustomobject]$Paths)
+
+    foreach ($entry in @(
+            @($Paths.executor_root, $true, "canonical reusable executor root"),
+            @($Paths.workset_root, $true, "canonical reusable workset"),
+            @($Paths.target_dir, $true, "canonical reusable target directory"),
+            @($Paths.build_dir, $true, "canonical reusable Cargo build directory"),
+            @($Paths.cargo_home, $true, "canonical reusable Cargo home"),
+            @($Paths.rustup_home, $true, "canonical reusable Rustup home"),
+            @($Paths.candidate_root, $true, "canonical reusable candidate"),
+            @($Paths.helper_state, $true, "canonical reusable helper state"),
+            @($Paths.tool_staging, $true, "canonical reusable tool staging"),
+            @($Paths.v8_cache, $true, "canonical reusable V8 cache"),
+            @($Paths.cache_state_path, $false, "canonical reusable cache state")
+        )) {
+        Assert-ReparseFreePersistentPath $entry[0] $entry[1] $entry[2]
+    }
+}
+
+function Initialize-CanonicalWorkset {
+    param(
+        [pscustomobject]$Paths,
+        [pscustomobject]$PathOwnership
+    )
+
+    if ($Paths.cache_mode -ne "cold") {
+        return
+    }
+    if (Test-Path -LiteralPath $Paths.workset_root) {
+        Fail-Manifest "canonical workset appeared before cold initialization: $($Paths.workset_root)"
+    }
+    $null = [System.IO.Directory]::CreateDirectory($Paths.workset_root)
+    foreach ($name in @("target_dir", "build_dir", "cargo_home", "rustup_home", "helper_state", "tool_staging", "v8_cache")) {
+        $null = [System.IO.Directory]::CreateDirectory([string]$Paths.$name)
+    }
+    $null = [System.IO.Directory]::CreateDirectory($Paths.temp_dir)
 }
 
 function Assert-ReuseReceiptPath {
@@ -561,48 +689,52 @@ function Assert-ReuseReceiptPath {
     $recorded = Assert-RunPath (Get-RequiredString $Value $Name)
     $expectedPath = Assert-RunPath $Expected
     if (-not $recorded.Equals($expectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Fail-Manifest "$Name does not match the selected reuse working set"
+        Fail-Manifest "$Name does not match the canonical reusable workset"
     }
 }
 
-function Get-ReuseReceipt {
+function Get-ReusableCacheState {
     param([pscustomobject]$Paths)
 
-    $receiptPath = Assert-RunPath (Join-Path $Paths.run_root "e\result.json")
+    $receiptPath = $Paths.cache_state_path
     if (-not [System.IO.File]::Exists($receiptPath)) {
-        Fail-Manifest "selected reuse working set is missing e\\result.json: $receiptPath"
+        Fail-Manifest "canonical reusable workset is missing cache-state.json: $receiptPath"
     }
     $receiptItem = Get-Item -LiteralPath $receiptPath -Force
     if (
         $receiptItem -isnot [System.IO.FileInfo] -or
         ($receiptItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
     ) {
-        Fail-Manifest "selected reuse receipt must be a non-reparse regular file: $receiptPath"
+        Fail-Manifest "canonical reusable cache state must be a non-reparse regular file: $receiptPath"
     }
     try {
         $receipt = ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($receiptPath, [System.Text.Encoding]::UTF8)) -AsHashtable -Depth 64 -NoEnumerate
     } catch {
-        Fail-Manifest "selected reuse receipt is not valid JSON: $receiptPath"
+        Fail-Manifest "canonical reusable cache state is not valid JSON: $receiptPath"
     }
-    $receipt = Get-RequiredMap $receipt "selected reuse receipt"
+    $receipt = Get-RequiredMap $receipt "canonical reusable cache state"
     Assert-ExactKeys $receipt @(
-        "schema", "status", "exit_code", "cache_root", "paths", "resource_contract", "bootstrap",
-        "candidate_materialization", "manifest_path", "plan_id", "validation_tooling_digest",
-        "candidate_identity", "command_results", "error"
-    ) "selected reuse receipt"
-    if ((Get-RequiredPositiveInt $receipt["schema"] "selected reuse receipt.schema") -ne 2) {
-        Fail-Manifest "selected reuse receipt.schema must equal 2"
+        "schema", "status", "cache_root", "paths", "bootstrap",
+        "candidate_materialization", "candidate_identity"
+    ) "canonical reusable cache state"
+    if ((Get-RequiredPositiveInt $receipt["schema"] "canonical reusable cache state.schema") -ne 2) {
+        Fail-Manifest "canonical reusable cache state.schema must equal 2"
     }
-    $recordedPaths = Get-RequiredMap $receipt["paths"] "selected reuse receipt.paths"
+    if ((Get-RequiredString $receipt["status"] "canonical reusable cache state.status") -cne "ready") {
+        Fail-Manifest "canonical reusable cache state must be ready"
+    }
+    Assert-ReuseReceiptPath $receipt["cache_root"] $script:CacheRoot "canonical reusable cache state.cache_root"
+    $recordedPaths = Get-RequiredMap $receipt["paths"] "canonical reusable cache state.paths"
     Assert-ExactKeys $recordedPaths @(
-        "cache_root", "executor_root", "run_root", "evidence_dir", "temp_dir", "target_dir", "cargo_home",
-        "rustup_home", "candidate_root", "helper_state", "tool_staging", "v8_cache"
-    ) "selected reuse receipt.paths"
+        "cache_root", "executor_root", "workset_root", "target_dir", "build_dir", "cargo_home", "rustup_home",
+        "candidate_root", "helper_state", "tool_staging", "v8_cache"
+    ) "canonical reusable cache state.paths"
     foreach ($entry in @(
             @("cache_root", $script:CacheRoot),
             @("executor_root", $Paths.executor_root),
-            @("run_root", $Paths.run_root),
+            @("workset_root", $Paths.workset_root),
             @("target_dir", $Paths.target_dir),
+            @("build_dir", $Paths.build_dir),
             @("cargo_home", $Paths.cargo_home),
             @("rustup_home", $Paths.rustup_home),
             @("candidate_root", $Paths.candidate_root),
@@ -610,25 +742,93 @@ function Get-ReuseReceipt {
             @("tool_staging", $Paths.tool_staging),
             @("v8_cache", $Paths.v8_cache)
         )) {
-        Assert-ReuseReceiptPath $recordedPaths[$entry[0]] $entry[1] "selected reuse receipt.paths.$($entry[0])"
+        Assert-ReuseReceiptPath $recordedPaths[$entry[0]] $entry[1] "canonical reusable cache state.paths.$($entry[0])"
     }
-    $materialization = Get-RequiredMap $receipt["candidate_materialization"] "selected reuse receipt.candidate_materialization"
+    $materialization = Get-RequiredMap $receipt["candidate_materialization"] "canonical reusable cache state.candidate_materialization"
+    Assert-ExactKeys $materialization @("status", "materialized", "candidate_root") "canonical reusable cache state.candidate_materialization"
     if (
-        (Get-RequiredString $materialization["status"] "selected reuse receipt.candidate_materialization.status") -cne "success" -or
+        (Get-RequiredString $materialization["status"] "canonical reusable cache state.candidate_materialization.status") -cne "success" -or
         $materialization["materialized"] -isnot [bool] -or
         -not $materialization["materialized"]
     ) {
-        Fail-Manifest "selected reuse receipt does not record a materialized candidate"
+        Fail-Manifest "canonical reusable cache state does not record a materialized candidate"
     }
-    Assert-ReuseReceiptPath $materialization["candidate_root"] $Paths.candidate_root "selected reuse receipt.candidate_materialization.candidate_root"
-    $bootstrap = Get-RequiredMap $receipt["bootstrap"] "selected reuse receipt.bootstrap"
-    if ((Get-RequiredString $bootstrap["status"] "selected reuse receipt.bootstrap.status") -cne "success") {
-        Fail-Manifest "selected reuse receipt does not record a successful bootstrap"
+    Assert-ReuseReceiptPath $materialization["candidate_root"] $Paths.candidate_root "canonical reusable cache state.candidate_materialization.candidate_root"
+    $recordedCandidate = Get-RequiredMap $receipt["candidate_identity"] "canonical reusable cache state.candidate_identity"
+    Assert-ExactKeys $recordedCandidate @("head", "merge_head", "index_tree") "canonical reusable cache state.candidate_identity"
+    foreach ($name in @("head", "index_tree")) {
+        $null = Assert-GitObjectId (Get-RequiredString $recordedCandidate[$name] "canonical reusable cache state.candidate_identity.$name") "canonical reusable cache state.candidate_identity.$name"
+    }
+    if ($null -ne $recordedCandidate["merge_head"]) {
+        $null = Assert-GitObjectId (Get-RequiredString $recordedCandidate["merge_head"] "canonical reusable cache state.candidate_identity.merge_head") "canonical reusable cache state.candidate_identity.merge_head"
+    }
+    $bootstrap = Get-RequiredMap $receipt["bootstrap"] "canonical reusable cache state.bootstrap"
+    Assert-ExactKeys $bootstrap @("status", "direct_toolchain", "msvc_setup", "nextest", "v8", "path_prefix") "canonical reusable cache state.bootstrap"
+    if ((Get-RequiredString $bootstrap["status"] "canonical reusable cache state.bootstrap.status") -cne "success") {
+        Fail-Manifest "canonical reusable cache state does not record a successful bootstrap"
     }
     return [pscustomobject]@{
         path = $receiptPath
         value = $receipt
     }
+}
+
+function Get-StableReusableBootstrap {
+    param([pscustomobject]$Bootstrap)
+
+    return [ordered]@{
+        status = "success"
+        direct_toolchain = $Bootstrap.direct_toolchain
+        msvc_setup = [ordered]@{
+            status = $Bootstrap.msvc_setup.status
+            script_path = $Bootstrap.msvc_setup.script_path
+            script_sha256 = $Bootstrap.msvc_setup.script_sha256
+            environment = $Bootstrap.msvc_setup.environment
+        }
+        nextest = $Bootstrap.nextest
+        v8 = $Bootstrap.v8
+        path_prefix = $Bootstrap.path_prefix
+    }
+}
+
+function Get-StableReusableMaterialization {
+    param([pscustomobject]$Materialization)
+
+    return [ordered]@{
+        status = "success"
+        materialized = $true
+        candidate_root = $Materialization.candidate_root
+    }
+}
+
+function Write-ReusableCacheState {
+    param(
+        [pscustomobject]$Paths,
+        [pscustomobject]$Bootstrap,
+        [pscustomobject]$Materialization,
+        [pscustomobject]$Candidate
+    )
+
+    if ($null -eq $Bootstrap -or $Bootstrap.status -cne "success" -or $null -eq $Materialization -or -not $Materialization.materialized) {
+        Fail-Manifest "canonical reusable cache state requires successful bootstrap and candidate materialization"
+    }
+    $stablePaths = [ordered]@{}
+    foreach ($name in @("cache_root", "executor_root", "workset_root", "target_dir", "build_dir", "cargo_home", "rustup_home", "candidate_root", "helper_state", "tool_staging", "v8_cache")) {
+        $stablePaths[$name] = $Paths.$name
+    }
+    Write-JsonEvidence $Paths.cache_state_path ([ordered]@{
+            schema = 2
+            status = "ready"
+            cache_root = $script:CacheRoot
+            paths = $stablePaths
+            bootstrap = Get-StableReusableBootstrap $Bootstrap
+            candidate_materialization = Get-StableReusableMaterialization $Materialization
+            candidate_identity = [ordered]@{
+                head = $Candidate.head
+                merge_head = $Candidate.merge_head
+                index_tree = $Candidate.index_tree
+            }
+        })
 }
 
 function Get-TestOnlyPreflightFixture {
@@ -637,10 +837,13 @@ function Get-TestOnlyPreflightFixture {
     # test-only opt-in is present in the Windows process environment.
     $fields = @(
         "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES",
+        "CARGO_VALIDATE_WINDOWS_TEST_DISK_TOTAL_BYTES",
         "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES",
         "CARGO_VALIDATE_WINDOWS_TEST_NATIVE_PROCESS_STATE",
         "CARGO_VALIDATE_WINDOWS_TEST_WSL_PROCESS_STATE",
-        "CARGO_VALIDATE_WINDOWS_TEST_MUTEX_STATE"
+        "CARGO_VALIDATE_WINDOWS_TEST_MUTEX_STATE",
+        "CARGO_VALIDATE_WINDOWS_TEST_CACHE_ROOT_STATE",
+        "CARGO_VALIDATE_WINDOWS_TEST_MONITOR_ERROR_AFTER_SAMPLES"
     )
     $provided = @($fields | Where-Object { $null -ne [System.Environment]::GetEnvironmentVariable($_) })
     $optIn = [System.Environment]::GetEnvironmentVariable($script:TestOnlyPreflightFixtureOptIn)
@@ -662,6 +865,7 @@ function Get-TestOnlyPreflightFixture {
     $numbers = [ordered]@{}
     foreach ($field in @(
             "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES",
+            "CARGO_VALIDATE_WINDOWS_TEST_DISK_TOTAL_BYTES",
             "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES"
         )) {
         $value = [System.Environment]::GetEnvironmentVariable($field)
@@ -677,6 +881,10 @@ function Get-TestOnlyPreflightFixture {
     $nativeState = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_NATIVE_PROCESS_STATE")
     $wslState = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_WSL_PROCESS_STATE")
     $mutexState = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_MUTEX_STATE")
+    $cacheRootState = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_CACHE_ROOT_STATE")
+    $monitorErrorAfterSamples = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_MONITOR_ERROR_AFTER_SAMPLES")
+    $failStage = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_PREFLIGHT_FAIL_STAGE")
+    $diskSamples = [System.Environment]::GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES")
     if ($nativeState -notin @("clear", "cargo", "cargo-nextest", "rustc", "rustdoc", "query-failure", "malformed")) {
         Fail-Manifest "test-only native process state is unsupported"
     }
@@ -686,12 +894,97 @@ function Get-TestOnlyPreflightFixture {
     if ($mutexState -notin @("clear", "busy", "abandoned")) {
         Fail-Manifest "test-only mutex state is unsupported"
     }
+    if ($cacheRootState -notin @("cleared", "residual")) {
+        Fail-Manifest "test-only cache-root state is unsupported"
+    }
+    if ($monitorErrorAfterSamples -notmatch "^(0|[1-9][0-9]{0,8})$") {
+        Fail-Manifest "test-only monitor-error sample count is unsupported"
+    }
+    if ($null -ne $failStage -and $failStage -notin @("before-approved-command-2")) {
+        Fail-Manifest "test-only preflight failure stage is unsupported"
+    }
+    $samples = [System.Collections.Generic.List[uint64]]::new()
+    if ($null -ne $diskSamples) {
+        foreach ($sample in $diskSamples.Split(",", [System.StringSplitOptions]::None)) {
+            if ($sample -notmatch "^(0|[1-9][0-9]{0,19})$") {
+                Fail-Manifest "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES must be comma-separated unsigned decimal integers"
+            }
+            try {
+                $samples.Add([uint64]$sample)
+            } catch {
+                Fail-Manifest "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES is outside the supported unsigned integer range"
+            }
+        }
+        if ($samples.Count -eq 0) {
+            Fail-Manifest "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_SAMPLES must not be empty"
+        }
+    }
     return [pscustomobject]@{
         disk_free_bytes = $numbers["CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES"]
+        disk_total_bytes = $numbers["CARGO_VALIDATE_WINDOWS_TEST_DISK_TOTAL_BYTES"]
         available_memory_bytes = $numbers["CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES"]
         native_process_state = $nativeState
         wsl_process_state = $wslState
         mutex_state = $mutexState
+        cache_root_state = $cacheRootState
+        fail_stage = $failStage
+        disk_free_samples = $samples.ToArray()
+        disk_free_sample_index = 0
+        monitor_error_after_samples = [int]$monitorErrorAfterSamples
+        monitor_samples_observed = 0
+    }
+}
+
+function Get-TestOnlyPathOwnership {
+    param(
+        [pscustomobject]$Runtime,
+        [pscustomobject]$TestFixture
+    )
+
+    # This test-only process input binds a Python unittest case's exact F: paths
+    # before New-RunPaths can create them. Production path generation is unchanged
+    # because the value is absent outside the harness fixture process.
+    $raw = [System.Environment]::GetEnvironmentVariable($script:TestOnlyPathOwnership)
+    if ([string]::IsNullOrEmpty($raw)) {
+        return $null
+    }
+    if (
+        $null -eq $TestFixture -or
+        [System.Environment]::GetEnvironmentVariable($script:TestOnlyPreflightFixtureOptIn) -cne "1"
+    ) {
+        Fail-Manifest "test-only fixture path ownership requires the preflight-fixture process opt-in"
+    }
+    try {
+        $ownership = ConvertFrom-Json -InputObject $raw -AsHashtable -Depth 8 -NoEnumerate
+    } catch {
+        Fail-Manifest "test-only fixture path ownership is not valid JSON"
+    }
+    $ownership = Get-RequiredMap $ownership "test-only fixture path ownership"
+    Assert-ExactKeys $ownership @("token", "namespace", "temp_leaf", "path_creation_failure") "test-only fixture path ownership"
+    $token = Get-RequiredString $ownership["token"] "test-only fixture path ownership.token"
+    if ($token -notmatch "^[a-f0-9]{32}$") {
+        Fail-Manifest "test-only fixture path ownership.token must be 32 lowercase hexadecimal characters"
+    }
+    $namespace = Get-SafeWorkflowNamespace $ownership["namespace"] "test-only fixture path ownership.namespace"
+    if ($namespace -cne $Runtime.workflow_namespace) {
+        Fail-Manifest "test-only fixture path ownership.namespace must match windows_runtime.workflow_namespace"
+    }
+    if ($namespace -notmatch "^cw-test-$token-[a-f0-9]{8}$") {
+        Fail-Manifest "test-only fixture path ownership.namespace must be token-bound"
+    }
+    $tempLeaf = Get-RequiredString $ownership["temp_leaf"] "test-only fixture path ownership.temp_leaf"
+    if ($tempLeaf -notmatch "^p$token[a-f0-9]{8}$") {
+        Fail-Manifest "test-only fixture path ownership.temp_leaf must be a token-bound hyphen-free leaf"
+    }
+    $pathCreationFailure = $ownership["path_creation_failure"]
+    if ($null -ne $pathCreationFailure -and $pathCreationFailure -cne "after-workset-root") {
+        Fail-Manifest "test-only fixture path ownership.path_creation_failure is unsupported"
+    }
+    return [pscustomobject]@{
+        token = $token
+        namespace = $namespace
+        temp_leaf = $tempLeaf
+        path_creation_failure = $pathCreationFailure
     }
 }
 
@@ -815,24 +1108,48 @@ function Exit-NativeExecutionMutex {
     }
 }
 
-function Get-WindowsDriveFreeBytes {
-    param([pscustomobject]$TestFixture)
+function Get-WindowsDriveSpace {
+    param(
+        [pscustomobject]$TestFixture,
+        [bool]$ConsumeFixtureSample = $false
+    )
 
     if ($null -ne $TestFixture) {
-        return [uint64]$TestFixture.disk_free_bytes
+        [uint64]$free = [uint64]$TestFixture.disk_free_bytes
+        if ($ConsumeFixtureSample -and @($TestFixture.disk_free_samples).Count -ne 0) {
+            $index = [int]$TestFixture.disk_free_sample_index
+            $samples = @($TestFixture.disk_free_samples)
+            $free = [uint64]$samples[[Math]::Min($index, $samples.Count - 1)]
+            $TestFixture.disk_free_sample_index = $index + 1
+        }
+        return [pscustomobject]@{
+            free_bytes = $free
+            total_bytes = [uint64]$TestFixture.disk_total_bytes
+            source = "test-only-fixture"
+        }
     }
     try {
         $drive = [System.IO.DriveInfo]::new("F:\")
         if (-not $drive.IsReady) {
             Fail-Manifest "F: is not ready for native Windows execution"
         }
-        return [uint64]$drive.AvailableFreeSpace
+        return [pscustomobject]@{
+            free_bytes = [uint64]$drive.AvailableFreeSpace
+            total_bytes = [uint64]$drive.TotalSize
+            source = "native"
+        }
     } catch {
         if ($_.Exception.Message -like "F: is not ready*") {
             throw
         }
         Fail-Manifest "native Windows F: free-byte query failed: $($_.Exception.Message)"
     }
+}
+
+function Get-WindowsDriveFreeBytes {
+    param([pscustomobject]$TestFixture)
+
+    return (Get-WindowsDriveSpace $TestFixture).free_bytes
 }
 
 function Get-WindowsAvailablePhysicalMemoryBytes {
@@ -968,7 +1285,7 @@ function Get-WslProcessText {
     }
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = "wsl.exe"
-    $startInfo.WorkingDirectory = $Paths.helper_state
+    $startInfo.WorkingDirectory = if ([System.IO.Directory]::Exists($Paths.helper_state)) { $Paths.helper_state } else { $Paths.evidence_dir }
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
@@ -1058,6 +1375,7 @@ function Invoke-ExecutionPreflight {
         stage = $Stage
         source = if ($null -eq $TestFixture) { "native" } else { "test-only-fixture" }
         status = "started"
+        cache_mode = $Paths.cache_mode
         free_disk_bytes = $null
         required_free_disk_bytes = $null
         available_memory_bytes = $null
@@ -1071,9 +1389,19 @@ function Invoke-ExecutionPreflight {
     }
     $script:LivePreflightChecks.Add($check)
     try {
+        if ($null -ne $TestFixture -and $TestFixture.fail_stage -ceq $Stage) {
+            Fail-Manifest "test-only execution preflight configured to fail at $Stage"
+        }
         [uint64]$gib = 1073741824
-        [uint64]$requiredDisk = [uint64]$Runtime.minimum_free_disk_gib * $gib
-        [uint64]$requiredMemory = [uint64]$Runtime.minimum_available_memory_gib * $gib
+        $selectedDiskFloor = if ($Paths.cache_mode -eq "cold") {
+            $Runtime.resource_contract.cold_minimum_free_disk_gib
+        } elseif ($Paths.cache_mode -eq "warm") {
+            $Runtime.resource_contract.warm_minimum_free_disk_gib
+        } else {
+            Fail-Manifest "native execution preflight received an unsupported cache mode: $($Paths.cache_mode)"
+        }
+        [uint64]$requiredDisk = [uint64]$selectedDiskFloor * $gib
+        [uint64]$requiredMemory = [uint64]$Runtime.resource_contract.minimum_available_memory_gib * $gib
         [uint64]$freeDisk = Get-WindowsDriveFreeBytes $TestFixture
         [uint64]$availableMemory = Get-WindowsAvailablePhysicalMemoryBytes $TestFixture
         $check.free_disk_bytes = $freeDisk
@@ -1111,7 +1439,9 @@ function Set-RunEnvironment {
     $env:TEMP = $Paths.temp_dir
     $env:TMP = $Paths.temp_dir
     $env:CARGO_TARGET_DIR = $Paths.target_dir
+    $env:CARGO_BUILD_BUILD_DIR = $Paths.build_dir
     $env:CARGO_HOME = $Paths.cargo_home
+    $env:CARGO_CACHE_AUTO_CLEAN_FREQUENCY = "never"
     $env:RUSTUP_HOME = $Paths.rustup_home
     $env:HOME = $Paths.helper_state
     $env:USERPROFILE = $Paths.helper_state
@@ -1979,7 +2309,7 @@ function Initialize-NativeWindowsBootstrap {
 
     if ($null -ne $ReuseReceipt) {
         if ($null -ne $Fixture) {
-            Fail-Manifest "test-only bootstrap fixtures cannot replace a selected reuse working set"
+            Fail-Manifest "test-only bootstrap fixtures cannot replace a canonical reusable workset"
         }
         return Restore-ReusedNativeWindowsBootstrap $Runtime $Paths $DirectToolchain $ReuseReceipt
     }
@@ -2027,7 +2357,7 @@ function Assert-ReusedPinnedArtifact {
     }
     $path = Assert-RunPath $ExpectedPath
     if (-not [System.IO.File]::Exists($path)) {
-        Fail-Manifest "$Name is missing from the selected reuse working set: $path"
+        Fail-Manifest "$Name is missing from the canonical reusable workset: $path"
     }
     $item = Get-Item -LiteralPath $path -Force
     if (
@@ -2038,7 +2368,7 @@ function Assert-ReusedPinnedArtifact {
         Fail-Manifest "$Name must be a non-empty non-reparse regular file"
     }
     if ((Get-FileSha256 $path) -cne $recordedSha256) {
-        Fail-Manifest "$Name no longer matches its selected reuse receipt"
+        Fail-Manifest "$Name no longer matches its canonical reusable cache state"
     }
     return [pscustomobject]$Record
 }
@@ -2050,21 +2380,21 @@ function Assert-ReusedDirectToolchain {
     )
 
     $recordedBin = [System.IO.Path]::GetFullPath(
-        (Get-RequiredString $Recorded["toolchain_bin"] "selected reuse bootstrap.direct_toolchain.toolchain_bin")
+        (Get-RequiredString $Recorded["toolchain_bin"] "canonical reusable cache state bootstrap.direct_toolchain.toolchain_bin")
     )
     if (-not $recordedBin.Equals($Current.toolchain_bin, [System.StringComparison]::OrdinalIgnoreCase)) {
-        Fail-Manifest "selected reuse direct Rust toolchain differs from the installed toolchain"
+        Fail-Manifest "canonical reusable direct Rust toolchain differs from the installed toolchain"
     }
     foreach ($name in @("cargo", "rustc", "rustdoc")) {
-        $record = Get-RequiredMap $Recorded[$name] "selected reuse bootstrap.direct_toolchain.$name"
+        $record = Get-RequiredMap $Recorded[$name] "canonical reusable cache state bootstrap.direct_toolchain.$name"
         $recordedPath = [System.IO.Path]::GetFullPath(
-            (Get-RequiredString $record["path"] "selected reuse bootstrap.direct_toolchain.$name.path")
+            (Get-RequiredString $record["path"] "canonical reusable cache state bootstrap.direct_toolchain.$name.path")
         )
         if (-not $recordedPath.Equals($Current.$name.path, [System.StringComparison]::OrdinalIgnoreCase)) {
-            Fail-Manifest "selected reuse $name.exe path differs from the installed toolchain"
+            Fail-Manifest "canonical reusable $name.exe path differs from the installed toolchain"
         }
-        if ((Get-RequiredSha256 $record["sha256"] "selected reuse bootstrap.direct_toolchain.$name.sha256" -Lowercase) -cne $Current.$name.sha256) {
-            Fail-Manifest "selected reuse $name.exe differs from the installed toolchain"
+        if ((Get-RequiredSha256 $record["sha256"] "canonical reusable cache state bootstrap.direct_toolchain.$name.sha256" -Lowercase) -cne $Current.$name.sha256) {
+            Fail-Manifest "canonical reusable $name.exe differs from the installed toolchain"
         }
     }
 }
@@ -2077,54 +2407,54 @@ function Restore-ReusedNativeWindowsBootstrap {
         [pscustomobject]$ReuseReceipt
     )
 
-    $bootstrap = Get-RequiredMap $ReuseReceipt.value["bootstrap"] "selected reuse receipt.bootstrap"
-    $recordedDirectToolchain = Get-RequiredMap $bootstrap["direct_toolchain"] "selected reuse receipt.bootstrap.direct_toolchain"
+    $bootstrap = Get-RequiredMap $ReuseReceipt.value["bootstrap"] "canonical reusable cache state.bootstrap"
+    $recordedDirectToolchain = Get-RequiredMap $bootstrap["direct_toolchain"] "canonical reusable cache state.bootstrap.direct_toolchain"
     Assert-ReusedDirectToolchain $recordedDirectToolchain $DirectToolchain
 
-    $recordedMsvc = Get-RequiredMap $bootstrap["msvc_setup"] "selected reuse receipt.bootstrap.msvc_setup"
-    if ((Get-RequiredString $recordedMsvc["status"] "selected reuse receipt.bootstrap.msvc_setup.status") -cne "success") {
-        Fail-Manifest "selected reuse receipt does not record a successful MSVC setup"
+    $recordedMsvc = Get-RequiredMap $bootstrap["msvc_setup"] "canonical reusable cache state.bootstrap.msvc_setup"
+    if ((Get-RequiredString $recordedMsvc["status"] "canonical reusable cache state.bootstrap.msvc_setup.status") -cne "success") {
+        Fail-Manifest "canonical reusable cache state does not record a successful MSVC setup"
     }
     $setupPath = Assert-RunPath (Join-Path $Paths.candidate_root ".github\actions\setup-msvc-env\setup-msvc-env.ps1")
-    Assert-ReuseReceiptPath $recordedMsvc["script_path"] $setupPath "selected reuse receipt.bootstrap.msvc_setup.script_path"
+    Assert-ReuseReceiptPath $recordedMsvc["script_path"] $setupPath "canonical reusable cache state.bootstrap.msvc_setup.script_path"
     if (-not [System.IO.File]::Exists($setupPath)) {
-        Fail-Manifest "selected reuse candidate MSVC setup script is missing: $setupPath"
+        Fail-Manifest "canonical reusable candidate MSVC setup script is missing: $setupPath"
     }
     $setupItem = Get-Item -LiteralPath $setupPath -Force
     if (
         $setupItem -isnot [System.IO.FileInfo] -or
         ($setupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
     ) {
-        Fail-Manifest "selected reuse candidate MSVC setup script must be a non-reparse regular file"
+        Fail-Manifest "canonical reusable candidate MSVC setup script must be a non-reparse regular file"
     }
-    if ((Get-FileSha256 $setupPath) -cne (Get-RequiredSha256 $recordedMsvc["script_sha256"] "selected reuse receipt.bootstrap.msvc_setup.script_sha256" -Lowercase)) {
-        Fail-Manifest "selected reuse candidate MSVC setup script changed"
+    if ((Get-FileSha256 $setupPath) -cne (Get-RequiredSha256 $recordedMsvc["script_sha256"] "canonical reusable cache state.bootstrap.msvc_setup.script_sha256" -Lowercase)) {
+        Fail-Manifest "canonical reusable candidate MSVC setup script changed"
     }
-    $recordedEnvironment = Get-RequiredMap $recordedMsvc["environment"] "selected reuse receipt.bootstrap.msvc_setup.environment"
+    $recordedEnvironment = Get-RequiredMap $recordedMsvc["environment"] "canonical reusable cache state.bootstrap.msvc_setup.environment"
     $environmentPath = Assert-RunPath (Join-Path $Paths.helper_state "msvc.github-env")
-    Assert-ReuseReceiptPath $recordedEnvironment["path"] $environmentPath "selected reuse receipt.bootstrap.msvc_setup.environment.path"
+    Assert-ReuseReceiptPath $recordedEnvironment["path"] $environmentPath "canonical reusable cache state.bootstrap.msvc_setup.environment.path"
     $environment = Import-MsvcEnvironmentFile $environmentPath $Runtime $DirectToolchain
-    if ($environment.sha256 -cne (Get-RequiredSha256 $recordedEnvironment["sha256"] "selected reuse receipt.bootstrap.msvc_setup.environment.sha256" -Lowercase)) {
-        Fail-Manifest "selected reuse MSVC environment record changed"
+    if ($environment.sha256 -cne (Get-RequiredSha256 $recordedEnvironment["sha256"] "canonical reusable cache state.bootstrap.msvc_setup.environment.sha256" -Lowercase)) {
+        Fail-Manifest "canonical reusable MSVC environment record changed"
     }
     $msvcSetup = [pscustomobject]@{
         status = "success"
         script_path = $setupPath
         script_sha256 = Get-FileSha256 $setupPath
-        stdout_path = Assert-RunPath (Get-RequiredString $recordedMsvc["stdout_path"] "selected reuse receipt.bootstrap.msvc_setup.stdout_path")
-        stderr_path = Assert-RunPath (Get-RequiredString $recordedMsvc["stderr_path"] "selected reuse receipt.bootstrap.msvc_setup.stderr_path")
+        stdout_path = $null
+        stderr_path = $null
         environment = $environment
     }
 
-    $recordedNextest = Get-RequiredMap $bootstrap["nextest"] "selected reuse receipt.bootstrap.nextest"
-    $nextestZip = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedNextest["zip"] "selected reuse receipt.bootstrap.nextest.zip") (Join-Path $Paths.tool_staging "bootstrap\cargo-nextest.zip") $Runtime.nextest_sha256 "selected reuse Nextest ZIP"
-    $nextestExecutable = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedNextest["executable"] "selected reuse receipt.bootstrap.nextest.executable") (Join-Path $Paths.tool_staging "nextest\cargo-nextest.exe") $null "selected reuse Nextest executable" -PathField "executable_path"
+    $recordedNextest = Get-RequiredMap $bootstrap["nextest"] "canonical reusable cache state.bootstrap.nextest"
+    $nextestZip = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedNextest["zip"] "canonical reusable cache state.bootstrap.nextest.zip") (Join-Path $Paths.tool_staging "bootstrap\cargo-nextest.zip") $Runtime.nextest_sha256 "canonical reusable Nextest ZIP"
+    $nextestExecutable = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedNextest["executable"] "canonical reusable cache state.bootstrap.nextest.executable") (Join-Path $Paths.tool_staging "nextest\cargo-nextest.exe") $null "canonical reusable Nextest executable" -PathField "executable_path"
     $nextestDirectory = Assert-RunPath (Join-Path $Paths.tool_staging "nextest")
-    Assert-ReuseReceiptPath $nextestExecutable.executable_directory $nextestDirectory "selected reuse receipt.bootstrap.nextest.executable.executable_directory"
+    Assert-ReuseReceiptPath $nextestExecutable.executable_directory $nextestDirectory "canonical reusable cache state.bootstrap.nextest.executable.executable_directory"
 
-    $recordedV8 = Get-RequiredMap $bootstrap["v8"] "selected reuse receipt.bootstrap.v8"
-    $v8Archive = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedV8["archive"] "selected reuse receipt.bootstrap.v8.archive") (Join-Path $Paths.v8_cache "rusty-v8.lib.gz") $Runtime.v8_archive_sha256 "selected reuse V8 archive"
-    $v8Binding = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedV8["binding"] "selected reuse receipt.bootstrap.v8.binding") (Join-Path $Paths.v8_cache "src-binding.rs") $Runtime.v8_binding_sha256 "selected reuse V8 binding"
+    $recordedV8 = Get-RequiredMap $bootstrap["v8"] "canonical reusable cache state.bootstrap.v8"
+    $v8Archive = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedV8["archive"] "canonical reusable cache state.bootstrap.v8.archive") (Join-Path $Paths.v8_cache "rusty-v8.lib.gz") $Runtime.v8_archive_sha256 "canonical reusable V8 archive"
+    $v8Binding = Assert-ReusedPinnedArtifact (Get-RequiredMap $recordedV8["binding"] "canonical reusable cache state.bootstrap.v8.binding") (Join-Path $Paths.v8_cache "src-binding.rs") $Runtime.v8_binding_sha256 "canonical reusable V8 binding"
     $env:RUSTY_V8_ARCHIVE = $v8Archive.path
     $env:RUSTY_V8_SRC_BINDING_PATH = $v8Binding.path
     Prepend-PathEntries @($DirectToolchain.toolchain_bin, $nextestDirectory)
@@ -2170,6 +2500,21 @@ function Resolve-NativeGit {
     return [pscustomobject]@{
         path = $path
         sha256 = Get-FileSha256 $path
+    }
+}
+
+function Resolve-NativeTestPython {
+    $path = "F:\codex-tools\bin\python3.exe"
+    if (-not [System.IO.File]::Exists($path)) {
+        Fail-Manifest "required native test Python is unavailable: $path"
+    }
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item -isnot [System.IO.FileInfo] -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail-Manifest "required native test Python must be a non-reparse regular file: $path"
+    }
+    return [pscustomobject]@{
+        path = $path
+        directory = [System.IO.Path]::GetDirectoryName($path)
     }
 }
 
@@ -2711,7 +3056,7 @@ function Assert-CandidateIntegrity {
     return $snapshot
 }
 
-function Assert-ReusedCandidateReady {
+function Assert-ReusableCandidateReady {
     param(
         [string]$GitPath,
         [System.Collections.IDictionary]$GitEnvironment,
@@ -2721,14 +3066,11 @@ function Assert-ReusedCandidateReady {
     )
 
     $snapshot = Capture-GitSnapshot $GitPath $GitEnvironment $Paths.candidate_root $Paths $Prefix
-    if ($snapshot.head -cne $Candidate.head) {
-        Fail-Manifest "reused candidate HEAD does not match manifest candidate_identity.head"
-    }
     if ($snapshot.untracked.byte_length -ne 0) {
-        Fail-Manifest "reused candidate has untracked paths"
+        Fail-Manifest "canonical reusable candidate has untracked paths"
     }
     if (-not $snapshot.worktree_equals_index) {
-        Fail-Manifest "reused candidate worktree differs from its index"
+        Fail-Manifest "canonical reusable candidate worktree differs from its index"
     }
     return $snapshot
 }
@@ -2792,24 +3134,47 @@ function Materialize-Candidate {
     Assert-SourceMatchesCandidateIdentity $sourceBefore $Candidate
     Assert-SourceReadyForMaterialization $sourceBefore
 
-    if ($null -ne $Runtime.reuse_run_root) {
+    if ($Paths.cache_mode -eq "warm") {
         if ($null -eq $ReuseReceipt) {
-            Fail-Manifest "selected reuse working set is missing its validated receipt"
+            Fail-Manifest "canonical reusable workset is missing its validated cache state"
         }
         if (-not (Test-Path -LiteralPath $Paths.candidate_root)) {
-            Fail-Manifest "selected reuse working set is missing its candidate: $($Paths.candidate_root)"
+            Fail-Manifest "canonical reusable workset is missing its candidate: $($Paths.candidate_root)"
         }
         $candidateItem = Get-Item -LiteralPath $Paths.candidate_root -Force
         if (
             $candidateItem -isnot [System.IO.DirectoryInfo] -or
             ($candidateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
         ) {
-            Fail-Manifest "selected reuse candidate must be a non-reparse directory: $($Paths.candidate_root)"
+            Fail-Manifest "canonical reusable candidate must be a non-reparse directory: $($Paths.candidate_root)"
         }
-        $candidateBeforeSync = Assert-ReusedCandidateReady $gitPath $gitEnvironment $Paths $Candidate "reused-candidate-before-sync"
+        $candidateBeforeSync = Assert-ReusableCandidateReady $gitPath $gitEnvironment $Paths $Candidate "reused-candidate-before-sync"
+        $headTransition = $candidateBeforeSync.head -cne $Candidate.head
+        if ($headTransition) {
+            $null = Invoke-Git $gitPath $gitEnvironment @(
+                "-C", $Paths.candidate_root,
+                "-c", "protocol.file.allow=always",
+                "fetch", "--no-tags", "--no-recurse-submodules", $sourceGit, "HEAD"
+            ) $Paths "reused-candidate-fetch"
+            $fetchHeadResult = Invoke-Git $gitPath $gitEnvironment @("-C", $Paths.candidate_root, "rev-parse", "FETCH_HEAD") $Paths "reused-candidate-fetch-head"
+            $fetchHead = Assert-GitObjectId (Get-TextFromBytes $fetchHeadResult.stdout_bytes) "reused candidate FETCH_HEAD"
+            if ($fetchHead -cne $Candidate.head) {
+                Fail-Manifest "canonical reusable candidate fetch did not resolve the manifest source HEAD"
+            }
+            $null = Invoke-Git $gitPath $gitEnvironment @(
+                "-C", $Paths.candidate_root,
+                "update-ref", "--no-deref", "HEAD", $Candidate.head, $candidateBeforeSync.head
+            ) $Paths "reused-candidate-update-head"
+            $updatedHeadResult = Invoke-Git $gitPath $gitEnvironment @("-C", $Paths.candidate_root, "rev-parse", "HEAD") $Paths "reused-candidate-updated-head"
+            $updatedHead = Assert-GitObjectId (Get-TextFromBytes $updatedHeadResult.stdout_bytes) "reused candidate updated HEAD"
+            if ($updatedHead -cne $Candidate.head) {
+                Fail-Manifest "canonical reusable candidate HEAD did not converge on the manifest source HEAD"
+            }
+        }
+        $candidateBeforePatch = Capture-GitSnapshot $gitPath $gitEnvironment $Paths.candidate_root $Paths "reused-candidate-before-index-sync"
         $patchResult = Invoke-GitToFile $gitPath $gitEnvironment (Get-GitSnapshotArguments $sourceRoot @(
                     "diff", "--binary", "--full-index", "--no-renames", "--no-ext-diff",
-                    $candidateBeforeSync.index_tree, $sourceBefore.index_tree, "--"
+                    $candidateBeforePatch.index_tree, $sourceBefore.index_tree, "--"
                 )) $Paths "reuse-source-index.patch"
         $patchPath = $patchResult.stdout_path
         if ($patchResult.stdout_byte_length -ne 0) {
@@ -2827,7 +3192,7 @@ function Materialize-Candidate {
             status = "success"
             materialized = $true
             reused = $true
-            reuse_receipt_path = $ReuseReceipt.path
+            cache_state_path = $ReuseReceipt.path
             candidate_root = $Paths.candidate_root
             source_unc = $sourceRoot
             source_git_unc = $sourceGit
@@ -2838,6 +3203,8 @@ function Materialize-Candidate {
             source_after = Get-SnapshotSummary $sourceAfter
             source_symlink_state = $sourceSymlinkState
             candidate_before_sync = Get-SnapshotSummary $candidateBeforeSync
+            head_transition = $headTransition
+            candidate_before_index_sync = Get-SnapshotSummary $candidateBeforePatch
             candidate_before_command = Get-SnapshotSummary $candidateBeforeCommand
             candidate_after_command = $null
             source_after_command_loop = $null
@@ -2915,13 +3282,31 @@ function New-FakeCargoTool {
     $sourcePath = Join-Path $toolDirectory "cargo.cs"
     $toolSource = @'
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 public static class CargoValidateWindowsFakeCargo
 {
     public static int Main(string[] args)
     {
+        var immediateDescendant = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_IMMEDIATE_DESCENDANT") == "1";
+        Process child = null;
+        if (immediateDescendant)
+        {
+            child = Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c ping -n 30 127.0.0.1 > nul",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            File.WriteAllText(
+                Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_CHILD_PID_LOG"),
+                child.Id.ToString() + "\n",
+                new UTF8Encoding(false));
+        }
         File.WriteAllText(
             Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_ARGV_LOG"),
             string.Join("\n", args) + "\n",
@@ -2931,6 +3316,8 @@ public static class CargoValidateWindowsFakeCargo
             new[]
             {
                 "CARGO_BUILD_JOBS=" + Environment.GetEnvironmentVariable("CARGO_BUILD_JOBS"),
+                "CARGO_BUILD_BUILD_DIR=" + Environment.GetEnvironmentVariable("CARGO_BUILD_BUILD_DIR"),
+                "CARGO_CACHE_AUTO_CLEAN_FREQUENCY=" + Environment.GetEnvironmentVariable("CARGO_CACHE_AUTO_CLEAN_FREQUENCY"),
                 "NEXTEST_TEST_THREADS=" + Environment.GetEnvironmentVariable("NEXTEST_TEST_THREADS"),
                 "RUST_MIN_STACK=" + Environment.GetEnvironmentVariable("RUST_MIN_STACK"),
                 "FORCE_COLOR=" + Environment.GetEnvironmentVariable("FORCE_COLOR"),
@@ -2941,6 +3328,8 @@ public static class CargoValidateWindowsFakeCargo
                 "TMP=" + Environment.GetEnvironmentVariable("TMP"),
                 "PYTHONPYCACHEPREFIX=" + Environment.GetEnvironmentVariable("PYTHONPYCACHEPREFIX"),
                 "PATH=" + Environment.GetEnvironmentVariable("PATH"),
+                "INSTA_PENDING_DIR=" + Environment.GetEnvironmentVariable("INSTA_PENDING_DIR"),
+                "INSTA_UPDATE=" + Environment.GetEnvironmentVariable("INSTA_UPDATE"),
                 "RUSTY_V8_ARCHIVE=" + Environment.GetEnvironmentVariable("RUSTY_V8_ARCHIVE"),
                 "RUSTY_V8_MIRROR=" + Environment.GetEnvironmentVariable("RUSTY_V8_MIRROR"),
                 "RUSTY_V8_SRC_BINDING_PATH=" + Environment.GetEnvironmentVariable("RUSTY_V8_SRC_BINDING_PATH"),
@@ -2953,6 +3342,67 @@ public static class CargoValidateWindowsFakeCargo
                 Path.Combine(Environment.CurrentDirectory, ".fixture-ignored"),
                 "ignored fixture\n",
                 new UTF8Encoding(false));
+        }
+        if (Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_CREATE_UNTRACKED") == "1")
+        {
+            File.WriteAllText(
+                Path.Combine(Environment.CurrentDirectory, "fixture-untracked.txt"),
+                "ordinary untracked fixture\n",
+                new UTF8Encoding(false));
+        }
+        if (Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_CREATE_INSTA_PENDING") == "1")
+        {
+            var pendingDirectory = Environment.GetEnvironmentVariable("INSTA_PENDING_DIR");
+            if (String.IsNullOrEmpty(pendingDirectory) || Environment.GetEnvironmentVariable("INSTA_UPDATE") != "new")
+            {
+                return 1;
+            }
+            var externalSnapshot = Path.Combine(pendingDirectory, "snapshots", "fixture.snap.new");
+            var inlineSnapshot = Path.Combine(pendingDirectory, "src", "fixture.rs.pending-snap");
+            Directory.CreateDirectory(Path.GetDirectoryName(externalSnapshot));
+            Directory.CreateDirectory(Path.GetDirectoryName(inlineSnapshot));
+            File.WriteAllText(externalSnapshot, "external pending fixture\n", new UTF8Encoding(false));
+            File.WriteAllText(inlineSnapshot, "inline pending fixture\n", new UTF8Encoding(false));
+        }
+        var longRunning = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_LONG_RUNNING") == "1";
+        var rootExitsFirst = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_ROOT_EXITS_FIRST") == "1";
+        if (longRunning || rootExitsFirst || immediateDescendant)
+        {
+            if (child == null)
+            {
+                child = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = rootExitsFirst ? "/c ping -n 5 127.0.0.1 > nul" : "/c ping -n 30 127.0.0.1 > nul",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+                File.WriteAllText(
+                    Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_CHILD_PID_LOG"),
+                    child.Id.ToString() + "\n",
+                    new UTF8Encoding(false));
+            }
+            var readinessLog = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG");
+            if (!String.IsNullOrEmpty(readinessLog) && Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS") != "1")
+            {
+                File.WriteAllText(readinessLog, "ready\n", new UTF8Encoding(false));
+            }
+            if (rootExitsFirst)
+            {
+                Thread.Sleep(250);
+            }
+            else
+            {
+                Thread.Sleep(30000);
+            }
+        }
+        else
+        {
+            var readinessLog = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG");
+            if (!String.IsNullOrEmpty(readinessLog) && Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS") != "1")
+            {
+                File.WriteAllText(readinessLog, "ready\n", new UTF8Encoding(false));
+            }
         }
         int exitCode;
         return Int32.TryParse(
@@ -3007,16 +3457,849 @@ public static class CargoValidateWindowsFakeCargo
     return $toolPath
 }
 
-function Get-TestOnlyFakeCreateIgnoredFile {
-    $value = [System.Environment]::GetEnvironmentVariable($script:TestOnlyFakeCreateIgnoredFile)
+function Get-TestOnlyFakeCreateFile {
+    param([string]$EnvironmentName)
+
+    $value = [System.Environment]::GetEnvironmentVariable($EnvironmentName)
     if ([string]::IsNullOrEmpty($value)) {
         return $false
     }
     if ($value -cne "1") {
-        Fail-Manifest "$($script:TestOnlyFakeCreateIgnoredFile) must equal 1 when present"
+        Fail-Manifest "$EnvironmentName must equal 1 when present"
     }
     if ([System.Environment]::GetEnvironmentVariable($script:TestOnlyFakeCargoOptIn) -ne "1") {
-        Fail-Manifest "$($script:TestOnlyFakeCreateIgnoredFile) requires the test-only fake-cargo process opt-in"
+        Fail-Manifest "$EnvironmentName requires the test-only fake-cargo process opt-in"
+    }
+    return $true
+}
+
+function New-NativeCommandContainment {
+    $type = "Cooldex.NativeValidation.NativeWindowsJob" -as [type]
+    if ($null -eq $type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Cooldex.NativeValidation
+{
+    internal static class NativeWindowsProcessInterop
+    {
+        internal const uint CreateSuspended = 0x00000004;
+        internal const uint CreateUnicodeEnvironment = 0x00000400;
+        internal const uint ExtendedStartupInfoPresent = 0x00080000;
+        internal const uint CreateNoWindow = 0x08000000;
+        internal const uint StartfUseStdHandles = 0x00000100;
+        internal const uint HandleFlagInherit = 0x00000001;
+        internal const uint GenericRead = 0x80000000;
+        internal const uint FileShareRead = 0x00000001;
+        internal const uint FileShareWrite = 0x00000002;
+        internal const uint OpenExisting = 3;
+        internal const uint FileAttributeNormal = 0x00000080;
+        internal const uint ProcThreadAttributeHandleList = 0x00020002;
+        internal const uint WaitObject0 = 0;
+        internal const uint WaitTimeout = 258;
+        internal const uint WaitFailed = 0xFFFFFFFF;
+        internal const uint Infinite = 0xFFFFFFFF;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct SecurityAttributes
+        {
+            public uint Length;
+            public IntPtr SecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool InheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct StartupInfo
+        {
+            public uint cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttribute;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct StartupInfoEx
+        {
+            public StartupInfo StartupInfo;
+            public IntPtr AttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct ProcessInformation
+        {
+            public IntPtr Process;
+            public IntPtr Thread;
+            public uint ProcessId;
+            public uint ThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CreateProcessW(
+            string applicationName,
+            StringBuilder commandLine,
+            IntPtr processAttributes,
+            IntPtr threadAttributes,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandles,
+            uint creationFlags,
+            IntPtr environment,
+            string currentDirectory,
+            ref StartupInfoEx startupInfo,
+            out ProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CreatePipe(
+            out IntPtr readPipe,
+            out IntPtr writePipe,
+            ref SecurityAttributes attributes,
+            uint size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetHandleInformation(
+            IntPtr handle,
+            uint mask,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        internal static extern IntPtr CreateFileW(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            ref SecurityAttributes securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool InitializeProcThreadAttributeList(
+            IntPtr attributeList,
+            int attributeCount,
+            int flags,
+            ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool UpdateProcThreadAttribute(
+            IntPtr attributeList,
+            uint flags,
+            IntPtr attribute,
+            IntPtr value,
+            IntPtr size,
+            IntPtr previousValue,
+            IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        internal static extern void DeleteProcThreadAttributeList(IntPtr attributeList);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint ResumeThread(IntPtr thread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool CloseHandle(IntPtr handle);
+
+        internal static void ThrowLastError(string operation)
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), operation + " failed");
+        }
+
+        internal static void CloseHandleIfPresent(ref IntPtr handle)
+        {
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+            {
+                CloseHandle(handle);
+                handle = IntPtr.Zero;
+            }
+        }
+    }
+
+    public sealed class NativeWindowsSuspendedProcess : IDisposable
+    {
+        private IntPtr processHandle;
+        private IntPtr threadHandle;
+        private readonly Stream standardOutput;
+        private readonly Stream standardError;
+
+        internal NativeWindowsSuspendedProcess(
+            IntPtr processHandle,
+            IntPtr threadHandle,
+            uint processId,
+            IntPtr standardOutputRead,
+            IntPtr standardErrorRead)
+        {
+            this.processHandle = processHandle;
+            this.threadHandle = threadHandle;
+            Id = checked((int)processId);
+            try
+            {
+                standardOutput = new FileStream(new SafeFileHandle(standardOutputRead, true), FileAccess.Read, 4096, false);
+                standardOutputRead = IntPtr.Zero;
+                standardError = new FileStream(new SafeFileHandle(standardErrorRead, true), FileAccess.Read, 4096, false);
+                standardErrorRead = IntPtr.Zero;
+            }
+            finally
+            {
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref standardOutputRead);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref standardErrorRead);
+            }
+        }
+
+        public int Id { get; private set; }
+
+        public IntPtr ProcessHandle
+        {
+            get
+            {
+                if (processHandle == IntPtr.Zero)
+                {
+                    throw new ObjectDisposedException("NativeWindowsSuspendedProcess");
+                }
+                return processHandle;
+            }
+        }
+
+        public bool HasExited
+        {
+            get
+            {
+                var result = NativeWindowsProcessInterop.WaitForSingleObject(ProcessHandle, 0);
+                if (result == NativeWindowsProcessInterop.WaitObject0)
+                {
+                    return true;
+                }
+                if (result == NativeWindowsProcessInterop.WaitTimeout)
+                {
+                    return false;
+                }
+                NativeWindowsProcessInterop.ThrowLastError("WaitForSingleObject");
+                return false;
+            }
+        }
+
+        public int ExitCode
+        {
+            get
+            {
+                uint exitCode;
+                if (!NativeWindowsProcessInterop.GetExitCodeProcess(ProcessHandle, out exitCode))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("GetExitCodeProcess");
+                }
+                return unchecked((int)exitCode);
+            }
+        }
+
+        public Task CopyStandardOutputToAsync(Stream destination)
+        {
+            if (destination == null)
+            {
+                throw new ArgumentNullException("destination");
+            }
+            return standardOutput.CopyToAsync(destination);
+        }
+
+        public Task CopyStandardErrorToAsync(Stream destination)
+        {
+            if (destination == null)
+            {
+                throw new ArgumentNullException("destination");
+            }
+            return standardError.CopyToAsync(destination);
+        }
+
+        public void Resume()
+        {
+            if (NativeWindowsProcessInterop.ResumeThread(threadHandle) == UInt32.MaxValue)
+            {
+                NativeWindowsProcessInterop.ThrowLastError("ResumeThread");
+            }
+        }
+
+        public bool WaitForExit(int milliseconds)
+        {
+            var result = NativeWindowsProcessInterop.WaitForSingleObject(ProcessHandle, checked((uint)milliseconds));
+            if (result == NativeWindowsProcessInterop.WaitObject0)
+            {
+                return true;
+            }
+            if (result == NativeWindowsProcessInterop.WaitTimeout)
+            {
+                return false;
+            }
+            NativeWindowsProcessInterop.ThrowLastError("WaitForSingleObject");
+            return false;
+        }
+
+        public void TerminateAndReap()
+        {
+            if (!HasExited && !NativeWindowsProcessInterop.TerminateProcess(ProcessHandle, 1))
+            {
+                NativeWindowsProcessInterop.ThrowLastError("TerminateProcess");
+            }
+            if (!WaitForExit(30000))
+            {
+                throw new InvalidOperationException("suspended native command did not terminate within 30000 milliseconds");
+            }
+        }
+
+        public void Dispose()
+        {
+            if (standardOutput != null)
+            {
+                standardOutput.Dispose();
+            }
+            if (standardError != null)
+            {
+                standardError.Dispose();
+            }
+            NativeWindowsProcessInterop.CloseHandleIfPresent(ref threadHandle);
+            NativeWindowsProcessInterop.CloseHandleIfPresent(ref processHandle);
+        }
+    }
+
+    public static class NativeWindowsSuspendedLauncher
+    {
+        private static string QuoteArgument(string argument)
+        {
+            if (argument.Length == 0)
+            {
+                return "\"\"";
+            }
+            if (argument.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0)
+            {
+                return argument;
+            }
+            var quoted = new StringBuilder();
+            quoted.Append('"');
+            var backslashes = 0;
+            foreach (var character in argument)
+            {
+                if (character == '\\')
+                {
+                    backslashes++;
+                }
+                else if (character == '"')
+                {
+                    quoted.Append('\\', backslashes * 2 + 1);
+                    quoted.Append(character);
+                    backslashes = 0;
+                }
+                else
+                {
+                    quoted.Append('\\', backslashes);
+                    quoted.Append(character);
+                    backslashes = 0;
+                }
+            }
+            quoted.Append('\\', backslashes * 2);
+            quoted.Append('"');
+            return quoted.ToString();
+        }
+
+        private static string BuildCommandLine(string applicationName, string[] arguments)
+        {
+            var commandLine = new StringBuilder(QuoteArgument(applicationName));
+            foreach (var argument in arguments)
+            {
+                commandLine.Append(' ');
+                commandLine.Append(QuoteArgument(argument));
+            }
+            return commandLine.ToString();
+        }
+
+        private static string BuildEnvironmentBlock(IDictionary<string, string> environment)
+        {
+            var entries = new List<KeyValuePair<string, string>>();
+            foreach (var entry in environment)
+            {
+                if (
+                    String.IsNullOrEmpty(entry.Key) ||
+                    entry.Key.IndexOf('\0') >= 0 ||
+                    entry.Key.IndexOf('=') >= 0 ||
+                    entry.Value == null ||
+                    entry.Value.IndexOf('\0') >= 0)
+                {
+                    throw new ArgumentException("native command environment contains an invalid entry");
+                }
+                entries.Add(entry);
+            }
+            entries.Sort(delegate(KeyValuePair<string, string> left, KeyValuePair<string, string> right)
+            {
+                return StringComparer.OrdinalIgnoreCase.Compare(left.Key, right.Key);
+            });
+            var block = new StringBuilder();
+            foreach (var entry in entries)
+            {
+                block.Append(entry.Key);
+                block.Append('=');
+                block.Append(entry.Value);
+                block.Append('\0');
+            }
+            block.Append('\0');
+            return block.ToString();
+        }
+
+        public static NativeWindowsSuspendedProcess CreateSuspended(
+            string applicationName,
+            string[] arguments,
+            string workingDirectory,
+            IDictionary<string, string> environment)
+        {
+            if (
+                String.IsNullOrEmpty(applicationName) ||
+                arguments == null ||
+                String.IsNullOrEmpty(workingDirectory) ||
+                environment == null)
+            {
+                throw new ArgumentException("native suspended command launch requires executable, arguments, working directory, and environment");
+            }
+
+            var security = new NativeWindowsProcessInterop.SecurityAttributes
+            {
+                Length = (uint)Marshal.SizeOf(typeof(NativeWindowsProcessInterop.SecurityAttributes)),
+                SecurityDescriptor = IntPtr.Zero,
+                InheritHandle = true,
+            };
+            IntPtr stdoutRead = IntPtr.Zero;
+            IntPtr stdoutWrite = IntPtr.Zero;
+            IntPtr stderrRead = IntPtr.Zero;
+            IntPtr stderrWrite = IntPtr.Zero;
+            IntPtr stdinHandle = IntPtr.Zero;
+            IntPtr attributeList = IntPtr.Zero;
+            IntPtr attributeListSize = IntPtr.Zero;
+            IntPtr inheritedHandles = IntPtr.Zero;
+            IntPtr environmentBlock = IntPtr.Zero;
+            var attributeListInitialized = false;
+            var processInformation = new NativeWindowsProcessInterop.ProcessInformation();
+            try
+            {
+                if (!NativeWindowsProcessInterop.CreatePipe(out stdoutRead, out stdoutWrite, ref security, 0))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("CreatePipe for stdout");
+                }
+                if (!NativeWindowsProcessInterop.SetHandleInformation(stdoutRead, NativeWindowsProcessInterop.HandleFlagInherit, 0))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("SetHandleInformation for stdout read pipe");
+                }
+                if (!NativeWindowsProcessInterop.CreatePipe(out stderrRead, out stderrWrite, ref security, 0))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("CreatePipe for stderr");
+                }
+                if (!NativeWindowsProcessInterop.SetHandleInformation(stderrRead, NativeWindowsProcessInterop.HandleFlagInherit, 0))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("SetHandleInformation for stderr read pipe");
+                }
+                stdinHandle = NativeWindowsProcessInterop.CreateFileW(
+                    "NUL",
+                    NativeWindowsProcessInterop.GenericRead,
+                    NativeWindowsProcessInterop.FileShareRead | NativeWindowsProcessInterop.FileShareWrite,
+                    ref security,
+                    NativeWindowsProcessInterop.OpenExisting,
+                    NativeWindowsProcessInterop.FileAttributeNormal,
+                    IntPtr.Zero);
+                if (stdinHandle == new IntPtr(-1))
+                {
+                    stdinHandle = IntPtr.Zero;
+                    NativeWindowsProcessInterop.ThrowLastError("CreateFileW for native command standard input");
+                }
+
+                NativeWindowsProcessInterop.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref attributeListSize);
+                if (attributeListSize == IntPtr.Zero)
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("InitializeProcThreadAttributeList size query");
+                }
+                attributeList = Marshal.AllocHGlobal(attributeListSize);
+                if (!NativeWindowsProcessInterop.InitializeProcThreadAttributeList(attributeList, 1, 0, ref attributeListSize))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("InitializeProcThreadAttributeList");
+                }
+                attributeListInitialized = true;
+                inheritedHandles = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(inheritedHandles, 0, stdinHandle);
+                Marshal.WriteIntPtr(inheritedHandles, IntPtr.Size, stdoutWrite);
+                Marshal.WriteIntPtr(inheritedHandles, IntPtr.Size * 2, stderrWrite);
+                if (!NativeWindowsProcessInterop.UpdateProcThreadAttribute(
+                    attributeList,
+                    0,
+                    new IntPtr((long)NativeWindowsProcessInterop.ProcThreadAttributeHandleList),
+                    inheritedHandles,
+                    new IntPtr(IntPtr.Size * 3),
+                    IntPtr.Zero,
+                    IntPtr.Zero))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("UpdateProcThreadAttribute handle list");
+                }
+
+                var startup = new NativeWindowsProcessInterop.StartupInfoEx();
+                startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(NativeWindowsProcessInterop.StartupInfoEx));
+                startup.StartupInfo.dwFlags = NativeWindowsProcessInterop.StartfUseStdHandles;
+                startup.StartupInfo.hStdInput = stdinHandle;
+                startup.StartupInfo.hStdOutput = stdoutWrite;
+                startup.StartupInfo.hStdError = stderrWrite;
+                startup.AttributeList = attributeList;
+                environmentBlock = Marshal.StringToHGlobalUni(BuildEnvironmentBlock(environment));
+                var commandLine = new StringBuilder(BuildCommandLine(applicationName, arguments));
+                var flags =
+                    NativeWindowsProcessInterop.CreateSuspended |
+                    NativeWindowsProcessInterop.CreateUnicodeEnvironment |
+                    NativeWindowsProcessInterop.ExtendedStartupInfoPresent |
+                    NativeWindowsProcessInterop.CreateNoWindow;
+                if (!NativeWindowsProcessInterop.CreateProcessW(
+                    applicationName,
+                    commandLine,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    true,
+                    flags,
+                    environmentBlock,
+                    workingDirectory,
+                    ref startup,
+                    out processInformation))
+                {
+                    NativeWindowsProcessInterop.ThrowLastError("CreateProcessW");
+                }
+
+                var process = new NativeWindowsSuspendedProcess(
+                    processInformation.Process,
+                    processInformation.Thread,
+                    processInformation.ProcessId,
+                    stdoutRead,
+                    stderrRead);
+                processInformation.Process = IntPtr.Zero;
+                processInformation.Thread = IntPtr.Zero;
+                stdoutRead = IntPtr.Zero;
+                stderrRead = IntPtr.Zero;
+                return process;
+            }
+            finally
+            {
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref processInformation.Thread);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref processInformation.Process);
+                if (attributeListInitialized)
+                {
+                    NativeWindowsProcessInterop.DeleteProcThreadAttributeList(attributeList);
+                }
+                if (attributeList != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(attributeList);
+                }
+                if (inheritedHandles != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(inheritedHandles);
+                }
+                if (environmentBlock != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(environmentBlock);
+                }
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref stdinHandle);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref stdoutWrite);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref stderrWrite);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref stdoutRead);
+                NativeWindowsProcessInterop.CloseHandleIfPresent(ref stderrRead);
+            }
+        }
+    }
+
+    public sealed class NativeWindowsJob : IDisposable
+    {
+        private const uint JobObjectExtendedLimitInformationClass = 9;
+        private const uint JobObjectBasicAccountingInformationClass = 1;
+        private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private IntPtr handle;
+
+        public bool FailTerminationForTest { get; set; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectBasicLimitInformation
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public IntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectExtendedLimitInformation
+        {
+            public JobObjectBasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct JobObjectBasicAccountingInformation
+        {
+            public long TotalUserTime;
+            public long TotalKernelTime;
+            public long ThisPeriodTotalUserTime;
+            public long ThisPeriodTotalKernelTime;
+            public uint TotalPageFaultCount;
+            public uint TotalProcesses;
+            public uint ActiveProcesses;
+            public uint TotalTerminatedProcesses;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr job, uint informationClass, ref JobObjectExtendedLimitInformation information, uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(IntPtr job, uint informationClass, out JobObjectBasicAccountingInformation information, uint informationLength, IntPtr returnLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public NativeWindowsJob()
+        {
+            handle = CreateJobObject(IntPtr.Zero, null);
+            if (handle == IntPtr.Zero)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateJobObject failed");
+            }
+            var information = new JobObjectExtendedLimitInformation();
+            information.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+            if (!SetInformationJobObject(handle, JobObjectExtendedLimitInformationClass, ref information, (uint)Marshal.SizeOf(typeof(JobObjectExtendedLimitInformation))))
+            {
+                var error = Marshal.GetLastWin32Error();
+                Dispose();
+                throw new Win32Exception(error, "SetInformationJobObject failed");
+            }
+        }
+
+        public void Assign(IntPtr processHandle)
+        {
+            if (!AssignProcessToJobObject(handle, processHandle))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "AssignProcessToJobObject failed");
+            }
+        }
+
+        public uint ActiveProcesses()
+        {
+            JobObjectBasicAccountingInformation information;
+            if (!QueryInformationJobObject(handle, JobObjectBasicAccountingInformationClass, out information, (uint)Marshal.SizeOf(typeof(JobObjectBasicAccountingInformation)), IntPtr.Zero))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "QueryInformationJobObject failed");
+            }
+            return information.ActiveProcesses;
+        }
+
+        public void Terminate(uint exitCode)
+        {
+            if (FailTerminationForTest)
+            {
+                throw new InvalidOperationException("test-only native command containment termination failure");
+            }
+            if (!TerminateJobObject(handle, exitCode))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject failed");
+            }
+        }
+
+        public void Dispose()
+        {
+            if (handle != IntPtr.Zero)
+            {
+                CloseHandle(handle);
+                handle = IntPtr.Zero;
+            }
+        }
+    }
+}
+'@
+        $type = "Cooldex.NativeValidation.NativeWindowsJob" -as [type]
+        if ($null -eq $type) {
+            Fail-Manifest "native Windows Job Object containment type was not registered"
+        }
+    }
+    return [Activator]::CreateInstance($type)
+}
+
+function Wait-NativeCommandContainmentQuiescence {
+    param(
+        [object]$Containment,
+        [int]$TimeoutMilliseconds = 30000
+    )
+
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $active = [uint32]$Containment.ActiveProcesses()
+        if ($active -eq 0) {
+            return [pscustomobject]@{
+                active_processes = 0
+                waited_milliseconds = $watch.ElapsedMilliseconds
+                quiescent = $true
+            }
+        }
+        if ($watch.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+            return [pscustomobject]@{
+                active_processes = $active
+                waited_milliseconds = $watch.ElapsedMilliseconds
+                quiescent = $false
+            }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+}
+
+function Get-ResourceAbortSample {
+    param(
+        [pscustomobject]$Runtime,
+        [pscustomobject]$TestFixture
+    )
+
+    if ($null -ne $TestFixture) {
+        $TestFixture.monitor_samples_observed = [int]$TestFixture.monitor_samples_observed + 1
+        if (
+            $TestFixture.monitor_error_after_samples -ne 0 -and
+            $TestFixture.monitor_samples_observed -ge $TestFixture.monitor_error_after_samples
+        ) {
+            Fail-Manifest "test-only native runtime disk monitor query failed"
+        }
+    }
+    $space = Get-WindowsDriveSpace $TestFixture $true
+    if ($space.total_bytes -le 0) {
+        Fail-Manifest "native runtime disk monitor received a non-positive F: capacity"
+    }
+    [uint64]$gib = 1073741824
+    [uint64]$absoluteFloor = [uint64]$Runtime.resource_contract.abort_free_gib * $gib
+    [uint64]$percentageFloor = [uint64]$Runtime.resource_contract.abort_free_pct
+    [bool]$absoluteReached = $space.free_bytes -le $absoluteFloor
+    [bool]$percentageReached = ([decimal]$space.free_bytes * 100) -le ([decimal]$space.total_bytes * $percentageFloor)
+    return [pscustomobject]@{
+        source = $space.source
+        free_disk_bytes = $space.free_bytes
+        total_disk_bytes = $space.total_bytes
+        abort_free_bytes = $absoluteFloor
+        abort_free_pct = $percentageFloor
+        absolute_threshold_reached = $absoluteReached
+        percentage_threshold_reached = $percentageReached
+        abort_required = $absoluteReached -or $percentageReached
+    }
+}
+
+function Stop-NativeCommandContainment {
+    param(
+        [object]$Process,
+        [object]$Containment,
+        [string]$Reason
+    )
+
+    $record = [ordered]@{
+        root_process_id = $Process.Id
+        root_exited_before_termination = $Process.HasExited
+        active_processes_before_termination = [uint32]$Containment.ActiveProcesses()
+        mechanism = "Windows Job Object TerminateJobObject"
+        reason = $Reason
+        terminated = $false
+        quiescent = $false
+        persistent_failure = $null
+        termination_error = $null
+        active_processes_after_termination = $null
+        waited_milliseconds = 0
+    }
+    if ($record.active_processes_before_termination -ne 0) {
+        try {
+            $Containment.Terminate([uint32]1)
+            $record.terminated = $true
+        } catch {
+            $record.termination_error = $_.Exception.Message
+            $record.persistent_failure = "native command containment could not terminate the approved command process tree: $($record.termination_error)"
+            return [pscustomobject]$record
+        }
+    }
+    $quiescence = Wait-NativeCommandContainmentQuiescence $Containment
+    $record.active_processes_after_termination = $quiescence.active_processes
+    $record.waited_milliseconds = $quiescence.waited_milliseconds
+    $record.quiescent = $quiescence.quiescent
+    if (-not $record.quiescent) {
+        $record.persistent_failure = "native command containment did not reach terminal quiescence within 30000 milliseconds; active processes: $($quiescence.active_processes)"
+    }
+    return [pscustomobject]$record
+}
+
+function Test-ReusableCachePublication {
+    param([object[]]$CommandResults)
+
+    foreach ($command in $CommandResults) {
+        $containmentProperty = $command.PSObject.Properties["containment"]
+        if ($null -eq $containmentProperty) {
+            continue
+        }
+        $containment = $containmentProperty.Value
+        if ($null -eq $containment -or $containment.active_processes -ne 0) {
+            return $false
+        }
+        if ($null -ne $command.resource_abort) {
+            $termination = $command.resource_abort.termination
+            if ($null -eq $termination -or -not $termination.quiescent) {
+                return $false
+            }
+        }
     }
     return $true
 }
@@ -3050,11 +4333,9 @@ function Invoke-ApprovedCommand {
     if (-not [System.IO.Directory]::Exists($workingDirectory)) {
         Fail-Manifest "approved command working directory does not exist: $workingDirectory"
     }
-    $python3Path = "F:\codex-tools\bin\python3.exe"
-    if (-not [System.IO.File]::Exists($python3Path)) {
-        Fail-Manifest "required native test Python is unavailable: $python3Path"
-    }
-    $python3Bin = [System.IO.Path]::GetDirectoryName($python3Path)
+    $nativePython = if ($null -eq $script:NativePython) { Resolve-NativeTestPython } else { $script:NativePython }
+    $python3Path = $nativePython.path
+    $python3Bin = $nativePython.directory
     $childNativeGit = if ($null -eq $script:NativeGit) { Resolve-NativeGit } else { $script:NativeGit }
     $gitUsrBin = Resolve-NativeGitUsrBin $childNativeGit
 
@@ -3062,9 +4343,24 @@ function Invoke-ApprovedCommand {
     $stderrPath = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).stderr.txt")
     $argvLogPath = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).argv.txt")
     $envLogPath = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).env.txt")
+    $instaPendingDir = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).insta-pending")
+    $childPidPath = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).child-pid.txt")
+    $fakeReadinessPath = Assert-RunPath (Join-Path $Paths.evidence_dir "command-$($Approved.index).readiness.txt")
+    if (Test-Path -LiteralPath $instaPendingDir) {
+        Fail-Manifest "fresh Insta pending directory already exists: $instaPendingDir"
+    }
+    $null = [System.IO.Directory]::CreateDirectory($instaPendingDir)
     $fakeTool = $null
     $directCargo = $null
     $createIgnoredFile = $false
+    $createUntrackedFile = $false
+    $createInstaPending = $false
+    $longRunning = $false
+    $rootExitsFirst = $false
+    $immediateDescendant = $false
+    $forceContainmentTerminationFailure = $false
+    $waitForFakeReadiness = $false
+    $suppressFakeReadiness = $false
     if ($isFixture) {
         $fakeTool = New-FakeCargoTool $Paths $Approved.index
         if (
@@ -3080,7 +4376,18 @@ function Invoke-ApprovedCommand {
         ) {
             Fail-Manifest "inert fake-cargo tool must be a non-reparse regular file"
         }
-        $createIgnoredFile = Get-TestOnlyFakeCreateIgnoredFile
+        $createIgnoredFile = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeCreateIgnoredFile
+        $createUntrackedFile = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeCreateUntrackedFile
+        $createInstaPending = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeCreateInstaPending
+        $longRunning = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeLongRunning
+        $rootExitsFirst = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeRootExitsFirst
+        $immediateDescendant = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeImmediateDescendant
+        $forceContainmentTerminationFailure = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeContainmentTerminateFailure
+        $waitForFakeReadiness = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeWaitForReadiness
+        $suppressFakeReadiness = Get-TestOnlyFakeCreateFile $script:TestOnlyFakeSuppressReadiness
+        if ($suppressFakeReadiness -and -not $waitForFakeReadiness) {
+            Fail-Manifest "test-only fake readiness suppression requires the readiness barrier"
+        }
     } else {
         $capturedCargo = $Bootstrap.direct_toolchain.cargo
         $directCargo = Assert-AbsoluteCDriveRegularFile ([string]$capturedCargo.path) "direct toolchain cargo.exe before launch"
@@ -3103,10 +4410,15 @@ function Invoke-ApprovedCommand {
         $null = $startInfo.ArgumentList.Add($argument)
     }
     $startInfo.Environment["CARGO_BUILD_JOBS"] = [string]$Runtime.resource_contract.cargo_build_jobs
+    $startInfo.Environment["CARGO_TARGET_DIR"] = $Paths.target_dir
+    $startInfo.Environment["CARGO_BUILD_BUILD_DIR"] = $Paths.build_dir
+    $startInfo.Environment["CARGO_CACHE_AUTO_CLEAN_FREQUENCY"] = "never"
     $startInfo.Environment["NEXTEST_TEST_THREADS"] = [string]$Runtime.resource_contract.nextest_test_threads
     $startInfo.Environment["RUST_MIN_STACK"] = "8388608"
     $startInfo.Environment["FORCE_COLOR"] = "0"
     $startInfo.Environment["PYTHONPYCACHEPREFIX"] = Assert-RunPath (Join-Path $Paths.temp_dir "python-pycache")
+    $startInfo.Environment["INSTA_PENDING_DIR"] = $instaPendingDir
+    $startInfo.Environment["INSTA_UPDATE"] = "new"
     $processPath = [System.Environment]::GetEnvironmentVariable("PATH", "Process")
     if ([string]::IsNullOrWhiteSpace($processPath)) {
         Fail-Manifest "native command PATH is unavailable after bootstrap preparation"
@@ -3130,26 +4442,241 @@ function Invoke-ApprovedCommand {
         if ($createIgnoredFile) {
             $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_CREATE_IGNORED"] = "1"
         }
+        if ($createUntrackedFile) {
+            $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_CREATE_UNTRACKED"] = "1"
+        }
+        if ($createInstaPending) {
+            $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_CREATE_INSTA_PENDING"] = "1"
+        }
+        if ($longRunning -or $rootExitsFirst -or $immediateDescendant) {
+            if ($longRunning) {
+                $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_LONG_RUNNING"] = "1"
+            }
+            if ($rootExitsFirst) {
+                $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_ROOT_EXITS_FIRST"] = "1"
+            }
+            if ($immediateDescendant) {
+                $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_IMMEDIATE_DESCENDANT"] = "1"
+            }
+            $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_CHILD_PID_LOG"] = $childPidPath
+        }
+        if ($waitForFakeReadiness) {
+            $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG"] = $fakeReadinessPath
+        }
+        if ($suppressFakeReadiness) {
+            $startInfo.Environment["CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS"] = "1"
+        }
     }
 
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
     $commandPreflight = Invoke-ExecutionPreflight $Runtime $Paths $TestFixture "before-approved-command-$($Approved.index)" $Yolo
-    try {
-        if (-not $process.Start()) {
-            Fail-Manifest "direct cargo process did not start"
-        }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $exitCode = $process.ExitCode
-    } finally {
-        $process.Dispose()
+    $containment = New-NativeCommandContainment
+    if ($forceContainmentTerminationFailure) {
+        $containment.FailTerminationForTest = $true
     }
-    Write-TextEvidence $stdoutPath $stdout
-    Write-TextEvidence $stderrPath $stderr
+    $process = $null
+    $launched = $false
+    $stdoutTask = $null
+    $stderrTask = $null
+    $stdoutStream = $null
+    $stderrStream = $null
+    $exitCode = 1
+    $resourceAbort = $null
+    $monitorError = $null
+    $postLaunchError = $null
+    $termination = $null
+    $containmentEvidence = $null
+    $contained = $false
+    $peakContainedProcessCount = 0
+    $fakeReadinessTimeoutMilliseconds = 5000
+    $fakeReadinessStopwatch = $null
+    $runtimeTelemetry = [ordered]@{
+        monitor_sample_count = 0
+        minimum_free_disk_bytes = $null
+        last_free_disk_bytes = $null
+        memory_sample_count = 0
+        minimum_available_memory_bytes = $null
+        last_available_memory_bytes = $null
+        maximum_active_processes = 0
+    }
+    try {
+        $stdoutStream = [System.IO.File]::Open($stdoutPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $stderrStream = [System.IO.File]::Open($stderrPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $launchEnvironment = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $startInfo.Environment.GetEnumerator()) {
+            $launchEnvironment.Add([string]$entry.Key, [string]$entry.Value)
+        }
+        $process = [Cooldex.NativeValidation.NativeWindowsSuspendedLauncher]::CreateSuspended(
+            $startInfo.FileName,
+            [string[]]$Approved.argv[1..($Approved.argv.Length - 1)],
+            $startInfo.WorkingDirectory,
+            $launchEnvironment
+        )
+        $launched = $true
+        $stdoutTask = $process.CopyStandardOutputToAsync($stdoutStream)
+        $stderrTask = $process.CopyStandardErrorToAsync($stderrStream)
+        $containment.Assign($process.ProcessHandle)
+        $contained = $true
+        $process.Resume()
+        if ($waitForFakeReadiness) {
+            $fakeReadinessStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        }
+        while ($true) {
+            $activeProcesses = [uint32]$containment.ActiveProcesses()
+            if ($activeProcesses -gt $peakContainedProcessCount) {
+                $peakContainedProcessCount = $activeProcesses
+            }
+            if ($activeProcesses -gt $runtimeTelemetry.maximum_active_processes) {
+                $runtimeTelemetry.maximum_active_processes = $activeProcesses
+            }
+            if ($activeProcesses -eq 0) {
+                break
+            }
+            if ($process.HasExited) {
+                $termination = Stop-NativeCommandContainment $process $containment "root-exited-with-contained-descendants"
+                break
+            }
+            if ($waitForFakeReadiness -and -not [System.IO.File]::Exists($fakeReadinessPath)) {
+                if ($fakeReadinessStopwatch.ElapsedMilliseconds -ge $fakeReadinessTimeoutMilliseconds) {
+                    $script:CurrentCommandExitCode = 1
+                    $monitorError = "test-only fake readiness timed out after $fakeReadinessTimeoutMilliseconds milliseconds"
+                    $termination = Stop-NativeCommandContainment $process $containment "test-only-fake-readiness-timeout"
+                    break
+                }
+                Start-Sleep -Milliseconds 25
+                continue
+            }
+            try {
+                $sample = Get-ResourceAbortSample $Runtime $TestFixture
+                $runtimeTelemetry.monitor_sample_count = [int]$runtimeTelemetry.monitor_sample_count + 1
+                $runtimeTelemetry.last_free_disk_bytes = $sample.free_disk_bytes
+                if ($null -eq $runtimeTelemetry.minimum_free_disk_bytes -or $sample.free_disk_bytes -lt $runtimeTelemetry.minimum_free_disk_bytes) {
+                    $runtimeTelemetry.minimum_free_disk_bytes = $sample.free_disk_bytes
+                }
+                if (($runtimeTelemetry.monitor_sample_count - 1) % 10 -eq 0) {
+                    $availableMemory = Get-WindowsAvailablePhysicalMemoryBytes $TestFixture
+                    $runtimeTelemetry.memory_sample_count = [int]$runtimeTelemetry.memory_sample_count + 1
+                    $runtimeTelemetry.last_available_memory_bytes = $availableMemory
+                    if ($null -eq $runtimeTelemetry.minimum_available_memory_bytes -or $availableMemory -lt $runtimeTelemetry.minimum_available_memory_bytes) {
+                        $runtimeTelemetry.minimum_available_memory_bytes = $availableMemory
+                    }
+                }
+            } catch {
+                $script:CurrentCommandExitCode = 1
+                $monitorError = $_.Exception.Message
+                $termination = Stop-NativeCommandContainment $process $containment "monitor-query-error"
+                break
+            }
+            if ($sample.abort_required) {
+                $script:CurrentCommandExitCode = 1
+                $termination = Stop-NativeCommandContainment $process $containment "native-runtime-disk-floor"
+                $resourceAbort = [pscustomobject]@{
+                    cause = "native-runtime-disk-floor"
+                    sample = $sample
+                    termination = $termination
+                }
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($null -eq $termination) {
+            $quiescence = Wait-NativeCommandContainmentQuiescence $containment
+            $containmentEvidence = [pscustomobject]@{
+                active_processes = $quiescence.active_processes
+                waited_milliseconds = $quiescence.waited_milliseconds
+                peak_active_processes = $peakContainedProcessCount
+            }
+        } else {
+            $containmentEvidence = [pscustomobject]@{
+                active_processes = $termination.active_processes_after_termination
+                waited_milliseconds = $termination.waited_milliseconds
+                peak_active_processes = $peakContainedProcessCount
+            }
+        }
+        if ($null -ne $termination -and -not $termination.quiescent) {
+            $postLaunchError = $termination.persistent_failure
+            $exitCode = 1
+            $script:CurrentCommandExitCode = 1
+        } else {
+            if (-not $process.WaitForExit(30000)) {
+                Fail-Manifest "approved command root process did not terminate after command containment quiescence"
+            }
+            $null = $stdoutTask.GetAwaiter().GetResult()
+            $null = $stderrTask.GetAwaiter().GetResult()
+            $stdoutStream.Flush()
+            $stderrStream.Flush()
+            $exitCode = if ($null -eq $resourceAbort -and $null -eq $monitorError) { $process.ExitCode } else { 1 }
+            $script:CurrentCommandExitCode = $exitCode
+        }
+    } catch {
+        if (-not $launched) {
+            throw
+        }
+        $script:CurrentCommandExitCode = 1
+        $postLaunchError = $_.Exception.Message
+        if ($null -eq $termination) {
+            try {
+                if ($contained) {
+                    $termination = Stop-NativeCommandContainment $process $containment "post-launch-error"
+                    $containmentEvidence = [pscustomobject]@{
+                        active_processes = $termination.active_processes_after_termination
+                        waited_milliseconds = $termination.waited_milliseconds
+                        peak_active_processes = $peakContainedProcessCount
+                    }
+                } else {
+                    $process.TerminateAndReap()
+                    $termination = [pscustomobject]@{
+                        root_process_id = $process.Id
+                        root_exited_before_termination = $false
+                        active_processes_before_termination = 0
+                        active_processes_after_termination = 0
+                        mechanism = "suspended native process TerminateProcess"
+                        reason = "job-enrollment-failed"
+                        terminated = $true
+                        quiescent = $true
+                        waited_milliseconds = 0
+                    }
+                    $containmentEvidence = [pscustomobject]@{
+                        active_processes = 0
+                        waited_milliseconds = 0
+                        peak_active_processes = 0
+                    }
+                }
+            } catch {
+                $postLaunchError = "$postLaunchError; containment termination failed: $($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $termination -and -not $termination.quiescent) {
+            $postLaunchError = "$postLaunchError; $($termination.persistent_failure)"
+        } else {
+            try {
+                if (-not $process.WaitForExit(30000)) {
+                    $postLaunchError = "$postLaunchError; approved command root process did not terminate"
+                }
+            } catch {
+                $postLaunchError = "$postLaunchError; approved command root wait failed: $($_.Exception.Message)"
+            }
+            if ($null -ne $stdoutTask) {
+                try { $null = $stdoutTask.GetAwaiter().GetResult(); $stdoutStream.Flush() } catch { $postLaunchError = "$postLaunchError; stdout drain failed: $($_.Exception.Message)" }
+            }
+            if ($null -ne $stderrTask) {
+                try { $null = $stderrTask.GetAwaiter().GetResult(); $stderrStream.Flush() } catch { $postLaunchError = "$postLaunchError; stderr drain failed: $($_.Exception.Message)" }
+            }
+        }
+        $exitCode = 1
+    } finally {
+        if ($null -ne $containment) {
+            $containment.Dispose()
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        if ($null -ne $stdoutStream) {
+            $stdoutStream.Dispose()
+        }
+        if ($null -ne $stderrStream) {
+            $stderrStream.Dispose()
+        }
+    }
     if (
         $isFixture -and
         (-not [System.IO.File]::Exists($argvLogPath) -or -not [System.IO.File]::Exists($envLogPath))
@@ -3164,16 +4691,27 @@ function Invoke-ApprovedCommand {
         launch_file_name = $startInfo.FileName
         launch_arguments = @($Approved.argv[1..($Approved.argv.Length - 1)])
         working_directory = $startInfo.WorkingDirectory
-        status = if ($exitCode -eq 0) { "success" } else { "failed" }
+        launch_mode = "CreateProcessW CREATE_SUSPENDED"
+        status = if ($null -ne $resourceAbort) { "resource-aborted" } elseif ($null -ne $monitorError -or $null -ne $postLaunchError) { "failed" } elseif ($exitCode -eq 0) { "success" } else { "failed" }
         exit_code = $exitCode
         stdout_path = $stdoutPath
         stderr_path = $stderrPath
+        stdout_byte_length = (Get-Item -LiteralPath $stdoutPath -Force).Length
+        stderr_byte_length = (Get-Item -LiteralPath $stderrPath -Force).Length
+        insta_pending_dir = $instaPendingDir
         launch_kind = if ($isFixture) { "test-only-fake-cargo" } else { "direct-toolchain-cargo" }
         direct_toolchain_cargo = $directCargo
         fake_tool_path = $fakeTool
         fake_argv_path = if ($isFixture) { $argvLogPath } else { $null }
         fake_env_path = if ($isFixture) { $envLogPath } else { $null }
+        fake_child_pid_path = if ($longRunning -or $rootExitsFirst -or $immediateDescendant) { $childPidPath } else { $null }
         command_preflight = $commandPreflight
+        resource_abort = $resourceAbort
+        monitor_error = $monitorError
+        post_launch_error = $postLaunchError
+        termination = $termination
+        containment = $containmentEvidence
+        runtime_telemetry = $runtimeTelemetry
     }
 }
 
@@ -3197,8 +4735,9 @@ try {
     $script:Runtime = $runtime
     $script:CacheRoot = $runtime.cache_root
     $testFixture = Get-TestOnlyPreflightFixture
+    $pathOwnership = Get-TestOnlyPathOwnership $runtime $testFixture
     $nativeMutexEvidence = Enter-NativeExecutionMutex $testFixture
-    $script:RunPaths = New-RunPaths $runtime.workflow_namespace $runtime.reuse_run_root
+    $script:RunPaths = New-RunPaths $runtime.workflow_namespace $testFixture $pathOwnership
     $script:Preflight = [ordered]@{
         schema = 2
         status = "started"
@@ -3209,9 +4748,7 @@ try {
         windows_runtime = [ordered]@{
             cache_root = $runtime.cache_root
             workflow_namespace = $runtime.workflow_namespace
-            reuse_run_root = $runtime.reuse_run_root
-            minimum_free_disk_gib = $runtime.minimum_free_disk_gib
-            minimum_available_memory_gib = $runtime.minimum_available_memory_gib
+            cache_mode = $script:RunPaths.cache_mode
             target = $runtime.target
             rust_toolchain = $runtime.rust_toolchain
             source_materialization = $runtime.source_materialization
@@ -3258,11 +4795,11 @@ try {
     }
 
     $reuseReceipt = $null
-    if ($null -ne $runtime.reuse_run_root) {
+    if ($script:RunPaths.cache_mode -eq "warm") {
         if (-not $candidate.is_bound) {
-            Fail-Manifest "selected reuse working set requires a bound candidate identity"
+            Fail-Manifest "canonical reusable workset requires a bound candidate identity"
         }
-        $reuseReceipt = Get-ReuseReceipt $script:RunPaths
+        $reuseReceipt = Get-ReusableCacheState $script:RunPaths
     }
     $hasProductionCommand = @($approved | Where-Object { $null -eq $_.fixture }).Count -ne 0
     $requiresBootstrap = $hasProductionCommand -or $null -ne $bootstrapFixture -or $null -ne $reuseReceipt
@@ -3283,6 +4820,21 @@ try {
         $script:DirectToolchain = $directToolchain
     } else {
         $directToolchain = $null
+    }
+
+    if ($approved.Count -ne 0) {
+        $script:NativePython = Resolve-NativeTestPython
+        if ($candidate.is_bound) {
+            $script:NativeGit = Resolve-NativeGit
+        }
+    }
+
+    if ($script:RunPaths.cache_mode -eq "cold" -and $approved.Count -ne 0) {
+        # First-use admission is deliberately nonmutating for the canonical workset.
+        # Run-local evidence/TEMP already exists to describe a rejection truthfully.
+        $null = Invoke-ExecutionPreflight $runtime $script:RunPaths $testFixture "before-cold-workset-initialization" $yolo
+        Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
+        Initialize-CanonicalWorkset $script:RunPaths $pathOwnership
     }
 
     Set-RunEnvironment $script:RunPaths
@@ -3307,7 +4859,7 @@ try {
                 status = "started"
                 materialized = $false
             }
-            $nativeGit = Resolve-NativeGit
+            $nativeGit = if ($null -eq $script:NativeGit) { Resolve-NativeGit } else { $script:NativeGit }
             $script:NativeGit = $nativeGit
             $script:Preflight.native_git = $nativeGit
             Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
@@ -3350,12 +4902,19 @@ try {
             $bootstrap = $null
         }
         foreach ($command in $approved) {
+            $script:CurrentCommandExitCode = $null
             $result = Invoke-ApprovedCommand $command $script:RunPaths $runtime $materialization $testFixture $bootstrap $yolo
             $script:CommandResults.Add($result)
             if ($null -ne $materialization) {
-                $candidateAfterCommand = Assert-CandidateIntegrity $script:NativeGit.path $script:GitEnvironment $script:RunPaths $candidate $materialization.source_symlink_state "candidate-after-command-$($command.index)" -AllowIgnoredUntracked
-                $materialization.candidate_after_command = Get-SnapshotSummary $candidateAfterCommand
-                $script:Preflight.candidate_materialization = $materialization
+                try {
+                    $candidateAfterCommand = Assert-CandidateIntegrity $script:NativeGit.path $script:GitEnvironment $script:RunPaths $candidate $materialization.source_symlink_state "candidate-after-command-$($command.index)" -AllowIgnoredUntracked
+                    $materialization.candidate_after_command = Get-SnapshotSummary $candidateAfterCommand
+                    $script:Preflight.candidate_materialization = $materialization
+                } catch {
+                    $materialization.status = "post-command-integrity-failed"
+                    $script:Preflight.candidate_materialization = $materialization
+                    throw
+                }
             }
             if ($result.exit_code -ne 0) {
                 $script:Status = "command-failed"
@@ -3365,6 +4924,15 @@ try {
         }
     }
     Finalize-SourceIntegrity
+    if (
+        $script:Status -in @("success", "command-failed") -and
+        $null -ne $script:Bootstrap -and
+        $null -ne $script:Materialization -and
+        $candidate.is_bound -and
+        (Test-ReusableCachePublication $script:CommandResults.ToArray())
+    ) {
+        Write-ReusableCacheState $script:RunPaths $script:Bootstrap $script:Materialization $candidate
+    }
 } catch {
     $failure = $_.Exception.Message
     if (-not $script:SourceFinalized -and $null -ne $script:SourceSnapshotBefore) {
@@ -3374,10 +4942,16 @@ try {
             $failure = "$failure; source final integrity check failed: $($_.Exception.Message)"
         }
     }
-    $script:Status = "preflight-failed"
-    $script:ExitCode = 1
+    $postCommandFailure = $null -ne $script:CurrentCommandExitCode
+    if ($postCommandFailure) {
+        $script:Status = "command-failed"
+        $script:ExitCode = if ($script:CurrentCommandExitCode -eq 0) { 1 } else { $script:CurrentCommandExitCode }
+    } else {
+        $script:Status = "preflight-failed"
+        $script:ExitCode = 1
+    }
     $script:Failure = $failure
-    if ($null -ne $script:Preflight) {
+    if (-not $postCommandFailure -and $null -ne $script:Preflight) {
         $script:Preflight.status = "failed"
         $script:Preflight.error = $script:Failure
         if (

@@ -176,7 +176,7 @@ async fn app_server_child_helper() -> Result<()> {
             socket_path: absolute(&socket_path)?,
         },
         codex_protocol::protocol::SessionSource::Cli,
-        codex_app_server::AppServerWebsocketAuthSettings::default(),
+        Default::default(),
         codex_app_server::AppServerRuntimeOptions {
             plugin_startup_tasks: codex_app_server::PluginStartupTasks::Skip,
             remote_control_startup_mode:

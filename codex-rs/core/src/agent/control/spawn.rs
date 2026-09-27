@@ -33,6 +33,8 @@ use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_thread_store::PersistContext;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
+use futures::stream;
 use std::collections::HashSet;
 
 const AGENT_NAMES: &str = include_str!("../../../assets/agent/agent_names.txt");
@@ -224,56 +226,14 @@ fn retain_forked_developer_message(
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
 
-// Merge-safety anchor: V2 reload restores captured identity from persisted thread settings and
-// rollout history, never a mutable role file. Typed usage-hint content must not be reclassified
-// as developer instructions while resolving the persisted identity.
-pub(super) fn first_persisted_developer_instructions(history: &[RolloutItem]) -> Option<String> {
-    for item in history {
-        let response_items = match item {
-            RolloutItem::ResponseItem(response_item) => std::slice::from_ref(response_item),
-            RolloutItem::Compacted(compacted) => {
-                compacted.replacement_history.as_deref().unwrap_or_default()
-            }
-            _ => continue,
-        };
-        for response_item in response_items {
-            match &response_item.item {
-                ResponseItem::Message {
-                    role,
-                    content,
-                    internal_chat_message_metadata_passthrough,
-                    ..
-                } if role == "developer" => {
-                    let content_item_kinds = internal_chat_message_metadata_passthrough
-                        .as_ref()
-                        .and_then(|metadata| metadata.content_item_kinds.as_deref());
-                    for (index, content_item) in content.iter().enumerate() {
-                        let is_usage_hint = content_item_kinds
-                            .and_then(|kinds| kinds.get(index))
-                            .is_some_and(|kind| kind.0.as_str() == "multi_agent.usage_hint");
-                        if !is_usage_hint
-                            && let Some(instructions) =
-                                crate::event_mapping::first_non_contextual_dev_message_text(
-                                    std::slice::from_ref(content_item),
-                                )
-                        {
-                            return Some(instructions.to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
-}
-
+// Merge-safety anchor: cold V2 restoration reads developer instructions from the persisted birth
+// snapshot and fails closed for historical snapshots that lack that required field.
 async fn restore_v2_identity_snapshot(
     state: &ThreadManagerState,
     config: &Config,
     stored_thread: &codex_thread_store::StoredThread,
 ) -> Result<Option<AgentIdentitySnapshot>, V2AgentMetadataRestoreError> {
-    let history = load_agent_model_context(
+    let model_context = load_agent_model_context(
         state,
         stored_thread.thread_id,
         stored_thread.history_mode,
@@ -287,7 +247,7 @@ async fn restore_v2_identity_snapshot(
     })?;
     let initial_history = InitialHistory::Resumed(ResumedHistory {
         conversation_id: stored_thread.thread_id,
-        history: Arc::new(history.clone()),
+        history: Arc::new(model_context.items.clone()),
         rollout_path: stored_thread.rollout_path.clone(),
     });
     if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
@@ -333,6 +293,12 @@ async fn restore_v2_identity_snapshot(
                 stored_thread.thread_id
             ))
         })?;
+    let developer_instructions = latest_thread_settings.developer_instructions.ok_or(
+        V2AgentMetadataRestoreError::MissingBirthIdentityField {
+            thread_id: stored_thread.thread_id,
+            field: "developer_instructions",
+        },
+    )?;
     let shell_tool_enabled = latest_thread_settings.shell_tool_enabled.ok_or(
         V2AgentMetadataRestoreError::MissingShellToolState {
             thread_id: stored_thread.thread_id,
@@ -385,7 +351,7 @@ async fn restore_v2_identity_snapshot(
         latest_thread_settings.reasoning_effort.clone(),
         latest_thread_settings.reasoning_summary,
         base_instructions,
-        first_persisted_developer_instructions(&history),
+        developer_instructions,
         latest_thread_settings.service_tier,
         Some(shell_tool_enabled),
         agent_role_feature_opt_outs,
@@ -414,7 +380,7 @@ async fn load_agent_model_context(
     state: &ThreadManagerState,
     thread_id: ThreadId,
     history_mode: ThreadHistoryMode,
-) -> CodexResult<Option<Vec<RolloutItem>>> {
+) -> CodexResult<Option<codex_thread_store::StoredModelContext>> {
     match history_mode {
         ThreadHistoryMode::Legacy => Ok(state
             .read_stored_thread(ReadThreadParams {
@@ -424,15 +390,17 @@ async fn load_agent_model_context(
             })
             .await?
             .history
-            .map(|history| history.items)),
+            .map(|history| codex_thread_store::StoredModelContext {
+                thread_id,
+                items: history.items,
+            })),
         ThreadHistoryMode::Paginated => Ok(Some(
             state
                 .load_latest_model_context(LoadThreadHistoryParams {
                     thread_id,
                     include_archived: true,
                 })
-                .await?
-                .items,
+                .await?,
         )),
     }
 }
@@ -497,18 +465,33 @@ impl LocalAgentControl {
             }
         };
 
-        for thread_id in descendant_ids {
+        // Overlap metadata reads, but reserve paths and nicknames in graph order.
+        let mut stored_threads = stream::iter(
+            descendant_ids
+                .into_iter()
+                .filter(|thread_id| registry.agent_metadata_for_thread(*thread_id).is_none())
+                .map(|thread_id| {
+                    let state = &state;
+                    async move {
+                        let stored_thread = state
+                            .read_stored_thread(ReadThreadParams {
+                                thread_id,
+                                include_archived: true,
+                                include_history: false,
+                            })
+                            .await;
+                        (thread_id, stored_thread)
+                    }
+                }),
+        )
+        .buffered(/*n*/ 8);
+
+        while let Some((thread_id, stored_thread)) = stored_threads.next().await {
             if registry.agent_metadata_for_thread(thread_id).is_some() {
                 continue;
             }
             let restore_result = async {
-                let stored_thread = state
-                    .read_stored_thread(ReadThreadParams {
-                        thread_id,
-                        include_archived: true,
-                        include_history: false,
-                    })
-                    .await?;
+                let stored_thread = stored_thread?;
                 let identity_snapshot = if restore_identity_snapshots {
                     restore_v2_identity_snapshot(&state, config, &stored_thread).await?
                 } else {
@@ -709,7 +692,7 @@ impl LocalAgentControl {
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
-            history: Arc::new(history),
+            history: Arc::new(history.items),
             rollout_path: stored_thread.rollout_path,
         });
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
@@ -1261,7 +1244,8 @@ impl LocalAgentControl {
                     CodexErr::Fatal(format!(
                         "parent thread history unavailable for fork: {parent_thread_id}"
                     ))
-                })?;
+                })?
+                .items;
 
         let selected_capability_roots = forked_rollout_items
             .iter()
@@ -1355,8 +1339,10 @@ impl LocalAgentControl {
                     .inherited_user_message = true;
             }
             if let Some(metadata) = &mut envelope.metadata
-                && metadata.sender_user_messages.take().is_some()
+                && (metadata.sender_user_messages.take().is_some()
+                    || !matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user"))
             {
+                // Assistant and tool positions belong to the parent's counter, not the child.
                 metadata.user_input_order = None;
             }
             let response_item = &mut envelope.item;
@@ -1431,8 +1417,15 @@ impl LocalAgentControl {
             match item {
                 RolloutItem::ResponseItem(response_item) => retain_forked_item(response_item),
                 RolloutItem::Compacted(compacted) => {
-                    // This checkpoint belongs to the inherited parent prefix.
+                    // This compaction becomes part of the subagent's initial history. Rewrite its
+                    // metadata to describe the child rather than the parent.
                     compacted.latest_token_usage_record = None;
+                    if let Some(resume_metadata) = &mut compacted.resume_metadata {
+                        resume_metadata.multi_agent_version = Some(multi_agent_version);
+                        if !preserve_reference_context_item {
+                            resume_metadata.previous_turn_settings = None;
+                        }
+                    }
                     // Parent-local review evidence must not become the child's authorization.
                     // Root user authorization is collected separately by the host.
                     compacted.guardian_history = None;
@@ -1593,7 +1586,7 @@ impl LocalAgentControl {
             .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
-            history: Arc::new(history),
+            history: Arc::new(history.items),
             rollout_path: stored_thread.rollout_path,
         });
         let parent_thread_id = stored_thread.parent_thread_id;

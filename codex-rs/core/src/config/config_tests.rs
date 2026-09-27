@@ -12412,8 +12412,7 @@ fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_renderi
         ResolvedModelMessages::bundled().multi_agent(),
         /*omit_update_plan_instructions*/ false,
     )
-    .err()
-    .expect("configured usage hint one byte over the rendered limit should fail");
+    .expect_err("configured usage hint one byte over the rendered limit should fail");
     assert!(
         configured_error
             .to_string()
@@ -12472,8 +12471,7 @@ fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_renderi
         over_bound_messages,
         /*omit_update_plan_instructions*/ false,
     )
-    .err()
-    .expect("composed catalog hint one byte over the rendered limit should fail");
+    .expect_err("composed catalog hint one byte over the rendered limit should fail");
     assert!(
         composed_error
             .to_string()

@@ -2,13 +2,16 @@ use super::*;
 use crate::CodexThread;
 use crate::StateDbHandle;
 use crate::ThreadManager;
+use crate::TurnStartOptions;
 use crate::agent::agent_status_from_event;
 use crate::agent::api::AgentControl;
-use crate::agent::api::AgentInfo;
 use crate::agent::api::AgentInput;
 use crate::agent::api::AgentTarget;
+use crate::agent::api::SendRequest;
 use crate::agent::api::SpawnRequest;
+use crate::agent::child_config::build_agent_resume_config;
 use crate::agent::next_thread_spawn_depth;
+use crate::agent::role::apply_role_to_config;
 use crate::agent::types::AgentMessage;
 use crate::agent::types::LiveAgent;
 use crate::agent::types::MessageDeliveryMode;
@@ -212,44 +215,6 @@ fn assistant_message(text: &str, phase: Option<MessagePhase>) -> ResponseItem {
 }
 
 #[test]
-fn compacted_history_developer_identity_scan_skips_user_messages_before_and_after() {
-    let developer_instructions = "persisted child developer instructions";
-    let history = vec![RolloutItem::Compacted(CompactedItem {
-        message: "compacted child history".to_string(),
-        replacement_history: Some(vec![
-            user_message("real user message before developer identity").into(),
-            ResponseItem::Message {
-                id: None,
-                role: "developer".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: developer_instructions.to_string(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }
-            .into(),
-            user_message("real user message after developer identity").into(),
-        ]),
-        guardian_history: None,
-        retained_context: None,
-        mcp_resource_origins: None,
-        window_number: Some(1),
-        first_window_id: None,
-        previous_window_id: None,
-        window_id: None,
-        post_compact_recovery: None,
-        compaction_response_id: None,
-        latest_token_usage_record: None,
-        resume_metadata: None,
-    })];
-
-    assert_eq!(
-        super::spawn::first_persisted_developer_instructions(&history),
-        Some(developer_instructions.to_string())
-    );
-}
-
-#[test]
 fn register_session_root_skips_threads_with_explicit_parent() {
     let control = LocalAgentControl::default();
 
@@ -378,6 +343,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
+            | RolloutItem::PostCompactRecoveryApplied(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)
@@ -934,6 +900,7 @@ async fn ensure_v2_agent_loaded_rejects_legacy_missing_shell_state() {
 
 #[test_case::test_case("agent_role_feature_opt_outs"; "feature opt-outs")]
 #[test_case::test_case("agent_role_skill_restrictions"; "skill restrictions")]
+#[test_case::test_case("developer_instructions"; "developer instructions")]
 #[test_case::test_case("model_context_window"; "context window")]
 #[test_case::test_case("model_auto_compact_token_limit"; "auto-compaction limit")]
 #[test_case::test_case("model_auto_compact_token_limit_scope"; "auto-compaction limit scope")]
@@ -1017,7 +984,7 @@ async fn resumed_v2_root_rejects_oversized_canonical_usage_hint_binding() {
 }
 
 #[tokio::test]
-async fn resumed_v2_root_restores_compacted_developer_instructions_and_model_provenance() {
+async fn resumed_v2_root_restores_persisted_developer_instructions_after_compaction() {
     check_v2_agent_reload(
         V2ReloadRoute::Sender,
         V2ReloadExpectation::CompactedColdIdentity,
@@ -1125,7 +1092,10 @@ async fn check_v2_agent_reload(
         expectation,
         V2ReloadExpectation::MissingShellState | V2ReloadExpectation::CompressedAncestor
     ) {
-        config.features.enable(Feature::ShellTool);
+        config
+            .features
+            .enable(Feature::ShellTool)
+            .expect("shell tool should be enabled for persisted-state reload fixture");
     }
     config.model = Some("gpt-5.6-sol".to_string());
     if uses_full_history_usage_hint {
@@ -1147,11 +1117,11 @@ async fn check_v2_agent_reload(
         }
     }
     let role_path = config.codex_home.join("worker.toml");
-    let role_model_limits = (!captures_explicitly_absent_numeric_birth_fields)
-        .then_some(
-            "model_context_window = 196000\nmodel_auto_compact_token_limit = 160000\nmodel_auto_compact_token_limit_scope = \"body_after_prefix\"\n",
-        )
-        .unwrap_or_default();
+    let role_model_limits = if !captures_explicitly_absent_numeric_birth_fields {
+        "model_context_window = 196000\nmodel_auto_compact_token_limit = 160000\nmodel_auto_compact_token_limit_scope = \"body_after_prefix\"\n"
+    } else {
+        Default::default()
+    };
     std::fs::write(
         &role_path,
         format!(
@@ -1269,13 +1239,22 @@ enabled = false
         child_config.developer_instructions =
             Some(COMPACTED_COLD_DEVELOPER_INSTRUCTIONS.to_string());
     }
-    child_config.features.disable(Feature::ShellTool);
+    child_config
+        .features
+        .disable(Feature::ShellTool)
+        .expect("shell tool should be disabled for child reload fixture");
     if uses_full_history_usage_hint {
         child_config.multi_agent_v2.root_agent_usage_hint_text =
             Some("full-history child reload root guidance".to_string());
         child_config.multi_agent_v2.subagent_usage_hint_text =
             Some("full-history child reload subagent guidance".to_string());
     }
+    apply_role_to_config(&mut child_config, Some("worker"))
+        .await
+        .expect("worker role should apply to the child birth configuration");
+    // The role file deliberately carries a different model so reload can prove it does not
+    // consult mutable role state; the fixture's effective child model remains explicit.
+    child_config.model = Some("gpt-5.6-luna".to_string());
     let child_fork_mode = uses_full_history_usage_hint.then_some(SpawnAgentForkMode::FullHistory);
     let spawned_agent = spawn_v2_reload_test_child(
         &control,
@@ -1296,38 +1275,37 @@ enabled = false
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
+    let initial_child_turn = child_thread.session.new_default_turn().await;
     assert_eq!(
-        child_thread
-            .session
-            .new_default_turn()
-            .await
-            .config
-            .agent_usage_hint_binding,
+        initial_child_turn.config.agent_usage_hint_binding,
         expected_usage_hint_binding
     );
     let expected_identity = child_thread.session.agent_identity_snapshot().await;
-    let initial_child_config = child_thread.config_snapshot().await;
     let expected_model_context_window =
         (!captures_explicitly_absent_numeric_birth_fields).then_some(196_000);
     let expected_model_auto_compact_token_limit =
         (!captures_explicitly_absent_numeric_birth_fields).then_some(160_000);
     let expected_model_auto_compact_token_limit_scope =
-        (!captures_explicitly_absent_numeric_birth_fields)
-            .then_some(codex_protocol::config_types::AutoCompactTokenLimitScope::BodyAfterPrefix)
-            .unwrap_or_default();
-    assert!(!initial_child_config.features.enabled(Feature::Apps));
-    assert!(!initial_child_config.features.enabled(Feature::Plugins));
-    assert!(!initial_child_config.include_skill_instructions);
+        if !captures_explicitly_absent_numeric_birth_fields {
+            codex_protocol::config_types::AutoCompactTokenLimitScope::BodyAfterPrefix
+        } else {
+            Default::default()
+        };
+    assert!(!initial_child_turn.config.features.enabled(Feature::Apps));
+    assert!(!initial_child_turn.config.features.enabled(Feature::Plugins));
+    assert!(!initial_child_turn.config.include_skill_instructions);
     assert_eq!(
-        initial_child_config.model_context_window,
+        initial_child_turn.config.model_context_window,
         expected_model_context_window
     );
     assert_eq!(
-        initial_child_config.model_auto_compact_token_limit,
+        initial_child_turn.config.model_auto_compact_token_limit,
         expected_model_auto_compact_token_limit
     );
     assert_eq!(
-        initial_child_config.model_auto_compact_token_limit_scope,
+        initial_child_turn
+            .config
+            .model_auto_compact_token_limit_scope,
         expected_model_auto_compact_token_limit_scope
     );
     child_thread
@@ -1389,6 +1367,7 @@ enabled = false
                     post_compact_recovery: None,
                     compaction_response_id: None,
                     latest_token_usage_record: None,
+                    resume_metadata: None,
                 }),
             ])
             .await;
@@ -1671,6 +1650,7 @@ enabled = false
             }
             V2ReloadExpectation::FullIdentity
             | V2ReloadExpectation::FullHistoryUsageHint
+            | V2ReloadExpectation::ExplicitlyAbsentNumericBirthFields
             | V2ReloadExpectation::BoundedModelContext => {
                 unreachable!("fresh-manager branch only handles persisted rollout fixtures")
             }
@@ -1842,7 +1822,7 @@ enabled = false
                 assert_eq!(
                     restored_turn.developer_instructions.as_deref(),
                     Some(COMPACTED_COLD_DEVELOPER_INSTRUCTIONS),
-                    "cold identity restore must retain developer instructions from replacement history"
+                    "cold identity restore must retain developer instructions from its persisted snapshot"
                 );
                 let restored_history = restored_child.session.clone_history().await;
                 assert!(
@@ -1850,7 +1830,7 @@ enabled = false
                         restored_history.raw_items(),
                         COMPACTED_COLD_DEVELOPER_INSTRUCTIONS,
                     ),
-                    "the rebuilt cold context must retain developer instructions from replacement history"
+                    "the rebuilt cold context must retain developer instructions from its persisted snapshot"
                 );
                 assert_eq!(
                     restored_child.session.get_base_instructions().await,
@@ -1913,6 +1893,7 @@ enabled = false
             }
             V2ReloadExpectation::FullIdentity
             | V2ReloadExpectation::FullHistoryUsageHint
+            | V2ReloadExpectation::ExplicitlyAbsentNumericBirthFields
             | V2ReloadExpectation::BoundedModelContext => {
                 unreachable!("fresh-manager branch only handles persisted rollout fixtures")
             }
@@ -1948,7 +1929,10 @@ enabled = false
     reload_config.service_tier = Some("identity-drift-tier".to_string());
     reload_config.model_context_window = Some(128_000);
     reload_config.model_auto_compact_token_limit = Some(96_000);
-    reload_config.features.enable(Feature::ShellTool);
+    reload_config
+        .features
+        .enable(Feature::ShellTool)
+        .expect("shell tool should be enabled for reload configuration");
     reload_config
         .permissions
         .approval_policy
@@ -2096,19 +2080,19 @@ enabled = false
         reloaded_snapshot.model, "gpt-5.6-luna",
         "residency reload must preserve the worker model instead of inheriting its parent model",
     );
-    assert!(!reloaded_snapshot.features.enabled(Feature::Apps));
-    assert!(!reloaded_snapshot.features.enabled(Feature::Plugins));
-    assert!(!reloaded_snapshot.include_skill_instructions);
+    assert!(!reloaded_turn.config.features.enabled(Feature::Apps));
+    assert!(!reloaded_turn.config.features.enabled(Feature::Plugins));
+    assert!(!reloaded_turn.config.include_skill_instructions);
     assert_eq!(
-        reloaded_snapshot.model_context_window,
+        reloaded_turn.config.model_context_window,
         expected_model_context_window
     );
     assert_eq!(
-        reloaded_snapshot.model_auto_compact_token_limit,
+        reloaded_turn.config.model_auto_compact_token_limit,
         expected_model_auto_compact_token_limit
     );
     assert_eq!(
-        reloaded_snapshot.model_auto_compact_token_limit_scope,
+        reloaded_turn.config.model_auto_compact_token_limit_scope,
         expected_model_auto_compact_token_limit_scope
     );
     assert_eq!(
@@ -2443,18 +2427,28 @@ async fn cold_resume_with_thread_instructions_preserves_lazy_v2_child_inheritanc
 
     if nested {
         let turn = resumed_parent.thread.session.new_default_turn().await;
+        let resume_config =
+            build_agent_resume_config(&turn).expect("build resume config for grandchild reload");
         resumed_parent
             .thread
             .session
             .services
             .agent_control
-            .deliver_message(
-                parent_thread_id,
-                &turn,
-                target_thread_id,
-                AgentMessage::Plaintext("hello after resume".to_string()),
-                MessageDeliveryMode::QueueOnly,
-            )
+            .send(SendRequest {
+                caller: parent_thread_id,
+                target: AgentTarget::Id(target_thread_id),
+                resume_config,
+                input: AgentInput::Message {
+                    message: AgentMessage::Plaintext("hello after resume".to_string()),
+                    mode: MessageDeliveryMode::QueueOnly,
+                },
+                start_options: TurnStartOptions {
+                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                    turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
+                    cyber_access_program: turn.cyber_access_program,
+                    ..Default::default()
+                },
+            })
             .await
             .expect("message should reload the grandchild");
         assert_thread_not_loaded(&resumed_manager, worker_thread_id).await;
@@ -2572,17 +2566,27 @@ async fn v2_sibling_reload_preserves_shared_instructions_after_root_unloads(shar
     *provider.text.write().expect("update thread instructions") =
         "updated while target was unloaded";
     let sender_turn = sender.session.new_default_turn().await;
+    let resume_config =
+        build_agent_resume_config(&sender_turn).expect("build resume config for sibling reload");
     sender
         .session
         .services
         .agent_control
-        .deliver_message(
-            sender_id,
-            &sender_turn,
-            target_id,
-            AgentMessage::Plaintext("wake the sibling".to_string()),
-            MessageDeliveryMode::QueueOnly,
-        )
+        .send(SendRequest {
+            caller: sender_id,
+            target: AgentTarget::Id(target_id),
+            resume_config,
+            input: AgentInput::Message {
+                message: AgentMessage::Plaintext("wake the sibling".to_string()),
+                mode: MessageDeliveryMode::QueueOnly,
+            },
+            start_options: TurnStartOptions {
+                root_turn_id: sender_turn.turn_metadata_state.root_turn_id(),
+                turn_trigger: sender_turn.turn_metadata_state.current_turn_trigger(),
+                cyber_access_program: sender_turn.cyber_access_program,
+                ..Default::default()
+            },
+        })
         .await
         .expect("reload target from its sibling");
     let resumed = harness
@@ -2789,6 +2793,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix() {
                                 developer_instructions: None,
                             },
                         },
+                        developer_instructions: Some(None),
                         agent_role_feature_opt_outs: Some(Vec::new()),
                         agent_role_skill_restrictions: Some(Default::default()),
                         model_context_window: Some(None),
@@ -3006,6 +3011,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata(thread_context
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
                 compaction_response_id: None,
                 latest_token_usage_record: Some(parent_record.clone()),
                 resume_metadata: Some(parent_resume_metadata.clone()),
@@ -3147,6 +3153,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
@@ -3405,10 +3412,19 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     };
     assert!(assistant_position(&parent_thread.session.clone_history().await).is_some());
     assert_eq!(assistant_position(&history), None);
-    let expected_final_answer = parent_thread
-        .session
-        .clone_history()
-        .await
+    let parent_history = parent_thread.session.clone_history().await;
+    let parent_developer_message = |expected_text: &str| {
+        parent_history
+            .raw_items()
+            .find(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. } if role == "developer" && content.iter().any(|content_item| matches!(content_item, ContentItem::InputText { text } if text == expected_text)))
+            })
+            .cloned()
+            .expect("parent developer message should be recorded")
+    };
+    let expected_parent_root_guidance = parent_developer_message("Parent root guidance.");
+    let expected_parent_subagent_guidance = parent_developer_message("Parent subagent guidance.");
+    let expected_final_answer = parent_history
         .raw_items()
         .find(|item| {
             matches!(
@@ -3427,7 +3443,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         role: "developer".to_string(),
         content: vec![
             ContentItem::InputText {
-                text: "Developer context before.\nChild developer instructions.\nDeveloper context after."
+                text: "Developer context before.\nParent developer instructions.\nDeveloper context after."
                     .to_string(),
             },
             ContentItem::InputText {
@@ -3455,24 +3471,28 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     };
     expected_developer_message.set_turn_id_if_missing(&turn_context.sub_id);
     expected_developer_message.set_create_time_if_missing(
-        history_items[1]
+        history_items
+            .iter()
+            .find(|item| {
+                matches!(item, ResponseItem::Message { role, content, .. } if role == "developer" && content.iter().any(|content_item| matches!(content_item, ContentItem::InputText { text } if text.contains("Developer context before."))))
+            })
+            .expect("recorded parent developer message")
             .executed_tool_call_metadata()
             .and_then(|metadata| metadata.create_time.clone())
             .expect("recorded developer message should have a creation timestamp"),
     );
     let expected_history = [
         expected_parent_seed,
+        expected_parent_root_guidance,
+        expected_parent_subagent_guidance,
         expected_developer_message,
         expected_final_answer,
         expected_standalone_output,
-        ContextualUserFragment::into(MultiAgentRoleInstructions::Configured(
-            "Child subagent guidance.".to_string(),
-        )),
     ];
     assert_eq!(
         strip_response_item_ids(&history_items),
         strip_response_item_ids(&expected_history),
-        "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
+        "full-history forked child history should retain the parent identity while filtering non-final assistant/tool chatter"
     );
     assert_eq!(
         serde_json::to_value(child_thread.session.reference_context_item().await)
@@ -3522,30 +3542,30 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                 no_hint_history.raw_items(),
                 "You are an agent in a team of agents"
             ),
-        "full-history forked child should not add configured or bundled subagent guidance"
-    );
-    assert!(
-        !history_contains_text(
-            no_hint_history.raw_items(),
-            "Developer context before.\nParent developer instructions."
-        ),
-        "empty child developer instructions should remove parent developer instructions"
-    );
-    assert!(
-        history_contains_text(no_hint_history.raw_items(), managed_fragment)
-            && history_contains_text(no_hint_history.raw_items(), persistent_fragment),
-        "clearing child instructions must preserve overlapping managed and persistent instructions"
+        "full-history forked child should not add a child or bundled subagent guidance"
     );
     assert!(
         history_contains_text(
             no_hint_history.raw_items(),
-            "Developer context before.\n\nDeveloper context after."
+            "Developer context before.\nParent developer instructions."
         ),
-        "empty child developer instructions should preserve surrounding developer context"
+        "full-history fork must retain parent developer instructions despite child configuration"
+    );
+    assert!(
+        history_contains_text(no_hint_history.raw_items(), managed_fragment)
+            && history_contains_text(no_hint_history.raw_items(), persistent_fragment),
+        "full-history fork must preserve overlapping managed and persistent instructions"
+    );
+    assert!(
+        history_contains_text(
+            no_hint_history.raw_items(),
+            "Developer context before.\nParent developer instructions.\nDeveloper context after."
+        ),
+        "full-history fork must preserve the parent developer context"
     );
     assert!(
         history_contains_text(no_hint_history.raw_items(), "Preserved developer context."),
-        "empty child developer instructions should preserve unrelated developer fragments"
+        "full-history fork must preserve unrelated developer fragments"
     );
 
     wait_for_recorded_user_message(child_thread.as_ref(), "child task").await;
@@ -3707,6 +3727,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
@@ -3759,6 +3780,18 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         .await
         .expect("child thread should be registered");
     let history = child_thread.session.clone_history().await;
+    let inherited_delivery_order = history
+        .annotated_items()
+        .iter()
+        .find(|item| {
+            matches!(&item.item, ResponseItem::FunctionCallOutput { id: Some(id), .. } if id.as_str() == "parent-delivery")
+        })
+        .and_then(|item| item.metadata.as_ref())
+        .and_then(|metadata| metadata.user_input_order);
+    assert_eq!(
+        inherited_delivery_order, None,
+        "forked tool output must not retain its parent's user-input order"
+    );
     assert!(
         !history_contains_text(
             history.conversation_history_snapshot().review_items(),
@@ -3787,8 +3820,8 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         "forked child history should strip the resolved parent hint from compacted replacement history"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Catalog child subagent guidance."),
-        "full-history forked child should add the resolved child hint after compacted-history sanitization"
+        !history_contains_text(history.raw_items(), "Catalog child subagent guidance."),
+        "full-history forked child should not append a child hint after compacted-history sanitization"
     );
     assert!(
         !history
@@ -3797,8 +3830,8 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         "forked child history should not inherit compacted parent agent messages"
     );
     assert!(
-        !history_contains_text(history.raw_items(), "Parent root guidance."),
-        "forked child history should strip stale parent hints from compacted replacement history"
+        history_contains_text(history.raw_items(), "Parent root guidance."),
+        "full-history forked child should retain the parent hint from compacted replacement history"
     );
     assert!(
         !history_contains_text(
@@ -3808,15 +3841,15 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         "forked child history should strip stale policy fragments from compound compacted messages"
     );
     assert!(
-        !history_contains_text(history.raw_items(), "Parent developer instructions."),
-        "forked child history should replace parent instructions in compacted replacement history"
+        history_contains_text(history.raw_items(), "Parent developer instructions."),
+        "full-history forked child should retain parent instructions in compacted replacement history"
     );
     assert!(
         history_contains_text(
             history.raw_items(),
-            "Compacted context before.\nChild developer instructions.\nCompacted context after."
+            "Compacted context before.\nParent developer instructions.\nCompacted context after."
         ),
-        "forked child history should replace compacted parent instructions without removing surrounding context"
+        "full-history forked child should retain compacted parent instructions without removing surrounding context"
     );
     assert!(
         history_contains_text(
@@ -3837,10 +3870,11 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         .expect("parent shutdown should submit");
 }
 
-/// Full-history forks must restore child instructions when compaction discarded
-/// the only matching parent instruction fragment from effective history.
+/// Full-history forks preserve effective compacted context without restoring discarded parent
+/// instructions.
 #[tokio::test]
-async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_parent_fragment() {
+async fn spawn_agent_full_fork_does_not_restore_parent_instructions_after_compaction_discards_parent_fragment()
+ {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
@@ -3913,6 +3947,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
@@ -3950,7 +3985,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
             },
         )
         .await
-        .expect("forked spawn should preserve effective compacted instructions")
+        .expect("forked spawn should preserve effective compacted context")
         .thread_id;
     let child_thread = harness
         .manager
@@ -3967,11 +4002,11 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent developer instructions."),
-        "full-history fork should not restore stale pre-compaction parent instructions"
+        "full-history fork should not restore parent instructions absent from effective compacted history"
     );
     assert!(
-        history_contains_text(history.raw_items(), "Child developer instructions."),
-        "full-history fork should append child instructions absent from effective compacted history"
+        !history_contains_text(history.raw_items(), "Child developer instructions."),
+        "full-history fork should not append child instructions absent from effective compacted history"
     );
 
     let _ = harness
@@ -4071,6 +4106,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 first_window_id: None,
                 previous_window_id: None,
                 window_id: None,
+                post_compact_recovery: None,
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: Some(codex_history::CompactionResumeMetadata {

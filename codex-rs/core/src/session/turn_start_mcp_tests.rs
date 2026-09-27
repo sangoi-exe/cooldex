@@ -101,9 +101,10 @@ async fn turn_start_refreshes_dirty_mcp_reuses_clean_runtime_and_cancels_discove
         let (cancellation_token, done) = {
             let active_turn = session.active_turn.lock().await;
             let task = active_turn
-                .running_task()
+                .as_ref()
+                .and_then(|turn| turn.task.as_ref())
                 .expect("discovery should run inside the registered task");
-            (task.cancellation_token.clone(), Arc::clone(&task.task_done))
+            (task.cancellation_token.clone(), Arc::clone(&task.done))
         };
         let completed = done.notified();
         tokio::pin!(completed);

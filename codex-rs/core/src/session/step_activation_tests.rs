@@ -738,14 +738,20 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
 
     let done = {
         let active = session.active_turn.lock().await;
-        Arc::clone(&active.running_task().expect("active task").task_done)
+        Arc::clone(
+            &active
+                .as_ref()
+                .and_then(|turn| turn.task.as_ref())
+                .expect("active task")
+                .done,
+        )
     };
     let completed = done.notified();
     finish.notify_one();
     timeout(Duration::from_secs(/*secs*/ 10), completed)
         .await
         .expect("original task completed");
-    assert!(session.active_turn.lock().await.is_idle());
+    assert!(session.active_turn.lock().await.is_none());
 
     // A retained context owns its last published snapshot even after the task
     // is unregistered. Capture must not fall back to the initial turn model.
@@ -809,8 +815,11 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
     assert_eq!(desired_step_settings(&session).await, desired);
     let (cancellation_token, done) = {
         let active = session.active_turn.lock().await;
-        let task = active.running_task().expect("active task");
-        (task.cancellation_token.clone(), Arc::clone(&task.task_done))
+        let task = active
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .expect("active task");
+        (task.cancellation_token.clone(), Arc::clone(&task.done))
     };
     let (expected_turn, expected_inputs) = match change {
         TaskChangeDuringLookup::CancelledWithRejectedDestination => {

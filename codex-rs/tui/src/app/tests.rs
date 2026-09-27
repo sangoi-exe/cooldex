@@ -197,10 +197,13 @@ use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::MODEL_SPECIALTY_CYBER;
+use codex_protocol::protocol::AgentRoleFeatureOptOut;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
@@ -2533,8 +2536,12 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                     agent_role: Some("worker".to_string()),
                 }),
                 model_provider: Some(app.config.model_provider_id.clone()),
-                base_instructions: (multi_agent_version == MultiAgentVersion::V2)
-                    .then(codex_protocol::models::BaseInstructions::default),
+                base_instructions: (multi_agent_version == MultiAgentVersion::V2).then(|| {
+                    BaseInstructions {
+                        provenance: Some(BaseInstructionsProvenance::Custom),
+                        ..Default::default()
+                    }
+                }),
                 multi_agent_version: Some(multi_agent_version),
                 agent_usage_hint_binding: (multi_agent_version == MultiAgentVersion::V2)
                     .then_some(AgentUsageHintBinding::Resolve),
@@ -2576,11 +2583,15 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
                                 .chat_widget
                                 .current_collaboration_mode()
                                 .clone(),
+                            developer_instructions: Some(app.config.developer_instructions.clone()),
                             disabled_plugin_ids: Vec::new(),
                             shell_tool_enabled: Some(
                                 app.config.features.enabled(Feature::ShellTool),
                             ),
-                            agent_role_feature_opt_outs: Some(Vec::new()),
+                            agent_role_feature_opt_outs: Some(vec![
+                                AgentRoleFeatureOptOut::MemoryTool,
+                                AgentRoleFeatureOptOut::RequestPermissionsTool,
+                            ]),
                             agent_role_skill_restrictions: Some(Default::default()),
                             model_context_window: Some(app.config.model_context_window),
                             model_auto_compact_token_limit: Some(

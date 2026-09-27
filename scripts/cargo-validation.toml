@@ -518,6 +518,7 @@ patterns = ["codex-rs/linux-sandbox/**"]
 packages = ["codex-linux-sandbox"]
 surfaces = ["cli", "sandbox_linux"]
 flags = ["runtime"]
+wsl_runtime_packages = ["codex-linux-sandbox"]
 
 [[path_rules]]
 patterns = ["codex-rs/config/**"]
@@ -729,7 +730,7 @@ patterns = ["justfile"]
 commands = ["just-summary", "validate-plan-self"]
 
 [[path_rules]]
-patterns = ["AGENTS.md"]
+patterns = ["AGENTS.md", "scripts/AGENTS.md"]
 
 [[path_rules]]
 patterns = [".github/workflows/rust-release-prepare.yml"]

@@ -901,7 +901,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
 
 #[tokio::test]
 async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> {
-    use crate::session::tests::claimed_turn_slot;
+    use crate::session::tests::active_turn_for_tests;
     use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
     use crate::tools::sandboxing::ToolError;
     use codex_features::Feature;
@@ -922,7 +922,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         },
     )
     .await;
-    *session.active_turn.lock().await = claimed_turn_slot();
+    *session.active_turn.lock().await = active_turn_for_tests();
     let manager = &session.services.unified_exec_manager;
     let command = "while IFS= read -r line; do printf 'received:%s\\n' \"$line\"; done";
     let opened = exec_command(

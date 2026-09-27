@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "clear-windows-build-cache.ps1"
 PRODUCTION_TARGET = r"F:\.cache"
 TEST_PREFIX = r"F:\.cache\cw\cleanup-tests"
+FIXTURE_ANCESTORS = (r"F:\.cache\cw", TEST_PREFIX)
 OPT_IN = "COOLDEX_WINDOWS_CACHE_CLEANUP_TEST_ONLY"
 SCRATCH = Path.home() / ".cache" / "codex" / "windows-cache-cleanup-tests"
 
@@ -56,15 +57,29 @@ class CleanupTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=SCRATCH, prefix="run.")
         self.work = Path(self.temp.name)
         self.roots: list[str] = []
+        self.fixture_ancestor_state = {
+            ancestor: self.path_state(ancestor) for ancestor in FIXTURE_ANCESTORS
+        }
 
     def tearDown(self) -> None:
+        try:
+            self.remove_owned_roots()
+            self.remove_created_fixture_ancestors()
+        finally:
+            self.temp.cleanup()
+
+    def remove_owned_roots(self) -> None:
         for root in reversed(self.roots):
-            self.ps(
+            result = self.ps(
                 "if (Test-Path -LiteralPath $env:CWC_PATH) { Remove-Item -LiteralPath $env:CWC_PATH -Recurse -Force }",
                 {"CWC_PATH": root},
                 check=False,
             )
-        self.temp.cleanup()
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"owned cleanup fixture removal failed for {root}: {result.stderr}",
+            )
 
     def windows_path(self, path: Path) -> str:
         result = subprocess.run(
@@ -140,6 +155,45 @@ class CleanupTests(unittest.TestCase):
             {"CWC_PATH": path},
         )
         return result.stdout == "true"
+
+    def path_state(self, path: str) -> str:
+        result = self.ps(
+            "if (-not (Test-Path -LiteralPath $env:CWC_PATH)) { [Console]::Out.Write('missing'); exit 0 }; "
+            "$item = Get-Item -LiteralPath $env:CWC_PATH -Force; "
+            "if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { [Console]::Out.Write('reparse'); exit 0 }; "
+            "if ($item -is [System.IO.DirectoryInfo]) { [Console]::Out.Write('directory'); exit 0 }; "
+            "[Console]::Out.Write('other')",
+            {"CWC_PATH": path},
+        )
+        self.assertIn(result.stdout, {"missing", "directory", "reparse", "other"})
+        return result.stdout
+
+    def remove_created_fixture_ancestors(self) -> None:
+        for ancestor in reversed(FIXTURE_ANCESTORS):
+            if self.fixture_ancestor_state[ancestor] != "missing":
+                continue
+            result = self.ps(
+                "$cacheRoot = [System.IO.Path]::GetFullPath('F:\\.cache').TrimEnd('\\'); "
+                "$path = [System.IO.Path]::GetFullPath($env:CWC_PATH); "
+                "$allowed = @((Join-Path $cacheRoot 'cw'), (Join-Path (Join-Path $cacheRoot 'cw') 'cleanup-tests')); "
+                "if ($path -notin $allowed) { throw 'fixture ancestor is outside the exact cleanup harness ancestry' }; "
+                "if (-not (Test-Path -LiteralPath $path)) { exit 0 }; "
+                "$item = Get-Item -LiteralPath $path -Force; "
+                "if ($item -isnot [System.IO.DirectoryInfo] -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'created fixture ancestor is not a non-reparse directory' }; "
+                "if (@(Get-ChildItem -LiteralPath $path -Force).Count -ne 0) { throw 'created fixture ancestor is not empty' }; "
+                "Remove-Item -LiteralPath $path -Force; "
+                "if (Test-Path -LiteralPath $path) { throw 'created fixture ancestor remained after removal' }",
+                {"CWC_PATH": ancestor},
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=(
+                    f"created cleanup fixture ancestor removal failed for {ancestor}: "
+                    f"{result.stderr}"
+                ),
+            )
 
     def direct_count(self, root: str) -> int:
         result = self.ps(
@@ -243,6 +297,18 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(self.exists(child))
         with self.assertRaises(AssertionError):
             self.invoke(PRODUCTION_TARGET, self.fixture(), delete=True)
+
+    def test_teardown_removes_only_ancestors_created_by_this_case(self) -> None:
+        root = self.synthetic_root("ancestry")
+        self.write_file(root, "owned.txt")
+        self.remove_owned_roots()
+        self.remove_created_fixture_ancestors()
+        for ancestor, state in self.fixture_ancestor_state.items():
+            self.assertEqual(
+                self.path_state(ancestor),
+                "missing" if state == "missing" else state,
+                msg=f"fixture teardown changed caller-owned ancestor {ancestor}",
+            )
 
     def test_test_override_and_invalid_roots_fail_closed(self) -> None:
         root = self.synthetic_root("optin")

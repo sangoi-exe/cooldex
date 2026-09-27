@@ -635,11 +635,13 @@ async fn final_instance_child_disconnect_cancels_pending_remote_control_enable()
             std::fs::read_to_string(&config_path)?
         ),
     )?;
-    let socket_path = codex_home.path().join("app-server.sock");
-    let transport =
-        AppServerTransport::from_listen_url(&format!("unix://{}", socket_path.display()))?;
+    let socket_path = codex_app_server::app_server_control_socket_path(codex_home.path())?;
+    let transport = AppServerTransport::from_listen_url(&format!(
+        "unix://{}",
+        socket_path.as_path().display()
+    ))?;
     let _codex_home_guard = EnvVarGuard::set("CODEX_HOME", codex_home.path().as_os_str());
-    let app_server = tokio::spawn(run_main_with_transport_options(
+    let mut app_server = tokio::spawn(run_main_with_transport_options(
         Arg0DispatchPaths {
             codex_self_exe: Some(std::env::current_exe()?),
             codex_linux_sandbox_exe: None,
@@ -662,17 +664,30 @@ async fn final_instance_child_disconnect_cancels_pending_remote_control_enable()
     ));
     let stream = timeout(STARTUP_TIMEOUT, async {
         loop {
-            match UnixStream::connect(&socket_path).await {
+            let connection = tokio::select! {
+                result = &mut app_server => {
+                    let _ = result??;
+                    anyhow::bail!("instance child exited before listening on its control socket");
+                }
+                connection = UnixStream::connect(socket_path.as_path()) => connection,
+            };
+            match connection {
                 Ok(stream) => break Ok(stream),
                 Err(err)
                     if matches!(
                         err.kind(),
                         ErrorKind::NotFound | ErrorKind::ConnectionRefused
-                    ) =>
+                    ) || !socket_path.as_path().exists() =>
                 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::select! {
+                        result = &mut app_server => {
+                            let _ = result??;
+                            anyhow::bail!("instance child exited before listening on its control socket");
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
                 }
-                Err(err) => break Err(err),
+                Err(err) => break Err(anyhow::Error::from(err)),
             }
         }
     })

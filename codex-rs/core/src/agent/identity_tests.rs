@@ -142,7 +142,10 @@ fn identity_equality_covers_every_field() {
 #[tokio::test]
 async fn identity_apply_restores_persisted_shell_tool_state() {
     let mut config = crate::config::test_config().await;
-    config.features.enable(Feature::ShellTool);
+    config
+        .features
+        .enable(Feature::ShellTool)
+        .expect("test setup should enable the shell tool");
     let mut session_source = thread_spawn_source();
 
     snapshot()
@@ -205,7 +208,10 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
 #[tokio::test]
 async fn identity_apply_preserves_reload_shell_tool_state_when_missing() {
     let mut config = crate::config::test_config().await;
-    config.features.enable(Feature::ShellTool);
+    config
+        .features
+        .enable(Feature::ShellTool)
+        .expect("test setup should enable the shell tool");
     let mut identity = snapshot();
     identity.shell_tool_enabled = None;
     let mut session_source = thread_spawn_source();

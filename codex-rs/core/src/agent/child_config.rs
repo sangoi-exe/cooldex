@@ -343,10 +343,12 @@ async fn apply_spawn_agent_base_instructions(
     let model = config.model.clone().ok_or_else(|| {
         "spawn_agent could not resolve the child model for base instructions".to_string()
     })?;
+    let mut models_manager_config = config.to_models_manager_config();
+    models_manager_config.base_instructions = None;
     let model_info = session
         .services
         .models_manager
-        .get_model_info(&model, &config.to_models_manager_config())
+        .get_model_info(&model, &models_manager_config)
         .await;
     config.base_instructions = Some(render_model_instructions(&model_info));
     config.base_instructions_provenance = Some(BaseInstructionsProvenance::Model {

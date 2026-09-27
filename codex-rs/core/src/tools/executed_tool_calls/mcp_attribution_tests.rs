@@ -71,6 +71,7 @@ fn restores_cumulative_item_and_compaction_checkpoints() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            post_compact_recovery: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,

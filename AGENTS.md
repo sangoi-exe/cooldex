@@ -236,7 +236,7 @@ current-user rescope. -->
 <!-- Merge-safety anchor: native-Windows validation is planner-accounted and PowerShell-executed; selected runtime packages use native Nextest while WSL test preparation uses the config-owned explicit package mapper and Linux production builds remain on the guarded WSL path. -->
 ### Native-Windows bulk test procedure
 
-- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...` to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use `--changed` to select all current staged, unstaged, and ordinary untracked paths, not a delta since a prior full collection; use `--file <corrected-path>` or an appropriate correction `--range <base>..<merge>` for a narrower post-collection batch, with `<base>` set to the merge's first parent. `--changed` does not materialize arbitrary unstaged or untracked worktree bytes: the native executor consumes the index candidate, which requires worktree/index equality and no ordinary untracked source. The root owns exact task staging; Workers do not stage. An explicit `--windows-reuse-root 'F:\.cache\...existing-run-root...'` on either guarded action selects in-place native reuse; no selector keeps cold preparation. Standard and strict runtime selections send their eligible selected packages plus evidenced native binary prerequisites to native Nextest while its test filter runs only affected package tests; non-runtime selections do not acquire a native test run. `--mode full` remains the complete bulk collector. Never run Cargo or Nextest directly on native Windows, and never use the former Windows `just test` route.
+- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...` to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use `--changed` to select all current staged, unstaged, and ordinary untracked paths, not a delta since a prior full collection; use `--file <corrected-path>` or an appropriate correction `--range <base>..<merge>` for a narrower post-collection batch, with `<base>` set to the merge's first parent. `--changed` does not materialize arbitrary unstaged or untracked worktree bytes: the native executor consumes the index candidate, which requires worktree/index equality and no ordinary untracked source. The root owns exact task staging; Workers do not stage. Every native validation automatically uses the canonical reusable workset at literal `F:\.cache\cw\workset`. Standard and strict runtime selections send their eligible selected packages plus evidenced native binary prerequisites to native Nextest while its test filter runs only affected package tests; non-runtime selections do not acquire a native test run. `--mode full` remains the complete bulk collector. Never run Cargo or Nextest directly on native Windows, and never use the former Windows `just test` route.
 - `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` are the only owners of
   selection, platform classification, exclusions, the frozen manifest, and resource
   contracts. The PowerShell executor runs only manifest-authorized Windows entries; it
@@ -252,34 +252,17 @@ but the planner must exclude only its validation and visibly retain its unvalida
 - Build and product output are always Linux/WSL. An ephemeral `codex.exe` is permitted
   only when a platform-neutral test requires it; it must never be installed, promoted,
   published, or operated as the Windows Codex CLI product.
-- Cold preparation retains its 120-GiB free-disk and 30-GiB available-RAM requirements.
-  An explicit reuse root uses the 5-GiB warm disk floor derived only from
-  `[resource_profiles.windows_nextest].reserve_free_gib`; it does not add another
-  configurable value or guarantee that every incremental build will fit. Both cold and
-  reuse retain 30 GiB of available RAM and the 16-build-job/8-test-thread ceiling. Do not run Cargo or Nextest
-  concurrently in WSL and native Windows. A missing prerequisite, tool, manifest,
-  candidate identity, space or RAM requirement, or required evidence must fail loud.
-- `--yolo` is an explicit per-plan native-Windows-only RAM/disk-floor override for
-  `./scripts/cargo-guard.sh plan ... --yolo` or `verify ... --yolo` when the selected
-  validation plan contains a native Windows command. It is invalid for prep and direct
-  guarded WSL Cargo, records the actual/required values and any bypass in native
-  preflight evidence, and does not weaken writer, mutex, bootstrap, candidate, or input
-  checks. It can cause paging, out-of-memory, disk-full, or incomplete outputs; it never
-  triggers automatic cleanup.
-- Every Windows-created mutable path belongs below literal `F:\.cache`: cold preparation
-  creates its disposable candidate checkout, target directory, applicable `CARGO_HOME` and
-  `RUSTUP_HOME`, `TEMP`/`TMP`, V8/compiler/tool caches, helper staging, and logs/evidence
-  there. A selected reuse root retains its existing candidate, target, mutable tool homes,
-  and compatible pinned tools in place; each execution still creates fresh evidence and a
-  short, hyphen-free `TEMP`/`TMP` root below `F:\.cache`. C: may provide executables and
-  toolchains only as read-only inputs; it must not hold a build cache, target directory, or
-  temporary state.
+- Cold first use is allowed only when the operator has cleared the whole literal `F:\.cache`; it retains the 120-GiB free-disk and 30-GiB available-RAM floors. A valid canonical workset reuses automatically with the 5-GiB warm free-disk floor derived only from `[resource_profiles.windows_nextest].reserve_free_gib`. Both modes retain the 30-GiB available-RAM floor and the 16-build-job/8-test-thread ceiling. Do not run Cargo or Nextest concurrently in WSL and native Windows. A missing prerequisite, tool, manifest, candidate identity, space or RAM requirement, or required evidence must fail loud.
+- `--yolo` is an explicit per-plan native-Windows-only RAM/disk-floor override for `./scripts/cargo-guard.sh plan ... --yolo` or `verify ... --yolo` when the selected validation plan contains a native Windows command. It is invalid for prep and direct guarded WSL Cargo, records the actual/required values and any bypass in native preflight evidence, and bypasses only the initial native Windows RAM/disk floors. It does not disable the runtime disk abort, weaken writer, mutex, bootstrap, candidate, or input checks, or trigger cleanup.
+- A rejected cold admission may retain only fresh non-reparse run evidence. It may retry without another cleanup only when no workset or other persistent cache state exists. The guarded workflow admission must prevent concurrent Cargo or Nextest execution across WSL and native Windows.
+- Every Windows-created mutable path belongs below literal `F:\.cache`. The canonical workset retains the candidate, target, `CARGO_HOME`, `RUSTUP_HOME`, helper state, V8/compiler/tool caches, and compatible pinned tools. Each execution creates fresh evidence and a short, hyphen-free `TEMP`/`TMP` root below `F:\.cache`. C: may provide executables and toolchains only as read-only inputs; it must not hold a build cache, target directory, or temporary state.
 - `F:\codex-tools\bin\python3.exe` is a read-only native test-child input. The child
   `PATH` keeps its directory first ahead of WindowsApps and also includes the selected
   native Git `usr\bin` directory that provides `true.exe`; this never changes parent/global
   `PATH` or installs tools. `FORCE_COLOR=0` applies only to the test child. Retain
   `RUST_MIN_STACK=8388608`, and keep `PYTHONPYCACHEPREFIX` below that run's `TEMP`
   directory in `F:\.cache`.
+- The canonical workset co-locates the Cargo target directory and Cargo intermediate build directory at the canonical target root below the Windows cache root; C: must not hold either output class.
 - The supported WSL access path mounts Windows volumes read-only. Native `pwsh.exe` or
   `pwsh` is the technical mechanism for Windows-side writes, not a user prohibition or
   extra permission checkpoint. Maintained Cargo/Nextest execution, candidate
@@ -288,31 +271,18 @@ but the planner must exclude only its validation and visibly retain its unvalida
   a bounded diagnostic need not be checked in. Do not write directly to `/mnt/f`.
   Installation, destructive actions, and privileged work retain their separate
   authorization boundaries. Fail loud when neither PowerShell 7 command is available.
-- Without `--windows-reuse-root`, candidate materialization must be fresh, pristine,
-  disposable, and match the frozen manifest and index identity without changing root refs,
-  index, or worktree. With an explicit selector, reuse the selected existing native working
-  set in place—candidate, target, `CARGO_HOME`/`RUSTUP_HOME`, and compatible pinned
-  tools—and synchronize only the changed tracked source needed to match the frozen index;
-  do not rewrite unchanged source. A selected root that cannot meet source, index, or tool
-  requirements must report the actual blocker: never move or delete its cache, auto-select
-  a latest root, or silently replace it with cold preparation. After synchronization,
-  tracked-source/index mismatch and ordinary untracked files still fail, while post-test
-  ignored outputs may remain; the root source-invariance check remains independent.
-  Receipts must bind the candidate, command, platform, executor, and terminal result.
-- For Windows space pressure, `scripts/clear-windows-build-cache.ps1` is the only cleanup
-  path. Its default is preflight; deletion requires `-Delete`, proof that no Windows or WSL
-  writer exists, literal `F:\.cache` as the target, preservation of that root, and JSON
-  stdout captured outside the target. Reuse must not trigger automatic cleanup. Deleted
-  content is unrecoverable; do not issue a manual partial cleanup command.
+- Source synchronization updates only changed tracked source needed to match the frozen index candidate; unchanged source and compatible Cargo, Nextest, and tool caches remain in place. Same-HEAD and supported committed-HEAD transitions preserve unchanged staged-tail source. Changed code relies on the normal build system to rebuild affected artifacts; do not delete or prune the cache merely because a crate, test, or package changed. A missing, residual, corrupt, source-mismatched, tool-incompatible, or otherwise unusable canonical workset must report the actual blocker. Never use a different or latest root, silently fall back to cold preparation, or automatically delete or prune the cache. After synchronization, tracked-source/index mismatch and ordinary untracked files still fail, while post-test ignored outputs may remain; the root source-invariance check remains independent. Receipts must bind the candidate, command, platform, executor, and terminal result.
+- Runtime disk monitoring aborts the contained native command tree before accepting quiescence when configured absolute or percentage free-space thresholds are crossed. It records truthful failure and termination evidence and performs no cleanup.
+- For Windows space pressure, `scripts/clear-windows-build-cache.ps1` is the only cleanup path and is operator-authorized destructive cleanup only; validation never invokes it. Its default is preflight; deletion requires `-Delete`, proof that no Windows or WSL writer exists, literal `F:\.cache` as the target, preservation of that root, and JSON stdout captured outside the target. Deleted content is unrecoverable; do not issue a manual partial cleanup command.
 - The root-wide sequencing rule applies to every admitted native batch—including
   diagnostic, prep, initial, retry, focused, and full runs: it continues through
   errors to terminal completion before failure investigation or correction. Retry
   reuse matches action, stage, plan, input, and
   validation-tooling identities exactly. When changed input or tooling leaves no matching
   prior evidence, `--only-failed` can execute zero commands and records partial coverage;
-  `--resume` refuses partial summaries. Use `--fresh` to start a new full validation and
-  emit fresh results; it does not require discarding reusable compiled artifacts.
-  Compiled-cache reuse is separate from validation-result reuse. Keep this procedure
+  `--resume` refuses partial summaries. `--fresh` controls validation-result reuse and
+  emits fresh evidence; it does not discard reusable compiled artifacts. Compiled-cache
+  reuse is separate from validation-result reuse. Keep this procedure
   durable: do not add branch or object IDs, session IDs, timestamps, receipt/run paths,
   execution hashes, or machine-state claims.
 
