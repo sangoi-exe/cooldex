@@ -71,6 +71,10 @@ impl Session {
     /// Merge-safety anchor: trusted client provenance stays attached through transition waits,
     /// queued delivery, and history fallback.
     /// Preserves trusted client provenance while items wait for an active turn.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn admission and history fallback must remain atomic"
+    )]
     pub(crate) async fn inject_client_response_items(
         &self,
         items: Vec<ResponseItem>,
@@ -80,27 +84,41 @@ impl Session {
             .into_iter()
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
-        let turn_state = {
+        loop {
             let active_turn = self.active_turn.lock().await;
-            active_turn
-                .as_ref()
-                .filter(|turn| turn.task.is_some())
-                .map(|turn| Arc::clone(&turn.turn_state))
-        };
-        if let Some(turn_state) = turn_state {
+            let Some(turn) = active_turn.as_ref() else {
+                self.record_annotated_conversation_items(
+                    turn_context,
+                    turn_context.model_info(),
+                    items,
+                )
+                .await;
+                return;
+            };
+            let Some(task) = turn.task.as_ref() else {
+                self.record_annotated_conversation_items(
+                    turn_context,
+                    turn_context.model_info(),
+                    items,
+                )
+                .await;
+                return;
+            };
+            if turn.finishing {
+                let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+                let _ = done.as_mut().enable();
+                drop(active_turn);
+                done.await;
+                continue;
+            }
+            let turn_state = Arc::clone(&turn.turn_state);
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     turn_state.as_ref(),
                     items.into_iter().map(TurnInput::ResponseItem).collect(),
                 )
                 .await;
-        } else {
-            self.record_annotated_conversation_items(
-                turn_context,
-                turn_context.model_info(),
-                items,
-            )
-            .await;
+            return;
         }
     }
 

@@ -1002,40 +1002,44 @@ impl Session {
     }
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
-        let _settings_guard = self.acquire_thread_settings_persistence().await;
-        let mut active = self.active_turn.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|active_turn| active_turn.finishing)
-        {
-            if matches!(reason, TurnAbortReason::Replaced) {
-                // A successor can arrive after terminal delivery but before the finishing task
-                // reacquires this slot. Retire that exact task instead of dropping the successor;
-                // direct interruption remains rejected while terminal finalization runs.
-                if let Some(task) = active
-                    .as_mut()
-                    .and_then(|active_turn| active_turn.task.take())
-                {
-                    task.handle.detach();
+        loop {
+            let settings_guard = self.acquire_thread_settings_persistence().await;
+            let mut active = self.active_turn.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.finishing)
+            {
+                if !matches!(reason, TurnAbortReason::Replaced) {
+                    return None;
                 }
-                *active = None;
+                let Some(task) = active
+                    .as_ref()
+                    .and_then(|active_turn| active_turn.task.as_ref())
+                else {
+                    return None;
+                };
+                let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+                let _ = done.as_mut().enable();
+                drop(active);
+                drop(settings_guard);
+                done.await;
+                continue;
             }
-            return None;
+            if matches!(
+                reason,
+                TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+            ) && active
+                .as_ref()
+                .is_some_and(|active_turn| active_turn.task.is_some())
+            {
+                self.mark_interrupted();
+            }
+            let active_turn = active.take();
+            if let Some(task) = active_turn.as_ref().and_then(|turn| turn.task.as_ref()) {
+                task.cancellation_token.cancel();
+            }
+            return active_turn;
         }
-        if matches!(
-            reason,
-            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-        ) && active
-            .as_ref()
-            .is_some_and(|active_turn| active_turn.task.is_some())
-        {
-            self.mark_interrupted();
-        }
-        let active_turn = active.take();
-        if let Some(task) = active_turn.as_ref().and_then(|turn| turn.task.as_ref()) {
-            task.cancellation_token.cancel();
-        }
-        active_turn
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {

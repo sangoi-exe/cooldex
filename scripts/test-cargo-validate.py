@@ -1115,6 +1115,26 @@ class CargoValidateTests(unittest.TestCase):
             list(command.argv[-2:]),
         )
 
+    def test_windows_nextest_package_filter_inherits_pty_windows_only_exclusion(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        workspace_argv = config["commands"]["windows-nextest-workspace"]["argv"]
+        workspace_filter = workspace_argv[workspace_argv.index("-E") + 1]
+        excluded_test = "contained_std_spawn_releases_inherited_pipes_after_root_exit"
+        self.assertIn(excluded_test, workspace_filter)
+
+        command = planner.windows_nextest_packages_command(
+            config, ["codex-utils-pty"], "fixture", []
+        )
+        self.assertIsNotNone(command)
+        selected_filter = command.argv[command.argv.index("-E") + 1]
+        self.assertEqual(
+            f"(package(codex-utils-pty)) & ({workspace_filter})", selected_filter
+        )
+        self.assertIn(excluded_test, selected_filter)
+
     def test_rmcp_client_native_selection_builds_cli_without_expanding_test_scope(
         self,
     ) -> None:
@@ -6900,6 +6920,63 @@ class CargoValidateTests(unittest.TestCase):
             initial_tooling_digest,
             identity_drift["validation_tooling_digest"]["observed"],
         )
+
+    def test_prep_accepts_terminal_input_identity_drift(self) -> None:
+        planner = load_planner_module()
+        fixture_path = self.repo_root / "fixture.txt"
+        tooling_path = self.repo_root / "scripts" / "cargo-guard.sh"
+        prep_stub_path = self.repo_root / "prep-identity-drift-stub.py"
+        receipt_dir = self.repo_root / "prep-identity-drift-receipts"
+        fixture_path.write_text("initial fixture\n")
+        tooling_path.parent.mkdir(parents=True, exist_ok=True)
+        tooling_path.write_text("initial validation tooling\n")
+        prep_stub_path.write_text(
+            "from pathlib import Path\n"
+            f"repo_root = Path({str(self.repo_root)!r})\n"
+            "(repo_root / 'fixture.txt').write_text('prepared fixture\\n')\n"
+        )
+        self.init_git_repo()
+        self.commit_all("prep identity drift fixture")
+
+        plan = planner.Plan(
+            action="prep",
+            stage="prep",
+            mode="standard",
+            files=["fixture.txt"],
+            selected_packages=[],
+            selected_surfaces=[],
+            flags=[],
+            warnings=[],
+            commands=[
+                planner.CommandEntry(
+                    argv=(sys.executable, str(prep_stub_path)),
+                    reason="terminal prep input drift fixture",
+                )
+            ],
+            manual=[],
+            receipt_dir=receipt_dir,
+            telemetry_level="full",
+            candidate_identity=planner.git_candidate_identity(self.repo_root),
+        )
+        initial_input_digest = planner.plan_input_digest(plan, self.repo_root)
+        initial_tooling_digest = planner.validation_tooling_digest(self.repo_root)
+
+        self.assertEqual(0, planner.verify_plan(plan, self.repo_root, keep_going=False))
+
+        summary = json.loads((receipt_dir / "last-run-summary.json").read_text())
+        self.assertEqual("full", summary["coverage"])
+        self.assertEqual(0, summary["status"])
+        self.assertEqual(initial_input_digest, summary["input_digest"])
+        self.assertEqual(initial_tooling_digest, summary["validation_tooling_digest"])
+        identity_drift = summary["identity_drift"]
+        self.assertEqual({"input_digest"}, set(identity_drift))
+        self.assertEqual(
+            initial_input_digest, identity_drift["input_digest"]["planned"]
+        )
+        self.assertNotEqual(
+            initial_input_digest, identity_drift["input_digest"]["observed"]
+        )
+        self.assertEqual("prepared fixture\n", fixture_path.read_text())
 
     def test_verify_from_index_is_partial_and_does_not_reuse_full_summary(self) -> None:
         config_path, metadata_path, command_log = self.write_resume_verify_fixture(

@@ -7,6 +7,7 @@ use std::time::Duration;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -40,6 +41,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::from_slice;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -145,6 +147,22 @@ fn is_deferred_mailbox_append(params: &AppendThreadItemsParams) -> bool {
             }
         )
     }) && params.items.iter().any(is_late_mailbox_response_item)
+}
+
+fn is_client_injected_developer_message(item: &RolloutItem, text: &str) -> bool {
+    matches!(
+        item,
+        RolloutItem::ResponseItem(envelope)
+            if matches!(
+                &envelope.item,
+                ResponseItem::Message { role, content, .. }
+                    if role == "developer"
+                        && content.iter().any(|item| matches!(
+                            item,
+                            ContentItem::InputText { text: item_text } if item_text == text
+                        ))
+            )
+    )
 }
 
 fn chunk(event: Value) -> StreamingSseChunk {
@@ -364,6 +382,215 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
             })
             .count(),
         1
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_waits_for_prior_turn_terminal_finalization() {
+    let (first_complete, first_completion) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![
+            chunk(ev_response_created("resp-first")),
+            chunk(ev_assistant_message("msg-first", "first answer")),
+            StreamingSseChunk {
+                gate: Some(first_completion),
+                body: sse(vec![ev_completed("resp-first")]),
+            },
+        ],
+        vec![
+            chunk(json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "terminal lifecycle compaction",
+                }
+            })),
+            chunk(ev_completed("resp-compact")),
+        ],
+    ])
+    .await;
+    let (pending_appends, mut append_requests) = mpsc::unbounded_channel();
+    let store = Arc::new(GatedAppendStore {
+        inner: InMemoryThreadStore::default(),
+        armed: AtomicBool::new(false),
+        pending_appends,
+    });
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_thread_store(store.clone())
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build streaming Codex test session")
+        .codex;
+
+    submit_user_input(&codex, "first prompt").await;
+    wait_for_event(&codex, |event| {
+        matches!(
+            event,
+            EventMsg::AgentMessage(message) if message.message == "first answer"
+        )
+    })
+    .await;
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "late mailbox input".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            start_options: Default::default(),
+        })
+        .await
+        .expect("submit queue-only mailbox input");
+    store.armed.store(true, Ordering::SeqCst);
+    first_complete
+        .send(())
+        .expect("first response completion should remain gated");
+    let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
+        .await
+        .expect("terminal transition should persist queued mail")
+        .expect("append observer should remain open");
+    assert!(
+        is_deferred_mailbox_append(&pending_append.params),
+        "gate must pause the deferred queue-only mailbox append"
+    );
+
+    codex.submit(Op::Compact).await.expect("submit compact");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            server.wait_for_request_count(/*count*/ 2),
+        )
+        .await
+        .is_err(),
+        "compact must not start while the prior turn is finalizing"
+    );
+
+    pending_append
+        .complete
+        .send(())
+        .expect("terminal append should still be waiting");
+    let EventMsg::TurnComplete(first_complete) =
+        wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn completion event");
+    };
+    assert_eq!(
+        first_complete.last_agent_message.as_deref(),
+        Some("first answer")
+    );
+    server.wait_for_request_count(/*count*/ 2).await;
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_injection_waits_for_terminal_finalization_and_persists_once() {
+    let (first_complete, first_completion) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![vec![
+        chunk(ev_response_created("resp-first")),
+        chunk(ev_assistant_message("msg-first", "first answer")),
+        StreamingSseChunk {
+            gate: Some(first_completion),
+            body: sse(vec![ev_completed("resp-first")]),
+        },
+    ]])
+    .await;
+    let (pending_appends, mut append_requests) = mpsc::unbounded_channel();
+    let store = Arc::new(GatedAppendStore {
+        inner: InMemoryThreadStore::default(),
+        armed: AtomicBool::new(false),
+        pending_appends,
+    });
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_thread_store(store.clone())
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build streaming Codex test session")
+        .codex;
+
+    submit_user_input(&codex, "first prompt").await;
+    wait_for_event(&codex, |event| {
+        matches!(
+            event,
+            EventMsg::AgentMessage(message) if message.message == "first answer"
+        )
+    })
+    .await;
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: codex_protocol::protocol::InterAgentCommunication::new(
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
+                AgentPath::root(),
+                Vec::new(),
+                "late mailbox input".to_string(),
+                /*trigger_turn*/ false,
+            ),
+            start_options: Default::default(),
+        })
+        .await
+        .expect("submit queue-only mailbox input");
+    store.armed.store(true, Ordering::SeqCst);
+    first_complete
+        .send(())
+        .expect("first response completion should remain gated");
+    let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
+        .await
+        .expect("terminal transition should persist queued mail")
+        .expect("append observer should remain open");
+    assert!(
+        is_deferred_mailbox_append(&pending_append.params),
+        "gate must pause the deferred queue-only mailbox append"
+    );
+
+    let injected_text = "client response item during terminal finalization";
+    let injected_item = serde_json::from_value(json!({
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": injected_text}],
+    }))
+    .expect("parse injected response item");
+    let mut injection = tokio::spawn({
+        let codex = Arc::clone(&codex);
+        async move { codex.inject_response_items(vec![injected_item]).await }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut injection)
+            .await
+            .is_err(),
+        "client injection must wait for the finishing task to retire"
+    );
+
+    pending_append
+        .complete
+        .send(())
+        .expect("terminal append should still be waiting");
+    tokio::time::timeout(Duration::from_secs(2), injection)
+        .await
+        .expect("client injection should finish after terminal retirement")
+        .expect("client injection task should not panic")
+        .expect("client injection should succeed");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    let history = codex
+        .load_history(/*include_archived*/ false)
+        .await
+        .expect("load thread history");
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_client_injected_developer_message(item, injected_text))
+            .count(),
+        1,
+        "the client-injected response item must remain durable exactly once"
     );
 
     server.shutdown().await;

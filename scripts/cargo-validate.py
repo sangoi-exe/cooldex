@@ -4421,10 +4421,16 @@ def verify_plan(
     ):
         if planned != observed:
             identity_drift[name] = {"planned": planned, "observed": observed}
-    if identity_drift:
+    allowed_identity_drift = {"input_digest"} if plan.stage == "prep" else set()
+    unexpected_identity_drift = {
+        name: drift
+        for name, drift in identity_drift.items()
+        if name not in allowed_identity_drift
+    }
+    if unexpected_identity_drift:
         print(
             "[cargo-validate][error] terminal receipt identity drift: "
-            + ", ".join(sorted(identity_drift)),
+            + ", ".join(sorted(unexpected_identity_drift)),
             file=sys.stderr,
         )
         exit_status = 2
@@ -4436,7 +4442,7 @@ def verify_plan(
             successful_run_entry(entry) or successful_exclusion_entry(entry)
             for entry in records
         )
-        and not identity_drift
+        and not unexpected_identity_drift
     )
     summary = {
         "schema_version": 1,
