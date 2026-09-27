@@ -2764,6 +2764,7 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-features",
+ "codex-install-context",
  "codex-protocol",
  "codex-utils-cargo-bin",
  "codex-utils-pty",

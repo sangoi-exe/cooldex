@@ -23,6 +23,7 @@ use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
 use codex_features::Feature;
+use codex_install_context::InstallContext;
 
 use crate::COMPUTER_USE_SERVER_NAME;
 
@@ -38,14 +39,20 @@ const MISSING_SOURCE_RUNTIME_PAIR_REASON: &str =
     "source/development runtime pair is not configured";
 const INCOMPLETE_RUNTIME_PAIR_REASON: &str =
     "Computer Use requires both mcp_bin and sky_bin when either path is configured";
+const INCOMPLETE_PACKAGE_RUNTIME_PAIR_REASON: &str =
+    "Computer Use package runtime requires both codex-computer-use-mcp and sky_linux_x64";
 const INVALID_OVERRIDE_MCP_REASON: &str = "invalid Computer Use mcp_bin";
 const INVALID_OVERRIDE_SKY_REASON: &str = "invalid Computer Use sky_bin";
+const INVALID_PACKAGE_MCP_REASON: &str = "invalid packaged Computer Use MCP runtime";
+const INVALID_PACKAGE_SKY_REASON: &str = "invalid packaged Computer Use Sky runtime";
 const INVALID_OVERRIDE_XVFB_REASON: &str = "invalid Computer Use xvfb";
 const INVALID_OVERRIDE_OPENBOX_REASON: &str = "invalid Computer Use openbox";
 const INVALID_OVERRIDE_TEMP_ROOT_REASON: &str = "invalid Computer Use temp_root";
 const ELF_CLASS_64: u8 = 2;
 const ELF_DATA_LSB: u8 = 1;
 const ELF_MACHINE_X86_64: u16 = 62;
+const COMPUTER_USE_MCP_RESOURCE_NAME: &str = "codex-computer-use-mcp";
+const SKY_RESOURCE_NAME: &str = "sky_linux_x64";
 
 #[derive(Clone)]
 struct ComputerUseExtension {
@@ -56,6 +63,7 @@ struct ComputerUseExtension {
 #[derive(Clone)]
 pub(crate) struct RuntimeLocator {
     path_overrides: RuntimePathOverrides,
+    package_resources: Option<PackageRuntimeResources>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +86,12 @@ pub(crate) struct RuntimePathOverrides {
     pub(crate) temp_root: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PackageRuntimeResources {
+    pub(crate) mcp_bin: Option<PathBuf>,
+    pub(crate) sky_bin: Option<PathBuf>,
+}
+
 #[derive(Default)]
 struct ComputerUseWarningState {
     emitted: AtomicBool,
@@ -85,6 +99,7 @@ struct ComputerUseWarningState {
 
 impl RuntimeLocator {
     fn from_process() -> Self {
+        let install_context = InstallContext::current();
         Self {
             path_overrides: RuntimePathOverrides {
                 mcp_bin: std::env::var_os(CODEX_COMPUTER_USE_MCP_BIN_ENV_VAR).map(PathBuf::from),
@@ -95,12 +110,33 @@ impl RuntimeLocator {
                 temp_root: std::env::var_os(CODEX_COMPUTER_USE_TEMP_ROOT_ENV_VAR)
                     .map(PathBuf::from),
             },
+            package_resources: install_context.local_package_lane().map(|_| {
+                PackageRuntimeResources {
+                    mcp_bin: install_context
+                        .bundled_resource(COMPUTER_USE_MCP_RESOURCE_NAME)
+                        .map(Into::into),
+                    sky_bin: install_context
+                        .bundled_resource(SKY_RESOURCE_NAME)
+                        .map(Into::into),
+                }
+            }),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(path_overrides: RuntimePathOverrides) -> Self {
-        Self { path_overrides }
+        Self::new_for_test_with_package_resources(path_overrides, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_package_resources(
+        path_overrides: RuntimePathOverrides,
+        package_resources: Option<PackageRuntimeResources>,
+    ) -> Self {
+        Self {
+            path_overrides,
+            package_resources,
+        }
     }
 
     fn resolve(&self, config: &Config) -> Result<ResolvedRuntimeConfig, &'static str> {
@@ -109,48 +145,93 @@ impl RuntimeLocator {
         }
 
         let configured = &config.computer_use;
-        let mcp_bin = self
-            .path_overrides
-            .mcp_bin
-            .as_deref()
-            .or(configured.mcp_bin.as_deref());
-        let sky_bin = self
-            .path_overrides
-            .sky_bin
-            .as_deref()
-            .or(configured.sky_bin.as_deref());
+        // Merge-safety anchor: Computer Use selects complete MCP/Sky pairs atomically in environment, recognized-package, then shared-config order; never mix paths across sources.
+        let (mcp_bin, sky_bin) =
+            if self.path_overrides.mcp_bin.is_some() || self.path_overrides.sky_bin.is_some() {
+                resolve_runtime_pair(
+                    self.path_overrides.mcp_bin.as_deref(),
+                    self.path_overrides.sky_bin.as_deref(),
+                    INCOMPLETE_RUNTIME_PAIR_REASON,
+                    INVALID_OVERRIDE_MCP_REASON,
+                    INVALID_OVERRIDE_SKY_REASON,
+                )?
+            } else if let Some(package_resources) = &self.package_resources {
+                match (
+                    package_resources.mcp_bin.as_deref(),
+                    package_resources.sky_bin.as_deref(),
+                ) {
+                    (None, None) => resolve_configured_runtime_pair(configured)?,
+                    (mcp_bin, sky_bin) => resolve_runtime_pair(
+                        mcp_bin,
+                        sky_bin,
+                        INCOMPLETE_PACKAGE_RUNTIME_PAIR_REASON,
+                        INVALID_PACKAGE_MCP_REASON,
+                        INVALID_PACKAGE_SKY_REASON,
+                    )?,
+                }
+            } else {
+                resolve_configured_runtime_pair(configured)?
+            };
 
-        match (mcp_bin, sky_bin) {
-            (Some(_), None) | (None, Some(_)) => Err(INCOMPLETE_RUNTIME_PAIR_REASON),
-            (Some(mcp_bin), Some(sky_bin)) => Ok(ResolvedRuntimeConfig {
-                mcp_bin: validate_linux_x64_binary(mcp_bin, INVALID_OVERRIDE_MCP_REASON)?,
-                sky_bin: validate_linux_x64_binary(sky_bin, INVALID_OVERRIDE_SKY_REASON)?,
-                xvfb: validate_nonempty_path(
-                    self.path_overrides
-                        .xvfb
-                        .as_deref()
-                        .or(configured.xvfb.as_deref()),
-                    INVALID_OVERRIDE_XVFB_REASON,
-                )?,
-                openbox: validate_nonempty_path(
-                    self.path_overrides
-                        .openbox
-                        .as_deref()
-                        .or(configured.openbox.as_deref()),
-                    INVALID_OVERRIDE_OPENBOX_REASON,
-                )?,
-                temp_root: validate_nonempty_path(
-                    self.path_overrides
-                        .temp_root
-                        .as_deref()
-                        .or(configured.temp_root.as_deref()),
-                    INVALID_OVERRIDE_TEMP_ROOT_REASON,
-                )?,
-                display_ready_timeout_ms: configured.display_ready_timeout_ms,
-                shutdown_grace_period_ms: configured.shutdown_grace_period_ms,
-            }),
-            (None, None) => Err(MISSING_SOURCE_RUNTIME_PAIR_REASON),
-        }
+        Ok(ResolvedRuntimeConfig {
+            mcp_bin,
+            sky_bin,
+            xvfb: validate_nonempty_path(
+                self.path_overrides
+                    .xvfb
+                    .as_deref()
+                    .or(configured.xvfb.as_deref()),
+                INVALID_OVERRIDE_XVFB_REASON,
+            )?,
+            openbox: validate_nonempty_path(
+                self.path_overrides
+                    .openbox
+                    .as_deref()
+                    .or(configured.openbox.as_deref()),
+                INVALID_OVERRIDE_OPENBOX_REASON,
+            )?,
+            temp_root: validate_nonempty_path(
+                self.path_overrides
+                    .temp_root
+                    .as_deref()
+                    .or(configured.temp_root.as_deref()),
+                INVALID_OVERRIDE_TEMP_ROOT_REASON,
+            )?,
+            display_ready_timeout_ms: configured.display_ready_timeout_ms,
+            shutdown_grace_period_ms: configured.shutdown_grace_period_ms,
+        })
+    }
+}
+
+fn resolve_configured_runtime_pair(
+    configured: &codex_core::config::ComputerUseConfig,
+) -> Result<(PathBuf, PathBuf), &'static str> {
+    match (configured.mcp_bin.as_deref(), configured.sky_bin.as_deref()) {
+        (None, None) => Err(MISSING_SOURCE_RUNTIME_PAIR_REASON),
+        (mcp_bin, sky_bin) => resolve_runtime_pair(
+            mcp_bin,
+            sky_bin,
+            INCOMPLETE_RUNTIME_PAIR_REASON,
+            INVALID_OVERRIDE_MCP_REASON,
+            INVALID_OVERRIDE_SKY_REASON,
+        ),
+    }
+}
+
+fn resolve_runtime_pair(
+    mcp_bin: Option<&Path>,
+    sky_bin: Option<&Path>,
+    incomplete_reason: &'static str,
+    invalid_mcp_reason: &'static str,
+    invalid_sky_reason: &'static str,
+) -> Result<(PathBuf, PathBuf), &'static str> {
+    match (mcp_bin, sky_bin) {
+        (Some(_), None) | (None, Some(_)) => Err(incomplete_reason),
+        (Some(mcp_bin), Some(sky_bin)) => Ok((
+            validate_linux_x64_binary(mcp_bin, invalid_mcp_reason)?,
+            validate_linux_x64_binary(sky_bin, invalid_sky_reason)?,
+        )),
+        (None, None) => Err(MISSING_SOURCE_RUNTIME_PAIR_REASON),
     }
 }
 
@@ -168,7 +249,7 @@ impl ComputerUseExtension {
         reason: &'static str,
     ) {
         let message = format!(
-            "Computer Use is unavailable: {reason}. Check [features.computer_use] and CODEX_COMPUTER_USE_* overrides; source/development execution only."
+            "Computer Use is unavailable: {reason}. Check [features.computer_use], package resources, shared mcp_bin/sky_bin paths, and CODEX_COMPUTER_USE_* overrides."
         );
         let Some(thread_store) = context.thread_store() else {
             tracing::warn!(%message, "computer use MCP server is unavailable");

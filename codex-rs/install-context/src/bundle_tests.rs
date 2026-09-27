@@ -3,6 +3,11 @@
 use super::*;
 use pretty_assertions::assert_eq;
 use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+const COMPUTER_USE_MCP_RESOURCE_NAME: &str = "codex-computer-use-mcp";
+const SKY_RESOURCE_NAME: &str = "sky_linux_x64";
 
 #[test]
 fn bundle_executable_preserves_package_layout_and_install_method() -> std::io::Result<()> {
@@ -45,6 +50,115 @@ fn bundle_executable_preserves_package_layout_and_install_method() -> std::io::R
         }
     );
     Ok(())
+}
+
+#[test]
+fn local_package_lanes_are_recognized_and_expose_package_resources() -> std::io::Result<()> {
+    let home = tempfile::tempdir()?;
+
+    for (package_name, expected_lane) in [
+        (LOCAL_CODEX_PACKAGES_DIRNAME, LocalPackageLane::Codex),
+        (LOCAL_CDX_DEV_PACKAGES_DIRNAME, LocalPackageLane::CdxDev),
+    ] {
+        let (executable, mcp_bin, sky_bin) = create_package_release(home.path(), package_name)?;
+        let context = InstallContext::from_exe_with_codex_home(
+            /*is_macos*/ false,
+            /*current_exe*/ Some(&executable),
+            /*method_override*/ None,
+            /*codex_home*/ Some(home.path()),
+        );
+
+        assert_eq!(
+            context.local_package_lane_with_codex_home(home.path()),
+            Some(expected_lane)
+        );
+        assert_eq!(
+            context.bundled_resource(COMPUTER_USE_MCP_RESOURCE_NAME),
+            Some(canonical_absolute_path(&mcp_bin).expect("MCP resource should canonicalize"))
+        );
+        assert_eq!(
+            context.bundled_resource(SKY_RESOURCE_NAME),
+            Some(canonical_absolute_path(&sky_bin).expect("Sky resource should canonicalize"))
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn standalone_and_generic_packages_do_not_bind_to_a_local_lane() -> std::io::Result<()> {
+    let home = tempfile::tempdir()?;
+
+    for package_name in [STANDALONE_PACKAGES_DIRNAME, "generic"] {
+        let (executable, _, _) = create_package_release(home.path(), package_name)?;
+        let context = InstallContext::from_exe_with_codex_home(
+            /*is_macos*/ false,
+            /*current_exe*/ Some(&executable),
+            /*method_override*/ None,
+            /*codex_home*/ Some(home.path()),
+        );
+
+        assert_eq!(
+            context.local_package_lane_with_codex_home(home.path()),
+            None
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn local_package_lane_follows_a_canonical_selector_symlink() -> std::io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (executable, _, _) = create_package_release(home.path(), LOCAL_CODEX_PACKAGES_DIRNAME)?;
+    let selector = home.path().join("packages/local-codex/current");
+    std::os::unix::fs::symlink(
+        executable
+            .parent()
+            .and_then(Path::parent)
+            .expect("package executable should have a release directory"),
+        &selector,
+    )?;
+    let selected_executable = selector.join("bin/codex");
+    let context = InstallContext::from_exe_with_codex_home(
+        /*is_macos*/ false,
+        /*current_exe*/ Some(&selected_executable),
+        /*method_override*/ None,
+        /*codex_home*/ Some(home.path()),
+    );
+
+    assert_eq!(
+        context.local_package_lane_with_codex_home(home.path()),
+        Some(LocalPackageLane::Codex)
+    );
+
+    Ok(())
+}
+
+fn create_package_release(
+    home: &Path,
+    package_name: &str,
+) -> std::io::Result<(PathBuf, PathBuf, PathBuf)> {
+    let release = home
+        .join("packages")
+        .join(package_name)
+        .join(RELEASES_DIRNAME)
+        .join("test");
+    let bin_dir = release.join(BIN_DIRNAME);
+    let resources_dir = release.join(RESOURCES_DIRNAME);
+    let executable = bin_dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    let mcp_bin = resources_dir.join(COMPUTER_USE_MCP_RESOURCE_NAME);
+    let sky_bin = resources_dir.join(SKY_RESOURCE_NAME);
+
+    fs::create_dir_all(&bin_dir)?;
+    fs::create_dir_all(&resources_dir)?;
+    fs::write(release.join(PACKAGE_METADATA_FILENAME), "{}")?;
+    fs::write(&executable, "")?;
+    fs::write(&mcp_bin, "")?;
+    fs::write(&sky_bin, "")?;
+
+    Ok((executable, mcp_bin, sky_bin))
 }
 
 #[cfg(windows)]

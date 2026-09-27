@@ -17,6 +17,8 @@ const PACKAGE_METADATA_FILENAME: &str = "codex-package.json";
 const PATH_DIRNAME: &str = "codex-path";
 const RELEASES_DIRNAME: &str = "releases";
 const RESOURCES_DIRNAME: &str = "codex-resources";
+const LOCAL_CODEX_PACKAGES_DIRNAME: &str = "local-codex";
+const LOCAL_CDX_DEV_PACKAGES_DIRNAME: &str = "local-cdx-dev";
 const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
 const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
@@ -25,6 +27,13 @@ static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
 pub enum StandalonePlatform {
     Unix,
     Windows,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A locally promoted package lane recognized from canonical release ancestry.
+pub enum LocalPackageLane {
+    Codex,
+    CdxDev,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +156,33 @@ impl InstallContext {
             std::fs::read_to_string(package_layout.package_dir.join(PACKAGE_METADATA_FILENAME))
                 .ok()?;
         serde_json::from_str(&manifest).ok()
+    }
+
+    /// Returns this package's local lane only when its canonical release directory is under the matching CODEX_HOME lane root.
+    pub fn local_package_lane(&self) -> Option<LocalPackageLane> {
+        let codex_home = codex_utils_home_dir::find_codex_home().ok()?;
+        self.local_package_lane_with_codex_home(&codex_home)
+    }
+
+    // Merge-safety anchor: local lane identity derives only from canonical direct release ancestry beneath CODEX_HOME/packages/local-{codex,cdx-dev}/releases; never infer it from executable names, metadata, selectors, versions, or mutable current links.
+    fn local_package_lane_with_codex_home(&self, codex_home: &Path) -> Option<LocalPackageLane> {
+        let package_dir = &self.package_layout.as_ref()?.package_dir;
+        let canonical_codex_home = canonical_absolute_path(codex_home)?;
+
+        for (lane, package_name) in [
+            (LocalPackageLane::Codex, LOCAL_CODEX_PACKAGES_DIRNAME),
+            (LocalPackageLane::CdxDev, LOCAL_CDX_DEV_PACKAGES_DIRNAME),
+        ] {
+            let releases_dir = canonical_codex_home
+                .join("packages")
+                .join(package_name)
+                .join(RELEASES_DIRNAME);
+            if package_dir.parent() == Some(releases_dir) {
+                return Some(lane);
+            }
+        }
+
+        None
     }
 
     pub fn rg_command(&self) -> PathBuf {
