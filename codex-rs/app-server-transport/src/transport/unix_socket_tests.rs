@@ -4,10 +4,16 @@ use super::DaemonShutdownAccess;
 use super::TransportEvent;
 use super::acquire_app_server_startup_lock;
 use super::app_server_control_socket_path;
+use super::app_server_control_socket_path_for_local_package_lane;
+use super::app_server_startup_lock_path;
+use super::app_server_startup_lock_path_for_local_package_lane;
+use super::daemon_recovery_file_path;
+use super::daemon_recovery_file_path_for_local_package_lane;
 use super::start_control_socket_acceptor;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
+use codex_install_context::LocalPackageLane;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::SinkExt;
@@ -32,6 +38,127 @@ fn listen_unix_socket_parses_as_unix_socket_transport() {
             socket_path: default_control_socket_path()
         })
     );
+}
+
+#[test]
+fn local_package_lane_paths_are_distinct_from_generic_paths_and_each_other() {
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let control_dir = codex_home.path().join("app-server-control");
+    let daemon_dir = codex_home.path().join("app-server-daemon");
+
+    assert_eq!(
+        app_server_control_socket_path(codex_home.path())
+            .expect("generic control socket path")
+            .as_path(),
+        control_dir.join("app-server-control.sock")
+    );
+    assert_eq!(
+        app_server_startup_lock_path(codex_home.path())
+            .expect("generic startup lock path")
+            .as_path(),
+        control_dir.join("app-server-startup.lock")
+    );
+    assert_eq!(
+        daemon_recovery_file_path(codex_home.path()),
+        daemon_dir.join("loaded-threads.json")
+    );
+
+    let codex_socket = app_server_control_socket_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::Codex,
+    )
+    .expect("codex control socket path");
+    let cdx_dev_socket = app_server_control_socket_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::CdxDev,
+    )
+    .expect("cdx-dev control socket path");
+    assert_eq!(
+        codex_socket.as_path(),
+        control_dir.join("local-codex/app-server-control.sock")
+    );
+    assert_eq!(
+        cdx_dev_socket.as_path(),
+        control_dir.join("local-cdx-dev/app-server-control.sock")
+    );
+    assert_ne!(codex_socket, cdx_dev_socket);
+
+    let codex_lock = app_server_startup_lock_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::Codex,
+    )
+    .expect("codex startup lock path");
+    let cdx_dev_lock = app_server_startup_lock_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::CdxDev,
+    )
+    .expect("cdx-dev startup lock path");
+    assert_eq!(
+        codex_lock.as_path(),
+        control_dir.join("local-codex/app-server-startup.lock")
+    );
+    assert_eq!(
+        cdx_dev_lock.as_path(),
+        control_dir.join("local-cdx-dev/app-server-startup.lock")
+    );
+    assert_ne!(codex_lock, cdx_dev_lock);
+
+    let codex_recovery = daemon_recovery_file_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::Codex,
+    );
+    let cdx_dev_recovery = daemon_recovery_file_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::CdxDev,
+    );
+    assert_eq!(
+        codex_recovery,
+        daemon_dir.join("local-codex/loaded-threads.json")
+    );
+    assert_eq!(
+        cdx_dev_recovery,
+        daemon_dir.join("local-cdx-dev/loaded-threads.json")
+    );
+    assert_ne!(codex_recovery, cdx_dev_recovery);
+}
+
+#[test]
+fn local_package_lane_default_unix_socket_uses_lane_path() {
+    let codex_home = find_codex_home().expect("codex home");
+
+    for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+        assert_eq!(
+            AppServerTransport::from_listen_url_for_local_package_lane(
+                "unix://",
+                local_package_lane,
+            ),
+            Ok(AppServerTransport::UnixSocket {
+                socket_path: app_server_control_socket_path_for_local_package_lane(
+                    &codex_home,
+                    local_package_lane,
+                )
+                .expect("local control socket path")
+            })
+        );
+    }
+}
+
+#[test]
+fn local_package_lane_listen_parser_preserves_explicit_and_non_unix_transports() {
+    for listen_url in [
+        "stdio://",
+        "unix:///tmp/codex.sock",
+        "off",
+        "ws://127.0.0.1:4545",
+    ] {
+        assert_eq!(
+            AppServerTransport::from_listen_url_for_local_package_lane(
+                listen_url,
+                LocalPackageLane::Codex,
+            ),
+            AppServerTransport::from_listen_url(listen_url)
+        );
+    }
 }
 
 #[test]

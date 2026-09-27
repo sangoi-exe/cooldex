@@ -17,8 +17,6 @@ const PACKAGE_METADATA_FILENAME: &str = "codex-package.json";
 const PATH_DIRNAME: &str = "codex-path";
 const RELEASES_DIRNAME: &str = "releases";
 const RESOURCES_DIRNAME: &str = "codex-resources";
-const LOCAL_CODEX_PACKAGES_DIRNAME: &str = "local-codex";
-const LOCAL_CDX_DEV_PACKAGES_DIRNAME: &str = "local-cdx-dev";
 const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
 const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
@@ -34,6 +32,16 @@ pub enum StandalonePlatform {
 pub enum LocalPackageLane {
     Codex,
     CdxDev,
+}
+
+impl LocalPackageLane {
+    // Merge-safety anchor: local daemon and package owners share this typed lane-to-package-root mapping; do not duplicate it in callers or derive it from mutable selectors.
+    pub const fn package_root_component(self) -> &'static str {
+        match self {
+            Self::Codex => "local-codex",
+            Self::CdxDev => "local-cdx-dev",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,13 +177,10 @@ impl InstallContext {
         let package_dir = &self.package_layout.as_ref()?.package_dir;
         let canonical_codex_home = canonical_absolute_path(codex_home)?;
 
-        for (lane, package_name) in [
-            (LocalPackageLane::Codex, LOCAL_CODEX_PACKAGES_DIRNAME),
-            (LocalPackageLane::CdxDev, LOCAL_CDX_DEV_PACKAGES_DIRNAME),
-        ] {
+        for lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
             let releases_dir = canonical_codex_home
                 .join("packages")
-                .join(package_name)
+                .join(lane.package_root_component())
                 .join(RELEASES_DIRNAME);
             if package_dir.parent() == Some(releases_dir) {
                 return Some(lane);

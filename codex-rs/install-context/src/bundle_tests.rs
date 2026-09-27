@@ -56,11 +56,9 @@ fn bundle_executable_preserves_package_layout_and_install_method() -> std::io::R
 fn local_package_lanes_are_recognized_and_expose_package_resources() -> std::io::Result<()> {
     let home = tempfile::tempdir()?;
 
-    for (package_name, expected_lane) in [
-        (LOCAL_CODEX_PACKAGES_DIRNAME, LocalPackageLane::Codex),
-        (LOCAL_CDX_DEV_PACKAGES_DIRNAME, LocalPackageLane::CdxDev),
-    ] {
-        let (executable, mcp_bin, sky_bin) = create_package_release(home.path(), package_name)?;
+    for expected_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+        let (executable, mcp_bin, sky_bin) =
+            create_package_release(home.path(), expected_lane.package_root_component())?;
         let context = InstallContext::from_exe_with_codex_home(
             /*is_macos*/ false,
             /*current_exe*/ Some(&executable),
@@ -83,6 +81,18 @@ fn local_package_lanes_are_recognized_and_expose_package_resources() -> std::io:
     }
 
     Ok(())
+}
+
+#[test]
+fn local_package_lane_package_root_components_are_canonical() {
+    assert_eq!(
+        LocalPackageLane::Codex.package_root_component(),
+        "local-codex"
+    );
+    assert_eq!(
+        LocalPackageLane::CdxDev.package_root_component(),
+        "local-cdx-dev"
+    );
 }
 
 #[test]
@@ -111,7 +121,10 @@ fn standalone_and_generic_packages_do_not_bind_to_a_local_lane() -> std::io::Res
 #[test]
 fn local_package_lane_follows_a_canonical_selector_symlink() -> std::io::Result<()> {
     let home = tempfile::tempdir()?;
-    let (executable, _, _) = create_package_release(home.path(), LOCAL_CODEX_PACKAGES_DIRNAME)?;
+    let (executable, _, _) = create_package_release(
+        home.path(),
+        LocalPackageLane::Codex.package_root_component(),
+    )?;
     let selector = home.path().join("packages/local-codex/current");
     std::os::unix::fs::symlink(
         executable

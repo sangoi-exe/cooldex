@@ -6,6 +6,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
 use codex_core::config::find_codex_home;
+use codex_install_context::LocalPackageLane;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -61,6 +62,17 @@ pub fn daemon_recovery_file_path(codex_home: &Path) -> PathBuf {
         .join(DAEMON_RECOVERY_FILE_NAME)
 }
 
+// Merge-safety anchor: unbound control and recovery paths remain stable for generic clients; only explicitly typed local package lanes receive their own control, startup-lock, recovery, and empty-unix-listen namespace.
+pub fn daemon_recovery_file_path_for_local_package_lane(
+    codex_home: &Path,
+    local_package_lane: LocalPackageLane,
+) -> PathBuf {
+    codex_home
+        .join("app-server-daemon")
+        .join(local_package_lane.package_root_component())
+        .join(DAEMON_RECOVERY_FILE_NAME)
+}
+
 pub fn app_server_control_socket_path(codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(
         codex_home
@@ -69,10 +81,34 @@ pub fn app_server_control_socket_path(codex_home: &Path) -> std::io::Result<Abso
     )
 }
 
+pub fn app_server_control_socket_path_for_local_package_lane(
+    codex_home: &Path,
+    local_package_lane: LocalPackageLane,
+) -> std::io::Result<AbsolutePathBuf> {
+    AbsolutePathBuf::from_absolute_path(
+        codex_home
+            .join(APP_SERVER_CONTROL_SOCKET_DIR_NAME)
+            .join(local_package_lane.package_root_component())
+            .join(APP_SERVER_CONTROL_SOCKET_FILE_NAME),
+    )
+}
+
 pub fn app_server_startup_lock_path(codex_home: &Path) -> std::io::Result<AbsolutePathBuf> {
     AbsolutePathBuf::from_absolute_path(
         codex_home
             .join(APP_SERVER_CONTROL_SOCKET_DIR_NAME)
+            .join(APP_SERVER_STARTUP_LOCK_FILE_NAME),
+    )
+}
+
+pub fn app_server_startup_lock_path_for_local_package_lane(
+    codex_home: &Path,
+    local_package_lane: LocalPackageLane,
+) -> std::io::Result<AbsolutePathBuf> {
+    AbsolutePathBuf::from_absolute_path(
+        codex_home
+            .join(APP_SERVER_CONTROL_SOCKET_DIR_NAME)
+            .join(local_package_lane.package_root_component())
             .join(APP_SERVER_STARTUP_LOCK_FILE_NAME),
     )
 }
@@ -163,6 +199,30 @@ impl AppServerTransport {
         Err(AppServerTransportParseError::UnsupportedListenUrl(
             listen_url.to_string(),
         ))
+    }
+
+    // Merge-safety anchor: a local package lane changes only the implicit empty unix:// target; explicit Unix paths and every non-Unix transport keep generic parsing semantics.
+    pub fn from_listen_url_for_local_package_lane(
+        listen_url: &str,
+        local_package_lane: LocalPackageLane,
+    ) -> Result<Self, AppServerTransportParseError> {
+        if listen_url != "unix://" {
+            return Self::from_listen_url(listen_url);
+        }
+
+        let codex_home = find_codex_home().map_err(|err| {
+            AppServerTransportParseError::InvalidUnixSocketPath {
+                listen_url: listen_url.to_string(),
+                message: format!("failed to resolve CODEX_HOME: {err}"),
+            }
+        })?;
+        let socket_path =
+            app_server_control_socket_path_for_local_package_lane(&codex_home, local_package_lane)
+                .map_err(|err| AppServerTransportParseError::InvalidUnixSocketPath {
+                    listen_url: listen_url.to_string(),
+                    message: err.to_string(),
+                })?;
+        Ok(Self::UnixSocket { socket_path })
     }
 }
 
