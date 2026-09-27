@@ -80,7 +80,9 @@ def build_package_dir(
 
     if computer_use_mcp_bin is not None or sky_bin is not None:
         if computer_use_mcp_bin is None or sky_bin is None:
-            raise AssertionError("Computer Use input pair must be complete after validation.")
+            raise AssertionError(
+                "Computer Use input pair must be complete after validation."
+            )
         copy_executable(
             computer_use_mcp_bin,
             resources_dir / COMPUTER_USE_MCP_RESOURCE_PATH,

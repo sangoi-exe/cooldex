@@ -199,7 +199,9 @@ class PackageLayoutTest(unittest.TestCase):
             )
 
             self.assertEqual(
-                (package_dir / "codex-resources" / "codex-computer-use-mcp").read_bytes(),
+                (
+                    package_dir / "codex-resources" / "codex-computer-use-mcp"
+                ).read_bytes(),
                 b"computer use mcp",
             )
             self.assertEqual(

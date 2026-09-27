@@ -1296,7 +1296,9 @@ class CargoValidateTests(unittest.TestCase):
         self.assertIn(["just", "strict-codex-bin"], commands)
         self.assertIn(["just", "smoke-codex-bin"], commands)
 
-    def test_local_package_inputs_recipe_is_guarded_and_builds_all_source_inputs(self) -> None:
+    def test_local_package_inputs_recipe_is_guarded_and_builds_all_source_inputs(
+        self,
+    ) -> None:
         planner = load_planner_module()
         command = planner.CommandEntry(
             argv=("just", "build-local-codex-package-inputs"), reason="fixture"

@@ -214,7 +214,9 @@ def validate_computer_use_input_pair(
     sky_bin: Path | None,
 ) -> None:
     if (computer_use_mcp_bin is None) != (sky_bin is None):
-        raise RuntimeError("--computer-use-mcp-bin and --sky-bin must be specified together.")
+        raise RuntimeError(
+            "--computer-use-mcp-bin and --sky-bin must be specified together."
+        )
     if computer_use_mcp_bin is not None and spec.target != COMPUTER_USE_INPUT_TARGET:
         raise RuntimeError(
             "--computer-use-mcp-bin and --sky-bin are only supported for target "
