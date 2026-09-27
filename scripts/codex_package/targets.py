@@ -64,6 +64,14 @@ class PackageInputs:
     bwrap_bin: Path | None
     codex_command_runner_bin: Path | None
     codex_windows_sandbox_setup_bin: Path | None
+    computer_use_mcp_bin: Path | None = None
+    sky_bin: Path | None = None
+
+
+# Merge-safety anchor: local GNU x86-64 Computer Use inputs remain a validated both-or-neither MCP/Sky pair with fixed package resource names.
+COMPUTER_USE_INPUT_TARGET = "x86_64-unknown-linux-gnu"
+COMPUTER_USE_MCP_RESOURCE_PATH = "codex-computer-use-mcp"
+SKY_RESOURCE_PATH = "sky_linux_x64"
 
 
 PACKAGE_VARIANTS: dict[str, PackageVariant] = {
@@ -169,6 +177,49 @@ def resolve_input_path(
         return path
 
     raise RuntimeError(f"Must specify {flag_name} for {description}.")
+
+
+def resolve_computer_use_input_pair(
+    spec: TargetSpec,
+    *,
+    computer_use_mcp_bin: Path | None,
+    sky_bin: Path | None,
+) -> tuple[Path | None, Path | None]:
+    validate_computer_use_input_pair(
+        spec,
+        computer_use_mcp_bin=computer_use_mcp_bin,
+        sky_bin=sky_bin,
+    )
+    if computer_use_mcp_bin is None:
+        return None, None
+
+    return (
+        resolve_input_path(
+            computer_use_mcp_bin,
+            "prebuilt Computer Use MCP executable",
+            "--computer-use-mcp-bin",
+        ),
+        resolve_input_path(
+            sky_bin,
+            "prebuilt Sky executable",
+            "--sky-bin",
+        ),
+    )
+
+
+def validate_computer_use_input_pair(
+    spec: TargetSpec,
+    *,
+    computer_use_mcp_bin: Path | None,
+    sky_bin: Path | None,
+) -> None:
+    if (computer_use_mcp_bin is None) != (sky_bin is None):
+        raise RuntimeError("--computer-use-mcp-bin and --sky-bin must be specified together.")
+    if computer_use_mcp_bin is not None and spec.target != COMPUTER_USE_INPUT_TARGET:
+        raise RuntimeError(
+            "--computer-use-mcp-bin and --sky-bin are only supported for target "
+            f"{COMPUTER_USE_INPUT_TARGET}."
+        )
 
 
 def is_executable(path: Path) -> bool:

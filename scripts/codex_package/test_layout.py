@@ -162,6 +162,51 @@ class PackageLayoutTest(unittest.TestCase):
 
             self.assertTrue((package_dir / "bin" / "codex-code-mode-host").is_file())
 
+    def test_gnu_linux_package_copies_complete_computer_use_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            computer_use_mcp_bin = touch_executable(root / "codex-computer-use-mcp")
+            sky_bin = touch_executable(root / "sky_linux_x64")
+            computer_use_mcp_bin.write_bytes(b"computer use mcp")
+            sky_bin.write_bytes(b"sky")
+            inputs = PackageInputs(
+                entrypoint_bin=touch_executable(root / "codex"),
+                code_mode_host_bin=touch_executable(root / "codex-code-mode-host"),
+                rg_bin=touch_executable(root / "rg"),
+                zsh_bin=None,
+                bwrap_bin=touch_executable(root / "bwrap"),
+                computer_use_mcp_bin=computer_use_mcp_bin,
+                sky_bin=sky_bin,
+                codex_command_runner_bin=None,
+                codex_windows_sandbox_setup_bin=None,
+            )
+
+            build_package_dir(
+                package_dir,
+                "1.2.3",
+                PACKAGE_VARIANTS["codex"],
+                TARGET_SPECS["x86_64-unknown-linux-gnu"],
+                inputs,
+            )
+            validate_package_dir(
+                package_dir,
+                PACKAGE_VARIANTS["codex"],
+                TARGET_SPECS["x86_64-unknown-linux-gnu"],
+                include_zsh=False,
+                include_computer_use=True,
+            )
+
+            self.assertEqual(
+                (package_dir / "codex-resources" / "codex-computer-use-mcp").read_bytes(),
+                b"computer use mcp",
+            )
+            self.assertEqual(
+                (package_dir / "codex-resources" / "sky_linux_x64").read_bytes(),
+                b"sky",
+            )
+
 
 def touch_executable(path: Path) -> Path:
     path.touch(mode=0o755)

@@ -15,6 +15,7 @@ from .targets import PACKAGE_VARIANTS
 from .targets import TARGET_SPECS
 from .targets import PackageInputs
 from .targets import default_target
+from .targets import resolve_computer_use_input_pair
 from .targets import resolve_input_path
 from .zsh import resolve_zsh_bin
 from .version import read_workspace_version
@@ -129,6 +130,22 @@ def parse_args() -> argparse.Namespace:
             "targets, bwrap is built with Cargo."
         ),
     )
+    parser.add_argument(
+        "--computer-use-mcp-bin",
+        type=Path,
+        help=(
+            "Optional prebuilt Computer Use MCP executable for a local GNU Linux "
+            "x86-64 package. Requires --sky-bin."
+        ),
+    )
+    parser.add_argument(
+        "--sky-bin",
+        type=Path,
+        help=(
+            "Optional prebuilt Sky executable for a local GNU Linux x86-64 package. "
+            "Requires --computer-use-mcp-bin."
+        ),
+    )
     zsh_source = parser.add_mutually_exclusive_group()
     zsh_source.add_argument(
         "--zsh-manifest",
@@ -172,10 +189,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Merge-safety anchor: the complete local GNU x86-64 MCP/Sky pair stays unpacked-only so proprietary Sky bytes cannot enter an archive output.
 def main() -> int:
     args = parse_args()
     spec = TARGET_SPECS[getattr(args, "target", None) or default_target()]
     variant = PACKAGE_VARIANTS[args.variant]
+    computer_use_mcp_bin, sky_bin = resolve_computer_use_input_pair(
+        spec,
+        computer_use_mcp_bin=args.computer_use_mcp_bin,
+        sky_bin=args.sky_bin,
+    )
+    if computer_use_mcp_bin is not None and args.archive_output:
+        raise RuntimeError(
+            "Computer Use input pairs do not support archive output; build a local unpacked package instead."
+        )
     package_dir_arg = getattr(args, "package_dir", None)
     package_dir = (
         package_dir_arg.resolve()
@@ -222,11 +249,17 @@ def main() -> int:
         bwrap_bin=source_outputs.bwrap_bin,
         codex_command_runner_bin=source_outputs.codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
+        computer_use_mcp_bin=computer_use_mcp_bin,
+        sky_bin=sky_bin,
     )
     prepare_package_dir(package_dir, force=args.force)
     build_package_dir(package_dir, args.package_version, variant, spec, inputs)
     validate_package_dir(
-        package_dir, variant, spec, include_zsh=inputs.zsh_bin is not None
+        package_dir,
+        variant,
+        spec,
+        include_zsh=inputs.zsh_bin is not None,
+        include_computer_use=inputs.computer_use_mcp_bin is not None,
     )
 
     for archive_output in args.archive_output:

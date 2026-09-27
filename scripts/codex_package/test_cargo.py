@@ -44,6 +44,20 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             [],
         )
 
+    def test_linux_source_targets_exclude_computer_use_sidecars(self) -> None:
+        self.assertEqual(
+            source_binaries_for_target(
+                TARGET_SPECS["x86_64-unknown-linux-gnu"],
+                PACKAGE_VARIANTS["codex"],
+                build_entrypoint=True,
+                build_code_mode_host=True,
+                build_bwrap=True,
+                build_codex_command_runner=False,
+                build_codex_windows_sandbox_setup=False,
+            ),
+            ["codex", "codex-code-mode-host", "bwrap"],
+        )
+
     def test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing(
         self,
     ) -> None:

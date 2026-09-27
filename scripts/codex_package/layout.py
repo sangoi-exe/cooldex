@@ -7,7 +7,10 @@ from pathlib import Path
 
 from .targets import PackageInputs
 from .targets import PackageVariant
+from .targets import COMPUTER_USE_MCP_RESOURCE_PATH
+from .targets import SKY_RESOURCE_PATH
 from .targets import TargetSpec
+from .targets import validate_computer_use_input_pair
 from .zsh import ZSH_RESOURCE_PATH
 
 
@@ -38,6 +41,13 @@ def build_package_dir(
     spec: TargetSpec,
     inputs: PackageInputs,
 ) -> None:
+    # Merge-safety anchor: a validated local GNU x86-64 MCP/Sky pair is copied and validated only at its fixed package-resource paths.
+    validate_computer_use_input_pair(
+        spec,
+        computer_use_mcp_bin=inputs.computer_use_mcp_bin,
+        sky_bin=inputs.sky_bin,
+    )
+    computer_use_mcp_bin, sky_bin = inputs.computer_use_mcp_bin, inputs.sky_bin
     bin_dir = package_dir / "bin"
     resources_dir = package_dir / "codex-resources"
     path_dir = package_dir / "codex-path"
@@ -67,6 +77,20 @@ def build_package_dir(
 
     if inputs.bwrap_bin is not None:
         copy_executable(inputs.bwrap_bin, resources_dir / "bwrap", is_windows=False)
+
+    if computer_use_mcp_bin is not None or sky_bin is not None:
+        if computer_use_mcp_bin is None or sky_bin is None:
+            raise AssertionError("Computer Use input pair must be complete after validation.")
+        copy_executable(
+            computer_use_mcp_bin,
+            resources_dir / COMPUTER_USE_MCP_RESOURCE_PATH,
+            is_windows=False,
+        )
+        copy_executable(
+            sky_bin,
+            resources_dir / SKY_RESOURCE_PATH,
+            is_windows=False,
+        )
 
     if inputs.codex_command_runner_bin is not None:
         copy_executable(
@@ -100,6 +124,7 @@ def validate_package_dir(
     spec: TargetSpec,
     *,
     include_zsh: bool,
+    include_computer_use: bool = False,
 ) -> None:
     required_dirs = [
         Path("bin"),
@@ -148,6 +173,14 @@ def validate_package_dir(
     if spec.is_linux:
         required_files.append(Path("codex-resources") / "bwrap")
         executable_files.append(Path("codex-resources") / "bwrap")
+
+    if include_computer_use:
+        computer_use_files = [
+            Path("codex-resources") / COMPUTER_USE_MCP_RESOURCE_PATH,
+            Path("codex-resources") / SKY_RESOURCE_PATH,
+        ]
+        required_files.extend(computer_use_files)
+        executable_files.extend(computer_use_files)
 
     if spec.is_windows:
         required_files.extend(

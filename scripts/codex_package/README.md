@@ -22,6 +22,8 @@ The builder creates a canonical Codex package directory:
 │   └── codex-code-mode-host[.exe]
 ├── codex-resources
 │   ├── bwrap                             # Linux only
+│   ├── codex-computer-use-mcp             # local GNU Linux x86-64 pair only
+│   ├── sky_linux_x64                      # local GNU Linux x86-64 pair only
 │   ├── zsh/bin/zsh                       # supported Unix targets only
 │   ├── codex-command-runner.exe          # Windows only
 │   └── codex-windows-sandbox-setup.exe   # Windows only
@@ -31,6 +33,9 @@ The builder creates a canonical Codex package directory:
 
 The package directory is the primary artifact. Archive formats such as
 `.tar.gz`, `.tar.zst`, and `.zip` are serializations of that directory.
+
+<!-- Merge-safety anchor: local GNU x86-64 Computer Use packages retain their complete MCP/Sky pair as unpacked-only resources so proprietary Sky bytes never enter archive output. -->
+Local GNU Linux x86-64 package assembly may include an explicit complete Computer Use pair with `--computer-use-mcp-bin` and `--sky-bin`. Both prebuilt executable inputs are required together and are copied to `codex-resources/codex-computer-use-mcp` and `codex-resources/sky_linux_x64`. Source-owned prebuilt inputs must be produced through `scripts/cargo-guard.sh`; the package builder only validates and assembles the exact MCP/Sky inputs and never invokes Cargo for either. The builder rejects every `--archive-output` when the pair is supplied so proprietary Sky bytes cannot enter archive publication paths.
 
 If `--target` is omitted, the builder uses the release target for the current
 host platform. On Linux, that default is a musl target to match Codex release
