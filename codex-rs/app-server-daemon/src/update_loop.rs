@@ -323,10 +323,6 @@ async fn update_once(
         return Ok((UpdateLoopControl::Continue, None));
     }
     let (package_root, previous_selection, previous_release) = selected_release(daemon)?;
-    let codex_home = package_root
-        .parent()
-        .and_then(Path::parent)
-        .context("daemon package root has no Codex home")?;
     let (installer_mode, installer_guard) =
         if let UpdateTrigger::RestoreProduction(expected) = trigger {
             anyhow::ensure!(
@@ -372,7 +368,7 @@ async fn update_once(
         return Ok((UpdateLoopControl::Continue, None));
     }
     anyhow::ensure!(
-        crate::managed_install::package_root(codex_home) == package_root,
+        daemon.managed_package_root() == package_root,
         "daemon package root changed during the update; retry the command"
     );
     #[cfg(unix)]
@@ -489,12 +485,11 @@ fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger<'_>) -> Re
 }
 
 fn selected_release(daemon: &Daemon) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let home = daemon
-        .settings_file
-        .parent()
-        .and_then(Path::parent)
-        .context("daemon settings path has no Codex home")?;
-    let root = crate::managed_install::package_root(home);
+    anyhow::ensure!(
+        daemon.local_package_lane().is_none(),
+        "local package lanes are pinned and do not support public daemon updates"
+    );
+    let root = daemon.managed_package_root();
     let release = std::fs::canonicalize(root.join("current"))?;
     let name = release
         .file_name()

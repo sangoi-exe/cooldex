@@ -15,6 +15,7 @@ use super::manual_update::run as manual_update_once;
 #[cfg(unix)]
 use crate::Daemon;
 #[cfg(unix)]
+use crate::DaemonOwner;
 use crate::UpdateOutput;
 #[cfg(unix)]
 use crate::UpdateStatus;
@@ -22,6 +23,8 @@ use crate::UpdateStatus;
 use crate::managed_install::executable_identity;
 #[cfg(unix)]
 use crate::managed_install::executable_identity_from_bytes;
+#[cfg(unix)]
+use codex_install_context::LocalPackageLane;
 
 #[tokio::test]
 async fn installer_fetch_uses_exact_url_and_preserves_bytes() {
@@ -301,6 +304,8 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
     std::fs::write(state.join("app-server.stderr.log"), b"").unwrap();
     (
         Daemon {
+            codex_home: home.path().to_path_buf(),
+            owner: DaemonOwner::Generic,
             socket_path: home.path().join("app-server-control/server.sock"),
             pid_file: state.join("app-server.pid"),
             update_pid_file: state.join("app-server-updater.pid"),
@@ -310,6 +315,31 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
         },
         release,
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn local_package_lane_is_rejected_from_public_update_selection() {
+    let home = TempDir::new().expect("home");
+    let (generic, expected_release) = manual_update_daemon(&home);
+    let (root, release, release_name) = super::selected_release(&generic).expect("generic release");
+    assert_eq!(root, home.path().join("packages/standalone"));
+    assert_eq!(release_name, expected_release);
+    assert_eq!(
+        release,
+        root.join("current")
+            .canonicalize()
+            .expect("generic selection")
+    );
+
+    let local = Daemon::from_owner(
+        home.path(),
+        DaemonOwner::LocalPackageLane(LocalPackageLane::CdxDev),
+    )
+    .expect("local daemon");
+    let error = super::selected_release(&local).expect_err("local package selection must fail");
+    assert!(error.to_string().contains("local package lanes are pinned"));
+    assert!(!super::manual_update::supported(&local).expect("local update support"));
 }
 
 #[cfg(unix)]

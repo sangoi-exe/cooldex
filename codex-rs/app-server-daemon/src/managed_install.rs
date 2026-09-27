@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_install_context::LocalPackageLane;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs;
@@ -55,6 +56,16 @@ pub(crate) fn package_root(codex_home: &Path) -> PathBuf {
     dedicated
 }
 
+// Merge-safety anchor: typed local lanes own fixed daemon package roots beneath their shared CODEX_HOME; generic package-root discovery remains unchanged for unbound callers.
+pub(crate) fn package_root_for_local_package_lane(
+    codex_home: &Path,
+    local_package_lane: LocalPackageLane,
+) -> PathBuf {
+    codex_home
+        .join("packages/app-server-daemon")
+        .join(local_package_lane.package_root_component())
+}
+
 /// Resolve both packaged and legacy binaries without requiring a valid install.
 pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
     let root = package_root(codex_home);
@@ -68,6 +79,15 @@ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
     } else {
         legacy
     }
+}
+
+pub(crate) fn managed_codex_bin_for_local_package_lane(
+    codex_home: &Path,
+    local_package_lane: LocalPackageLane,
+) -> PathBuf {
+    package_root_for_local_package_lane(codex_home, local_package_lane)
+        .join("current/bin")
+        .join(managed_codex_file_name())
 }
 
 /// Only latest-channel stable releases may run the public latest-version updater.

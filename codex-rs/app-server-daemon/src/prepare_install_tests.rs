@@ -4,6 +4,7 @@ use super::InstallMode;
 use super::prepare_from_package;
 use super::validate_package;
 use crate::settings::DaemonSettings;
+use codex_install_context::LocalPackageLane;
 use pretty_assertions::assert_eq;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -12,6 +13,8 @@ use std::path::PathBuf;
 fn daemon(home: &std::path::Path) -> crate::Daemon {
     let state = home.join("app-server-daemon");
     crate::Daemon {
+        codex_home: home.to_path_buf(),
+        owner: crate::DaemonOwner::Generic,
         socket_path: state.join("app-server.sock"),
         pid_file: state.join("app-server.pid"),
         update_pid_file: state.join("app-server-updater.pid"),
@@ -19,6 +22,14 @@ fn daemon(home: &std::path::Path) -> crate::Daemon {
         settings_file: state.join("settings.json"),
         managed_codex_bin: crate::managed_install::managed_codex_bin(home),
     }
+}
+
+fn local_daemon(home: &Path, local_package_lane: LocalPackageLane) -> crate::Daemon {
+    crate::Daemon::from_owner(
+        home,
+        crate::DaemonOwner::LocalPackageLane(local_package_lane),
+    )
+    .expect("local daemon")
 }
 
 fn package(root: &Path, version: &str) -> PathBuf {
@@ -90,6 +101,75 @@ async fn seeds_full_package() {
         selected.file_name().expect("name").to_string_lossy()
     );
     assert!(validate_package(&selected).is_ok());
+}
+
+#[tokio::test]
+async fn local_lane_packages_are_isolated_and_pinned() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let codex_source = temp.path().join("codex-package");
+    let cdx_dev_source = temp.path().join("cdx-dev-package");
+    let codex_bin = package(&codex_source, "0.152.0");
+    let cdx_dev_bin = package(&cdx_dev_source, "0.153.0");
+    let settings = DaemonSettings::default();
+    let codex = local_daemon(&home, LocalPackageLane::Codex);
+    let cdx_dev = local_daemon(&home, LocalPackageLane::CdxDev);
+
+    prepare_from_package(
+        &codex,
+        &settings,
+        InstallMode::Missing,
+        Some(&codex_source),
+        &codex_bin,
+        |_| Ok(true),
+    )
+    .await
+    .expect("seed codex lane");
+
+    let codex_root = codex.managed_package_root();
+    let codex_selection = codex_root
+        .join("current")
+        .canonicalize()
+        .expect("codex selection");
+    assert!(!codex_root.join("auto-update-version").exists());
+    assert!(!home.join("packages/app-server-daemon/current").exists());
+
+    prepare_from_package(
+        &cdx_dev,
+        &settings,
+        InstallMode::Missing,
+        Some(&cdx_dev_source),
+        &cdx_dev_bin,
+        |_| Ok(true),
+    )
+    .await
+    .expect("seed cdx-dev lane");
+
+    let cdx_dev_root = cdx_dev.managed_package_root();
+    let cdx_dev_selection = cdx_dev_root
+        .join("current")
+        .canonicalize()
+        .expect("cdx-dev selection");
+    assert_ne!(codex_root, cdx_dev_root);
+    assert_ne!(codex_selection, cdx_dev_selection);
+    assert_eq!(
+        codex_root
+            .join("current")
+            .canonicalize()
+            .expect("codex unchanged"),
+        codex_selection
+    );
+    assert_eq!(
+        std::fs::read(codex_selection.join("bin/codex")).expect("codex binary"),
+        std::fs::read(&codex_bin).expect("source codex binary")
+    );
+    assert_eq!(
+        std::fs::read(cdx_dev_selection.join("bin/codex")).expect("cdx-dev binary"),
+        std::fs::read(&cdx_dev_bin).expect("source cdx-dev binary")
+    );
+    assert!(!codex_root.join("auto-update-version").exists());
+    assert!(!cdx_dev_root.join("auto-update-version").exists());
+    assert!(!home.join("packages/app-server-daemon/current").exists());
 }
 
 #[tokio::test]

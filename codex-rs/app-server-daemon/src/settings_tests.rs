@@ -1,3 +1,4 @@
+use codex_install_context::LocalPackageLane;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -151,5 +152,20 @@ async fn telemetry_distinguishes_presence_from_default_values() -> anyhow::Resul
             ["enabled", presence, presence, presence]
         );
     }
+
+    let local_package_lane = LocalPackageLane::CdxDev;
+    let lane_dir = dir.join(local_package_lane.package_root_component());
+    tokio::fs::create_dir(&lane_dir).await?;
+    tokio::fs::write(
+        lane_dir.join("settings.json"),
+        r#"{"updater":{"autoUpdateEnabled":false}}"#,
+    )
+    .await?;
+    assert_eq!(
+        crate::telemetry::settings_tags_for_local_package_lane(home.path(), local_package_lane)
+            .await
+            .map(|(_, value)| value),
+        ["disabled", "configured", "default", "default"]
+    );
     Ok(())
 }

@@ -1,4 +1,31 @@
+use codex_install_context::LocalPackageLane;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn local_package_lanes_have_distinct_managed_roots() {
+    let home = tempfile::TempDir::new().expect("home");
+    let generic_root = home.path().join("packages/app-server-daemon");
+
+    assert_eq!(super::package_root(home.path()), generic_root);
+    assert_eq!(
+        super::managed_codex_bin(home.path()),
+        generic_root
+            .join("current/bin")
+            .join(super::managed_codex_file_name())
+    );
+    for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+        let root = generic_root.join(local_package_lane.package_root_component());
+        assert_eq!(
+            super::package_root_for_local_package_lane(home.path(), local_package_lane),
+            root
+        );
+        assert_eq!(
+            super::managed_codex_bin_for_local_package_lane(home.path(), local_package_lane),
+            root.join("current/bin")
+                .join(super::managed_codex_file_name())
+        );
+    }
+}
 
 #[test]
 fn discovers_package_and_legacy_installs() {

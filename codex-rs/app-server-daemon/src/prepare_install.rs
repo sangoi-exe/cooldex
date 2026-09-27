@@ -90,13 +90,9 @@ async fn prepare_from_package(
     running_exe: &Path,
     confirm: impl FnOnce(&InstallRequest) -> Result<bool>,
 ) -> Result<bool> {
-    let home = daemon
-        .settings_file
-        .parent()
-        .and_then(Path::parent)
-        .context("daemon settings path has no Codex home")?;
-    let previous_root = managed_install::package_root(home);
-    let root = home.join("packages/app-server-daemon");
+    let home = daemon.codex_home.as_path();
+    let previous_root = daemon.managed_package_root();
+    let root = daemon.managed_package_destination_root();
     anyhow::ensure!(
         daemon.managed_codex_bin.starts_with(&previous_root),
         "daemon package location changed; retry the command"
@@ -110,7 +106,7 @@ async fn prepare_from_package(
         }
         if !matches!(root.join("current").symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
             || ["daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log"]
-                .iter().any(|name| !matches!(home.join("app-server-daemon").join(name).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+                .iter().any(|name| !matches!(daemon.owner.state_dir(home).join(name).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
         {
             daemon.ensure_managed_codex_bin()?;
             return Ok(true);
@@ -123,7 +119,7 @@ async fn prepare_from_package(
     }
     std::fs::create_dir_all(&root)?;
     anyhow::ensure!(
-        managed_install::package_root(home) == previous_root,
+        daemon.managed_package_root() == previous_root,
         "daemon package location changed; retry the command"
     );
     let backend = daemon.running_backend_instance(settings).await?;
@@ -131,7 +127,7 @@ async fn prepare_from_package(
         backend.is_some() || crate::client::probe(&daemon.socket_path).await.is_err(),
         "app server is running but is not managed by codex app-server daemon"
     );
-    let selected = managed_install::managed_codex_bin(home);
+    let selected = daemon.current_managed_codex_bin()?;
     let previous_release = previous_root.join("current").canonicalize().ok();
     if mode == InstallMode::Missing {
         if selected.is_file() {
@@ -204,10 +200,10 @@ async fn prepare_from_package(
     let settings = current_settings.as_ref().unwrap_or(settings);
     let _install_lock = acquire_install_lock(&root).await?;
     anyhow::ensure!(
-        managed_install::package_root(home) == previous_root,
+        daemon.managed_package_root() == previous_root,
         "daemon package location changed; retry the command"
     );
-    if mode == InstallMode::Missing && managed_install::managed_codex_bin(home).is_file() {
+    if mode == InstallMode::Missing && daemon.current_managed_codex_bin()?.is_file() {
         return Ok(true);
     }
     anyhow::ensure!(
@@ -266,7 +262,8 @@ async fn prepare_from_package(
     }
     let standalone = home.join("packages/standalone");
     let canonical_source = source.canonicalize()?;
-    let follows_latest = mode == InstallMode::Missing
+    let follows_latest = daemon.local_package_lane().is_none()
+        && mode == InstallMode::Missing
         && stable
         && (standalone.join("current").canonicalize().ok().as_deref()
             != Some(canonical_source.as_path())
@@ -275,7 +272,7 @@ async fn prepare_from_package(
                 .as_deref()
                 == canonical_source.file_name().and_then(|name| name.to_str()));
     anyhow::ensure!(
-        managed_install::package_root(home) == previous_root
+        daemon.managed_package_root() == previous_root
             && (backend.is_some() || crate::client::probe(&daemon.socket_path).await.is_err()),
         "daemon package location or socket ownership changed while preparing its package; retry the command"
     );
@@ -291,7 +288,7 @@ async fn prepare_from_package(
                 .stop()
                 .await?;
             anyhow::ensure!(
-                managed_install::package_root(home) == previous_root
+                daemon.managed_package_root() == previous_root
                     && previous_root.join("current").canonicalize().ok() == previous_release,
                 "daemon selection changed while preparing its package; retry the command"
             );

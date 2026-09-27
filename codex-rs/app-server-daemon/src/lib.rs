@@ -31,6 +31,9 @@ use backend::BackendPaths;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlPairingStartResponse;
 use codex_app_server_transport::app_server_control_socket_path;
+use codex_app_server_transport::app_server_control_socket_path_for_local_package_lane;
+use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
 #[cfg(any(unix, windows))]
@@ -302,8 +305,49 @@ fn ensure_supported_platform() -> Result<()> {
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonOwner {
+    Generic,
+    LocalPackageLane(LocalPackageLane),
+}
+
+impl DaemonOwner {
+    fn local_package_lane(self) -> Option<LocalPackageLane> {
+        match self {
+            Self::Generic => None,
+            Self::LocalPackageLane(local_package_lane) => Some(local_package_lane),
+        }
+    }
+
+    fn state_dir(self, codex_home: &Path) -> PathBuf {
+        let state_dir = codex_home.join(STATE_DIR_NAME);
+        match self {
+            Self::Generic => state_dir,
+            Self::LocalPackageLane(local_package_lane) => {
+                state_dir.join(local_package_lane.package_root_component())
+            }
+        }
+    }
+
+    fn socket_path(self, codex_home: &Path) -> Result<PathBuf> {
+        let socket_path = match self {
+            Self::Generic => app_server_control_socket_path(codex_home)?,
+            Self::LocalPackageLane(local_package_lane) => {
+                app_server_control_socket_path_for_local_package_lane(
+                    codex_home,
+                    local_package_lane,
+                )?
+            }
+        };
+        Ok(socket_path.as_path().to_path_buf())
+    }
+}
+
+// Merge-safety anchor: local package lanes retain the invoking typed install-context binding through daemon lifecycle and package ownership; unbound callers retain the generic daemon namespace.
 #[derive(Clone)]
 struct Daemon {
+    codex_home: PathBuf,
+    owner: DaemonOwner,
     socket_path: PathBuf,
     pid_file: PathBuf,
     update_pid_file: PathBuf,
@@ -315,20 +359,35 @@ struct Daemon {
 impl Daemon {
     fn from_environment() -> Result<Self> {
         let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-        let socket_path = app_server_control_socket_path(codex_home.as_path())?
-            .as_path()
-            .to_path_buf();
-        let state_dir = codex_home.as_path().join(STATE_DIR_NAME);
-        let managed_codex_bin = managed_codex_bin(codex_home.as_path());
+        let owner = InstallContext::current()
+            .local_package_lane()
+            .map_or(DaemonOwner::Generic, DaemonOwner::LocalPackageLane);
+        Self::from_owner(codex_home.as_path(), owner)
+    }
+
+    fn from_owner(codex_home: &Path, owner: DaemonOwner) -> Result<Self> {
+        let state_dir = owner.state_dir(codex_home);
+        let managed_codex_bin = match owner {
+            DaemonOwner::Generic => managed_codex_bin(codex_home),
+            DaemonOwner::LocalPackageLane(local_package_lane) => {
+                managed_install::managed_codex_bin_for_local_package_lane(
+                    codex_home,
+                    local_package_lane,
+                )
+            }
+        };
         // Old CLIs must not mistake a daemon-owned installation for their backend.
-        let (pid_file, update_pid_file) =
-            if managed_codex_bin.starts_with(codex_home.as_path().join("packages/standalone")) {
-                (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
-            } else {
-                (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
-            };
+        let (pid_file, update_pid_file) = if owner == DaemonOwner::Generic
+            && managed_codex_bin.starts_with(codex_home.join("packages/standalone"))
+        {
+            (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
+        } else {
+            (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
+        };
         Ok(Self {
-            socket_path,
+            codex_home: codex_home.to_path_buf(),
+            owner,
+            socket_path: owner.socket_path(codex_home)?,
             pid_file: state_dir.join(pid_file),
             update_pid_file: state_dir.join(update_pid_file),
             operation_lock_file: state_dir.join(OPERATION_LOCK_FILE_NAME),
@@ -338,24 +397,26 @@ impl Daemon {
     }
 
     fn recovery_file(&self) -> Result<PathBuf> {
-        Ok(codex_app_server_transport::daemon_recovery_file_path(
-            self.settings_file
-                .parent()
-                .and_then(Path::parent)
-                .context("daemon settings path has no Codex home")?,
-        ))
+        Ok(match self.owner {
+            DaemonOwner::Generic => {
+                codex_app_server_transport::daemon_recovery_file_path(&self.codex_home)
+            }
+            DaemonOwner::LocalPackageLane(local_package_lane) => {
+                codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane(
+                    &self.codex_home,
+                    local_package_lane,
+                )
+            }
+        })
     }
 
     // Call only after taking the operation lock: an explicit update may have
     // migrated the package and PID namespace while this command was waiting.
     fn current_installation(&self) -> Result<Self> {
         let managed_codex_bin = self.current_managed_codex_bin()?;
-        let home = self
-            .settings_file
-            .parent()
-            .and_then(Path::parent)
-            .context("daemon settings path has no Codex home")?;
-        let (pid, updater) = if managed_codex_bin.starts_with(home.join("packages/standalone")) {
+        let (pid, updater) = if self.owner == DaemonOwner::Generic
+            && managed_codex_bin.starts_with(self.codex_home.join("packages/standalone"))
+        {
             (LEGACY_PID_FILE_NAME, LEGACY_UPDATE_PID_FILE_NAME)
         } else {
             (DAEMON_PID_FILE_NAME, DAEMON_UPDATE_PID_FILE_NAME)
@@ -888,36 +949,59 @@ impl Daemon {
     }
 
     fn is_stable_standalone_release(&self) -> Result<bool> {
-        let codex_home = self
-            .settings_file
-            .parent()
-            .and_then(Path::parent)
-            .context("daemon settings path has no Codex home")?;
-        Ok(managed_install::is_stable_standalone_release(
-            codex_home,
-            &self.current_managed_codex_bin()?,
-        ))
+        Ok(self.owner.local_package_lane().is_none()
+            && managed_install::is_stable_standalone_release(
+                &self.codex_home,
+                &self.current_managed_codex_bin()?,
+            ))
     }
 
     fn current_managed_codex_bin(&self) -> Result<PathBuf> {
         // An installer can move a legacy binary into bin/ while this updater runs.
-        let home = self
-            .settings_file
-            .parent()
-            .and_then(Path::parent)
-            .context("daemon settings path has no Codex home")?;
-        Ok(managed_install::managed_codex_bin(home))
+        Ok(match self.owner {
+            DaemonOwner::Generic => managed_install::managed_codex_bin(&self.codex_home),
+            DaemonOwner::LocalPackageLane(local_package_lane) => {
+                managed_install::managed_codex_bin_for_local_package_lane(
+                    &self.codex_home,
+                    local_package_lane,
+                )
+            }
+        })
     }
 
     fn has_latest_selection_marker(&self) -> bool {
-        self.settings_file
-            .parent()
-            .and_then(Path::parent)
-            .is_some_and(|home| {
-                managed_install::package_root(home)
-                    .join("auto-update-version")
-                    .is_file()
-            })
+        self.owner.local_package_lane().is_none()
+            && managed_install::package_root(&self.codex_home)
+                .join("auto-update-version")
+                .is_file()
+    }
+
+    fn local_package_lane(&self) -> Option<LocalPackageLane> {
+        self.owner.local_package_lane()
+    }
+
+    fn managed_package_root(&self) -> PathBuf {
+        match self.owner {
+            DaemonOwner::Generic => managed_install::package_root(&self.codex_home),
+            DaemonOwner::LocalPackageLane(local_package_lane) => {
+                managed_install::package_root_for_local_package_lane(
+                    &self.codex_home,
+                    local_package_lane,
+                )
+            }
+        }
+    }
+
+    fn managed_package_destination_root(&self) -> PathBuf {
+        match self.owner {
+            DaemonOwner::Generic => self.codex_home.join("packages/app-server-daemon"),
+            DaemonOwner::LocalPackageLane(local_package_lane) => {
+                managed_install::package_root_for_local_package_lane(
+                    &self.codex_home,
+                    local_package_lane,
+                )
+            }
+        }
     }
 
     async fn is_bootstrapped(&self, settings: &DaemonSettings) -> Result<bool> {
@@ -998,9 +1082,7 @@ impl Daemon {
     async fn open_operation_lock_file(&self) -> Result<tokio::fs::File> {
         if let Some(parent) = self.operation_lock_file.parent() {
             #[cfg(unix)]
-            if let Some(home) = parent.parent() {
-                tokio::fs::create_dir_all(home).await?;
-            }
+            tokio::fs::create_dir_all(&self.codex_home).await?;
             codex_uds::prepare_private_socket_directory(parent)
                 .await
                 .with_context(|| {
@@ -1126,6 +1208,7 @@ mod tests {
     use super::BootstrapOutput;
     use super::BootstrapStatus;
     use super::Daemon;
+    use super::DaemonOwner;
     use super::LifecycleOutput;
     use super::LifecycleStatus;
     use super::RemoteControlStartOutput;
@@ -1136,6 +1219,7 @@ mod tests {
     use crate::client::ProbeInfo;
     #[cfg(unix)]
     use crate::settings::DaemonSettings;
+    use codex_install_context::LocalPackageLane;
 
     #[test]
     fn remote_control_status_uses_camel_case_json() {
@@ -1243,6 +1327,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_package_lanes_have_independent_daemon_owners() {
+        let home = TempDir::new().expect("home");
+        let generic = Daemon::from_owner(home.path(), DaemonOwner::Generic).expect("generic");
+
+        assert_eq!(
+            generic.socket_path,
+            home.path()
+                .join("app-server-control/app-server-control.sock")
+        );
+        assert_eq!(
+            generic.settings_file,
+            home.path().join("app-server-daemon/settings.json")
+        );
+        assert_eq!(
+            generic.pid_file,
+            home.path().join("app-server-daemon/daemon.pid")
+        );
+        assert_eq!(
+            generic.update_pid_file,
+            home.path().join("app-server-daemon/daemon-updater.pid")
+        );
+        assert_eq!(
+            generic.operation_lock_file,
+            home.path().join("app-server-daemon/daemon.lock")
+        );
+        assert_eq!(
+            generic.manual_update_socket_path(),
+            home.path().join("app-server-daemon/daemon-updater.sock")
+        );
+        assert_eq!(
+            generic.recovery_file().expect("generic recovery"),
+            home.path().join("app-server-daemon/loaded-threads.json")
+        );
+        assert_eq!(
+            generic.managed_package_root(),
+            home.path().join("packages/app-server-daemon")
+        );
+
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            let daemon = Daemon::from_owner(
+                home.path(),
+                DaemonOwner::LocalPackageLane(local_package_lane),
+            )
+            .expect("local daemon");
+            let component = local_package_lane.package_root_component();
+            let state = home.path().join("app-server-daemon").join(component);
+            let package_root = home
+                .path()
+                .join("packages/app-server-daemon")
+                .join(component);
+
+            assert_eq!(
+                daemon.owner,
+                DaemonOwner::LocalPackageLane(local_package_lane)
+            );
+            assert_eq!(
+                daemon.socket_path,
+                home.path()
+                    .join("app-server-control")
+                    .join(component)
+                    .join("app-server-control.sock")
+            );
+            assert_eq!(daemon.settings_file, state.join("settings.json"));
+            assert_eq!(daemon.pid_file, state.join("daemon.pid"));
+            assert_eq!(daemon.update_pid_file, state.join("daemon-updater.pid"));
+            assert_eq!(daemon.operation_lock_file, state.join("daemon.lock"));
+            assert_eq!(
+                daemon.manual_update_socket_path(),
+                state.join("daemon-updater.sock")
+            );
+            assert_eq!(
+                daemon.recovery_file().expect("local recovery"),
+                state.join("loaded-threads.json")
+            );
+            assert_eq!(daemon.managed_package_root(), package_root);
+            assert_eq!(
+                daemon.current_managed_codex_bin().expect("local binary"),
+                package_root.join("current/bin/codex")
+            );
+
+            let selected = daemon.current_installation().expect("current installation");
+            assert_eq!(selected.owner, daemon.owner);
+            assert_eq!(selected.codex_home, daemon.codex_home);
+            assert_eq!(selected.settings_file, daemon.settings_file);
+            assert_eq!(selected.socket_path, daemon.socket_path);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_package_lane_cannot_become_latest_updater_eligible() {
+        let home = TempDir::new().expect("home");
+        let daemon = Daemon::from_owner(
+            home.path(),
+            DaemonOwner::LocalPackageLane(LocalPackageLane::CdxDev),
+        )
+        .expect("local daemon");
+        let root = daemon.managed_package_root();
+        let release = root.join("releases/0.150.0-x86_64-unknown-linux-musl");
+        let managed = release.join("bin/codex");
+        std::fs::create_dir_all(managed.parent().expect("bin parent")).expect("release");
+        std::fs::write(&managed, b"managed").expect("managed binary");
+        std::os::unix::fs::symlink(&release, root.join("current")).expect("current release");
+        std::fs::write(
+            root.join("auto-update-version"),
+            "0.150.0-x86_64-unknown-linux-musl",
+        )
+        .expect("latest marker");
+
+        assert!(
+            !daemon
+                .is_stable_standalone_release()
+                .expect("updater eligibility")
+        );
+        assert!(!daemon.has_latest_selection_marker());
+    }
+
     #[tokio::test]
     async fn waiting_lifecycle_command_uses_migrated_installation() {
         let home = TempDir::new().expect("home");
@@ -1250,6 +1452,8 @@ mod tests {
         let legacy = home.path().join("packages/standalone/current");
         std::fs::create_dir_all(&legacy).expect("legacy selection");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
+            owner: DaemonOwner::Generic,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join(super::LEGACY_PID_FILE_NAME),
             update_pid_file: state.join(super::LEGACY_UPDATE_PID_FILE_NAME),
@@ -1283,6 +1487,8 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let state = temp.path().join("missing-home").join("daemon-state");
         let daemon = Daemon {
+            codex_home: temp.path().join("missing-home"),
+            owner: DaemonOwner::Generic,
             socket_path: state.join("server.sock"),
             pid_file: state.join("server.pid"),
             update_pid_file: state.join("updater.pid"),
@@ -1308,6 +1514,8 @@ mod tests {
             .await
             .expect("private state directory");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
+            owner: DaemonOwner::Generic,
             socket_path: home.path().join("server.sock"),
             pid_file: state.join("server.pid"),
             update_pid_file: state.join("updater.pid"),
@@ -1362,6 +1570,8 @@ mod tests {
             .expect("current local build");
         let state = home.path().join("app-server-daemon");
         let daemon = Daemon {
+            codex_home: home.path().to_path_buf(),
+            owner: DaemonOwner::Generic,
             socket_path: home
                 .path()
                 .join("app-server-control/app-server-control.sock"),
@@ -1389,6 +1599,8 @@ mod tests {
     async fn not_ready_context_reports_daemon_app_server_before_stderr() {
         let temp_dir = TempDir::new().expect("temp dir");
         let daemon = Daemon {
+            codex_home: temp_dir.path().to_path_buf(),
+            owner: DaemonOwner::Generic,
             socket_path: temp_dir.path().join("app-server-control.sock"),
             pid_file: temp_dir.path().join("app-server.pid"),
             update_pid_file: temp_dir.path().join("app-server-updater.pid"),
