@@ -1296,6 +1296,28 @@ class CargoValidateTests(unittest.TestCase):
         self.assertIn(["just", "strict-codex-bin"], commands)
         self.assertIn(["just", "smoke-codex-bin"], commands)
 
+    def test_local_package_inputs_recipe_is_guarded_and_builds_all_source_inputs(self) -> None:
+        planner = load_planner_module()
+        command = planner.CommandEntry(
+            argv=("just", "build-local-codex-package-inputs"), reason="fixture"
+        )
+        self.assertTrue(planner.command_uses_guarded_cargo(command))
+
+        process = subprocess.run(
+            ["just", "--dry-run", "build-local-codex-package-inputs"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, process.returncode, process.stderr)
+        self.assertEqual("", process.stdout)
+        self.assertEqual(
+            'CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build --target x86_64-unknown-linux-gnu -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-computer-use-extension --bin codex-computer-use-mcp\n',
+            process.stderr,
+        )
+
     def test_features_and_tools_paths_have_explicit_cli_runtime_rules(self) -> None:
         plan = self.plan_json(
             "--file",

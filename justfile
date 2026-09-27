@@ -150,6 +150,9 @@ validate-cli:
 build-codex-bin:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
 
+build-local-codex-package-inputs:
+    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build --target x86_64-unknown-linux-gnu -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-computer-use-extension --bin codex-computer-use-mcp
+
 check-codex-bin:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-check}" bash ../scripts/cargo-guard.sh cargo check -p codex-cli --bin codex
     just check-strict -p codex-cli --bin codex

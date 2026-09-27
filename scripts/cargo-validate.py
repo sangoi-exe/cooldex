@@ -224,6 +224,7 @@ DEFAULT_TELEMETRY_LEVEL = "full"
 
 GUARDED_JUST_RECIPES = {
     "build-codex-bin",
+    "build-local-codex-package-inputs",
     "check-codex-bin",
     "check-strict",
     "clippy",
