@@ -20,7 +20,9 @@ use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name;
 use super::helpers::sqlite_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
+use super::live_writer;
 use super::thread_rollout_resolver;
+use crate::LoadThreadHistoryParams;
 use crate::ReadThreadParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
@@ -28,9 +30,61 @@ use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
 
+#[derive(Clone, Copy)]
+enum HistoryScope {
+    LegacyOnly,
+    Complete,
+}
+
+// Merge-safety anchor: complete replay preserves legacy selection and loading while paginated replay uses the shared lineage owner; the direct read APIs remain legacy-history-only.
+pub(super) async fn load_history(
+    store: &LocalThreadStore,
+    params: LoadThreadHistoryParams,
+) -> ThreadStoreResult<StoredThreadHistory> {
+    let thread = if let Ok(rollout_path) = live_writer::rollout_path(store, params.thread_id).await {
+        if !params.include_archived
+            && rollout_path_is_archived(store.config.codex_home.as_path(), rollout_path.as_path())
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!("thread {} is archived", params.thread_id),
+            });
+        }
+        read_thread_by_rollout_path_with_history_scope(
+            store,
+            rollout_path,
+            /*include_archived*/ true,
+            /*include_history*/ true,
+            HistoryScope::Complete,
+        )
+        .await?
+    } else {
+        read_thread_with_history_scope(
+            store,
+            ReadThreadParams {
+                thread_id: params.thread_id,
+                include_archived: params.include_archived,
+                include_history: true,
+            },
+            HistoryScope::Complete,
+        )
+        .await?
+    };
+    thread.history.ok_or_else(|| ThreadStoreError::Internal {
+        message: format!("failed to load history for thread {}", params.thread_id),
+    })
+}
+
 pub(super) async fn read_thread(
     store: &LocalThreadStore,
     params: ReadThreadParams,
+) -> ThreadStoreResult<StoredThread> {
+    read_thread_with_history_scope(store, params, HistoryScope::LegacyOnly).await
+}
+
+async fn read_thread_with_history_scope(
+    store: &LocalThreadStore,
+    params: ReadThreadParams,
+    history_scope: HistoryScope,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let sqlite_metadata = read_sqlite_metadata(store, thread_id).await;
@@ -84,8 +138,8 @@ pub(super) async fn read_thread(
             );
             thread = rollout_thread;
         }
-        reject_paginated_history(&thread, params.include_history)?;
-        attach_history_if_requested(&mut thread, params.include_history).await?;
+        reject_paginated_history(&thread, params.include_history, history_scope)?;
+        attach_history_if_requested(store, &mut thread, params.include_history).await?;
         return Ok(thread);
     }
 
@@ -112,8 +166,8 @@ pub(super) async fn read_thread(
             message: format!("thread {} is archived", thread.thread_id),
         });
     }
-    reject_paginated_history(&thread, params.include_history)?;
-    attach_history_if_requested(&mut thread, params.include_history).await?;
+    reject_paginated_history(&thread, params.include_history, history_scope)?;
+    attach_history_if_requested(store, &mut thread, params.include_history).await?;
     Ok(thread)
 }
 
@@ -137,6 +191,23 @@ pub(super) async fn read_thread_by_rollout_path(
     rollout_path: std::path::PathBuf,
     include_archived: bool,
     include_history: bool,
+) -> ThreadStoreResult<StoredThread> {
+    read_thread_by_rollout_path_with_history_scope(
+        store,
+        rollout_path,
+        include_archived,
+        include_history,
+        HistoryScope::LegacyOnly,
+    )
+    .await
+}
+
+async fn read_thread_by_rollout_path_with_history_scope(
+    store: &LocalThreadStore,
+    rollout_path: std::path::PathBuf,
+    include_archived: bool,
+    include_history: bool,
+    history_scope: HistoryScope,
 ) -> ThreadStoreResult<StoredThread> {
     let path = resolve_requested_rollout_path(store, rollout_path).await?;
     let mut thread = read_thread_from_rollout_path(store, path.clone()).await?;
@@ -187,13 +258,17 @@ pub(super) async fn read_thread_by_rollout_path(
             );
         }
     }
-    reject_paginated_history(&thread, include_history)?;
-    attach_history_if_requested(&mut thread, include_history).await?;
+    reject_paginated_history(&thread, include_history, history_scope)?;
+    attach_history_if_requested(store, &mut thread, include_history).await?;
     Ok(thread)
 }
 
-fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> ThreadStoreResult<()> {
-    if include_history {
+fn reject_paginated_history(
+    thread: &StoredThread,
+    include_history: bool,
+    history_scope: HistoryScope,
+) -> ThreadStoreResult<()> {
+    if include_history && matches!(history_scope, HistoryScope::LegacyOnly) {
         reject_paginated_history_mode(thread.history_mode)?;
     }
     Ok(())
@@ -241,6 +316,7 @@ async fn resolve_requested_rollout_path(
 }
 
 async fn attach_history_if_requested(
+    store: &LocalThreadStore,
     thread: &mut StoredThread,
     include_history: bool,
 ) -> ThreadStoreResult<()> {
@@ -253,7 +329,16 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
-    let items = load_history_items(&path).await?;
+    let items = match thread.history_mode {
+        ThreadHistoryMode::Legacy => load_history_items(&path).await?,
+        ThreadHistoryMode::Paginated => {
+            store
+                .resolve_rollout_lineage(thread_id)
+                .await?
+                .load_history()
+                .await?
+        }
+    };
     thread.history = Some(StoredThreadHistory { thread_id, items });
     Ok(())
 }

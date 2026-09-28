@@ -394,43 +394,8 @@ impl LocalThreadStore {
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreResult<StoredThreadHistory> {
-        if let Ok(rollout_path) = live_writer::rollout_path(self, params.thread_id).await {
-            if !params.include_archived
-                && helpers::rollout_path_is_archived(
-                    self.config.codex_home.as_path(),
-                    rollout_path.as_path(),
-                )
-            {
-                return Err(ThreadStoreError::InvalidRequest {
-                    message: format!("thread {} is archived", params.thread_id),
-                });
-            }
-            return read_thread::read_thread_by_rollout_path(
-                self,
-                rollout_path,
-                /*include_archived*/ true,
-                /*include_history*/ true,
-            )
-            .await?
-            .history
-            .ok_or_else(|| ThreadStoreError::Internal {
-                message: format!("failed to load history for thread {}", params.thread_id),
-            });
-        }
-
-        read_thread::read_thread(
-            self,
-            ReadThreadParams {
-                thread_id: params.thread_id,
-                include_archived: params.include_archived,
-                include_history: true,
-            },
-        )
-        .await?
-        .history
-        .ok_or_else(|| ThreadStoreError::Internal {
-            message: format!("failed to load history for thread {}", params.thread_id),
-        })
+        // Merge-safety anchor: only the complete-history facade enables lineage replay; direct legacy history reads retain their paginated-mode rejection.
+        read_thread::load_history(self, params).await
     }
 
     async fn read_thread_by_rollout_path_params(
@@ -839,6 +804,7 @@ mod tests {
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_rollout::RolloutItem;
+    use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
     use super::*;
@@ -1758,6 +1724,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_history_preserves_legacy_rollout_replay() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = uuid::Uuid::from_u128(/*v*/ 409);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path = write_session_file(home.path(), "2025-01-04T10-00-00", uuid)
+            .expect("session file");
+        let (items, _, _) = RolloutRecorder::load_rollout_items(rollout_path.as_path())
+            .await
+            .expect("load legacy rollout");
+
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("load legacy history");
+
+        assert_eq!(
+            serde_json::to_value(history).expect("serialize history"),
+            serde_json::to_value(StoredThreadHistory { thread_id, items })
+                .expect("serialize expected history")
+        );
+    }
+
+    #[tokio::test]
     async fn load_history_uses_live_writer_rollout_path() {
         let home = TempDir::new().expect("temp dir");
         let external_home = TempDir::new().expect("external temp dir");
@@ -2023,14 +2016,23 @@ mod tests {
                 .await
                 .expect_err("full history path read should fail"),
         );
-        assert_paginated_threads_unsupported(
-            store
-                .load_history(LoadThreadHistoryParams {
-                    thread_id,
-                    include_archived: false,
-                })
-                .await
-                .expect_err("history load should fail"),
+        let history = store
+            .load_history(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("complete history load should succeed");
+        let session_meta = codex_rollout::read_session_meta_line(rollout_path.as_path())
+            .await
+            .expect("read canonical session metadata");
+        assert_eq!(
+            serde_json::to_value(history).expect("serialize history"),
+            serde_json::to_value(StoredThreadHistory {
+                thread_id,
+                items: vec![RolloutItem::SessionMeta(session_meta)],
+            })
+            .expect("serialize expected history")
         );
         store
             .resume_thread(ResumeThreadParams {

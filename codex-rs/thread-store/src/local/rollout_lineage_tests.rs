@@ -1,11 +1,14 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
 use pretty_assertions::assert_eq;
@@ -14,6 +17,113 @@ use tempfile::TempDir;
 use super::super::LocalThreadStore;
 use super::super::test_support::test_config;
 use super::RolloutLineageSegment;
+use crate::LoadThreadHistoryParams;
+use crate::StoredThreadHistory;
+use crate::ThreadStoreError;
+
+#[tokio::test]
+async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
+    let home = TempDir::new().expect("temp dir");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let root = ThreadId::default();
+    let middle = ThreadId::default();
+    let child = ThreadId::default();
+    let root_item = turn_started("root");
+    let middle_item = turn_started("middle");
+    let child_item = turn_started("child");
+    let root_path = write_rollout_under(
+        home.path().join("archived_sessions"),
+        root,
+        /*history_base*/ None,
+        /*next_ordinal*/ 1,
+    );
+    append_rollout_lines(
+        root_path.as_path(),
+        [(1, root_item.clone()), (7, turn_started("excluded root suffix"))],
+    );
+    let root_end = history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 4);
+    let middle_path = write_rollout(home.path(), middle, Some(root_end), /*next_ordinal*/ 1);
+    append_rollout_lines(
+        middle_path.as_path(),
+        [(6, middle_item.clone()), (9, turn_started("excluded middle suffix"))],
+    );
+    let middle_end = history_position(
+        middle_path.as_path(),
+        middle,
+        /*end_ordinal_exclusive*/ 7,
+    );
+    let child_path = write_rollout(home.path(), child, Some(middle_end), /*next_ordinal*/ 1);
+    append_rollout_lines(child_path.as_path(), [(8, child_item.clone())]);
+    let session_meta = codex_rollout::read_session_meta_line(child_path.as_path())
+        .await
+        .expect("read current session metadata");
+    let expected = StoredThreadHistory {
+        thread_id: child,
+        items: vec![
+            RolloutItem::SessionMeta(session_meta),
+            root_item,
+            middle_item,
+            child_item,
+        ],
+    };
+
+    let history = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: child,
+            include_archived: false,
+        })
+        .await
+        .expect("load complete history with archived ancestry");
+    assert_eq!(
+        serde_json::to_value(history).expect("serialize history"),
+        serde_json::to_value(&expected).expect("serialize expected history")
+    );
+
+    let archived_path = home
+        .path()
+        .join("archived_sessions")
+        .join(child_path.file_name().expect("child rollout filename"));
+    fs::rename(child_path, &archived_path).expect("archive current rollout");
+    let err = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: child,
+            include_archived: false,
+        })
+        .await
+        .expect_err("active-only history must reject an archived current rollout");
+    assert!(matches!(err, ThreadStoreError::InvalidRequest { .. }));
+    let history = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: child,
+            include_archived: true,
+        })
+        .await
+        .expect("load archived complete history");
+    assert_eq!(
+        serde_json::to_value(history).expect("serialize archived history"),
+        serde_json::to_value(&expected).expect("serialize expected history")
+    );
+
+    for path in [&root_path, &middle_path, &archived_path] {
+        let input = fs::File::open(path).expect("open rollout");
+        let output = fs::File::create(path.with_extension("jsonl.zst"))
+            .expect("create compressed rollout");
+        zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
+        fs::remove_file(path).expect("remove plain rollout");
+    }
+    let history = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: child,
+            include_archived: true,
+        })
+        .await
+        .expect("load complete history from compressed lineage");
+    assert_eq!(
+        serde_json::to_value(history).expect("serialize compressed history"),
+        serde_json::to_value(expected).expect("serialize expected history")
+    );
+    assert!([root_path, middle_path, archived_path].iter().all(|path| !path.exists()));
+}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -250,6 +360,35 @@ async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, d
         .await
         .expect_err("lineage should be invalid");
     assert!(err.to_string().contains(detail), "{err}");
+    let err = store
+        .load_history(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect_err("complete history should reject invalid lineage");
+    assert!(err.to_string().contains(detail), "{err}");
+}
+
+fn append_rollout_lines(path: &Path, items: impl IntoIterator<Item = (u64, RolloutItem)>) {
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open rollout for append");
+    for (ordinal, item) in items {
+        writeln!(file, "{}", rollout_line(ordinal, item)).expect("append rollout line");
+    }
+}
+
+fn turn_started(turn_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: turn_id.to_string(),
+        root_turn_id: None,
+        trace_id: None,
+        started_at: None,
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    }))
 }
 
 fn write_rollout(
