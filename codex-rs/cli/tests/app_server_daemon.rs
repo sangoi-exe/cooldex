@@ -660,7 +660,7 @@ fn packaged_daemon_launch(action: &str, initial: InitialDaemon) -> Result<()> {
         assert_eq!(standalone.join("current").canonicalize()?, cli_selection);
     }
     if action == "bootstrap" {
-        // This fixture's cli-package is generic and stable, so Missing installation follows the public update channel.
+        // Merge-safety anchor: this fixture's cli-package is generic and stable, so Missing installation follows the public update channel.
         assert_eq!(output["autoUpdateEnabled"], true);
     }
     Ok(())
