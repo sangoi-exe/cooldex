@@ -8,6 +8,7 @@ use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_thread_store::LoadThreadHistoryParams;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 
 use super::Session;
@@ -20,10 +21,26 @@ pub(crate) enum RecallIntervals {
     All(AllIntervals),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AllIntervals {
-    #[serde(rename = "all")]
     All,
+}
+
+impl<'de> Deserialize<'de> for AllIntervals {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "all" {
+            Ok(Self::All)
+        } else {
+            Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&value),
+                &"the string \"all\"",
+            ))
+        }
+    }
 }
 
 impl Default for RecallIntervals {

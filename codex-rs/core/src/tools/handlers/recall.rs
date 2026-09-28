@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::JsonSchema;
@@ -6,6 +7,10 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
+use serde::Deserializer;
+use serde::de::Error;
+use serde::de::MapAccess;
+use serde::de::Visitor;
 use serde_json::Value as JsonValue;
 
 use crate::context::ContextualUserFragment;
@@ -23,11 +28,49 @@ use crate::tools::registry::ToolExecutor;
 
 const TOOL_NAME: &str = "recall";
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Eq, PartialEq)]
 struct RecallArgs {
-    #[serde(default)]
     intervals: RecallIntervals,
+}
+
+impl<'de> Deserialize<'de> for RecallArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RecallArgsVisitor;
+
+        impl<'de> Visitor<'de> for RecallArgsVisitor {
+            type Value = RecallArgs;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object with an optional intervals property")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut intervals = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "intervals" => {
+                            if intervals.is_some() {
+                                return Err(A::Error::duplicate_field("intervals"));
+                            }
+                            intervals = Some(map.next_value()?);
+                        }
+                        _ => return Err(A::Error::unknown_field(&key, &["intervals"])),
+                    }
+                }
+                Ok(RecallArgs {
+                    intervals: intervals.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(RecallArgsVisitor)
+    }
 }
 
 struct RecallToolOutput {
