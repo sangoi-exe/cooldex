@@ -11,6 +11,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use codex_core::config::Config;
+use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 use serde::Deserialize;
 
 use super::CheckStatus;
@@ -41,8 +43,26 @@ struct ConfiguredUpdater {
 /// be treated as failures. A stale socket is a warning because it can explain
 /// client connection problems without proving the daemon itself is broken.
 pub(super) async fn background_server_check(config: &Config) -> DoctorCheck {
+    background_server_check_for_local_package_lane(
+        config,
+        InstallContext::current().local_package_lane(),
+    )
+    .await
+}
+
+async fn background_server_check_for_local_package_lane(
+    config: &Config,
+    local_package_lane: Option<LocalPackageLane>,
+) -> DoctorCheck {
     let mut details = Vec::new();
-    let state_dir = config.codex_home.join(STATE_DIR_NAME);
+    // Merge-safety anchor: doctor must inspect the daemon state namespace selected by the executable's typed local package lane while leaving unbound CODEX_HOME state unchanged.
+    let state_dir = match local_package_lane {
+        Some(local_package_lane) => config
+            .codex_home
+            .join(STATE_DIR_NAME)
+            .join(local_package_lane.package_root_component()),
+        None => config.codex_home.join(STATE_DIR_NAME),
+    };
     details.push(format!("daemon state dir: {}", state_dir.display()));
     push_file_detail(
         &mut details,
@@ -67,7 +87,16 @@ pub(super) async fn background_server_check(config: &Config) -> DoctorCheck {
     );
     push_configured_updater(&mut details, &state_dir.join(SETTINGS_FILE_NAME));
 
-    let socket_path = match codex_app_server::app_server_control_socket_path(&config.codex_home) {
+    let socket_path_result = match local_package_lane {
+        Some(local_package_lane) => {
+            codex_app_server::app_server_control_socket_path_for_local_package_lane(
+                &config.codex_home,
+                local_package_lane,
+            )
+        }
+        None => codex_app_server::app_server_control_socket_path(&config.codex_home),
+    };
+    let socket_path = match socket_path_result {
         Ok(socket_path) => socket_path,
         Err(err) => {
             return DoctorCheck::new(
@@ -247,9 +276,17 @@ mod tests {
             .expect("config")
     }
 
-    fn create_socket_placeholder(config: &Config) {
-        let socket_path = codex_app_server::app_server_control_socket_path(&config.codex_home)
-            .expect("socket path");
+    fn create_socket_placeholder(config: &Config, local_package_lane: Option<LocalPackageLane>) {
+        let socket_path = match local_package_lane {
+            Some(local_package_lane) => {
+                codex_app_server::app_server_control_socket_path_for_local_package_lane(
+                    &config.codex_home,
+                    local_package_lane,
+                )
+            }
+            None => codex_app_server::app_server_control_socket_path(&config.codex_home),
+        }
+        .expect("socket path");
         std::fs::create_dir_all(socket_path.parent().expect("socket parent"))
             .expect("create socket dir");
         std::fs::write(socket_path, "").expect("create socket placeholder");
@@ -260,10 +297,20 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = test_config(temp.path().to_path_buf()).await;
 
-        let check = background_server_check(&config).await;
+        let check = background_server_check_for_local_package_lane(&config, None).await;
 
         assert_eq!(check.status, CheckStatus::Ok);
         assert_eq!(check.summary, "background server is not running");
+        assert!(check.details.contains(&format!(
+            "daemon state dir: {}",
+            config.codex_home.join(STATE_DIR_NAME).display()
+        )));
+        assert!(check.details.contains(&format!(
+            "control socket: {}",
+            codex_app_server::app_server_control_socket_path(&config.codex_home)
+                .expect("generic socket")
+                .display()
+        )));
         assert!(check.details.contains(&"status: not running".to_string()));
         assert!(
             !check
@@ -290,9 +337,9 @@ mod tests {
     async fn failed_version_probe_reports_unavailable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config = test_config(temp.path().to_path_buf()).await;
-        create_socket_placeholder(&config);
+        create_socket_placeholder(&config, None);
 
-        let check = background_server_check(&config).await;
+        let check = background_server_check_for_local_package_lane(&config, None).await;
 
         assert_eq!(check.status, CheckStatus::Warning);
         assert_eq!(
@@ -324,7 +371,7 @@ mod tests {
         .expect("settings");
         let config = test_config(temp.path().to_path_buf()).await;
 
-        let check = background_server_check(&config).await;
+        let check = background_server_check_for_local_package_lane(&config, None).await;
         let details = check
             .details
             .iter()
@@ -342,6 +389,54 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         insta::assert_snapshot!("configured_updater", details);
+    }
+
+    #[tokio::test]
+    async fn local_package_lanes_use_their_daemon_state_and_control_socket() {
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let config = test_config(temp.path().to_path_buf()).await;
+            let state_dir = config
+                .codex_home
+                .join(STATE_DIR_NAME)
+                .join(local_package_lane.package_root_component());
+            std::fs::create_dir_all(&state_dir).expect("local lane state dir");
+            std::fs::write(
+                state_dir.join(SETTINGS_FILE_NAME),
+                r#"{"updater":{"autoUpdateEnabled":false}}"#,
+            )
+            .expect("settings");
+            create_socket_placeholder(&config, Some(local_package_lane));
+
+            let check =
+                background_server_check_for_local_package_lane(&config, Some(local_package_lane))
+                    .await;
+
+            assert_eq!(check.status, CheckStatus::Warning);
+            assert_eq!(
+                check.summary,
+                "background server socket is stale or unreachable"
+            );
+            assert!(
+                check
+                    .details
+                    .contains(&format!("daemon state dir: {}", state_dir.display()))
+            );
+            assert!(check.details.contains(&format!(
+                "control socket: {}",
+                codex_app_server::app_server_control_socket_path_for_local_package_lane(
+                    &config.codex_home,
+                    local_package_lane,
+                )
+                .expect("local lane socket")
+                .display()
+            )));
+            assert!(
+                check
+                    .details
+                    .contains(&"automatic updates: disabled (configured)".to_string())
+            );
+        }
     }
 
     #[test]

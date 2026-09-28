@@ -32,6 +32,18 @@ fn local_daemon(home: &Path, local_package_lane: LocalPackageLane) -> crate::Dae
     .expect("local daemon")
 }
 
+#[test]
+fn selected_cli_package_guidance_distinguishes_local_lanes() {
+    assert_eq!(
+        super::selected_cli_package_message(None),
+        "The CLI package is selected and pinned. Run `codex app-server daemon update` to return to production updates."
+    );
+    assert_eq!(
+        super::selected_cli_package_message(Some(LocalPackageLane::CdxDev)),
+        "The CLI package is selected and remains promotion-owned and pinned. Promote a newly complete package to update this daemon again."
+    );
+}
+
 fn package(root: &Path, version: &str) -> PathBuf {
     let target = super::platform_target().expect("target");
     for dir in ["bin", "codex-path", "codex-resources/nested"] {

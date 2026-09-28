@@ -346,6 +346,7 @@ async fn incomplete_environment_pair_emits_one_warning_per_thread() -> TestResul
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
 async fn incomplete_package_pair_does_not_fall_back_to_configured_paths() -> TestResult {
     let config = test_config_with_contents(
@@ -430,6 +431,7 @@ sky_bin = "{configured_sky_bin}"
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[tokio::test]
 async fn incomplete_config_pair_removes_server() -> TestResult {
     let config = test_config_with_contents(

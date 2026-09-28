@@ -132,7 +132,7 @@ async fn update_interval_accepts_long_values_and_rejects_zero() {
 }
 
 #[tokio::test]
-async fn telemetry_distinguishes_presence_from_default_values() -> anyhow::Result<()> {
+async fn telemetry_selects_generic_or_lane_settings() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let dir = home.path().join("app-server-daemon");
     tokio::fs::create_dir(&dir).await?;
@@ -146,7 +146,7 @@ async fn telemetry_distinguishes_presence_from_default_values() -> anyhow::Resul
     ] {
         tokio::fs::write(&path, contents).await?;
         assert_eq!(
-            crate::telemetry::settings_tags(home.path())
+            crate::telemetry::settings_tags_for_local_package_lane_or_default(home.path(), None)
                 .await
                 .map(|(_, value)| value),
             ["enabled", presence, presence, presence]
@@ -162,9 +162,18 @@ async fn telemetry_distinguishes_presence_from_default_values() -> anyhow::Resul
     )
     .await?;
     assert_eq!(
-        crate::telemetry::settings_tags_for_local_package_lane(home.path(), local_package_lane)
+        crate::telemetry::settings_tags_for_local_package_lane_or_default(home.path(), None)
             .await
             .map(|(_, value)| value),
+        ["enabled", "configured", "configured", "configured"]
+    );
+    assert_eq!(
+        crate::telemetry::settings_tags_for_local_package_lane_or_default(
+            home.path(),
+            Some(local_package_lane),
+        )
+        .await
+        .map(|(_, value)| value),
         ["disabled", "configured", "default", "default"]
     );
     Ok(())

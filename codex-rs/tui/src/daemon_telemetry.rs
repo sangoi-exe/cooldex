@@ -50,7 +50,12 @@ pub(super) async fn record_start(
         return;
     };
     if let Some(metrics) = otel.metrics() {
-        let mut tags = codex_app_server_daemon::telemetry::settings_tags(&config.codex_home)
+        // Merge-safety anchor: TUI startup telemetry reads daemon settings through the current typed package lane, retaining generic settings only for unbound execution.
+        let mut tags =
+            codex_app_server_daemon::telemetry::settings_tags_for_local_package_lane_or_default(
+                &config.codex_home,
+                codex_install_context::InstallContext::current().local_package_lane(),
+            )
             .await
             .to_vec();
         tags.extend([

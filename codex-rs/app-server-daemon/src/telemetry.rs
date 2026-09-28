@@ -33,6 +33,20 @@ pub async fn settings_tags_for_local_package_lane(
     .await
 }
 
+// Merge-safety anchor: foreground telemetry receives a resolved typed package lane here so local packages read only their own daemon settings while unbound execution retains the generic settings path.
+/// Reads daemon telemetry settings for a local package lane, or generic settings when unbound.
+pub async fn settings_tags_for_local_package_lane_or_default(
+    codex_home: &Path,
+    local_package_lane: Option<LocalPackageLane>,
+) -> [(&'static str, &'static str); 4] {
+    match local_package_lane {
+        Some(local_package_lane) => {
+            settings_tags_for_local_package_lane(codex_home, local_package_lane).await
+        }
+        None => settings_tags(codex_home).await,
+    }
+}
+
 async fn settings_tags_for_path(path: impl AsRef<Path>) -> [(&'static str, &'static str); 4] {
     crate::settings::telemetry_tags(path.as_ref())
         .await

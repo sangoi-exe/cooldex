@@ -162,6 +162,7 @@ pub(super) fn supported(daemon: &Daemon) -> Result<bool> {
 const UNSUPPORTED_MESSAGE: &str =
     "This command requires a daemon package selected from its managed releases directory.";
 
+// Merge-safety anchor: local package lanes are promotion-owned and pinned, so their unsupported manual-update result must not imply the generic managed-release remediation.
 pub(super) async fn unsupported(daemon: &Daemon) -> Result<UpdateOutput> {
     let managed_codex_path = daemon.current_managed_codex_bin()?;
     Ok(UpdateOutput {
@@ -172,7 +173,12 @@ pub(super) async fn unsupported(daemon: &Daemon) -> Result<UpdateOutput> {
             .ok()
             .map(|info| info.app_server_version),
         managed_codex_path,
-        message: UNSUPPORTED_MESSAGE.to_string(),
+        message: (if daemon.local_package_lane().is_some() {
+            "This local package lane is promotion-owned and pinned; promote a newly complete package to update its daemon."
+        } else {
+            UNSUPPORTED_MESSAGE
+        })
+        .to_string(),
     })
 }
 

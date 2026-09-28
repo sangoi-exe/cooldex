@@ -17,6 +17,7 @@ use crate::config_update::format_config_error;
 use crate::external_agent_config_migration::flow::ExternalAgentConfigMigrationFlowOutcome;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::session_resume::cwds_differ;
+use crate::update_action::DaemonUpdateSource;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ThreadGoalStatus;
 #[cfg(target_os = "windows")]
@@ -121,8 +122,12 @@ impl App {
             AppEvent::OpenDaemonMenu => self.open_daemon_menu(),
             AppEvent::ConfirmDaemonUpdate(source) => self.confirm_daemon_update(source),
             AppEvent::RunDaemonUpdate(source) => {
-                self.pending_update_action = Some(UpdateAction::Daemon(source));
-                return Ok(self.handle_exit_mode(app_server, ExitMode::Immediate).await);
+                if self.begin_daemon_update_handoff(
+                    source,
+                    codex_install_context::InstallContext::current().local_package_lane(),
+                ) {
+                    return Ok(self.handle_exit_mode(app_server, ExitMode::Immediate).await);
+                }
             }
             AppEvent::UserVerificationApproved { thread_id, server_name, request_id } => {
                 Box::pin(self.start_user_verification(app_server, thread_id, server_name, request_id)).await?;
@@ -3516,5 +3521,18 @@ impl App {
                 AppRunControl::Continue
             }
         })
+    }
+
+    // Merge-safety anchor: stale public-update events for a recognized local package lane must remain in the TUI because the pinned backend cannot execute that update.
+    pub(super) fn begin_daemon_update_handoff(
+        &mut self,
+        source: DaemonUpdateSource,
+        local_package_lane: Option<codex_install_context::LocalPackageLane>,
+    ) -> bool {
+        if local_package_lane.is_some() && source == DaemonUpdateSource::PublicStable {
+            return false;
+        }
+        self.pending_update_action = Some(UpdateAction::Daemon(source));
+        true
     }
 }

@@ -9,6 +9,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use codex_install_context::CodexPackageManifest;
 use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 
 use crate::Daemon;
 use crate::install_lock::acquire_install_lock;
@@ -72,8 +73,17 @@ pub async fn update_from_cli(
             .ok()
             .map(|info| info.app_server_version),
         managed_codex_path,
-        message: "The CLI package is selected and pinned. Run `codex app-server daemon update` to return to production updates.".to_string(),
+        message: selected_cli_package_message(daemon.local_package_lane()).to_string(),
     }))
+}
+
+// Merge-safety anchor: a local package lane stays promotion-owned after this selection; only an unbound daemon can return to public updates.
+fn selected_cli_package_message(local_package_lane: Option<LocalPackageLane>) -> &'static str {
+    if local_package_lane.is_some() {
+        "The CLI package is selected and remains promotion-owned and pinned. Promote a newly complete package to update this daemon again."
+    } else {
+        "The CLI package is selected and pinned. Run `codex app-server daemon update` to return to production updates."
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

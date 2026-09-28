@@ -28,6 +28,8 @@ pub(crate) use codex_app_server_transport::RemoteControlUnavailable;
 pub(crate) use codex_app_server_transport::TransportEvent;
 pub(crate) use codex_app_server_transport::acquire_app_server_startup_lock;
 pub use codex_app_server_transport::app_server_control_socket_path;
+// Merge-safety anchor: the app-server facade preserves typed local-package control-socket selection for CLI consumers without giving them a transport-crate dependency.
+pub use codex_app_server_transport::app_server_control_socket_path_for_local_package_lane;
 pub(crate) use codex_app_server_transport::app_server_startup_lock_path;
 pub(crate) use codex_app_server_transport::start_control_socket_acceptor;
 pub(crate) use codex_app_server_transport::start_remote_control;

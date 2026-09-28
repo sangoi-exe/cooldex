@@ -55,7 +55,6 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
-use codex_app_server_transport::app_server_control_socket_path_for_local_package_lane;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane;
 use codex_config::ConfigLayerSource;
@@ -160,6 +159,8 @@ pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
+// Merge-safety anchor: package-lane control-socket resolution remains available only through the existing app-server facade, matching the CLI's app-server dependency boundary.
+pub use crate::transport::app_server_control_socket_path_for_local_package_lane;
 pub use crate::transport::take_remote_control_disabled_env;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";

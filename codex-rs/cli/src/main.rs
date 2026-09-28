@@ -38,6 +38,7 @@ use codex_utils_cli::SharedCliOptions;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
@@ -1440,7 +1441,10 @@ async fn cli_main(
                         Some(socket_path) => socket_path,
                         None => {
                             let codex_home = find_codex_home()?;
-                            codex_app_server::app_server_control_socket_path(&codex_home)?
+                            app_server_proxy_socket_path(
+                                &codex_home,
+                                InstallContext::current().local_package_lane(),
+                            )?
                         }
                     };
                     codex_stdio_to_uds::run(socket_path.as_path()).await?;
@@ -2422,6 +2426,23 @@ fn app_server_transport_for_listen_url(
             )
         }
         None => codex_app_server::AppServerTransport::from_listen_url(listen_url),
+    }
+    .map_err(anyhow::Error::from)
+}
+
+// Merge-safety anchor: implicit app-server proxy connections inherit only the current executable's typed local package lane; explicit --sock routing stays in the dispatch branch above.
+fn app_server_proxy_socket_path(
+    codex_home: &Path,
+    local_package_lane: Option<LocalPackageLane>,
+) -> anyhow::Result<AbsolutePathBuf> {
+    match local_package_lane {
+        Some(local_package_lane) => {
+            codex_app_server::app_server_control_socket_path_for_local_package_lane(
+                codex_home,
+                local_package_lane,
+            )
+        }
+        None => codex_app_server::app_server_control_socket_path(codex_home),
     }
     .map_err(anyhow::Error::from)
 }
@@ -4792,6 +4813,29 @@ mod tests {
                     .expect("unchanged transport"),
                 codex_app_server::AppServerTransport::from_listen_url(listen_url)
                     .expect("generic transport")
+            );
+        }
+    }
+
+    #[test]
+    fn app_server_proxy_uses_the_local_package_lane_or_generic_control_socket() {
+        let codex_home = tempfile::tempdir().expect("codex home");
+
+        assert_eq!(
+            app_server_proxy_socket_path(codex_home.path(), None).expect("generic socket"),
+            codex_app_server::app_server_control_socket_path(codex_home.path())
+                .expect("expected generic socket")
+        );
+
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            assert_eq!(
+                app_server_proxy_socket_path(codex_home.path(), Some(local_package_lane))
+                    .expect("local lane socket"),
+                codex_app_server::app_server_control_socket_path_for_local_package_lane(
+                    codex_home.path(),
+                    local_package_lane,
+                )
+                .expect("expected local lane socket")
             );
         }
     }

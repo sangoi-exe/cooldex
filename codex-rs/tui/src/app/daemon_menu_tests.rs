@@ -99,7 +99,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         (100, DaemonUpdateSource::ThisCli, "daemon_cli_confirmation"),
     ] {
         app.daemon_cli_executable = executable.clone();
-        app.open_daemon_menu();
+        app.open_daemon_menu_for_local_package_lane(None);
         if source == DaemonUpdateSource::PublicStable {
             insta::assert_snapshot!(
                 "daemon_menu",
@@ -121,7 +121,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
             })
             .unwrap(),
         );
-        app.confirm_daemon_update(source);
+        app.confirm_daemon_update_for_local_package_lane(source, None);
         insta::assert_snapshot!(
             snapshot,
             render_bottom_popup(&app.chat_widget, width)
@@ -131,7 +131,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         app.chat_widget.handle_key_event(KeyCode::Enter.into());
         assert!(rx.try_recv().is_err());
         assert_eq!(app.pending_update_action, None);
-        app.confirm_daemon_update(source);
+        app.confirm_daemon_update_for_local_package_lane(source, None);
         app.chat_widget.handle_key_event(KeyCode::Down.into());
         app.chat_widget.handle_key_event(KeyCode::Enter.into());
         assert!(
@@ -147,7 +147,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         DaemonUpdateSource::PublicStable,
         DaemonUpdateSource::ThisCli,
     ] {
-        app.open_daemon_menu();
+        app.open_daemon_menu_for_local_package_lane(None);
         if source == DaemonUpdateSource::PublicStable {
             insta::assert_snapshot!(
                 "daemon_disconnected",
@@ -161,11 +161,11 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
         assert!(
             matches!(rx.try_recv().unwrap(), AppEvent::ConfirmDaemonUpdate(selected) if selected == source)
         );
-        app.confirm_daemon_update(source);
+        app.confirm_daemon_update_for_local_package_lane(source, None);
         app.chat_widget.handle_key_event(KeyCode::Enter.into());
         assert!(rx.try_recv().is_err());
         assert_eq!(app.pending_update_action, None);
-        app.confirm_daemon_update(source);
+        app.confirm_daemon_update_for_local_package_lane(source, None);
         app.chat_widget.handle_key_event(KeyCode::Down.into());
         app.chat_widget.handle_key_event(KeyCode::Enter.into());
         assert!(
@@ -177,7 +177,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
     // The full CLI can have any filename; capability comes from its entry point.
     app.daemon_cli_executable =
         Some(AbsolutePathBuf::from_absolute_path(package.path().join("bin/codex-tui")).unwrap());
-    app.open_daemon_menu();
+    app.open_daemon_menu_for_local_package_lane(None);
     insta::assert_snapshot!(
         "daemon_unpackaged_cli",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -189,7 +189,7 @@ async fn daemon_menu_is_read_only_and_confirmation_can_cancel_or_handoff() {
     ));
 
     app.daemon_cli_executable = None;
-    app.open_daemon_menu();
+    app.open_daemon_menu_for_local_package_lane(None);
     insta::assert_snapshot!(
         "daemon_no_cli_handoff",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -216,7 +216,7 @@ async fn unavailable_daemon_menu_offers_guidance_without_update_actions() {
         version: "v0.153.0".into(),
         is_local_daemon: false,
     });
-    app.open_daemon_menu();
+    app.open_daemon_menu_for_local_package_lane(None);
     insta::assert_snapshot!(
         "daemon_remote_guidance",
         render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -224,4 +224,58 @@ async fn unavailable_daemon_menu_offers_guidance_without_update_actions() {
     app.chat_widget.handle_key_event(KeyCode::Enter.into());
     assert!(rx.try_recv().is_err());
     assert_eq!(app.pending_update_action, None);
+}
+
+#[tokio::test]
+async fn local_package_lane_daemon_menu_hides_public_stable_and_rejects_stale_events() {
+    let mut app = make_test_app().await;
+    let (chat, _, mut rx, _) = make_chatwidget_manual_with_sender().await;
+    app.chat_widget = chat;
+    let package = tempfile::tempdir().unwrap();
+    std::fs::create_dir(package.path().join("bin")).unwrap();
+    std::fs::write(package.path().join("bin/codex"), "CLI").unwrap();
+    std::fs::write(package.path().join("codex-package.json"), "{}").unwrap();
+    app.daemon_cli_executable =
+        Some(AbsolutePathBuf::from_absolute_path(package.path().join("bin/codex")).unwrap());
+    app.app_server_target = AppServerTarget::Embedded;
+
+    app.open_daemon_menu_for_local_package_lane(Some(LocalPackageLane::Codex));
+    insta::assert_snapshot!(
+        "daemon_local_package_lane_menu",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
+    app.confirm_daemon_update_for_local_package_lane(
+        DaemonUpdateSource::PublicStable,
+        Some(LocalPackageLane::Codex),
+    );
+    assert!(
+        !render_bottom_popup(&app.chat_widget, /*width*/ 80)
+            .contains("Update daemon and exit Codex?")
+    );
+    assert!(rx.try_recv().is_err());
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        AppEvent::ConfirmDaemonUpdate(DaemonUpdateSource::ThisCli)
+    ));
+
+    assert!(!app.begin_daemon_update_handoff(
+        DaemonUpdateSource::PublicStable,
+        Some(LocalPackageLane::Codex),
+    ));
+    assert_eq!(app.pending_update_action, None);
+
+    assert!(app.begin_daemon_update_handoff(
+        DaemonUpdateSource::ThisCli,
+        Some(LocalPackageLane::Codex),
+    ));
+    assert!(matches!(
+        app.pending_update_action,
+        Some(UpdateAction::Daemon(DaemonUpdateSource::ThisCli))
+    ));
+    assert!(app.begin_daemon_update_handoff(DaemonUpdateSource::PublicStable, None));
+    assert!(matches!(
+        app.pending_update_action,
+        Some(UpdateAction::Daemon(DaemonUpdateSource::PublicStable))
+    ));
 }

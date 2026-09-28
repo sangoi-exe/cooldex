@@ -343,6 +343,33 @@ fn local_package_lane_is_rejected_from_public_update_selection() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn unsupported_manual_update_guidance_distinguishes_local_package_lanes() {
+    let home = TempDir::new().expect("home");
+    let (generic, _) = manual_update_daemon(&home);
+    let generic_output = super::manual_update::unsupported(&generic)
+        .await
+        .expect("generic unsupported output");
+    assert_eq!(
+        generic_output.message,
+        "This command requires a daemon package selected from its managed releases directory."
+    );
+
+    let local = Daemon::from_owner(
+        home.path(),
+        DaemonOwner::LocalPackageLane(LocalPackageLane::Codex),
+    )
+    .expect("local daemon");
+    let local_output = super::manual_update::unsupported(&local)
+        .await
+        .expect("local unsupported output");
+    assert_eq!(
+        local_output.message,
+        "This local package lane is promotion-owned and pinned; promote a newly complete package to update its daemon."
+    );
+}
+
+#[cfg(unix)]
 fn test_terminate() -> tokio::signal::unix::Signal {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install test signal handler")

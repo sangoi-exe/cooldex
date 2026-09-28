@@ -90,8 +90,11 @@ impl Drop for TestDaemon {
             let _ = child.wait();
         }
         let _ = self.lifecycle("stop");
-        if let Ok(pid) = self.pid("app-server-updater.pid") {
-            let _ = signal(pid, libc::SIGTERM);
+        for name in ["daemon-updater.pid", "app-server-updater.pid"] {
+            if let Ok(pid) = self.pid(name) {
+                let _ = signal(pid, libc::SIGTERM);
+                let _ = wait_for_exit(pid);
+            }
         }
     }
 }
@@ -657,7 +660,8 @@ fn packaged_daemon_launch(action: &str, initial: InitialDaemon) -> Result<()> {
         assert_eq!(standalone.join("current").canonicalize()?, cli_selection);
     }
     if action == "bootstrap" {
-        assert_eq!(output["autoUpdateEnabled"], false);
+        // This fixture's cli-package is generic and stable, so Missing installation follows the public update channel.
+        assert_eq!(output["autoUpdateEnabled"], true);
     }
     Ok(())
 }
@@ -673,7 +677,7 @@ fn packaged_daemon_restart_seeds_local_package() -> Result<()> {
 }
 
 #[test]
-fn packaged_daemon_bootstrap_seeds_local_package() -> Result<()> {
+fn packaged_daemon_bootstrap_seeds_generic_stable_package() -> Result<()> {
     packaged_daemon_launch("bootstrap", InitialDaemon::Missing)
 }
 

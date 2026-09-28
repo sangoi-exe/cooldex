@@ -678,9 +678,13 @@ pub(super) async fn run_main_inner(
         (AppServerTarget::Embedded, None) => "auto_start_disabled",
     };
     let daemon_settings = if metrics.is_some() {
-        codex_app_server_daemon::telemetry::settings_tags(&config.codex_home)
-            .await
-            .to_vec()
+        // Merge-safety anchor: TUI launch telemetry reads daemon settings through the current typed package lane, retaining generic settings only for unbound execution.
+        codex_app_server_daemon::telemetry::settings_tags_for_local_package_lane_or_default(
+            &config.codex_home,
+            codex_install_context::InstallContext::current().local_package_lane(),
+        )
+        .await
+        .to_vec()
     } else {
         Vec::new()
     };

@@ -6,6 +6,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::update_action::DaemonUpdateSource;
 use crate::wrapping::word_wrap_lines;
+use codex_install_context::LocalPackageLane;
 use ratatui::buffer::Buffer;
 use ratatui::widgets::Paragraph;
 
@@ -27,6 +28,16 @@ impl Renderable for DaemonMenuHeader {
 
 impl App {
     pub(super) fn open_daemon_menu(&mut self) {
+        self.open_daemon_menu_for_local_package_lane(
+            codex_install_context::InstallContext::current().local_package_lane(),
+        );
+    }
+
+    // Merge-safety anchor: recognized local package lanes are promotion-owned and pinned, so the TUI must not offer their unsupported public daemon-update route.
+    fn open_daemon_menu_for_local_package_lane(
+        &mut self,
+        local_package_lane: Option<LocalPackageLane>,
+    ) {
         let status = self
             .chat_widget
             .remote_connection
@@ -64,6 +75,9 @@ impl App {
             (DaemonUpdateSource::ThisCli, "Use this CLI build"),
         ]
         .into_iter()
+        .filter(|(source, _)| {
+            local_package_lane.is_none() || *source != DaemonUpdateSource::PublicStable
+        })
         .map(|(source, name)| SelectionItem {
             name: name.to_string(),
             is_disabled: unavailable.is_some(),
@@ -86,6 +100,20 @@ impl App {
     }
 
     pub(super) fn confirm_daemon_update(&mut self, source: DaemonUpdateSource) {
+        self.confirm_daemon_update_for_local_package_lane(
+            source,
+            codex_install_context::InstallContext::current().local_package_lane(),
+        );
+    }
+
+    fn confirm_daemon_update_for_local_package_lane(
+        &mut self,
+        source: DaemonUpdateSource,
+        local_package_lane: Option<LocalPackageLane>,
+    ) {
+        if local_package_lane.is_some() && source == DaemonUpdateSource::PublicStable {
+            return;
+        }
         let Some(executable) = &self.daemon_cli_executable else {
             return;
         };
