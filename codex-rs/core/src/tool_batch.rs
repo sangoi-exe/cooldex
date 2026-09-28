@@ -29,7 +29,6 @@ pub(crate) struct CompleteToolBatch {
 }
 
 pub(crate) struct IncompleteToolBatch {
-    pub(crate) end: usize,
     pub(crate) reason: &'static str,
 }
 
@@ -145,18 +144,15 @@ pub(crate) fn tool_batch_at(
 
     if !saw_output {
         return Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-            end,
             reason: "no_matching_tool_outputs",
         })));
     }
     if let Some(reason) = incomplete_reason {
         return Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-            end,
             reason,
         })));
     }
     Ok(Some(ToolBatchMatch::Incomplete(IncompleteToolBatch {
-        end,
         reason: "incomplete_or_asymmetric_tool_batch",
     })))
 }
