@@ -95,9 +95,7 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
     {
         Box::pin(async move {
             let ToolInvocation {
-                session,
-                payload,
-                ..
+                session, payload, ..
             } = invocation;
             let arguments = match payload {
                 ToolPayload::Function { arguments } => arguments,
@@ -112,7 +110,9 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
                 .load_current_thread_recall_context(args.intervals)
                 .await
                 .map_err(|error| {
-                    FunctionCallError::RespondToModel(format!("failed to recall thread history: {error:#}"))
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to recall thread history: {error:#}"
+                    ))
                 })?;
             let code_mode_result = serde_json::from_str(context.json()).map_err(|err| {
                 FunctionCallError::RespondToModel(format!(

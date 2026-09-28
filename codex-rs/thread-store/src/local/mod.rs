@@ -1711,8 +1711,8 @@ mod tests {
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let uuid = uuid::Uuid::from_u128(/*v*/ 409);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
-        let rollout_path = write_session_file(home.path(), "2025-01-04T10-00-00", uuid)
-            .expect("session file");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-04T10-00-00", uuid).expect("session file");
         let (items, _, _) = RolloutRecorder::load_rollout_items(rollout_path.as_path())
             .await
             .expect("load legacy rollout");

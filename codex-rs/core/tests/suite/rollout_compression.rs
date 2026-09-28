@@ -63,7 +63,8 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     )
     .await?;
     test.codex.flush_rollout().await?;
-    let persisted_answer = test.thread_store
+    let persisted_answer = test
+        .thread_store
         .load_history(LoadThreadHistoryParams {
             thread_id: test.session_configured.thread_id,
             include_archived: false,
@@ -73,7 +74,10 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .into_iter()
         .find_map(|item| match item {
             RolloutItem::ResponseItem(envelope)
-                if envelope.item.id().is_some_and(|id| id.as_str() == "reply") => Some(envelope.item),
+                if envelope.item.id().is_some_and(|id| id.as_str() == "reply") =>
+            {
+                Some(envelope.item)
+            }
             _ => None,
         })
         .context("persisted answer before checkpoint")?;

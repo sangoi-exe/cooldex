@@ -115,7 +115,11 @@ fn selects_newest_closed_intervals_without_skipping_empty_intervals() {
 fn no_compaction_returns_no_intervals() {
     let items = vec![
         response(message("assistant", "uncompacted answer")),
-        response(reasoning(&["visible summary"], &[], /*encrypted_content*/ None)),
+        response(reasoning(
+            &["visible summary"],
+            &[],
+            /*encrypted_content*/ None,
+        )),
     ];
 
     for intervals in [
@@ -132,7 +136,10 @@ fn one_compaction_closes_start_to_first_without_emitting_replacement_or_suffix()
     let before = message("assistant", "persisted before compaction");
     let items = vec![
         response(before.clone()),
-        compacted(Some(vec![message("assistant", "synthetic replacement history")])),
+        compacted(Some(vec![message(
+            "assistant",
+            "synthetic replacement history",
+        )])),
         response(message("assistant", "current open suffix")),
     ];
 
@@ -155,7 +162,8 @@ fn returns_only_assistant_messages_and_visible_reasoning_in_persisted_order() {
         "summary": [],
         "content": [{"type": "text", "text": "visible text"}],
         "encrypted_content": "encrypted text"
-    })).unwrap();
+    }))
+    .unwrap();
     let mut items = vec![
         response(message("system", "system instructions")),
         response(message("developer", "developer instructions")),
@@ -197,7 +205,9 @@ fn returns_only_assistant_messages_and_visible_reasoning_in_persisted_order() {
         json!({"type": "compaction_trigger"}),
         json!({"type": "other"}),
     ] {
-        items.push(response(serde_json::from_value(item).expect("canonical response fixture")));
+        items.push(response(
+            serde_json::from_value(item).expect("canonical response fixture"),
+        ));
     }
     items.push(compacted(/*replacement_history*/ None));
     let expected_summary = json!({
@@ -244,5 +254,8 @@ fn persisted_compaction_markers_are_not_reinterpreted_by_rollback_events() {
         })),
     ];
 
-    assert_eq!(parsed(&items, RecallIntervals::All(AllIntervals::All)), json!([[first], [second]]));
+    assert_eq!(
+        parsed(&items, RecallIntervals::All(AllIntervals::All)),
+        json!([[first], [second]])
+    );
 }

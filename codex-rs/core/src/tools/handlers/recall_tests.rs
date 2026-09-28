@@ -16,7 +16,10 @@ fn arguments_default_to_one_and_accept_a_positive_count_or_all() {
             r#"{"intervals":3}"#,
             RecallIntervals::Count(NonZeroUsize::new(/*n*/ 3).unwrap()),
         ),
-        (r#"{"intervals":"all"}"#, RecallIntervals::All(AllIntervals::All)),
+        (
+            r#"{"intervals":"all"}"#,
+            RecallIntervals::All(AllIntervals::All),
+        ),
     ] {
         let args: RecallArgs = parse_arguments(arguments).expect("valid recall arguments");
         assert_eq!(args.intervals, expected);

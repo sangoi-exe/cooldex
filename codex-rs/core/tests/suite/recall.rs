@@ -86,7 +86,9 @@ fn user_turn(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
 #[test_case(r#"{"intervals":"all"}"#; "all intervals")]
 #[test_case(r#"{"intervals":8}"#; "clamped count")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(arguments: &str) -> Result<()> {
+async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
+    arguments: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -131,7 +133,8 @@ async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
     })
     .await;
     test.codex.flush_rollout().await?;
-    let persisted_answer = test.thread_store
+    let persisted_answer = test
+        .thread_store
         .load_history(LoadThreadHistoryParams {
             thread_id: test.session_configured.thread_id,
             include_archived: false,
@@ -141,7 +144,13 @@ async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
         .into_iter()
         .find_map(|item| match item {
             RolloutItem::ResponseItem(envelope)
-                if envelope.item.id().is_some_and(|id| id.as_str() == "old-answer") => Some(envelope.item),
+                if envelope
+                    .item
+                    .id()
+                    .is_some_and(|id| id.as_str() == "old-answer") =>
+            {
+                Some(envelope.item)
+            }
             _ => None,
         })
         .context("persisted answer before compaction")?;

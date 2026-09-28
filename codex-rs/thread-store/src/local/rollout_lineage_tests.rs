@@ -39,20 +39,31 @@ async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
     );
     append_rollout_lines(
         root_path.as_path(),
-        [(1, root_item.clone()), (7, turn_started("excluded root suffix"))],
+        [
+            (1, root_item.clone()),
+            (7, turn_started("excluded root suffix")),
+        ],
     );
     let root_end = history_position(root_path.as_path(), root, /*end_ordinal_exclusive*/ 4);
     let middle_path = write_rollout(home.path(), middle, Some(root_end), /*next_ordinal*/ 1);
     append_rollout_lines(
         middle_path.as_path(),
-        [(6, middle_item.clone()), (9, turn_started("excluded middle suffix"))],
+        [
+            (6, middle_item.clone()),
+            (9, turn_started("excluded middle suffix")),
+        ],
     );
     let middle_end = history_position(
         middle_path.as_path(),
         middle,
         /*end_ordinal_exclusive*/ 7,
     );
-    let child_path = write_rollout(home.path(), child, Some(middle_end), /*next_ordinal*/ 1);
+    let child_path = write_rollout(
+        home.path(),
+        child,
+        Some(middle_end),
+        /*next_ordinal*/ 1,
+    );
     append_rollout_lines(child_path.as_path(), [(8, child_item.clone())]);
     let session_meta = codex_rollout::read_session_meta_line(child_path.as_path())
         .await
@@ -106,8 +117,8 @@ async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
 
     for path in [&root_path, &middle_path, &archived_path] {
         let input = fs::File::open(path).expect("open rollout");
-        let output = fs::File::create(path.with_extension("jsonl.zst"))
-            .expect("create compressed rollout");
+        let output =
+            fs::File::create(path.with_extension("jsonl.zst")).expect("create compressed rollout");
         zstd::stream::copy_encode(input, output, /*level*/ 3).expect("compress rollout");
         fs::remove_file(path).expect("remove plain rollout");
     }
@@ -122,7 +133,11 @@ async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
         serde_json::to_value(history).expect("serialize compressed history"),
         serde_json::to_value(expected).expect("serialize expected history")
     );
-    assert!([root_path, middle_path, archived_path].iter().all(|path| !path.exists()));
+    assert!(
+        [root_path, middle_path, archived_path]
+            .iter()
+            .all(|path| !path.exists())
+    );
 }
 
 #[cfg(unix)]

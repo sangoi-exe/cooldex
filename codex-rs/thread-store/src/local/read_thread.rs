@@ -41,7 +41,8 @@ pub(super) async fn load_history(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
 ) -> ThreadStoreResult<StoredThreadHistory> {
-    let thread = if let Ok(rollout_path) = live_writer::rollout_path(store, params.thread_id).await {
+    let thread = if let Ok(rollout_path) = live_writer::rollout_path(store, params.thread_id).await
+    {
         if !params.include_archived
             && rollout_path_is_archived(store.config.codex_home.as_path(), rollout_path.as_path())
         {

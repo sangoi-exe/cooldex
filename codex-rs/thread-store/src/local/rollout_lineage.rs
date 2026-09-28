@@ -250,7 +250,8 @@ impl RolloutLineage {
         tokio::task::spawn_blocking(move || {
             let mut items = vec![RolloutItem::SessionMeta(session_meta)];
             for segment in self.segments() {
-                let file = codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+                let file =
+                    codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
                 let end_byte_offset = segment.end.map_or(u64::MAX, |end| end.end_byte_offset);
                 let reader = BufReader::new(file.take(end_byte_offset));
                 for line in reader.lines() {
@@ -258,7 +259,8 @@ impl RolloutLineage {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let line = codex_rollout::parse_rollout_line(&line).map_err(io::Error::other)?;
+                    let line =
+                        codex_rollout::parse_rollout_line(&line).map_err(io::Error::other)?;
                     if matches!(line.item, RolloutItem::SessionMeta(_)) {
                         continue;
                     }

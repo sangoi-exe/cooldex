@@ -114,14 +114,17 @@ fn build_recall_context(
                         ) || content.iter().flatten().any(|entry| match entry {
                             ReasoningItemContent::ReasoningText { text }
                             | ReasoningItemContent::Text { text } => !text.is_empty(),
-                        }) => Some(RecallItem::Reasoning(RecallReasoning {
-                            item_type: "reasoning",
-                            id: id.as_ref(),
-                            summary,
-                            content: content.as_deref(),
-                            internal_chat_message_metadata_passthrough:
-                                internal_chat_message_metadata_passthrough.as_ref(),
-                        })),
+                        }) =>
+                        {
+                            Some(RecallItem::Reasoning(RecallReasoning {
+                                item_type: "reasoning",
+                                id: id.as_ref(),
+                                summary,
+                                content: content.as_deref(),
+                                internal_chat_message_metadata_passthrough:
+                                    internal_chat_message_metadata_passthrough.as_ref(),
+                            }))
+                        }
                         _ => None,
                     }
                 })
