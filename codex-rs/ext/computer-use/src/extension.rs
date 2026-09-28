@@ -160,7 +160,7 @@ impl RuntimeLocator {
                     package_resources.mcp_bin.as_deref(),
                     package_resources.sky_bin.as_deref(),
                 ) {
-                    (None, None) => resolve_configured_runtime_pair(configured)?,
+                    (None, None) => return Err(INCOMPLETE_PACKAGE_RUNTIME_PAIR_REASON),
                     (mcp_bin, sky_bin) => resolve_runtime_pair(
                         mcp_bin,
                         sky_bin,

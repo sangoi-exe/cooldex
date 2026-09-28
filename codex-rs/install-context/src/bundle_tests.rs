@@ -159,6 +159,54 @@ fn local_package_lane_follows_a_canonical_selector_symlink() -> std::io::Result<
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn selected_cdx_dev_source_and_managed_releases_bind_the_same_lane_and_resources()
+-> std::io::Result<()> {
+    let home = tempfile::tempdir()?;
+
+    for package_path in [
+        PathBuf::from(LocalPackageLane::CdxDev.package_root_component()),
+        PathBuf::from(MANAGED_DAEMON_PACKAGES_DIRNAME)
+            .join(LocalPackageLane::CdxDev.package_root_component()),
+    ] {
+        let (executable, mcp_bin, sky_bin) = create_package_release(home.path(), &package_path)?;
+        let selector = home
+            .path()
+            .join("packages")
+            .join(&package_path)
+            .join("current");
+        std::os::unix::fs::symlink(
+            executable
+                .parent()
+                .and_then(Path::parent)
+                .expect("package executable should have a release directory"),
+            &selector,
+        )?;
+        let context = InstallContext::from_exe_with_codex_home(
+            /*is_macos*/ false,
+            /*current_exe*/ Some(&selector.join("bin/codex")),
+            /*method_override*/ None,
+            /*codex_home*/ Some(home.path()),
+        );
+
+        assert_eq!(
+            context.local_package_lane_with_codex_home(home.path()),
+            Some(LocalPackageLane::CdxDev)
+        );
+        assert_eq!(
+            context.bundled_resource(COMPUTER_USE_MCP_RESOURCE_NAME),
+            Some(canonical_absolute_path(&mcp_bin).expect("MCP resource should canonicalize"))
+        );
+        assert_eq!(
+            context.bundled_resource(SKY_RESOURCE_NAME),
+            Some(canonical_absolute_path(&sky_bin).expect("Sky resource should canonicalize"))
+        );
+    }
+
+    Ok(())
+}
+
 fn create_package_release(
     home: &Path,
     package_path: &Path,

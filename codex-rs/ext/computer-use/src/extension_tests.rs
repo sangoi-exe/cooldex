@@ -101,42 +101,37 @@ shutdown_grace_period = 3000
     ))
     .await?;
 
-    for package_resources in [None, Some(PackageRuntimeResources::default())] {
-        let contributions = contribute_global(
-            &config,
-            RuntimeLocator::new_for_test_with_package_resources(
-                RuntimePathOverrides::default(),
-                package_resources,
-            ),
-        )
-        .await;
+    let contributions = contribute_global(
+        &config,
+        RuntimeLocator::new_for_test(RuntimePathOverrides::default()),
+    )
+    .await;
 
-        let [McpServerContribution::Set { name, config }] = contributions.as_slice() else {
-            panic!("expected one computer_use registration");
-        };
-        assert_eq!(name, COMPUTER_USE_SERVER_NAME);
-        let McpServerTransportConfig::Stdio { command, args, .. } = &config.transport else {
-            panic!("computer_use should use stdio transport");
-        };
-        assert_eq!(Path::new(command), mcp_bin.as_path());
-        assert_eq!(
-            args,
-            &vec![
-                "--sky-bin".to_string(),
-                sky_bin.display().to_string(),
-                "--xvfb".to_string(),
-                "/usr/bin/Xvfb".to_string(),
-                "--openbox".to_string(),
-                "/usr/bin/openbox".to_string(),
-                "--temp-root".to_string(),
-                "/tmp/codex-computer-use".to_string(),
-                "--display-ready-timeout-ms".to_string(),
-                "7000".to_string(),
-                "--shutdown-grace-period-ms".to_string(),
-                "3000".to_string(),
-            ]
-        );
-    }
+    let [McpServerContribution::Set { name, config }] = contributions.as_slice() else {
+        panic!("expected one computer_use registration");
+    };
+    assert_eq!(name, COMPUTER_USE_SERVER_NAME);
+    let McpServerTransportConfig::Stdio { command, args, .. } = &config.transport else {
+        panic!("computer_use should use stdio transport");
+    };
+    assert_eq!(Path::new(command), mcp_bin.as_path());
+    assert_eq!(
+        args,
+        &vec![
+            "--sky-bin".to_string(),
+            sky_bin.display().to_string(),
+            "--xvfb".to_string(),
+            "/usr/bin/Xvfb".to_string(),
+            "--openbox".to_string(),
+            "/usr/bin/openbox".to_string(),
+            "--temp-root".to_string(),
+            "/tmp/codex-computer-use".to_string(),
+            "--display-ready-timeout-ms".to_string(),
+            "7000".to_string(),
+            "--shutdown-grace-period-ms".to_string(),
+            "3000".to_string(),
+        ]
+    );
 
     Ok(())
 }
@@ -373,6 +368,50 @@ sky_bin = "/tmp/configured-sky"
         ),
         sink.clone(),
         "thread-incomplete-package",
+    )
+    .await;
+
+    assert!(matches!(
+        contributions.as_slice(),
+        [McpServerContribution::Remove { name }] if name == COMPUTER_USE_SERVER_NAME
+    ));
+    let warnings = sink.warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0]
+            .message
+            .contains("package runtime requires both codex-computer-use-mcp and sky_linux_x64")
+    );
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+async fn missing_package_pair_does_not_fall_back_to_valid_configured_paths() -> TestResult {
+    let tempdir = tempfile::tempdir()?;
+    let configured_sky_bin = vendored_artifact_path(VENDORED_SKY_LINUX_X64);
+    let configured_mcp_bin = tempdir.path().join("configured-codex-computer-use-mcp");
+    copy_executable(&configured_sky_bin, &configured_mcp_bin)?;
+    let config = test_config_with_contents(&format!(
+        r#"[features.computer_use]
+enabled = true
+mcp_bin = "{configured_mcp_bin}"
+sky_bin = "{configured_sky_bin}"
+"#,
+        configured_mcp_bin = configured_mcp_bin.display(),
+        configured_sky_bin = configured_sky_bin.display(),
+    ))
+    .await?;
+    let sink = Arc::new(RecordingEventSink::default());
+    let contributions = contribute_for_thread(
+        &config,
+        RuntimeLocator::new_for_test_with_package_resources(
+            RuntimePathOverrides::default(),
+            Some(PackageRuntimeResources::default()),
+        ),
+        sink.clone(),
+        "thread-missing-package",
     )
     .await;
 

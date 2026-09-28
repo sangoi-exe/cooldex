@@ -42,7 +42,9 @@ fn package(root: &Path, version: &str) -> PathBuf {
     for file in [
         "bin/codex-code-mode-host",
         "codex-path/rg",
+        "codex-resources/codex-computer-use-mcp",
         "codex-resources/nested/runtime",
+        "codex-resources/sky_linux_x64",
     ] {
         std::fs::write(root.join(file), b"runtime").expect("package file");
         if file != "codex-resources/nested/runtime" {
@@ -170,6 +172,70 @@ async fn local_lane_packages_are_isolated_and_pinned() {
     assert!(!codex_root.join("auto-update-version").exists());
     assert!(!cdx_dev_root.join("auto-update-version").exists());
     assert!(!home.join("packages/app-server-daemon/current").exists());
+}
+
+#[tokio::test]
+async fn selected_cdx_dev_package_uses_only_its_managed_domain() {
+    let temp = tempfile::TempDir::new().expect("temp");
+    let home = temp.path().join("home");
+    let source = home.join("packages/local-cdx-dev/releases/source");
+    let source_bin = package(&source, "0.153.0");
+    let daemon = local_daemon(&home, LocalPackageLane::CdxDev);
+
+    prepare_from_package(
+        &daemon,
+        &DaemonSettings::default(),
+        InstallMode::Missing,
+        Some(&source),
+        &source_bin,
+        |_| Ok(true),
+    )
+    .await
+    .expect("seed cdx-dev lane");
+
+    let managed_root = home.join("packages/app-server-daemon/local-cdx-dev");
+    let selected = managed_root
+        .join("current")
+        .canonicalize()
+        .expect("cdx-dev selection");
+    assert_eq!(daemon.managed_package_root(), managed_root);
+    assert_eq!(
+        daemon.socket_path,
+        home.join("app-server-control/local-cdx-dev/app-server-control.sock")
+    );
+    assert_eq!(
+        daemon.settings_file,
+        home.join("app-server-daemon/local-cdx-dev/settings.json")
+    );
+    assert!(validate_package(&selected).is_ok());
+    assert_eq!(
+        std::fs::read(selected.join("bin/codex")).expect("managed cdx-dev binary"),
+        std::fs::read(&source_bin).expect("source cdx-dev binary")
+    );
+    for resource in [
+        "codex-resources/codex-computer-use-mcp",
+        "codex-resources/nested/runtime",
+        "codex-resources/sky_linux_x64",
+    ] {
+        assert_eq!(
+            std::fs::read(selected.join(resource)).expect("managed resource"),
+            std::fs::read(source.join(resource)).expect("source resource")
+        );
+    }
+    assert!(!home.join("packages/local-codex").exists());
+    assert!(!home.join("packages/app-server-daemon/local-codex").exists());
+    assert!(!home.join("packages/app-server-daemon/current").exists());
+    assert!(
+        !home
+            .join("packages/app-server-daemon/auto-update-version")
+            .exists()
+    );
+    assert!(!home.join("app-server-daemon/app-server.pid").exists());
+    assert!(
+        !home
+            .join("app-server-control/app-server-control.sock")
+            .exists()
+    );
 }
 
 #[tokio::test]
