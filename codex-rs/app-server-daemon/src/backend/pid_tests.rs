@@ -10,6 +10,7 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
+use codex_install_context::LocalPackageLane;
 
 use super::PidBackend;
 use super::PidCommandKind;
@@ -160,30 +161,47 @@ async fn start_retries_stale_empty_pid_file_under_its_own_lock() {
 #[cfg(unix)]
 #[tokio::test]
 async fn legacy_launch_clears_recovery_best_effort() {
-    for snapshot_is_directory in [false, true] {
-        let home = TempDir::new().expect("temp dir");
-        let state_dir = home.path().join("app-server-daemon");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        let recovery_file = codex_app_server_transport::daemon_recovery_file_path(home.path());
-        if snapshot_is_directory {
-            std::fs::create_dir(&recovery_file).expect("invalid snapshot directory");
-        } else {
-            std::fs::write(&recovery_file, "{}").expect("pending snapshot");
-        }
-        let backend = PidBackend::new(
-            home.path().join("missing-codex"),
-            state_dir.join("app-server.pid"),
-            /*remote_control_enabled*/ false,
-        );
+    for local_package_lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        for snapshot_is_directory in [false, true] {
+            let home = TempDir::new().expect("temp dir");
+            let state_dir = home.path().join("app-server-daemon");
+            std::fs::create_dir_all(&state_dir).expect("state dir");
+            let recovery_file = match local_package_lane {
+                Some(local_package_lane) => {
+                    codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane(
+                        home.path(),
+                        local_package_lane,
+                    )
+                }
+                None => codex_app_server_transport::daemon_recovery_file_path(home.path()),
+            };
+            std::fs::create_dir_all(recovery_file.parent().expect("recovery parent"))
+                .expect("recovery parent");
+            if snapshot_is_directory {
+                std::fs::create_dir(&recovery_file).expect("invalid snapshot directory");
+            } else {
+                std::fs::write(&recovery_file, "{}").expect("pending snapshot");
+            }
+            let backend = PidBackend::new(
+                home.path().join("missing-codex"),
+                state_dir.join("app-server.pid"),
+                /*remote_control_enabled*/ false,
+            )
+            .with_daemon_owner(home.path().to_path_buf(), local_package_lane);
 
-        let error = backend.start().await.expect_err("missing binary");
-        assert!(
-            error
-                .to_string()
-                .starts_with("failed to spawn detached app-server process using "),
-            "{error:#}"
-        );
-        assert_eq!(recovery_file.exists(), snapshot_is_directory);
+            let error = backend.start().await.expect_err("missing binary");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("failed to spawn detached app-server process using "),
+                "{error:#}"
+            );
+            assert_eq!(recovery_file.exists(), snapshot_is_directory);
+        }
     }
 }
 
@@ -581,6 +599,8 @@ fn update_loop_uses_hidden_app_server_subcommand() {
     let backend = PidBackend {
         feature_overrides: Default::default(),
         codex_bin: "codex".into(),
+        codex_home: None,
+        local_package_lane: None,
         pid_file: "updater.pid".into(),
         lock_file: "updater.pid.lock".into(),
         command_kind: PidCommandKind::UpdateLoop {
@@ -623,6 +643,46 @@ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
     assert_eq!(
         backend.command_env(),
         Some((REMOTE_CONTROL_DISABLED_ENV_VAR, "1"))
+    );
+}
+
+#[test]
+fn daemon_owner_uses_its_local_package_lane_socket() {
+    let home = TempDir::new().expect("temp dir");
+    for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+        let backend = PidBackend::new(
+            home.path().join("codex"),
+            home.path().join("app-server-daemon/daemon.pid"),
+            /*remote_control_enabled*/ false,
+        )
+        .with_daemon_owner(home.path().to_path_buf(), Some(local_package_lane));
+
+        assert_eq!(
+            backend
+                .app_server_control_socket_path()
+                .expect("local app-server socket"),
+            codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                home.path(),
+                local_package_lane,
+            )
+            .map(|socket_path| socket_path.into_path_buf())
+            .expect("expected local app-server socket")
+        );
+    }
+
+    let generic = PidBackend::new(
+        home.path().join("codex"),
+        home.path().join("app-server-daemon/daemon.pid"),
+        /*remote_control_enabled*/ false,
+    )
+    .with_daemon_owner(home.path().to_path_buf(), None);
+    assert_eq!(
+        generic
+            .app_server_control_socket_path()
+            .expect("generic app-server socket"),
+        codex_app_server_transport::app_server_control_socket_path(home.path())
+            .map(|socket_path| socket_path.into_path_buf())
+            .expect("expected generic app-server socket")
     );
 }
 

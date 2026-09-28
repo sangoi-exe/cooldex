@@ -55,7 +55,9 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::app_server_control_socket_path_for_local_package_lane;
 use codex_app_server_transport::daemon_recovery_file_path;
+use codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
 use codex_config::TextRange as CoreTextRange;
@@ -66,6 +68,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_install_context::LocalPackageLane;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::state_db as rollout_state_db;
 use codex_state::log_db;
@@ -487,6 +490,7 @@ pub struct AppServerRuntimeOptions {
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
     pub managed_daemon: bool,
+    pub local_package_lane: Option<LocalPackageLane>,
     pub launch_mode: AppServerLaunchMode,
 }
 
@@ -498,6 +502,7 @@ impl Default for AppServerRuntimeOptions {
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
             managed_daemon: false,
+            local_package_lane: None,
             launch_mode: AppServerLaunchMode::Direct,
         }
     }
@@ -699,7 +704,11 @@ pub async fn run_main_with_transport_options(
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { .. } => {
-            let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
+            let startup_lock_path = app_server_startup_lock_path_for_runtime(
+                &codex_home,
+                &transport,
+                &runtime_options,
+            )?;
             let startup_lock = acquire_app_server_startup_lock(startup_lock_path).await?;
             Some(startup_lock)
         }
@@ -1005,7 +1014,7 @@ pub async fn run_main_with_transport_options(
         info!("outbound router task exited (channel closed)");
     });
 
-    let recovery_file = daemon_recovery_file_path(&config.codex_home);
+    let recovery_file = daemon_recovery_file_path_for_runtime(&config.codex_home, &runtime_options);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
@@ -1528,6 +1537,39 @@ fn sqlite_recovery_notice(
     Some(SqliteRecoveryNotice { details })
 }
 
+// Merge-safety anchor: canonical package ancestry gives managed lanes isolated recovery state, and a resolved Unix socket equal to the lane's canonical control socket receives the matching startup lock; nonlocal explicit Unix and non-Unix transports retain generic lock behavior.
+fn daemon_recovery_file_path_for_runtime(
+    codex_home: &Path,
+    runtime_options: &AppServerRuntimeOptions,
+) -> std::path::PathBuf {
+    match runtime_options.local_package_lane {
+        Some(local_package_lane) => {
+            daemon_recovery_file_path_for_local_package_lane(codex_home, local_package_lane)
+        }
+        None => daemon_recovery_file_path(codex_home),
+    }
+}
+
+fn app_server_startup_lock_path_for_runtime(
+    codex_home: &Path,
+    transport: &AppServerTransport,
+    runtime_options: &AppServerRuntimeOptions,
+) -> std::io::Result<codex_utils_absolute_path::AbsolutePathBuf> {
+    let Some(local_package_lane) = runtime_options.local_package_lane else {
+        return app_server_startup_lock_path(codex_home);
+    };
+    let local_socket_path =
+        app_server_control_socket_path_for_local_package_lane(codex_home, local_package_lane)?;
+    if matches!(transport, AppServerTransport::UnixSocket { socket_path } if socket_path == &local_socket_path)
+    {
+        return codex_app_server_transport::app_server_startup_lock_path_for_local_package_lane(
+            codex_home,
+            local_package_lane,
+        );
+    }
+    app_server_startup_lock_path(codex_home)
+}
+
 fn emit_state_db_backup_warning(message: &str) {
     warn!("{message}");
     if !tracing::dispatcher::has_been_set() {
@@ -1587,11 +1629,14 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 #[cfg(test)]
 mod tests {
     use super::AppServerLaunchMode;
+    use super::AppServerRuntimeOptions;
     use super::AppServerTransport;
     use super::LogFormat;
     use super::ShutdownAction;
     use super::ShutdownSignal;
     use super::ShutdownState;
+    use super::app_server_startup_lock_path_for_runtime;
+    use super::daemon_recovery_file_path_for_runtime;
     #[cfg(debug_assertions)]
     use super::loader_overrides_with_test_user_config_file;
     use super::turn_admission::TurnAdmission;
@@ -1599,7 +1644,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
     use codex_config::types::AppServerMode;
-    #[cfg(debug_assertions)]
+    use codex_install_context::LocalPackageLane;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
 
@@ -1651,6 +1696,79 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[test]
+    fn managed_recovery_paths_follow_the_runtime_local_package_lane() {
+        let home = std::env::temp_dir().join("codex-app-server-recovery-paths");
+        assert_eq!(
+            daemon_recovery_file_path_for_runtime(&home, &AppServerRuntimeOptions::default()),
+            codex_app_server_transport::daemon_recovery_file_path(&home)
+        );
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            assert_eq!(
+                daemon_recovery_file_path_for_runtime(
+                    &home,
+                    &AppServerRuntimeOptions {
+                        local_package_lane: Some(local_package_lane),
+                        ..Default::default()
+                    },
+                ),
+                codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane(
+                    &home,
+                    local_package_lane,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn startup_lock_uses_a_lane_lock_only_for_its_canonical_socket() {
+        let home = std::env::temp_dir().join("codex-app-server-startup-lock-paths");
+        let explicit_unix = AppServerTransport::UnixSocket {
+            socket_path: AbsolutePathBuf::from_absolute_path(home.join("explicit.sock"))
+                .expect("explicit socket"),
+        };
+        assert_eq!(
+            app_server_startup_lock_path_for_runtime(
+                &home,
+                &explicit_unix,
+                &AppServerRuntimeOptions {
+                    local_package_lane: Some(LocalPackageLane::Codex),
+                    ..Default::default()
+                },
+            )
+            .expect("generic startup lock"),
+            codex_app_server_transport::app_server_startup_lock_path(&home)
+                .expect("expected generic startup lock")
+        );
+
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            let local_socket_path =
+                codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    &home,
+                    local_package_lane,
+                )
+                .expect("lane socket");
+            assert_eq!(
+                app_server_startup_lock_path_for_runtime(
+                    &home,
+                    &AppServerTransport::UnixSocket {
+                        socket_path: local_socket_path,
+                    },
+                    &AppServerRuntimeOptions {
+                        local_package_lane: Some(local_package_lane),
+                        ..Default::default()
+                    },
+                )
+                .expect("lane startup lock"),
+                codex_app_server_transport::app_server_startup_lock_path_for_local_package_lane(
+                    &home,
+                    local_package_lane,
+                )
+                .expect("expected lane startup lock")
+            );
+        }
     }
 
     #[test]

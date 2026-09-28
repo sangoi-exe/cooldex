@@ -99,6 +99,8 @@ use codex_features::FEATURES;
 use codex_features::Stage;
 use codex_features::is_known_feature_key;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 use codex_login::AuthManager;
 use codex_login::is_workload_identity_selected;
 use codex_memories_write::clear_memory_roots_contents;
@@ -573,9 +575,10 @@ struct AppServerCommand {
     #[arg(
         long = "listen",
         value_name = "URL",
-        default_value = codex_app_server::AppServerTransport::DEFAULT_LISTEN_URL
+        default_value = codex_app_server::AppServerTransport::DEFAULT_LISTEN_URL,
+        value_parser = validate_app_server_listen_url,
     )]
-    listen: codex_app_server::AppServerTransport,
+    listen: String,
 
     /// Use stdio as the transport (equivalent to `--listen stdio://`).
     #[arg(long = "stdio", conflicts_with = "listen")]
@@ -1273,10 +1276,12 @@ async fn cli_main(
             )?;
             match subcommand {
                 None => {
+                    // Merge-safety anchor: the packaged CLI app-server route resolves canonical install ancestry before it maps only empty unix:// to a lane control socket.
+                    let local_package_lane = InstallContext::current().local_package_lane();
                     let transport = if stdio {
                         codex_app_server::AppServerTransport::Stdio
                     } else {
-                        listen
+                        app_server_transport_for_listen_url(&listen, local_package_lane)?
                     };
                     let auth = auth.try_into_settings()?;
                     // Merge-safety anchor: InstanceChild startup forces disabled ephemeral
@@ -1284,6 +1289,7 @@ async fn cli_main(
                     let runtime_options = codex_app_server::AppServerRuntimeOptions {
                         code_mode_host_transport: code_mode_host.into(),
                         managed_daemon,
+                        local_package_lane,
                         remote_control_startup_mode: if instance_child {
                             codex_app_server::RemoteControlStartupMode::DisabledEphemeral
                         } else {
@@ -2398,6 +2404,28 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
     }
 }
 
+fn validate_app_server_listen_url(listen_url: &str) -> Result<String, String> {
+    codex_app_server::AppServerTransport::from_listen_url(listen_url)
+        .map(|_| listen_url.to_string())
+        .map_err(|err| err.to_string())
+}
+
+fn app_server_transport_for_listen_url(
+    listen_url: &str,
+    local_package_lane: Option<LocalPackageLane>,
+) -> anyhow::Result<codex_app_server::AppServerTransport> {
+    match local_package_lane {
+        Some(local_package_lane) => {
+            codex_app_server::AppServerTransport::from_listen_url_for_local_package_lane(
+                listen_url,
+                local_package_lane,
+            )
+        }
+        None => codex_app_server::AppServerTransport::from_listen_url(listen_url),
+    }
+    .map_err(anyhow::Error::from)
+}
+
 async fn print_app_server_daemon_output(command: AppServerLifecycleCommand) -> anyhow::Result<()> {
     let output = codex_app_server_daemon::run(command).await?;
     println!("{}", serde_json::to_string(&output)?);
@@ -3426,12 +3454,6 @@ mod tests {
         app_server
     }
 
-    fn default_app_server_socket_path() -> AbsolutePathBuf {
-        let codex_home = find_codex_home().expect("codex home");
-        codex_app_server::app_server_control_socket_path(&codex_home)
-            .expect("default app-server socket path")
-    }
-
     #[test]
     fn debug_prompt_input_parses_prompt_and_images() {
         let cli = MultitoolCli::try_parse_from([
@@ -4231,10 +4253,7 @@ mod tests {
         let app_server = app_server_from_args(["codex", "app-server"].as_ref());
         assert!(!app_server.analytics_default_enabled);
         assert!(!app_server.remote_control);
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::Stdio
-        );
+        assert_eq!(app_server.listen, "stdio://");
     }
 
     #[test]
@@ -4632,22 +4651,14 @@ mod tests {
         let app_server = app_server_from_args(
             ["codex", "app-server", "--listen", "ws://127.0.0.1:4500"].as_ref(),
         );
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::WebSocket {
-                bind_address: "127.0.0.1:4500".parse().expect("valid socket address"),
-            }
-        );
+        assert_eq!(app_server.listen, "ws://127.0.0.1:4500");
     }
 
     #[test]
     fn app_server_listen_stdio_url_parses() {
         let app_server =
             app_server_from_args(["codex", "app-server", "--listen", "stdio://"].as_ref());
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::Stdio
-        );
+        assert_eq!(app_server.listen, "stdio://");
     }
 
     #[test]
@@ -4727,12 +4738,7 @@ mod tests {
     fn app_server_listen_unix_socket_url_parses() {
         let app_server =
             app_server_from_args(["codex", "app-server", "--listen", "unix://"].as_ref());
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::UnixSocket {
-                socket_path: default_app_server_socket_path()
-            }
-        );
+        assert_eq!(app_server.listen, "unix://");
     }
 
     #[test]
@@ -4740,19 +4746,13 @@ mod tests {
         let app_server = app_server_from_args(
             ["codex", "app-server", "--listen", "unix:///tmp/codex.sock"].as_ref(),
         );
-        assert_eq!(
-            app_server.listen,
-            codex_app_server::AppServerTransport::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path("/tmp/codex.sock")
-                    .expect("absolute path should parse")
-            }
-        );
+        assert_eq!(app_server.listen, "unix:///tmp/codex.sock");
     }
 
     #[test]
     fn app_server_listen_off_parses() {
         let app_server = app_server_from_args(["codex", "app-server", "--listen", "off"].as_ref());
-        assert_eq!(app_server.listen, codex_app_server::AppServerTransport::Off);
+        assert_eq!(app_server.listen, "off");
     }
 
     #[test]
@@ -4760,6 +4760,40 @@ mod tests {
         let parse_result =
             MultitoolCli::try_parse_from(["codex", "app-server", "--listen", "http://foo"]);
         assert!(parse_result.is_err());
+    }
+
+    #[test]
+    fn app_server_dispatch_uses_the_local_package_lane_only_for_implicit_unix() {
+        let codex_home = find_codex_home().expect("codex home");
+        for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+            assert_eq!(
+                app_server_transport_for_listen_url("unix://", Some(local_package_lane))
+                    .expect("local lane transport"),
+                codex_app_server::AppServerTransport::UnixSocket {
+                    socket_path: AbsolutePathBuf::from_absolute_path(
+                        codex_home
+                            .join("app-server-control")
+                            .join(local_package_lane.package_root_component())
+                            .join("app-server-control.sock"),
+                    )
+                    .expect("local lane socket")
+                }
+            );
+        }
+
+        for listen_url in [
+            "stdio://",
+            "unix:///tmp/codex.sock",
+            "off",
+            "ws://127.0.0.1:4545",
+        ] {
+            assert_eq!(
+                app_server_transport_for_listen_url(listen_url, Some(LocalPackageLane::Codex))
+                    .expect("unchanged transport"),
+                codex_app_server::AppServerTransport::from_listen_url(listen_url)
+                    .expect("generic transport")
+            );
+        }
     }
 
     #[test]

@@ -80,7 +80,8 @@ pub(crate) async fn request(daemon: &Daemon) -> Result<UpdateOutput> {
                             paths.codex_bin,
                             paths.update_pid_file,
                             restore_release,
-                        );
+                        )
+                        .with_daemon_owner(paths.codex_home, paths.local_package_lane);
                         worker.start().await?;
                         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                         loop {

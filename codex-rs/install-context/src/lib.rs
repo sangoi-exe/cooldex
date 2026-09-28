@@ -17,6 +17,7 @@ const PACKAGE_METADATA_FILENAME: &str = "codex-package.json";
 const PATH_DIRNAME: &str = "codex-path";
 const RELEASES_DIRNAME: &str = "releases";
 const RESOURCES_DIRNAME: &str = "codex-resources";
+const MANAGED_DAEMON_PACKAGES_DIRNAME: &str = "app-server-daemon";
 const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
 const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
@@ -166,23 +167,30 @@ impl InstallContext {
         serde_json::from_str(&manifest).ok()
     }
 
-    /// Returns this package's local lane only when its canonical release directory is under the matching CODEX_HOME lane root.
+    /// Returns this package's local lane only when its canonical release directory is under the matching source or managed-daemon lane root.
     pub fn local_package_lane(&self) -> Option<LocalPackageLane> {
         let codex_home = codex_utils_home_dir::find_codex_home().ok()?;
         self.local_package_lane_with_codex_home(&codex_home)
     }
 
-    // Merge-safety anchor: local lane identity derives only from canonical direct release ancestry beneath CODEX_HOME/packages/local-{codex,cdx-dev}/releases; never infer it from executable names, metadata, selectors, versions, or mutable current links.
+    // Merge-safety anchor: local lane identity derives only from canonical direct source or managed-daemon release ancestry beneath CODEX_HOME; never infer it from executable names, metadata, selectors, versions, or mutable current links.
     fn local_package_lane_with_codex_home(&self, codex_home: &Path) -> Option<LocalPackageLane> {
         let package_dir = &self.package_layout.as_ref()?.package_dir;
         let canonical_codex_home = canonical_absolute_path(codex_home)?;
 
         for lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
-            let releases_dir = canonical_codex_home
+            let source_releases_dir = canonical_codex_home
                 .join("packages")
                 .join(lane.package_root_component())
                 .join(RELEASES_DIRNAME);
-            if package_dir.parent() == Some(releases_dir) {
+            let managed_daemon_releases_dir = canonical_codex_home
+                .join("packages")
+                .join(MANAGED_DAEMON_PACKAGES_DIRNAME)
+                .join(lane.package_root_component())
+                .join(RELEASES_DIRNAME);
+            if package_dir.parent() == Some(source_releases_dir)
+                || package_dir.parent() == Some(managed_daemon_releases_dir)
+            {
                 return Some(lane);
             }
         }

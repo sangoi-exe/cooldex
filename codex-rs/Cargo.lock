@@ -2085,6 +2085,7 @@ dependencies = [
  "codex-hooks",
  "codex-http-client",
  "codex-image-generation-extension",
+ "codex-install-context",
  "codex-login",
  "codex-mcp",
  "codex-mcp-extension",

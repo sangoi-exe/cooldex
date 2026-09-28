@@ -1048,9 +1048,11 @@ impl Daemon {
         managed_codex_bin: &Path,
     ) -> BackendPaths {
         BackendPaths {
+            codex_home: self.codex_home.clone(),
             codex_bin: managed_codex_bin.to_path_buf(),
             pid_file: self.pid_file.clone(),
             update_pid_file: self.update_pid_file.clone(),
+            local_package_lane: self.owner.local_package_lane(),
             remote_control_enabled: settings.remote_control_enabled,
             feature_overrides: settings.feature_overrides.clone(),
         }
@@ -1405,7 +1407,10 @@ mod tests {
             assert_eq!(daemon.managed_package_root(), package_root);
             assert_eq!(
                 daemon.current_managed_codex_bin().expect("local binary"),
-                package_root.join("current/bin/codex")
+                crate::managed_install::managed_codex_bin_for_local_package_lane(
+                    home.path(),
+                    local_package_lane,
+                )
             );
 
             let selected = daemon.current_installation().expect("current installation");

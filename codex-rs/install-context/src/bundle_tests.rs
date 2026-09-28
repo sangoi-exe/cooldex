@@ -57,27 +57,33 @@ fn local_package_lanes_are_recognized_and_expose_package_resources() -> std::io:
     let home = tempfile::tempdir()?;
 
     for expected_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
-        let (executable, mcp_bin, sky_bin) =
-            create_package_release(home.path(), expected_lane.package_root_component())?;
-        let context = InstallContext::from_exe_with_codex_home(
-            /*is_macos*/ false,
-            /*current_exe*/ Some(&executable),
-            /*method_override*/ None,
-            /*codex_home*/ Some(home.path()),
-        );
+        for package_path in [
+            PathBuf::from(expected_lane.package_root_component()),
+            PathBuf::from(MANAGED_DAEMON_PACKAGES_DIRNAME)
+                .join(expected_lane.package_root_component()),
+        ] {
+            let (executable, mcp_bin, sky_bin) =
+                create_package_release(home.path(), &package_path)?;
+            let context = InstallContext::from_exe_with_codex_home(
+                /*is_macos*/ false,
+                /*current_exe*/ Some(&executable),
+                /*method_override*/ None,
+                /*codex_home*/ Some(home.path()),
+            );
 
-        assert_eq!(
-            context.local_package_lane_with_codex_home(home.path()),
-            Some(expected_lane)
-        );
-        assert_eq!(
-            context.bundled_resource(COMPUTER_USE_MCP_RESOURCE_NAME),
-            Some(canonical_absolute_path(&mcp_bin).expect("MCP resource should canonicalize"))
-        );
-        assert_eq!(
-            context.bundled_resource(SKY_RESOURCE_NAME),
-            Some(canonical_absolute_path(&sky_bin).expect("Sky resource should canonicalize"))
-        );
+            assert_eq!(
+                context.local_package_lane_with_codex_home(home.path()),
+                Some(expected_lane)
+            );
+            assert_eq!(
+                context.bundled_resource(COMPUTER_USE_MCP_RESOURCE_NAME),
+                Some(canonical_absolute_path(&mcp_bin).expect("MCP resource should canonicalize"))
+            );
+            assert_eq!(
+                context.bundled_resource(SKY_RESOURCE_NAME),
+                Some(canonical_absolute_path(&sky_bin).expect("Sky resource should canonicalize"))
+            );
+        }
     }
 
     Ok(())
@@ -99,8 +105,12 @@ fn local_package_lane_package_root_components_are_canonical() {
 fn standalone_and_generic_packages_do_not_bind_to_a_local_lane() -> std::io::Result<()> {
     let home = tempfile::tempdir()?;
 
-    for package_name in [STANDALONE_PACKAGES_DIRNAME, "generic"] {
-        let (executable, _, _) = create_package_release(home.path(), package_name)?;
+    for package_path in [
+        PathBuf::from(STANDALONE_PACKAGES_DIRNAME),
+        PathBuf::from("generic"),
+        PathBuf::from(MANAGED_DAEMON_PACKAGES_DIRNAME).join("generic"),
+    ] {
+        let (executable, _, _) = create_package_release(home.path(), &package_path)?;
         let context = InstallContext::from_exe_with_codex_home(
             /*is_macos*/ false,
             /*current_exe*/ Some(&executable),
@@ -123,7 +133,7 @@ fn local_package_lane_follows_a_canonical_selector_symlink() -> std::io::Result<
     let home = tempfile::tempdir()?;
     let (executable, _, _) = create_package_release(
         home.path(),
-        LocalPackageLane::Codex.package_root_component(),
+        Path::new(LocalPackageLane::Codex.package_root_component()),
     )?;
     let selector = home.path().join("packages/local-codex/current");
     std::os::unix::fs::symlink(
@@ -151,11 +161,11 @@ fn local_package_lane_follows_a_canonical_selector_symlink() -> std::io::Result<
 
 fn create_package_release(
     home: &Path,
-    package_name: &str,
+    package_path: &Path,
 ) -> std::io::Result<(PathBuf, PathBuf, PathBuf)> {
     let release = home
         .join("packages")
-        .join(package_name)
+        .join(package_path)
         .join(RELEASES_DIRNAME)
         .join("test");
     let bin_dir = release.join(BIN_DIRNAME);

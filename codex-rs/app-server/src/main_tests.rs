@@ -1,6 +1,8 @@
 use super::AppServerArgs;
+use super::transport_for_listen_url;
 use clap::Parser;
 use codex_app_server::AppServerTransport;
+use codex_install_context::LocalPackageLane;
 use pretty_assertions::assert_eq;
 use toml::Value as TomlValue;
 use url::Url;
@@ -53,7 +55,39 @@ fn app_server_accepts_process_scoped_grpc_code_mode_host() {
         args.code_mode_host.code_mode_host,
         Some(Url::parse("https://example.test").expect("test endpoint should parse"))
     );
-    assert_eq!(args.listen, AppServerTransport::Off);
+    assert_eq!(args.listen, "off");
+}
+
+#[test]
+fn managed_package_lane_selects_only_implicit_lane_socket() {
+    for local_package_lane in [LocalPackageLane::Codex, LocalPackageLane::CdxDev] {
+        let transport =
+            transport_for_listen_url("unix://", Some(local_package_lane)).expect("lane listen URL");
+        let codex_home = codex_core::config::find_codex_home().expect("codex home");
+        assert_eq!(
+            transport,
+            AppServerTransport::UnixSocket {
+                socket_path: codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    &codex_home,
+                    local_package_lane,
+                )
+                .expect("lane socket")
+            }
+        );
+    }
+
+    for listen_url in [
+        "stdio://",
+        "unix:///tmp/codex.sock",
+        "off",
+        "ws://127.0.0.1:4545",
+    ] {
+        assert_eq!(
+            transport_for_listen_url(listen_url, Some(LocalPackageLane::Codex))
+                .expect("unchanged transport"),
+            AppServerTransport::from_listen_url(listen_url).expect("generic transport")
+        );
+    }
 }
 
 #[test]

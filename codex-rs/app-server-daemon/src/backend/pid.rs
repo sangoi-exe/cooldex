@@ -20,6 +20,7 @@ use anyhow::Result;
 use anyhow::bail;
 #[cfg(any(unix, windows))]
 use codex_app_server_transport::REMOTE_CONTROL_DISABLED_ENV_VAR;
+use codex_install_context::LocalPackageLane;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs;
@@ -41,6 +42,8 @@ const STDERR_LOG_TAIL_BYTES: u64 = 4096;
 pub(crate) struct PidBackend {
     pub(super) feature_overrides: BTreeMap<String, bool>,
     codex_bin: PathBuf,
+    codex_home: Option<PathBuf>,
+    local_package_lane: Option<LocalPackageLane>,
     pid_file: PathBuf,
     lock_file: PathBuf,
     command_kind: PidCommandKind,
@@ -107,6 +110,8 @@ impl PidBackend {
         Self {
             feature_overrides: BTreeMap::new(),
             codex_bin,
+            codex_home: None,
+            local_package_lane: None,
             pid_file,
             lock_file,
             command_kind: PidCommandKind::AppServer {
@@ -124,10 +129,23 @@ impl PidBackend {
         Self {
             feature_overrides: BTreeMap::new(),
             codex_bin,
+            codex_home: None,
+            local_package_lane: None,
             pid_file,
             lock_file,
             command_kind: PidCommandKind::UpdateLoop { restore_release },
         }
+    }
+
+    pub(crate) fn with_daemon_owner(
+        mut self,
+        codex_home: PathBuf,
+        local_package_lane: Option<LocalPackageLane>,
+    ) -> Self {
+        // Merge-safety anchor: daemon backend path projection retains the typed install-context lane for Windows shutdown and legacy recovery; never infer ownership from PID path parents.
+        self.codex_home = Some(codex_home);
+        self.local_package_lane = local_package_lane;
+        self
     }
 
     pub(crate) async fn is_starting_or_running(&self) -> Result<bool> {
@@ -190,13 +208,7 @@ impl PidBackend {
                 }
                 match self.command_kind {
                     PidCommandKind::AppServer { .. } => {
-                        let codex_home = self
-                            .pid_file
-                            .parent()
-                            .and_then(Path::parent)
-                            .context("daemon pid path has no Codex home")?;
-                        let socket_path =
-                            codex_app_server_transport::app_server_control_socket_path(codex_home)?;
+                        let socket_path = self.app_server_control_socket_path()?;
                         if let Err(err) =
                             crate::client::request_shutdown(socket_path.as_path(), pid).await
                         {
@@ -415,6 +427,41 @@ impl PidBackend {
             }
             | PidCommandKind::UpdateLoop { .. } => None,
         }
+    }
+
+    #[cfg(any(windows, test))]
+    fn app_server_control_socket_path(&self) -> Result<PathBuf> {
+        let codex_home = self
+            .codex_home
+            .as_deref()
+            .context("pid backend is missing its daemon CODEX_HOME")?;
+        match self.local_package_lane {
+            Some(local_package_lane) => {
+                codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    codex_home,
+                    local_package_lane,
+                )
+                .map(|socket_path| socket_path.into_path_buf())
+                .map_err(Into::into)
+            }
+            None => codex_app_server_transport::app_server_control_socket_path(codex_home)
+                .map(|socket_path| socket_path.into_path_buf())
+                .map_err(Into::into),
+        }
+    }
+
+    fn daemon_recovery_file_path(&self) -> Option<PathBuf> {
+        self.codex_home
+            .as_deref()
+            .map(|codex_home| match self.local_package_lane {
+                Some(local_package_lane) => {
+                    codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane(
+                        codex_home,
+                        local_package_lane,
+                    )
+                }
+                None => codex_app_server_transport::daemon_recovery_file_path(codex_home),
+            })
     }
 
     fn terminate_process(&self, pid: u32) -> Result<()> {

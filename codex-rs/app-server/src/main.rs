@@ -9,6 +9,8 @@ use codex_app_server::run_main_with_transport_options;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_config::LoaderOverrides;
+use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use codex_websocket_auth::WebsocketAuthArgs;
@@ -41,9 +43,10 @@ struct AppServerArgs {
     #[arg(
         long = "listen",
         value_name = "URL",
-        default_value = AppServerTransport::DEFAULT_LISTEN_URL
+        default_value = AppServerTransport::DEFAULT_LISTEN_URL,
+        value_parser = validate_listen_url,
     )]
-    listen: AppServerTransport,
+    listen: String,
 
     /// Session source used to derive product restrictions and metadata.
     #[arg(
@@ -77,6 +80,8 @@ struct AppServerArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Merge-safety anchor: standalone app-server resolves package lane identity from canonical install ancestry before it maps only empty unix:// to a lane control socket.
+    let local_package_lane = InstallContext::current().local_package_lane();
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         let AppServerArgs {
@@ -98,11 +103,12 @@ fn main() -> anyhow::Result<()> {
                 .map(LoaderOverrides::with_managed_config_path_for_tests)
                 .unwrap_or_default()
         };
-        let transport = listen;
+        let transport = transport_for_listen_url(&listen, local_package_lane)?;
         let auth = auth.try_into_settings()?;
         let mut runtime_options = AppServerRuntimeOptions {
             code_mode_host_transport: code_mode_host.into(),
             managed_daemon,
+            local_package_lane,
             ..Default::default()
         };
         #[cfg(debug_assertions)]
@@ -134,6 +140,26 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+fn validate_listen_url(listen_url: &str) -> Result<String, String> {
+    AppServerTransport::from_listen_url(listen_url)
+        .map(|_| listen_url.to_string())
+        .map_err(|err| err.to_string())
+}
+
+fn transport_for_listen_url(
+    listen_url: &str,
+    local_package_lane: Option<LocalPackageLane>,
+) -> anyhow::Result<AppServerTransport> {
+    match local_package_lane {
+        Some(local_package_lane) => AppServerTransport::from_listen_url_for_local_package_lane(
+            listen_url,
+            local_package_lane,
+        ),
+        None => AppServerTransport::from_listen_url(listen_url),
+    }
+    .map_err(anyhow::Error::from)
 }
 
 fn disable_managed_config_from_debug_env() -> bool {
