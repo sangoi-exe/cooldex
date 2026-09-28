@@ -182,6 +182,56 @@ async fn prepare_private_socket_directory_creates_directory() {
 
 #[cfg(unix)]
 #[tokio::test]
+// Merge-safety anchor: fresh local package lane control paths require every helper-created nested directory component to remain owner-only.
+async fn prepare_private_socket_directory_creates_nested_directory_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let control_dir = temp_dir.path().join("app-server-control");
+    let socket_dir = control_dir.join("local-cdx-dev");
+
+    prepare_private_socket_directory(&socket_dir)
+        .await
+        .expect("nested socket directory should be created");
+
+    let metadata = std::fs::symlink_metadata(&socket_dir).expect("socket dir metadata");
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+    let metadata = std::fs::symlink_metadata(&control_dir).expect("control dir metadata");
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prepare_private_socket_directory_rejects_existing_non_directories() {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let file = temp_dir.path().join("file");
+    std::fs::write(&file, b"not a directory").expect("file");
+    assert_eq!(
+        prepare_private_socket_directory(&file)
+            .await
+            .expect_err("file should be rejected")
+            .kind(),
+        ErrorKind::AlreadyExists,
+    );
+
+    let target = temp_dir.path().join("target");
+    let symlink = temp_dir.path().join("symlink");
+    std::fs::create_dir(&target).expect("target directory");
+    std::os::unix::fs::symlink(&target, &symlink).expect("directory symlink");
+    assert_eq!(
+        prepare_private_socket_directory(&symlink)
+            .await
+            .expect_err("symlink should be rejected")
+            .kind(),
+        ErrorKind::AlreadyExists,
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn prepare_private_socket_directory_sets_existing_permissions_to_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 

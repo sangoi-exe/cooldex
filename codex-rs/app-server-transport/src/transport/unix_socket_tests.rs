@@ -396,6 +396,25 @@ async fn app_server_startup_lock_serializes_waiters() {
 
 #[cfg(unix)]
 #[tokio::test]
+// Merge-safety anchor: local package lane startup locks must create their nested fresh-home control directory.
+async fn local_package_lane_startup_lock_creates_nested_private_directory() {
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let lock_path = app_server_startup_lock_path_for_local_package_lane(
+        codex_home.path(),
+        LocalPackageLane::CdxDev,
+    )
+    .expect("cdx-dev startup lock path");
+
+    let _lock = acquire_app_server_startup_lock(lock_path.clone())
+        .await
+        .expect("startup lock should create its nested private directory");
+
+    assert!(lock_path.as_path().is_file());
+    assert!(lock_path.as_path().parent().expect("lock parent").is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn control_socket_rejects_writable_parent_without_changing_permissions() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -1511,6 +1511,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    // Merge-safety anchor: local package lane operation locks must create their nested fresh-home state directory.
+    async fn local_package_lane_operation_lock_creates_nested_private_state_directory() {
+        let home = TempDir::new().expect("home");
+        let daemon = Daemon::from_owner(
+            home.path(),
+            DaemonOwner::LocalPackageLane(LocalPackageLane::CdxDev),
+        )
+        .expect("local daemon");
+
+        let _lock = daemon
+            .acquire_operation_lock()
+            .await
+            .expect("operation lock should create its nested private state directory");
+
+        assert!(daemon.operation_lock_file.is_file());
+        assert!(
+            daemon
+                .operation_lock_file
+                .parent()
+                .expect("operation lock parent")
+                .is_dir()
+        );
+    }
+
     #[tokio::test]
     async fn stop_and_fresh_start_discard_pending_thread_restore() {
         let home = TempDir::new().expect("home");

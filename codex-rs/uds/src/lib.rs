@@ -120,13 +120,14 @@ mod platform {
 
     pub(super) struct Listener(UnixListener);
 
+    // Merge-safety anchor: local package lane startup needs recursive private-directory creation, while final-path metadata validation preserves the leaf type and mode contract.
     pub(super) async fn prepare_private_socket_directory(socket_dir: &Path) -> IoResult<()> {
         let mut dir_builder = fs::DirBuilder::new();
-        dir_builder.mode(SOCKET_DIR_MODE);
-        match dir_builder.create(socket_dir).await {
-            Ok(()) => return Ok(()),
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
+        dir_builder.recursive(true).mode(SOCKET_DIR_MODE);
+        if let Err(err) = dir_builder.create(socket_dir).await
+            && err.kind() != ErrorKind::AlreadyExists
+        {
+            return Err(err);
         }
 
         let metadata = fs::symlink_metadata(socket_dir).await?;
