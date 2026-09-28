@@ -55,6 +55,8 @@ use codex_config::types::ResumeCwdMode;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_features::Feature;
+use codex_install_context::InstallContext;
+use codex_install_context::LocalPackageLane;
 use codex_login::AuthConfig;
 use codex_login::default_client::originator;
 use codex_login::default_client::set_default_client_residency_requirement;
@@ -512,8 +514,25 @@ async fn connect_remote_app_server(
     Ok(AppServerClient::Remote(app_server))
 }
 
+// Merge-safety anchor: passive implicit daemon discovery follows only the current package's canonical lane control socket; unbound execution retains generic selection and never probes another lane.
 async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
-    let socket_path = codex_app_server_client::app_server_control_socket_path(codex_home).ok()?;
+    maybe_probe_daemon_socket(codex_home, InstallContext::current().local_package_lane()).await
+}
+
+async fn maybe_probe_daemon_socket(
+    codex_home: &Path,
+    local_package_lane: Option<LocalPackageLane>,
+) -> Option<AbsolutePathBuf> {
+    let socket_path = match local_package_lane {
+        Some(local_package_lane) => {
+            codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                codex_home,
+                local_package_lane,
+            )
+        }
+        None => codex_app_server_client::app_server_control_socket_path(codex_home),
+    }
+    .ok()?;
     #[cfg(windows)]
     let (validated_path, _directory) =
         codex_uds::validate_private_socket_path(socket_path.as_path()).ok()?;
@@ -3138,7 +3157,7 @@ requires_openai_auth = {requires_openai_auth}
     async fn default_daemon_auto_connect_skips_missing_socket() -> color_eyre::Result<()> {
         let codex_home = TempDir::new()?;
         assert!(
-            maybe_probe_default_daemon_socket(codex_home.path())
+            maybe_probe_daemon_socket(codex_home.path(), /*local_package_lane*/ None)
                 .await
                 .is_none()
         );
@@ -3156,7 +3175,7 @@ requires_openai_auth = {requires_openai_auth}
             std::fs::create_dir_all(parent)?;
             let listener = codex_uds::UnixListener::bind(socket_path.as_path()).await?;
             assert!(
-                maybe_probe_default_daemon_socket(codex_home.path())
+                maybe_probe_daemon_socket(codex_home.path(), /*local_package_lane*/ None)
                     .await
                     .is_none()
             );
@@ -3185,9 +3204,75 @@ requires_openai_auth = {requires_openai_auth}
             }
         };
         assert_eq!(
-            maybe_probe_default_daemon_socket(codex_home.path()).await,
+            maybe_probe_daemon_socket(codex_home.path(), /*local_package_lane*/ None).await,
             expected
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_daemon_auto_connect_probes_only_selected_local_package_lane_socket()
+    -> color_eyre::Result<()> {
+        for (local_package_lane, other_package_lane) in [
+            (LocalPackageLane::Codex, LocalPackageLane::CdxDev),
+            (LocalPackageLane::CdxDev, LocalPackageLane::Codex),
+        ] {
+            let codex_home = TempDir::new()?;
+            for socket_path in [
+                codex_app_server_client::app_server_control_socket_path(codex_home.path())?,
+                codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    codex_home.path(),
+                    other_package_lane,
+                )?,
+            ] {
+                codex_uds::prepare_private_socket_directory(
+                    socket_path.as_path().parent().expect("socket parent"),
+                )
+                .await?;
+                let mut listener = codex_uds::UnixListener::bind(socket_path.as_path()).await?;
+
+                assert_eq!(
+                    maybe_probe_daemon_socket(codex_home.path(), Some(local_package_lane)).await,
+                    None
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "probe connected to unselected daemon socket {}",
+                    socket_path.display()
+                );
+            }
+
+            let socket_path =
+                codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    codex_home.path(),
+                    local_package_lane,
+                )?;
+            codex_uds::prepare_private_socket_directory(
+                socket_path.as_path().parent().expect("socket parent"),
+            )
+            .await?;
+            let _listener = codex_uds::UnixListener::bind(socket_path.as_path()).await?;
+
+            let expected = Some(socket_path);
+            #[cfg(windows)]
+            let expected = {
+                let output = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-Command", "([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"])
+                    .output()?;
+                assert!(output.status.success());
+                match String::from_utf8(output.stdout)?.trim() {
+                    "True" => None,
+                    "False" => expected,
+                    other => panic!("unexpected elevation result: {other}"),
+                }
+            };
+            assert_eq!(
+                maybe_probe_daemon_socket(codex_home.path(), Some(local_package_lane)).await,
+                expected
+            );
+        }
         Ok(())
     }
 
