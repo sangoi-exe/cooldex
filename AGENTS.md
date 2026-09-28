@@ -25,12 +25,8 @@
 - When the operator says `main`, use the local branch named `main`.
 - The supported operator path is WSL with ChatGPT Pro authentication through ordinary
   `codex`/`cdx` TUI or exec sessions.
-- The supported command topology is `/home/lucas/.cargo/bin/codex` as the reviewed
-  regular Cooldex executable, `/home/lucas/.local/bin/cdx-dev` for development sessions,
-  and `cdx` selecting `/home/lucas/.codex/packages/standalone/current/bin/codex` through
-  `/home/lucas/.cargo/bin/cdx` for the standalone release. The supported topology has no
-  interactive Bash `codex` alias. `cdx-pro` is retired and must not be recreated as an
-  alias, wrapper, or compatibility path.
+- `/home/lucas/.cargo/bin/codex` and `/home/lucas/.local/bin/cdx-dev` are stable selectors for independent local package lanes. Each lane owns its selected complete package, source-built helpers and sidecars, daemon namespace, and pinned subordinate managed daemon package; user authentication, sessions, general configuration, SQLite, and history remain shared under one `CODEX_HOME`.
+- `cdx` selects `/home/lucas/.codex/packages/standalone/current/bin/codex` through `/home/lucas/.cargo/bin/cdx` for the standalone release. It is a separate lane and is excluded from the local source-promotion procedure. The supported topology has no interactive Bash `codex` alias. `cdx-pro` is retired and must not be recreated as an alias, wrapper, or compatibility path.
 - Before installing, promoting, removing, or publishing command surfaces, inspect the
   live resolution, aliases, symlink targets, executable identities, and hashes with
   `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable. This file defines
@@ -82,58 +78,31 @@
 - The delimited upstream core below must remain byte-identical to the blob named by its
   opening marker. Local policy belongs outside that core.
 
-<!-- Merge-safety anchor: local regular `codex` promotion preserves the guarded build,
-metadata-resolved candidate, atomic replacement without backup or rollback, and exclusions
-for companion command, package, host, and Computer Use surfaces. -->
-### One-shot local regular `codex` promotion
+<!-- Merge-safety anchor: local source promotion selects one complete package generation for one explicit stable local lane, preserving package-local helpers and the lane-bound daemon lifecycle without runtime Git-branch awareness. -->
+### Branch-scoped local complete-package promotion
 
-- This procedure applies only to one-shot WSL/Linux promotion of the regular
-  `/home/lucas/.cargo/bin/codex` executable.
-- Before building, revalidate the relevant root branch/OID and clean task-owned source
-  state. Revalidate live command resolution, aliases, symlink or regular-file identity,
-  executable identity, and hashes with `type -a`, `alias -p`, `readlink -f`, and
-  `sha256sum` as applicable.
-- Build only through root `just build-codex-bin`, which delegates to
-  `scripts/cargo-guard.sh`; raw Cargo and `just install` are not promotion routes.
-- Resolve the effective Cargo target directory through guarded Cargo metadata in the build
-  context. Take the candidate from the metadata-resolved path rather than assuming
-  `codex-rs/target/debug/codex`.
-- Before replacement, prove that the candidate is a regular executable Linux x86-64 ELF
-  with the intended executable mode and SHA-256, then run `--version`, `--help`,
-  `exec --help`, and `app-server --help`.
-- Stage exactly one temporary sibling beneath `/home/lucas/.cargo/bin`, set its intended
-  executable mode, and atomically rename it to replace only
-  `/home/lucas/.cargo/bin/codex`; never overwrite that target in place.
-- Retain no backup or rollback copy. If post-write proof fails, stop and report the actual
-  installed state; never silently restore.
-- After replacement, prove candidate and installed SHA-256 equality; regular executable,
-  mode, and Linux x86-64 ELF identity; live command resolution and aliases; the same
-  bounded smoke results; and absence of the temporary sibling.
-- Already-running processes retain their old executable inode; only new processes use the
-  replacement.
-- `cdx`, `cdx-dev`, standalone packaging, aliases, shell profiles, `codex-code-mode-host`,
-  `codex-computer-use-mcp`, and Computer Use tooling are excluded unless direct dependency
-  evidence later proves an inseparable follower and the current user expands scope.
+- This procedure applies only to one WSL/Linux local source-promotion invocation for one explicit destination: `codex` or `cdx-dev`. `cdx`, Windows/macOS product promotion, release publication, and remote mutation remain separate and excluded.
+- Before building, verify one clean source checkout by its explicit branch and immutable HEAD, plus one explicit destination. Reject ambiguity, never infer the destination from the branch name, and never make runtime code inspect Git branches.
+- Before any operation, record the live command, alias, symlink, package, and executable identities and pre-operation hashes for both the selected and excluded destinations with `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable.
+- Rebuild every applicable source-owned package input only through root `just build-local-codex-package-inputs`, which delegates guarded Cargo work. Raw Cargo, prior-generation compiled inputs, partial helper or sidecar replacement, and cross-lane reuse are not promotion routes.
+- Assemble exactly one complete package from those exact guarded inputs through `scripts/build_codex_package.py` and `scripts/codex_package/`; do not assemble, select, or reuse a second lane package in the invocation.
+- Before selection, validate the package manifest and layout; CLI, Code Mode host, bwrap, Computer Use MCP and Sky, rg, and applicable zsh resources; target, modes, and hashes; and bounded CLI `--version`, `--help`, `exec --help`, and `app-server --help` smoke behavior.
+- Stage the complete package only beneath the selected lane package root, then atomically select that lane's `current` generation and stable command selector. Never overwrite an executable, helper, sidecar, package, or selector in place.
+- The existing app-server-daemon owner may create or select only the selected lane's validated, pinned subordinate managed copy. That copy derives from the selected complete package; it is neither another promotion nor an independent update authority.
+- Observe the excluded lane only for required read-only identity and non-mutation proof. Build, select, and mutate only the selected lane; do not consume or reuse excluded-lane package, selector, helper, sidecar, daemon, socket, state, or generation-bound resources.
+- Retain no backup, rollback copy, pruning, cleanup, or partial temporary staging directory or sibling. If a proof fails, stop and report the actual selected state without silently restoring or altering either lane.
+- After selection, prove selected command resolution; package and resource identity; lane identity; daemon socket, state, and managed selection; pinned status; daemon-backed resume; Computer Use availability; selected candidate-to-package hash linkage; excluded-lane non-mutation; and temporary staging absence.
+- Existing processes retain their old generation; only new processes use the selected generation.
 
 ## Computer Use Operator Contract
 
-- The canonical local config owner for Computer Use runtime knobs is
-  `[features.computer_use]`.
-- The supported keys are `mcp_bin`, `sky_bin`, `xvfb`, `openbox`, `temp_root`,
-  `display_ready_timeout`, and `shutdown_grace_period`.
-- `display_ready_timeout` and `shutdown_grace_period` are millisecond values.
-- Path precedence is: matching environment-variable override first, then
-  `config.toml`, then the current runtime owner default or absence.
-- The supported path override environment variables are
-  `CODEX_COMPUTER_USE_MCP_BIN`, `CODEX_COMPUTER_USE_SKY_BIN`,
-  `CODEX_COMPUTER_USE_XVFB_BIN`, `CODEX_COMPUTER_USE_OPENBOX_BIN`, and
-  `CODEX_COMPUTER_USE_TEMP_ROOT`.
-- Missing `mcp_bin` and `sky_bin` leaves the source/development Computer Use MCP
-  runtime unavailable. Do not invent a fallback runtime pair.
-- `codex-rs/ext/computer-use/AGENTS.md` is the Computer Use extension owner. Its
-  live worktree reserves Xvfb starting at `FIRST_DISPLAY = 90` and scans a high
-  display range rather than relying on the default allocation path; retain that
-  high-range invariant unless current evidence changes it.
+- The canonical local config owner for Computer Use runtime knobs is `[features.computer_use]`.
+- The supported keys are `mcp_bin`, `sky_bin`, `xvfb`, `openbox`, `temp_root`, `display_ready_timeout`, and `shutdown_grace_period`; `display_ready_timeout` and `shutdown_grace_period` are millisecond values.
+- MCP/Sky resolution requires a complete pair and uses this exact precedence: a complete explicit process override pair; otherwise a complete package-local pair for a recognized local package; otherwise a complete shared `config.toml` pair only for unbundled, source, or legacy execution. A missing or one-sided package pair fails loud without mixing sources or falling back to shared config.
+- Xvfb, Openbox, and temporary-root paths use their matching environment override when supplied, then the shared configuration; the timeout values remain configuration-owned.
+- The supported path override environment variables are `CODEX_COMPUTER_USE_MCP_BIN`, `CODEX_COMPUTER_USE_SKY_BIN`, `CODEX_COMPUTER_USE_XVFB_BIN`, `CODEX_COMPUTER_USE_OPENBOX_BIN`, and `CODEX_COMPUTER_USE_TEMP_ROOT`.
+- Missing `mcp_bin` and `sky_bin` leaves unbundled/source/legacy Computer Use unavailable. Do not invent a fallback runtime pair.
+- `codex-rs/ext/computer-use/AGENTS.md` is the Computer Use extension owner. Its live worktree reserves Xvfb starting at `FIRST_DISPLAY = 90` and scans a high display range rather than relying on the default allocation path; retain that high-range invariant unless current evidence changes it.
 
 ## Upstream Defect Policy
 
@@ -684,19 +653,16 @@ handler owners; canonical statuses stay full. -->
   `/home/lucas/work/codex/codex-rs/core/src/tools/handlers/multi_agents_v2/list_agents.rs`
   — current owners for token-efficient V2 fan-in, body-free list presentation, and full
   canonical statuses.
-- `/home/lucas/work/codex/scripts/cargo-guard.sh`,
-  `/home/lucas/work/codex/scripts/cargo-validation.toml`, and
-  `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust
-  execution, validation policy, and impact-inventory owners.
-- `/home/lucas/work/codex/scripts/cargo-validate-windows.ps1` and
-  `/home/lucas/work/codex/scripts/clear-windows-build-cache.ps1` — native-Windows manifest
-  executor and exact `F:\.cache` cleanup owner.
-- `/home/lucas/work/codex/scripts/install/install.sh` and
-  `/home/lucas/work/codex/scripts/build_codex_package.py` and
-  `/home/lucas/work/codex/scripts/codex_package/` — release installer and package
-  construction owners.
-- `/home/lucas/work/codex/codex-rs/ext/computer-use/AGENTS.md` — Computer Use
-  extension crate, vendored payload provenance, and future MCP sidecar owner.
+- `/home/lucas/work/codex/scripts/cargo-guard.sh`, `/home/lucas/work/codex/scripts/cargo-validation.toml`, and `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust execution, validation policy, and impact-inventory owners.
+- `/home/lucas/work/codex/justfile` / `build-local-codex-package-inputs` — guarded complete local source-input owner for the CLI, Code Mode host, bwrap, and Computer Use MCP.
+- `/home/lucas/work/codex/scripts/build_codex_package.py` and `/home/lucas/work/codex/scripts/codex_package/` — one-complete-package assembly and layout-validation owners.
+- `/home/lucas/work/codex/codex-rs/install-context/` — typed local-lane recognition and package-resource lookup owner.
+- `/home/lucas/work/codex/codex-rs/app-server-daemon/` — lane state, subordinate managed package, lifecycle, and pinning owner.
+- `/home/lucas/work/codex/codex-rs/app-server-transport/` — lane socket, startup-lock, and recovery-path owner.
+- `/home/lucas/work/codex/codex-rs/app-server/`, `/home/lucas/work/codex/codex-rs/cli/`, and `/home/lucas/work/codex/codex-rs/tui/` — direct app-server, CLI, and TUI lane followers.
+- `/home/lucas/work/codex/scripts/cargo-validate-windows.ps1` and `/home/lucas/work/codex/scripts/clear-windows-build-cache.ps1` — native-Windows manifest executor and exact `F:\.cache` cleanup owner.
+- `/home/lucas/work/codex/scripts/install/install.sh` — release installer owner.
+- `/home/lucas/work/codex/codex-rs/ext/computer-use/AGENTS.md` — Computer Use extension crate, vendored payload provenance, and current package-local MCP/Sky owner.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — TUI bottom-pane
   subtree instruction owner.
 
