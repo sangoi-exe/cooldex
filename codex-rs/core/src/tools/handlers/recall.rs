@@ -11,7 +11,7 @@ use serde_json::Value as JsonValue;
 use crate::context::ContextualUserFragment;
 use crate::context::RecallContext;
 use crate::function_tool::FunctionCallError;
-use crate::session::recall::unavailable_recall_context_for_error;
+use crate::session::recall::RecallIntervals;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -25,7 +25,10 @@ const TOOL_NAME: &str = "recall";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecallArgs {}
+struct RecallArgs {
+    #[serde(default)]
+    intervals: RecallIntervals,
+}
 
 struct RecallToolOutput {
     context: RecallContext,
@@ -61,12 +64,24 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
     fn spec(&self) -> ToolSpec {
         ToolSpec::Function(ResponsesApiTool {
             name: TOOL_NAME.to_string(),
-            description: "Return a bounded chronological slice immediately before the latest surviving compaction in the current thread."
+            description: "Return closed compaction intervals from the current thread as a chronological JSON list of intervals containing assistant messages and visible reasoning. The current open interval is excluded."
                 .to_string(),
             strict: true,
             defer_loading: None,
             parameters: JsonSchema::object(
-                BTreeMap::new(),
+                BTreeMap::from([(
+                    "intervals".to_string(),
+                    JsonSchema::one_of(
+                        vec![
+                            JsonSchema::integer(/*description*/ None),
+                            JsonSchema::string_enum(
+                                vec![JsonValue::String("all".to_string())],
+                                /*description*/ None,
+                            ),
+                        ],
+                        Some("Closed compaction intervals to return: a positive integer for the newest count, or \"all\". Defaults to 1; requests larger than available clamp to available.".to_string()),
+                    ),
+                )]),
                 /*required*/ None,
                 /*additional_properties*/ Some(false.into()),
             ),
@@ -81,7 +96,6 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
         Box::pin(async move {
             let ToolInvocation {
                 session,
-                turn,
                 payload,
                 ..
             } = invocation;
@@ -93,22 +107,16 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
                     ));
                 }
             };
-            let _: RecallArgs = parse_arguments(arguments.as_str())?;
-            let context = match session
-                .load_current_thread_recall_context(turn.as_ref())
+            let args: RecallArgs = parse_arguments(arguments.as_str())?;
+            let context = session
+                .load_current_thread_recall_context(args.intervals)
                 .await
-            {
-                Ok(context) => context,
-                Err(error) => unavailable_recall_context_for_error(session.thread_id, &error)
-                    .map_err(|render_error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "recall was unavailable and its bounded diagnostic could not be rendered: {render_error}"
-                        ))
-                    })?,
-            };
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!("failed to recall thread history: {error:#}"))
+                })?;
             let code_mode_result = serde_json::from_str(context.json()).map_err(|err| {
                 FunctionCallError::RespondToModel(format!(
-                    "recall produced an invalid bounded result: {err}"
+                    "recall produced an invalid interval result: {err}"
                 ))
             })?;
             Ok(boxed_tool_output(RecallToolOutput {

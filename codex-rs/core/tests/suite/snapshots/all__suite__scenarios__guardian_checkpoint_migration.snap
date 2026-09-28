@@ -1,6 +1,6 @@
 ---
 source: core/tests/suite/scenarios.rs
-assertion_line: 938
+assertion_line: 1176
 expression: snapshot
 ---
 Scenario: An old checkpoint retains a user restriction and verified answer. Incompatible automatic compaction keeps legacy review across restart with its saved answer; compatible manual compaction immediately activates thread-owned review.
@@ -17,10 +17,10 @@ Settings:
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
-  tools (8; hash=f81a741b0157eb10):
+  tools (8; hash=e4d5f430a2cedc67):
     - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=c04108e51a8548c5
     - function/write_stdin: Writes characters to an existing unified exec session and returns recent output.; args=[chars, max_output_tokens, session_id, yield_time_ms]; hash=7fb62d8a3e2df4e2
-    - function/recall: Return a bounded chronological slice immediately before the latest surviving compaction in the cu...; args=[]; hash=35a292aa6c2a049b
+    - function/recall: Return closed compaction intervals from the current thread as a chronological JSON list of interv...; args=[intervals]; hash=d4891e491102d14c
     - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=7c8f464569dbaa9c
     - custom/apply_patch: The `apply_patch` tool can be used to edit files. Each file path may appear in only one patch ope...; hash=a7af004fdc64b8d6
     - function/view_image: View a local image file from the filesystem when visual inspection is needed. Use this for images...; args=[detail, path]; hash=3b766d5bdec5d50e
@@ -45,14 +45,14 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 00)
 Settings: relative to window 1
   model: "gpt-5.6-luna"
-  tools (4; hash=e403eebae3c05dd7):
+  tools (4; hash=c38bbbe89765e276):
     - removed function/exec_command
     - removed function/write_stdin
     - removed function/recall
     - removed custom/apply_patch
     - removed function/view_image
     - removed tool_search
-    + custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=f282420d9c68709b
+    + custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=c3d4ac4b73cb2b9a
     + function/wait: Waits on a yielded `exec` cell and returns new output or completion. - Use `wait` only after `exe...; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=6692d8f6c55be489
 -- request 4 (turn) --
 00:message/user:

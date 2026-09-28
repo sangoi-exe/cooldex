@@ -1,19 +1,14 @@
 use super::ContextualUserFragment;
 use codex_protocol::models::ContentItemKind;
 
-/// One bounded historical context result returned by the explicit `recall` tool.
-// Merge-safety anchor: explicit recall availability remains solely in its bounded JSON contract,
-// avoiding a redundant internal flag that could drift from rendered tool output.
+/// Chronological persisted assistant and reasoning intervals returned by the explicit `recall` tool.
+// Merge-safety anchor: Recall renders its interval list directly, without an availability envelope or local truncation.
 pub(crate) struct RecallContext {
     json: String,
 }
 
 impl RecallContext {
     pub(crate) fn new(json: String) -> Self {
-        Self { json }
-    }
-
-    pub(crate) fn unavailable(json: String) -> Self {
         Self { json }
     }
 

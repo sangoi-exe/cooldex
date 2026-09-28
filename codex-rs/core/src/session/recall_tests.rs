@@ -1,81 +1,67 @@
+use std::num::NonZeroUsize;
+
 use codex_history::CompactedItem;
 use codex_history::PostCompactRecoveryAppliedItem;
 use codex_history::PostCompactRecoveryPayloadKind;
-use codex_history::ResponseItemEnvelope;
-use codex_history::RolloutItem;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
-use codex_protocol::models::ResponseItem;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadRolledBackEvent;
-use codex_protocol::protocol::TurnCompleteEvent;
-use codex_protocol::protocol::TurnStartedEvent;
-use codex_protocol::protocol::UserMessageEvent;
-use codex_thread_store::RecallRolloutSourceIssue;
-use codex_thread_store::RecallRolloutSourceIssueKind;
-use codex_thread_store::StoredRecallRolloutTail;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
 
 use super::*;
-use crate::session::tests::make_session_and_context;
 
 fn message(role: &str, text: &str) -> ResponseItem {
-    let content = if role == "assistant" {
-        ContentItem::OutputText {
-            text: text.to_string(),
-        }
-    } else {
-        ContentItem::InputText {
-            text: text.to_string(),
-        }
-    };
     ResponseItem::Message {
         id: None,
         role: role.to_string(),
-        content: vec![content],
+        content: vec![ContentItem::OutputText {
+            text: text.to_string(),
+        }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
 }
 
-fn function_call(call_id: &str) -> ResponseItem {
-    ResponseItem::FunctionCall {
-        id: None,
-        name: "shell".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        encrypted_function_args: None,
-        call_id: call_id.to_string(),
+fn reasoning(summary: &[&str], content: &[&str], encrypted_content: Option<&str>) -> ResponseItem {
+    ResponseItem::Reasoning {
+        id: Some(ResponseItemId::from_server("reasoning-id".to_string())),
+        summary: summary
+            .iter()
+            .map(|text| ReasoningItemReasoningSummary::SummaryText {
+                text: text.to_string(),
+            })
+            .collect(),
+        content: Some(
+            content
+                .iter()
+                .map(|text| ReasoningItemContent::ReasoningText {
+                    text: text.to_string(),
+                })
+                .collect(),
+        ),
+        encrypted_content: encrypted_content.map(str::to_string),
         internal_chat_message_metadata_passthrough: None,
     }
 }
 
-fn function_output(call_id: &str, output: &str) -> ResponseItem {
-    ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: Some(call_id.to_string()),
-        name: Some("shell".to_string()),
-        namespace: None,
-        output: FunctionCallOutputPayload::from_text(output.to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
-fn rollout_response_item(item: ResponseItem) -> RolloutItem {
+fn response(item: ResponseItem) -> RolloutItem {
     RolloutItem::ResponseItem(item.into())
 }
 
-fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
+fn compacted(replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
-        message: message.to_string(),
+        message: "compaction summary".to_string(),
         replacement_history: replacement_history
-            .map(|items| items.into_iter().map(ResponseItemEnvelope::new).collect()),
-        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
+            .map(|items| items.into_iter().map(Into::into).collect()),
         guardian_history: None,
         retained_context: None,
-        window_number: Some(1),
+        window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
@@ -87,1172 +73,176 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
     })
 }
 
-fn compacted_window(
-    message: &str,
-    replacement_history: Vec<ResponseItem>,
-    window_number: u64,
-    first_window_id: &str,
-    previous_window_id: Option<&str>,
-    window_id: &str,
-) -> RolloutItem {
-    RolloutItem::Compacted(CompactedItem {
-        message: message.to_string(),
-        replacement_history: Some(
-            replacement_history
-                .into_iter()
-                .map(ResponseItemEnvelope::new)
-                .collect(),
-        ),
-        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
-        guardian_history: None,
-        retained_context: None,
-        window_number: Some(window_number),
-        first_window_id: Some(first_window_id.to_string()),
-        previous_window_id: previous_window_id.map(ToString::to_string),
-        window_id: Some(window_id.to_string()),
-        post_compact_recovery: None,
-        mcp_resource_origins: None,
-        compaction_response_id: None,
-        latest_token_usage_record: None,
-        resume_metadata: None,
-    })
+fn newest(intervals: usize) -> RecallIntervals {
+    RecallIntervals::Count(NonZeroUsize::new(intervals).expect("positive interval count"))
 }
 
-fn legacy_compacted_window(
-    message: &str,
-    window_number: u64,
-    first_window_id: &str,
-    previous_window_id: Option<&str>,
-    window_id: &str,
-) -> RolloutItem {
-    RolloutItem::Compacted(CompactedItem {
-        message: message.to_string(),
-        replacement_history: None,
-        // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
-        guardian_history: None,
-        retained_context: None,
-        window_number: Some(window_number),
-        first_window_id: Some(first_window_id.to_string()),
-        previous_window_id: previous_window_id.map(ToString::to_string),
-        window_id: Some(window_id.to_string()),
-        post_compact_recovery: None,
-        mcp_resource_origins: None,
-        compaction_response_id: None,
-        latest_token_usage_record: None,
-        resume_metadata: None,
-    })
-}
-
-fn tail(thread_id: codex_protocol::ThreadId, items: Vec<RolloutItem>) -> StoredRecallRolloutTail {
-    StoredRecallRolloutTail {
-        thread_id,
-        items,
-        reached_start: true,
-        bytes_read: 1_024,
-        records_read: 8,
-        segments_read: 1,
-        source_issue: None,
-    }
-}
-
-fn parsed(context: &crate::context::RecallContext) -> Value {
+fn parsed(items: &[RolloutItem], intervals: RecallIntervals) -> Value {
+    let context = build_recall_context(items, intervals).expect("build recall intervals");
     serde_json::from_str(context.json()).expect("parse recall JSON")
 }
 
-fn turn_started(turn_id: &str) -> RolloutItem {
-    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-        turn_id: turn_id.to_string(),
-        root_turn_id: None,
-        trace_id: None,
-        started_at: None,
-        model_context_window: Some(128_000),
-        collaboration_mode_kind: codex_protocol::config_types::ModeKind::Default,
-    }))
-}
+#[test]
+fn selects_newest_closed_intervals_without_skipping_empty_intervals() {
+    let first = message("assistant", "first interval");
+    let second = message("assistant", "second interval, first item");
+    let third = message("assistant", "second interval, second item");
+    let items = vec![
+        response(first.clone()),
+        compacted(/*replacement_history*/ None),
+        response(second.clone()),
+        response(third.clone()),
+        compacted(Some(Vec::new())),
+        response(message("user", "an interval with no eligible content")),
+        compacted(/*replacement_history*/ None),
+        compacted(/*replacement_history*/ None),
+        response(message("assistant", "current open suffix")),
+    ];
+    let all = json!([[first], [second, third], [], []]);
 
-fn user_event(text: &str) -> RolloutItem {
-    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-        client_id: None,
-        message: text.to_string(),
-        images: None,
-        local_images: Vec::new(),
-        text_elements: Vec::new(),
-        ..Default::default()
-    }))
-}
-
-fn turn_complete(turn_id: &str) -> RolloutItem {
-    RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
-        turn_id: turn_id.to_string(),
-        last_agent_message: None,
-        error: None,
-        started_at: None,
-        completed_at: None,
-        duration_ms: None,
-        time_to_first_token_ms: None,
-    }))
-}
-
-#[tokio::test]
-async fn returns_paired_chronological_groups_before_the_surviving_boundary() {
-    let (session, turn_context) = make_session_and_context().await;
-    let call = function_call("call-1");
-    let output = function_output("call-1", "done");
-    let tool_search_call = ResponseItem::ToolSearchCall {
-        id: None,
-        call_id: Some("search-1".to_string()),
-        status: Some("completed".to_string()),
-        execution: "client".to_string(),
-        arguments: serde_json::json!({"query": "context"}),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let tool_search_output = ResponseItem::ToolSearchOutput {
-        id: None,
-        call_id: Some("search-1".to_string()),
-        status: "completed".to_string(),
-        execution: "client".to_string(),
-        tools: vec![serde_json::json!({"name": "read_file"})],
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(message("user", "old question")),
-                    rollout_response_item(call),
-                    rollout_response_item(output),
-                    rollout_response_item(tool_search_call),
-                    rollout_response_item(tool_search_output),
-                    rollout_response_item(message("assistant", "old answer")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build recall context");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["boundary"]["rollout_item_index"], 6);
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 4);
-    assert_eq!(
-        value["groups"][1]["items"]
-            .as_array()
-            .expect("paired items")
-            .len(),
-        2
-    );
-    assert_eq!(
-        value["groups"][2]["items"]
-            .as_array()
-            .expect("tool-search pair")
-            .len(),
-        2
-    );
-    assert_eq!(value["omitted_groups"], 0);
-    assert_eq!(value["truncated"], false);
-}
-
-#[tokio::test]
-async fn preserves_parallel_tool_batch_order_and_atomicity() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(function_call("call-a")),
-                    rollout_response_item(function_call("call-b")),
-                    rollout_response_item(function_output("call-b", "second")),
-                    rollout_response_item(function_output("call-a", "first")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build atomic recall batch");
-    let value = parsed(&context);
-    let groups = value["groups"].as_array().expect("groups");
-    let items = groups[0]["items"].as_array().expect("batch items");
-
-    assert_eq!(groups.len(), 1);
-    assert_eq!(items.len(), 4);
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item["call_id"].as_str().expect("call id"))
-            .collect::<Vec<_>>(),
-        vec!["call-a", "call-b", "call-b", "call-a"]
-    );
-    assert_eq!(value["omitted_groups"], 0);
-}
-
-#[tokio::test]
-async fn preserves_interleaved_native_tool_batch_order_and_atomicity() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(function_call("call-1")),
-                    rollout_response_item(message("assistant", "interleaved response item")),
-                    rollout_response_item(function_output("call-1", "done")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build interleaved recall batch");
-    let value = parsed(&context);
-    let groups = value["groups"].as_array().expect("groups");
-    let items = groups[0]["items"].as_array().expect("batch items");
-
-    assert_eq!(groups.len(), 1);
-    assert_eq!(
-        items
-            .iter()
-            .map(|item| item["type"].as_str().expect("item type"))
-            .collect::<Vec<_>>(),
-        vec!["function_call", "message", "function_call_output"]
-    );
-    assert_eq!(value["omitted_groups"], 0);
-}
-
-#[tokio::test]
-async fn preserves_standalone_and_server_tool_outputs_as_history_items() {
-    let (session, turn_context) = make_session_and_context().await;
-    let named_output = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: None,
-        name: Some("send_message_to_thread".to_string()),
-        namespace: Some("codex_app".to_string()),
-        output: FunctionCallOutputPayload::from_text("delegated work".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let server_output = ResponseItem::ToolSearchOutput {
-        id: None,
-        call_id: Some("server-search".to_string()),
-        status: "completed".to_string(),
-        execution: "server".to_string(),
-        tools: vec![serde_json::json!({"name": "read_file"})],
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(named_output),
-                    rollout_response_item(server_output),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build standalone output recall");
-    let value = parsed(&context);
-    let groups = value["groups"].as_array().expect("groups");
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0]["items"][0]["type"], "function_call_output");
-    assert_eq!(groups[1]["items"][0]["type"], "tool_search_output");
-    assert_eq!(value["omitted_groups"], 0);
-}
-
-#[tokio::test]
-async fn omits_an_incomplete_tool_batch_as_one_group() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(function_call("call-a")),
-                    rollout_response_item(function_call("call-b")),
-                    rollout_response_item(function_output("call-a", "only one")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("omit incomplete recall batch");
-    let value = parsed(&context);
-
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
-    assert_eq!(value["omitted_groups"], 1);
-    assert_eq!(value["truncated"], true);
-}
-
-#[tokio::test]
-async fn omits_an_unidentified_call_with_its_parallel_batch() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(function_call("")),
-                    rollout_response_item(function_call("call-b")),
-                    rollout_response_item(function_output("call-b", "second")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("omit unidentified call and its complete parallel follower");
-    let value = parsed(&context);
-
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
-    assert_eq!(value["omitted_groups"], 1);
-    assert_eq!(value["truncated"], true);
-}
-
-#[tokio::test]
-async fn rollback_removes_the_newest_compaction_boundary() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    turn_started("turn-1"),
-                    user_event("first"),
-                    rollout_response_item(message("assistant", "before older")),
-                    compacted("older", Some(Vec::new())),
-                    turn_complete("turn-1"),
-                    turn_started("turn-2"),
-                    user_event("second"),
-                    rollout_response_item(message("assistant", "before latest")),
-                    compacted("latest", Some(Vec::new())),
-                    turn_complete("turn-2"),
-                    RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
-                        num_turns: 1,
-                    })),
-                ],
-            ),
-        )
-        .await
-        .expect("build rollback recall");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["boundary"]["rollout_item_index"], 3);
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
-}
-
-#[tokio::test]
-async fn selects_the_latest_of_multiple_surviving_compactions() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(message("assistant", "before first")),
-                    compacted("first", Some(Vec::new())),
-                    rollout_response_item(message("assistant", "before latest")),
-                    compacted("latest", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build multiple-compaction recall");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["boundary"]["rollout_item_index"], 3);
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
-    assert_eq!(
-        value["groups"][0]["items"][0]["content"][0]["text"],
-        "before latest"
-    );
-}
-
-#[tokio::test]
-async fn excludes_the_predecessor_replacement_history_from_the_next_recall_window() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    const RETAINED_USER: &str = "retained historical request";
-    const INTERCOMPACT_DELTA: &str = "work completed after the predecessor compact";
-    let (session, turn_context) = make_session_and_context().await;
-    let retained_user = message("user", RETAINED_USER);
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    compacted_window(
-                        "first",
-                        vec![retained_user.clone()],
-                        1,
-                        FIRST_WINDOW_ID,
-                        None,
-                        FIRST_WINDOW_ID,
-                    ),
-                    rollout_response_item(message("assistant", INTERCOMPACT_DELTA)),
-                    compacted_window(
-                        "latest",
-                        vec![retained_user],
-                        2,
-                        FIRST_WINDOW_ID,
-                        Some(FIRST_WINDOW_ID),
-                        CURRENT_WINDOW_ID,
-                    ),
-                ],
-            ),
-        )
-        .await
-        .expect("build intercompact recall delta");
-    let value = parsed(&context);
-
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
-    assert_eq!(
-        value["groups"][0]["items"][0]["content"][0]["text"],
-        INTERCOMPACT_DELTA
-    );
-    assert!(
-        !context.json().contains(RETAINED_USER),
-        "the predecessor replacement history must not be serialized into the next recall"
-    );
-}
-
-#[tokio::test]
-async fn excludes_a_user_message_already_retained_by_the_current_replacement() {
-    const RETAINED_USER: &str = "retained historical request";
-    const UNRETAINED_HISTORY: &str = "historical work omitted from the replacement";
-    let (session, turn_context) = make_session_and_context().await;
-    let retained_user = message("user", RETAINED_USER);
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(retained_user.clone()),
-                    rollout_response_item(message("assistant", UNRETAINED_HISTORY)),
-                    compacted("summary", Some(vec![retained_user])),
-                ],
-            ),
-        )
-        .await
-        .expect("build first-window recall");
-
-    // Merge-safety anchor: explicit recall projects only history absent from the current
-    // replacement, so retained user input never appears twice in its bounded JSON.
-    assert!(
-        !context.json().contains(RETAINED_USER),
-        "a natively retained user message must not be repeated in explicit recall"
-    );
-    assert!(context.json().contains(UNRETAINED_HISTORY));
-}
-
-#[tokio::test]
-async fn bounded_history_reaches_previous_compaction_without_reaching_session_start() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    let (session, turn_context) = make_session_and_context().await;
-    let call = ResponseItem::FunctionCall {
-        id: None,
-        name: "shell".to_string(),
-        namespace: None,
-        arguments: "{}".to_string(),
-        encrypted_function_args: None,
-        call_id: "continuity-call".to_string(),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let output = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: Some("continuity-call".to_string()),
-        name: Some("shell".to_string()),
-        namespace: None,
-        output: FunctionCallOutputPayload::from_text("continuity output".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            compacted_window(
-                "first",
-                Vec::new(),
-                1,
-                FIRST_WINDOW_ID,
-                None,
-                FIRST_WINDOW_ID,
-            ),
-            rollout_response_item(message("assistant", "between compactions")),
-            rollout_response_item(call.clone()),
-            rollout_response_item(output.clone()),
-            compacted_window(
-                "latest",
-                vec![ResponseItem::Compaction {
-                    id: None,
-                    encrypted_content: "opaque".to_string(),
-                    internal_chat_message_metadata_passthrough: None,
-                }],
-                2,
-                FIRST_WINDOW_ID,
-                Some(FIRST_WINDOW_ID),
-                CURRENT_WINDOW_ID,
-            ),
-        ],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("previous compaction should complete the bounded recall window");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["source"]["reached_start"], false);
-    assert_eq!(value["source"]["reached_recall_origin"], true);
-    assert!(value.get("excluded_native_continuity_pairs").is_none());
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 2);
-    assert_eq!(
-        value["groups"][0]["items"][0]["content"][0]["text"],
-        "between compactions"
-    );
-    assert_eq!(
-        value["groups"][1]["items"]
-            .as_array()
-            .expect("complete historical tool batch")
-            .iter()
-            .map(|item| (item["type"].as_str(), item["call_id"].as_str(),))
-            .collect::<Vec<_>>(),
-        vec![
-            (Some("function_call"), Some("continuity-call")),
-            (Some("function_call_output"), Some("continuity-call")),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn first_compaction_accepts_metadata_backed_virtual_root() {
-    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(message(
-                        "assistant",
-                        "history before the first compaction",
-                    )),
-                    compacted_window(
-                        "first",
-                        Vec::new(),
-                        1,
-                        VIRTUAL_ROOT_ID,
-                        Some(VIRTUAL_ROOT_ID),
-                        CURRENT_WINDOW_ID,
-                    ),
-                ],
-            ),
-        )
-        .await
-        .expect("first compaction should accept its metadata-backed virtual root");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["source"]["reached_start"], true);
-    assert_eq!(value["source"]["reached_recall_origin"], true);
-    assert_eq!(
-        value["groups"][0]["items"][0]["content"][0]["text"],
-        "history before the first compaction"
-    );
-}
-
-#[tokio::test]
-async fn first_compaction_virtual_root_requires_complete_source_start() {
-    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![compacted_window(
-            "first",
-            Vec::new(),
-            1,
-            VIRTUAL_ROOT_ID,
-            Some(VIRTUAL_ROOT_ID),
-            CURRENT_WINDOW_ID,
-        )],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("an incomplete source should report work limit");
-    let value = parsed(&context);
-    assert_eq!(value["availability"], "work_limit");
-    assert_eq!(value["source"]["reached_recall_origin"], false);
-}
-
-#[tokio::test]
-async fn virtual_root_rejects_window_after_first() {
-    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
-    let (session, turn_context) = make_session_and_context().await;
-    let error = match session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![compacted_window(
-                    "second",
-                    Vec::new(),
-                    2,
-                    VIRTUAL_ROOT_ID,
-                    Some(VIRTUAL_ROOT_ID),
-                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002",
-                )],
-            ),
-        )
-        .await
-    {
-        Ok(_) => panic!("a later window cannot use the virtual root"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("names missing predecessor"));
-}
-
-#[tokio::test]
-async fn virtual_root_rejects_unequal_first_and_previous_window_ids() {
-    let (session, turn_context) = make_session_and_context().await;
-    let error = match session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![compacted_window(
-                    "first",
-                    Vec::new(),
-                    1,
-                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000",
-                    Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7afff"),
-                    "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
-                )],
-            ),
-        )
-        .await
-    {
-        Ok(_) => panic!("unequal first and previous window ids must be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("names missing predecessor"));
-}
-
-#[tokio::test]
-async fn virtual_root_rejects_missing_first_window_id() {
-    const VIRTUAL_ROOT_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
-    let (session, turn_context) = make_session_and_context().await;
-    let RolloutItem::Compacted(mut first) = compacted_window(
-        "first",
-        Vec::new(),
-        1,
-        VIRTUAL_ROOT_ID,
-        Some(VIRTUAL_ROOT_ID),
-        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001",
-    ) else {
-        unreachable!("compacted_window always builds a compacted item");
-    };
-    first.first_window_id = None;
-    let error = match session
-        .build_recall_context(
-            &turn_context,
-            tail(session.thread_id, vec![RolloutItem::Compacted(first)]),
-        )
-        .await
-    {
-        Ok(_) => panic!("missing first window id must be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("names missing predecessor"));
-}
-
-#[tokio::test]
-async fn named_predecessor_rejects_mismatched_present_window_id() {
-    const EXPECTED_PREDECESSOR_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a000";
-    let (session, turn_context) = make_session_and_context().await;
-    let error = match session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    compacted_window(
-                        "predecessor",
-                        Vec::new(),
-                        1,
-                        EXPECTED_PREDECESSOR_ID,
-                        None,
-                        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7afff",
-                    ),
-                    compacted_window(
-                        "current",
-                        Vec::new(),
-                        2,
-                        EXPECTED_PREDECESSOR_ID,
-                        Some(EXPECTED_PREDECESSOR_ID),
-                        "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002",
-                    ),
-                ],
-            ),
-        )
-        .await
-    {
-        Ok(_) => panic!("a present predecessor with the wrong id must be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("compaction predecessor mismatch")
-    );
-}
-
-#[tokio::test]
-async fn bounded_tail_without_named_previous_compaction_reports_work_limit() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            rollout_response_item(message("assistant", "bounded suffix only")),
-            compacted_window(
-                "latest",
-                Vec::new(),
-                2,
-                FIRST_WINDOW_ID,
-                Some(FIRST_WINDOW_ID),
-                CURRENT_WINDOW_ID,
-            ),
-        ],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("bounded source should report its incomplete origin");
-
-    assert_eq!(parsed(&context)["availability"], "work_limit");
-}
-
-#[tokio::test]
-async fn bounded_tail_with_legacy_predecessor_reports_work_limit() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            legacy_compacted_window(
-                "legacy predecessor",
-                1,
-                FIRST_WINDOW_ID,
-                None,
-                FIRST_WINDOW_ID,
-            ),
-            rollout_response_item(message("assistant", "bounded legacy suffix")),
-            compacted_window(
-                "current",
-                Vec::new(),
-                2,
-                FIRST_WINDOW_ID,
-                Some(FIRST_WINDOW_ID),
-                CURRENT_WINDOW_ID,
-            ),
-        ],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("legacy predecessor should require complete source chronology");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "work_limit");
-    assert_eq!(value["source"]["reached_recall_origin"], false);
-}
-
-#[tokio::test]
-async fn bounded_tail_with_legacy_current_and_predecessor_reports_work_limit() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            legacy_compacted_window(
-                "legacy predecessor",
-                1,
-                FIRST_WINDOW_ID,
-                None,
-                FIRST_WINDOW_ID,
-            ),
-            rollout_response_item(message("assistant", "bounded legacy suffix")),
-            legacy_compacted_window(
-                "legacy current",
-                2,
-                FIRST_WINDOW_ID,
-                Some(FIRST_WINDOW_ID),
-                CURRENT_WINDOW_ID,
-            ),
-        ],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("legacy current window should not legitimize an incomplete predecessor");
-
-    assert_eq!(parsed(&context)["availability"], "work_limit");
-}
-
-#[tokio::test]
-async fn bounded_legacy_current_accepts_a_self_contained_modern_predecessor() {
-    const FIRST_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001";
-    const CURRENT_WINDOW_ID: &str = "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a002";
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            compacted_window(
-                "modern predecessor",
-                Vec::new(),
-                1,
-                FIRST_WINDOW_ID,
-                None,
-                FIRST_WINDOW_ID,
-            ),
-            rollout_response_item(message("assistant", "bounded modern suffix")),
-            legacy_compacted_window(
-                "legacy current",
-                2,
-                FIRST_WINDOW_ID,
-                Some(FIRST_WINDOW_ID),
-                CURRENT_WINDOW_ID,
-            ),
-        ],
-    );
-    stored_tail.reached_start = false;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("replacement history should provide a complete bounded origin");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["boundary"]["kind"], "legacy");
-    assert_eq!(value["source"]["reached_recall_origin"], true);
-}
-
-#[tokio::test]
-async fn reports_unavailable_source_and_missing_compaction() {
-    let (session, turn_context) = make_session_and_context().await;
-    let mut incomplete = tail(session.thread_id, Vec::new());
-    incomplete.reached_start = false;
-    incomplete.bytes_read = RECALL_SOURCE_MAX_BYTES;
-    let work_limit = session
-        .build_recall_context(&turn_context, incomplete)
-        .await
-        .expect("work limit result");
-    // Merge-safety anchor: explicit recall availability is asserted from the bounded JSON
-    // contract, rather than from a redundant internal boolean.
-    assert_eq!(parsed(&work_limit)["availability"], "work_limit");
-
-    let no_compaction = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![rollout_response_item(message("user", "hello"))],
-            ),
-        )
-        .await
-        .expect("no compaction result");
-    assert_eq!(parsed(&no_compaction)["availability"], "no_compaction");
-}
-
-#[tokio::test]
-async fn reports_projected_historical_schema_drift_without_reconstruction() {
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![rollout_response_item(message(
-            "assistant",
-            "must not be reconstructed",
-        ))],
-    );
-    stored_tail.reached_start = false;
-    stored_tail.source_issue = Some(RecallRolloutSourceIssue {
-        kind: RecallRolloutSourceIssueKind::UnsupportedSchema,
-        path: Some("/tmp/copied-rollout.jsonl".into()),
-        line: None,
-        byte_offset: Some(1234),
-        ordinal: Some(17),
-        record_type: Some("response_item".to_string()),
-        event_type: None,
-        message: "historical response item drift".to_string(),
-    });
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("schema drift should become a bounded recall result");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "unsupported_schema");
-    assert_eq!(value["diagnostic_class"], "historical_schema_drift");
-    assert_eq!(value["source"]["path"], "/tmp/copied-rollout.jsonl");
-    assert_eq!(value["source"]["line"], Value::Null);
-    assert_eq!(value["source"]["byte_offset"], 1234);
-    assert_eq!(value["source"]["ordinal"], 17);
-    assert_eq!(value["source"]["record_type"], "response_item");
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
-}
-
-#[tokio::test]
-async fn oversized_source_metadata_uses_a_fixed_bounded_unavailable_result() {
-    let (session, turn_context) = make_session_and_context().await;
-    let oversized = "x".repeat(RECALL_RESULT_MAX_BYTES);
-    let mut stored_tail = tail(session.thread_id, Vec::new());
-    stored_tail.reached_start = false;
-    stored_tail.source_issue = Some(RecallRolloutSourceIssue {
-        kind: RecallRolloutSourceIssueKind::UnsupportedSchema,
-        path: Some(oversized.clone().into()),
-        line: Some(7),
-        byte_offset: Some(1234),
-        ordinal: Some(17),
-        record_type: Some(oversized.clone()),
-        event_type: Some(oversized),
-        message: "historical response item drift".to_string(),
-    });
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("oversized source metadata should use a fixed bounded fallback");
-    let value = parsed(&context);
-
-    assert!(context.json().len() <= RECALL_RESULT_MAX_BYTES);
-    assert!(approx_token_count(context.json()) <= RECALL_RESULT_MAX_TOKENS);
-    assert_eq!(value["availability"], "unsupported_schema");
-    assert_eq!(value["diagnostic_class"], "historical_schema_drift");
-    assert_eq!(value["diagnostic_message"], RECALL_METADATA_OMITTED_MESSAGE);
-    assert_eq!(value["truncated"], true);
-    assert_eq!(value["source"]["path"], Value::Null);
-    assert_eq!(value["source"]["line"], 7);
-    assert_eq!(value["source"]["byte_offset"], 1234);
-    assert_eq!(value["source"]["ordinal"], 17);
-    assert_eq!(value["source"]["record_type"], Value::Null);
-    assert_eq!(value["source"]["event_type"], Value::Null);
-    assert_eq!(value["groups"], serde_json::json!([]));
+    for (intervals, expected) in [
+        (RecallIntervals::default(), json!([[]])),
+        (newest(/*intervals*/ 2), json!([[], []])),
+        (newest(/*intervals*/ 3), json!([all[1], [], []])),
+        (newest(/*intervals*/ usize::MAX), all.clone()),
+        (RecallIntervals::All(AllIntervals::All), all),
+    ] {
+        assert_eq!(parsed(&items, intervals), expected);
+    }
 }
 
 #[test]
-fn renders_source_failures_as_bounded_nonfatal_recall_results() {
-    let thread_id = codex_protocol::ThreadId::new();
-    let error = RecallLoadError::Source(anyhow::anyhow!(
-        "historical source failed: {}",
-        "x".repeat(RECALL_DIAGNOSTIC_MAX_BYTES * 2)
-    ));
-
-    let context = unavailable_recall_context_for_error(thread_id, &error)
-        .expect("render bounded source diagnostic");
-    let value = parsed(&context);
-    let diagnostic = value["diagnostic_message"]
-        .as_str()
-        .expect("diagnostic message");
-
-    assert_eq!(value["availability"], "source_error");
-    assert_eq!(value["diagnostic_class"], "source_read_error");
-    assert!(diagnostic.len() <= RECALL_DIAGNOSTIC_MAX_BYTES);
-    assert!(diagnostic.ends_with("..."));
-    assert_eq!(value["groups"], serde_json::json!([]));
-}
-
-#[tokio::test]
-async fn accepts_legacy_boundary_after_complete_replay() {
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    rollout_response_item(message("user", "legacy input")),
-                    compacted("legacy summary", /*replacement_history*/ None),
-                ],
-            ),
-        )
-        .await
-        .expect("legacy recall");
-    let value = parsed(&context);
-
-    assert_eq!(value["availability"], "available");
-    assert_eq!(value["boundary"]["kind"], "legacy");
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 1);
-}
-
-#[tokio::test]
-async fn rejects_legacy_boundary_when_chronology_spans_multiple_segments() {
-    let (session, turn_context) = make_session_and_context().await;
-    let mut stored_tail = tail(
-        session.thread_id,
-        vec![
-            rollout_response_item(message("user", "legacy parent input")),
-            compacted("legacy summary", /*replacement_history*/ None),
-        ],
-    );
-    stored_tail.segments_read = 2;
-
-    let context = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("unsupported legacy recall");
-
-    assert_eq!(parsed(&context)["availability"], "unsupported_legacy");
-}
-
-#[tokio::test]
-async fn keeps_only_the_newest_64_complete_groups() {
-    let (session, turn_context) = make_session_and_context().await;
-    let mut items = (0..70)
-        .map(|index| {
-            rollout_response_item(message("assistant", format!("message {index}").as_str()))
-        })
-        .collect::<Vec<_>>();
-    items.push(compacted("summary", Some(Vec::new())));
-    let context = session
-        .build_recall_context(&turn_context, tail(session.thread_id, items))
-        .await
-        .expect("group-bounded recall");
-    let value = parsed(&context);
-
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 64);
-    assert_eq!(value["omitted_groups"], 6);
-    assert_eq!(value["truncated"], true);
-    assert_eq!(
-        value["groups"][0]["items"][0]["content"][0]["text"],
-        "message 6"
-    );
-}
-
-#[tokio::test]
-async fn applies_serialized_output_limits_deterministically() {
-    let (session, turn_context) = make_session_and_context().await;
+fn no_compaction_returns_no_intervals() {
     let items = vec![
-        rollout_response_item(message("assistant", &"x".repeat(RECALL_RESULT_MAX_BYTES))),
-        compacted("summary", Some(Vec::new())),
+        response(message("assistant", "uncompacted answer")),
+        response(reasoning(&["visible summary"], &[], /*encrypted_content*/ None)),
     ];
-    let stored_tail = tail(session.thread_id, items);
 
-    let first = session
-        .build_recall_context(&turn_context, stored_tail.clone())
-        .await
-        .expect("first bounded recall");
-    let second = session
-        .build_recall_context(&turn_context, stored_tail)
-        .await
-        .expect("second bounded recall");
-    let value = parsed(&first);
-
-    assert_eq!(first.json(), second.json());
-    assert!(first.json().len() <= RECALL_RESULT_MAX_BYTES);
-    assert!(approx_token_count(first.json()) <= RECALL_RESULT_MAX_TOKENS);
-    assert_eq!(value["groups"].as_array().expect("groups").len(), 0);
-    assert_eq!(value["omitted_groups"], 1);
-    assert_eq!(value["truncated"], true);
+    for intervals in [
+        RecallIntervals::default(),
+        newest(/*intervals*/ 8),
+        RecallIntervals::All(AllIntervals::All),
+    ] {
+        assert_eq!(parsed(&items, intervals), json!([]));
+    }
 }
 
-#[tokio::test]
-async fn post_compact_recovery_cross_thread_tail_is_rejected_before_sampling() {
-    let (session, turn_context) = make_session_and_context().await;
-    let other_thread = codex_protocol::ThreadId::new();
-    assert_ne!(other_thread, session.thread_id);
+#[test]
+fn one_compaction_closes_start_to_first_without_emitting_replacement_or_suffix() {
+    let before = message("assistant", "persisted before compaction");
+    let items = vec![
+        response(before.clone()),
+        compacted(Some(vec![message("assistant", "synthetic replacement history")])),
+        response(message("assistant", "current open suffix")),
+    ];
 
-    let result = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                other_thread,
-                vec![compacted("other thread summary", Some(Vec::new()))],
-            ),
-        )
-        .await;
-    let Err(error) = result else {
-        panic!("cross-thread bounded tail must be rejected");
-    };
+    for intervals in [
+        RecallIntervals::default(),
+        newest(/*intervals*/ 8),
+        RecallIntervals::All(AllIntervals::All),
+    ] {
+        assert_eq!(parsed(&items, intervals), json!([[before]]));
+    }
+}
 
-    assert!(
-        error.to_string().contains(&other_thread.to_string()),
-        "error should identify the rejected tail owner: {error:#}"
-    );
-    assert!(
-        error.to_string().contains(&session.thread_id.to_string()),
-        "error should identify the live session owner: {error:#}"
+#[test]
+fn returns_only_assistant_messages_and_visible_reasoning_in_persisted_order() {
+    let assistant = message("assistant", "persisted assistant answer");
+    let visible_summary = reasoning(&["", "visible summary"], &[], Some("encrypted summary"));
+    let visible_content = reasoning(&[], &["", "visible content"], Some("encrypted content"));
+    let visible_text: ResponseItem = serde_json::from_value(json!({
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "text", "text": "visible text"}],
+        "encrypted_content": "encrypted text"
+    })).unwrap();
+    let mut items = vec![
+        response(message("system", "system instructions")),
+        response(message("developer", "developer instructions")),
+        response(message("user", "user input")),
+        response(assistant.clone()),
+        response(reasoning(&[], &[], Some("encrypted-only reasoning"))),
+        response(reasoning(&[""], &[""], Some("empty visible entries"))),
+        response(visible_summary),
+        response(visible_content),
+        response(visible_text),
+        RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
+            message: "diagnostic".to_string(),
+            codex_error_info: None,
+            misalignment: None,
+        })),
+        RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
+            compaction_window_id: "window-id".to_string(),
+            boundary_item_id: "boundary-id".to_string(),
+            turn_id: "turn-id".to_string(),
+            payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
+        }),
+        RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+    ];
+    for item in [
+        json!({"type": "additional_tools", "role": "assistant", "tools": []}),
+        json!({"type": "agent_message", "author": "/root", "recipient": "/root/child", "content": []}),
+        json!({"type": "local_shell_call", "status": "completed", "action": {"type": "exec", "command": ["true"]}}),
+        json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "call-id"}),
+        json!({"type": "function_call_output", "call_id": "call-id", "output": "tool output"}),
+        json!({"type": "custom_tool_call", "name": "apply_patch", "input": "patch", "call_id": "custom-id"}),
+        json!({"type": "custom_tool_call_output", "call_id": "custom-id", "output": "custom output"}),
+        json!({"type": "tool_search_call", "execution": "client", "arguments": {"query": "tools"}}),
+        json!({"type": "tool_search_output", "status": "completed", "execution": "client", "tools": []}),
+        json!({"type": "web_search_call"}),
+        json!({"type": "image_generation_call", "status": "completed", "result": "image"}),
+        json!({"type": "compaction", "encrypted_content": "encrypted compaction"}),
+        json!({"type": "context_compaction", "encrypted_content": "context compaction"}),
+        json!({"type": "configuration_update", "reasoning": {"effort": "medium"}}),
+        json!({"type": "compaction_trigger"}),
+        json!({"type": "other"}),
+    ] {
+        items.push(response(serde_json::from_value(item).expect("canonical response fixture")));
+    }
+    items.push(compacted(/*replacement_history*/ None));
+    let expected_summary = json!({
+        "type": "reasoning",
+        "id": "reasoning-id",
+        "summary": [
+            {"type": "summary_text", "text": ""},
+            {"type": "summary_text", "text": "visible summary"}
+        ],
+        "content": []
+    });
+    let expected_content = json!({
+        "type": "reasoning",
+        "id": "reasoning-id",
+        "summary": [],
+        "content": [
+            {"type": "reasoning_text", "text": ""},
+            {"type": "reasoning_text", "text": "visible content"}
+        ]
+    });
+    let expected_text = json!({
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "text", "text": "visible text"}]
+    });
+
+    assert_eq!(
+        parsed(&items, RecallIntervals::default()),
+        json!([[assistant, expected_summary, expected_content, expected_text]])
     );
 }
 
-#[tokio::test]
-async fn post_compact_recovery_raw_rollout_receipt_data_is_not_projected() {
-    const RECEIPT_SENTINEL: &str = "GATE_RECEIPT_MUST_REMAIN_RAW_ROLLOUT_DATA";
-    let (session, turn_context) = make_session_and_context().await;
-    let context = session
-        .build_recall_context(
-            &turn_context,
-            tail(
-                session.thread_id,
-                vec![
-                    RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
-                        message: RECEIPT_SENTINEL.to_string(),
-                        codex_error_info: None,
-                        misalignment: None,
-                    })),
-                    RolloutItem::PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem {
-                        compaction_window_id: "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string(),
-                        boundary_item_id: "msg_boundary".to_string(),
-                        turn_id: "turn_consuming".to_string(),
-                        payload_kind: PostCompactRecoveryPayloadKind::HandoffAndRecovery,
-                    }),
-                    rollout_response_item(message("assistant", "model-visible history")),
-                    compacted("summary", Some(Vec::new())),
-                ],
-            ),
-        )
-        .await
-        .expect("build bounded recall without raw rollout metadata");
+#[test]
+fn persisted_compaction_markers_are_not_reinterpreted_by_rollback_events() {
+    let first = message("assistant", "first interval");
+    let second = message("assistant", "second interval");
+    let items = vec![
+        response(first.clone()),
+        compacted(/*replacement_history*/ None),
+        response(second.clone()),
+        compacted(/*replacement_history*/ None),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    ];
 
-    assert!(!context.json().contains(RECEIPT_SENTINEL));
-    assert!(!context.json().contains("post_compact_recovery_applied"));
-    assert!(
-        context.json().contains("model-visible history"),
-        "model-visible response items should remain projected"
-    );
+    assert_eq!(parsed(&items, RecallIntervals::All(AllIntervals::All)), json!([[first], [second]]));
 }

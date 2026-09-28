@@ -259,7 +259,7 @@ async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
 }
 
 #[tokio::test]
-async fn recall_is_a_strict_plain_args_less_tool() {
+async fn recall_is_a_strict_plain_interval_tool() {
     let plan = probe(|_| {}).await;
     plan.assert_visible_contains(&["recall"]);
     plan.assert_registered_contains(&["recall"]);
@@ -275,11 +275,20 @@ async fn recall_is_a_strict_plain_args_less_tool() {
 
     assert_eq!(name, "recall");
     assert!(*strict);
+    // Merge-safety anchor: Recall owns one optional interval selection, not a bounded-tail query or result envelope.
     assert_eq!(
         serde_json::to_value(parameters).expect("serialize recall parameters"),
         json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "intervals": {
+                    "description": "Closed compaction intervals to return: a positive integer for the newest count, or \"all\". Defaults to 1; requests larger than available clamp to available.",
+                    "oneOf": [
+                        {"type": "integer"},
+                        {"type": "string", "enum": ["all"]}
+                    ]
+                }
+            },
             "additionalProperties": false
         })
     );

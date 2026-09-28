@@ -33,10 +33,10 @@ Settings:
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
-  tools (8; hash=f2ceb425d73383f6):
+  tools (8; hash=f5c7ff97f7e08447):
     - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=c04108e51a8548c5
     - function/write_stdin: Writes characters to an existing unified exec session and returns recent output.; args=[chars, max_output_tokens, session_id, yield_time_ms]; hash=7fb62d8a3e2df4e2
-    - function/recall: Return a bounded chronological slice immediately before the latest surviving compaction in the cu...; args=[]; hash=35a292aa6c2a049b
+    - function/recall: Return closed compaction intervals from the current thread as a chronological JSON list of interv...; args=[intervals]; hash=d4891e491102d14c
     - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
     - custom/apply_patch: The `apply_patch` tool can be used to edit files. Each file path may appear in only one patch ope...; hash=a7af004fdc64b8d6
     - function/view_image: View a local image file from the filesystem when visual inspection is needed. Use this for images...; args=[detail, path]; hash=3b766d5bdec5d50e

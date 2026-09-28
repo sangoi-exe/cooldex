@@ -1,10 +1,13 @@
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::LoadThreadHistoryParams;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -78,8 +81,12 @@ fn user_turn(text: &str) -> codex_protocol::turn_input::TurnInputRequest {
     }])
 }
 
+#[test_case("{}"; "default one interval")]
+#[test_case(r#"{"intervals":1}"#; "positive count")]
+#[test_case(r#"{"intervals":"all"}"#; "all intervals")]
+#[test_case(r#"{"intervals":8}"#; "clamped count")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
+async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(arguments: &str) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -95,7 +102,8 @@ async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
                 ev_completed("response-2"),
             ]),
             sse(vec![
-                ev_function_call("recall-call", "recall", "{}"),
+                ev_assistant_message("open-answer", "answer in the current open interval"),
+                ev_function_call("recall-call", "recall", arguments),
                 ev_completed("response-3"),
             ]),
             sse(vec![
@@ -122,6 +130,21 @@ async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.codex.flush_rollout().await?;
+    let persisted_answer = test.thread_store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: false,
+        })
+        .await?
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if envelope.item.id().is_some_and(|id| id.as_str() == "old-answer") => Some(envelope.item),
+            _ => None,
+        })
+        .context("persisted answer before compaction")?;
     test.codex.submit(Op::Compact).await?;
     wait_for_event(&test.codex, |event| matches!(event, EventMsg::Warning(_))).await;
     wait_for_event(&test.codex, |event| {
@@ -142,31 +165,18 @@ async fn recall_returns_an_inert_current_thread_tool_result() -> Result<()> {
         .function_call_output_text("recall-call")
         .expect("recall function output");
     let value: Value = serde_json::from_str(&output)?;
-    assert_eq!(value["availability"], "available");
-    assert_eq!(
-        value["thread_id"],
-        test.session_configured.thread_id.to_string()
-    );
-    assert!(value["source"]["reached_start"].as_bool().unwrap_or(false));
-    assert_eq!(value["source"]["segments_read"], 1);
-    assert!(
-        value["groups"]
-            .as_array()
-            .is_some_and(|groups| !groups.is_empty())
-    );
-    assert!(!output.contains("<system>"));
-    assert!(!output.contains("<developer>"));
+    assert_eq!(value, json!([[persisted_answer]]));
 
     Ok(())
 }
 
-#[test_case("all", "available"; "full history")]
-#[test_case("1", "no_compaction"; "partial history")]
-#[test_case("none", "no_compaction"; "no history")]
+#[test_case("all", json!([[]]); "full history")]
+#[test_case("1", json!([]); "partial history")]
+#[test_case("none", json!([]); "no history")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_recall_reads_only_the_rollout_owned_by_its_history_mode(
     fork_turns: &str,
-    expected_availability: &str,
+    expected_intervals: Value,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -274,26 +284,17 @@ async fn child_recall_reads_only_the_rollout_owned_by_its_history_mode(
 
     let output = wait_for_recall_output_request(&child_recall_output).await?;
     let value: Value = serde_json::from_str(&output)?;
-    assert_eq!(value["availability"], expected_availability);
-    let child_thread_id = value["thread_id"]
-        .as_str()
-        .expect("recall output should name its current thread");
-    assert_ne!(child_thread_id, parent_thread_id.to_string());
-    assert!(
+    assert_eq!(value, expected_intervals);
+    assert_eq!(
         test.thread_manager
             .list_thread_ids()
             .await
-            .iter()
-            .any(|thread_id| thread_id.to_string() == child_thread_id)
+            .into_iter()
+            .filter(|thread_id| *thread_id != parent_thread_id)
+            .count(),
+        1
     );
     assert_eq!(parent_setup.requests().len(), 2);
-    if expected_availability == "available" {
-        assert_eq!(value["boundary"]["kind"], "replacement_history");
-        assert_eq!(value["source"]["reached_recall_origin"], true);
-    } else {
-        assert!(value["boundary"].is_null());
-        assert_eq!(value["source"]["reached_recall_origin"], false);
-    }
 
     Ok(())
 }
