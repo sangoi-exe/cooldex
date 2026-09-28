@@ -172,21 +172,6 @@ pub struct LoadThreadHistoryParams {
     pub include_archived: bool,
 }
 
-// Merge-safety anchor: generic bounded-tail inputs/results retain physical-byte, record-count,
-// reached-start, and segment accounting independently of the narrower recall projection.
-/// Parameters for a bounded newest-to-oldest read of one thread's canonical rollout.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoadRolloutTailParams {
-    /// Thread id to load.
-    pub thread_id: ThreadId,
-    /// Whether archived threads are eligible.
-    pub include_archived: bool,
-    /// Maximum physical source bytes the store may read.
-    pub max_bytes: u64,
-    /// Maximum nonblank rollout records the store may inspect.
-    pub max_records: usize,
-}
-
 /// Persisted rollout history for a thread, without any filesystem path requirement.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThreadHistory {
@@ -207,76 +192,6 @@ pub struct StoredModelContext {
     pub thread_id: ThreadId,
     /// Persisted rollout items in replay order.
     pub items: Vec<RolloutItem>,
-}
-
-// Merge-safety anchor: stored rollout tails retain reached-start plus physical byte, record, and
-// segment accounting.
-/// Bounded canonical rollout items returned in replay order.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredRolloutTail {
-    /// Thread id represented by the rollout tail.
-    pub thread_id: ThreadId,
-    /// Persisted rollout items in replay order.
-    pub items: Vec<RolloutItem>,
-    /// Whether the read reached the canonical beginning of the thread history.
-    pub reached_start: bool,
-    /// Physical source bytes read while producing this result.
-    pub bytes_read: u64,
-    /// Nonblank rollout records inspected while producing this result.
-    pub records_read: usize,
-    /// Physical lineage segments inspected while producing this result.
-    pub segments_read: usize,
-}
-
-/// Failure class reported by the recall-specific rollout projection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecallRolloutSourceIssueKind {
-    /// The source could not be parsed as a JSONL rollout envelope.
-    SourceError,
-    /// A reconstruction-relevant record uses an unsupported historical schema.
-    UnsupportedSchema,
-}
-
-/// Bounded source diagnostic produced by the recall-specific rollout projection.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecallRolloutSourceIssue {
-    pub kind: RecallRolloutSourceIssueKind,
-    pub path: Option<PathBuf>,
-    pub line: Option<u64>,
-    pub byte_offset: Option<u64>,
-    pub ordinal: Option<u64>,
-    pub record_type: Option<String>,
-    pub event_type: Option<String>,
-    pub message: String,
-}
-
-// Merge-safety anchor: stored recall tails feed explicit recall only; post-compaction recovery
-// remains boundary/packet based and must not reconstruct raw history.
-/// Bounded reconstruction projection returned for explicit recall.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StoredRecallRolloutTail {
-    pub thread_id: ThreadId,
-    pub items: Vec<RolloutItem>,
-    pub reached_start: bool,
-    pub bytes_read: u64,
-    pub records_read: usize,
-    pub segments_read: usize,
-    pub source_issue: Option<RecallRolloutSourceIssue>,
-}
-
-impl From<StoredRolloutTail> for StoredRecallRolloutTail {
-    fn from(tail: StoredRolloutTail) -> Self {
-        Self {
-            thread_id: tail.thread_id,
-            items: tail.items,
-            reached_start: tail.reached_start,
-            bytes_read: tail.bytes_read,
-            records_read: tail.records_read,
-            segments_read: tail.segments_read,
-            source_issue: None,
-        }
-    }
 }
 
 /// Requested boundary for inheriting a paginated thread's history.

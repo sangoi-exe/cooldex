@@ -12,7 +12,6 @@ mod projects;
 mod read_thread;
 mod revert_thread;
 mod rollout_migration;
-mod rollout_tail;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;
@@ -77,7 +76,6 @@ use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTimelineParams;
 use crate::ListTurnsParams;
-use crate::LoadRolloutTailParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
@@ -97,8 +95,6 @@ use crate::SearchThreadsParams;
 use crate::StoredModelContext;
 use crate::StoredProject;
 use crate::StoredProjectsPage;
-use crate::StoredRecallRolloutTail;
-use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
@@ -545,20 +541,6 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move {
             thread_settings_snapshot::load_latest_thread_settings_snapshot(self, params).await
         })
-    }
-
-    fn load_rollout_tail(
-        &self,
-        params: LoadRolloutTailParams,
-    ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
-        Box::pin(async move { rollout_tail::load_rollout_tail(self, params).await })
-    }
-
-    fn load_recall_rollout_tail(
-        &self,
-        params: LoadRolloutTailParams,
-    ) -> ThreadStoreFuture<'_, StoredRecallRolloutTail> {
-        Box::pin(async move { rollout_tail::load_recall_rollout_tail(self, params).await })
     }
 
     fn prepare_fork(&self, params: PrepareForkParams) -> ThreadStoreFuture<'_, PreparedFork> {

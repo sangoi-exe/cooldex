@@ -44,23 +44,11 @@ fn scans_jsonl_records_from_end() -> std::io::Result<()> {
 {"value":"second"}
 {"value":"third"}
 "#;
-    let second_offset = br#"{"value":"first"}
-"#
-    .len() as u64;
-    let third_offset = second_offset
-        + br#"{"value":"second"}
-"#
-        .len() as u64;
-    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
 
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("third"));
-    assert_eq!(scanner.last_record_start_offset(), Some(third_offset));
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
-    assert_eq!(scanner.last_record_start_offset(), Some(second_offset));
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
-    assert_eq!(scanner.last_record_start_offset(), Some(0));
-    assert!(scanner.scan_next::<TestRecord>()?.is_none());
-    Ok(())
+    assert_records(
+        &mut ReverseJsonlScanner::new(Cursor::new(input))?,
+        &["third", "second", "first"],
+    )
 }
 
 #[test]
@@ -98,15 +86,11 @@ fn skips_records_over_the_configured_limit() -> std::io::Result<()> {
 #[test]
 fn accepts_valid_json_at_eof() -> std::io::Result<()> {
     let input = b"{\"value\":\"first\"}\n{\"value\":\"second\"}";
-    let second_offset = b"{\"value\":\"first\"}\n".len() as u64;
-    let mut scanner = ReverseJsonlScanner::new(Cursor::new(input))?;
 
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
-    assert_eq!(scanner.last_record_start_offset(), Some(second_offset));
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
-    assert_eq!(scanner.last_record_start_offset(), Some(0));
-    assert!(scanner.scan_next::<TestRecord>()?.is_none());
-    Ok(())
+    assert_records(
+        &mut ReverseJsonlScanner::new(Cursor::new(input))?,
+        &["second", "first"],
+    )
 }
 
 #[test]
@@ -181,55 +165,4 @@ fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
     let mut scanner = ReverseJsonlScanner::new(Cursor::new(input.into_bytes()))?;
 
     assert_records(&mut scanner, &["third", &large_value, "first"])
-}
-
-#[test]
-fn byte_limit_discards_a_partial_record() -> std::io::Result<()> {
-    let input = b"{\"value\":\"first\"}\n{\"value\":\"second\"}\n";
-    let max_bytes = 8;
-    let mut scanner = ReverseJsonlScanner::new_at_with_byte_limit(
-        Cursor::new(input),
-        input.len() as u64,
-        max_bytes,
-    )?;
-
-    assert!(scanner.scan_next::<TestRecord>()?.is_none());
-    assert_eq!(scanner.bytes_read(), max_bytes);
-    assert!(!scanner.reached_start());
-    Ok(())
-}
-
-#[test]
-fn byte_limit_returns_complete_records_inside_the_window() -> std::io::Result<()> {
-    let first = serde_json::to_string(&record("first"))?;
-    let second = serde_json::to_string(&record("second"))?;
-    let input = format!("{first}\n{second}\n");
-    let max_bytes = (second.len() + 2) as u64;
-    let mut scanner = ReverseJsonlScanner::new_at_with_byte_limit(
-        Cursor::new(input.as_bytes()),
-        input.len() as u64,
-        max_bytes,
-    )?;
-
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("second"));
-    assert!(scanner.scan_next::<TestRecord>()?.is_none());
-    assert_eq!(scanner.bytes_read(), max_bytes);
-    assert!(!scanner.reached_start());
-    Ok(())
-}
-
-#[test]
-fn bounded_scanner_reports_the_real_source_start() -> std::io::Result<()> {
-    let input = b"{\"value\":\"first\"}\n";
-    let mut scanner = ReverseJsonlScanner::new_at_with_byte_limit(
-        Cursor::new(input),
-        input.len() as u64,
-        input.len() as u64,
-    )?;
-
-    assert_eq!(parsed(scanner.scan_next::<TestRecord>()?), record("first"));
-    assert!(scanner.reached_start());
-    assert!(scanner.scan_next::<TestRecord>()?.is_none());
-    assert_eq!(scanner.bytes_read(), input.len() as u64);
-    Ok(())
 }

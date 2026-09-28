@@ -27,7 +27,6 @@ use crate::ListThreadAttachmentsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTurnsParams;
-use crate::LoadRolloutTailParams;
 use crate::LoadThreadHistoryParams;
 use crate::MoveProjectParams;
 use crate::MoveThreadToSectionParams;
@@ -46,8 +45,6 @@ use crate::SearchThreadsParams;
 use crate::StoredModelContext;
 use crate::StoredProject;
 use crate::StoredProjectsPage;
-use crate::StoredRecallRolloutTail;
-use crate::StoredRolloutTail;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
@@ -212,8 +209,7 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
-    // Merge-safety anchor: ThreadStore preserves fallback settings-snapshot and bounded-tail
-    // contracts, with recall projection separate.
+    // Merge-safety anchor: ThreadStore retains settings-snapshot reconstruction from complete persisted history for stores without a targeted reader.
     /// Loads the newest persisted thread settings snapshot.
     ///
     /// Implementations with a targeted persisted-history reader should override this method.
@@ -233,33 +229,6 @@ pub trait ThreadStore: Any + Send + Sync {
                 }
                 _ => None,
             }))
-        })
-    }
-
-    /// Reads a bounded tail of the current thread's canonical rollout.
-    fn load_rollout_tail(
-        &self,
-        _params: LoadRolloutTailParams,
-    ) -> ThreadStoreFuture<'_, StoredRolloutTail> {
-        Box::pin(async {
-            Err(ThreadStoreError::Unsupported {
-                operation: "load_rollout_tail",
-            })
-        })
-    }
-
-    /// Reads the reconstruction-relevant projection of a bounded canonical rollout tail.
-    ///
-    /// Stores without a specialized persisted-schema projection may delegate to their ordinary
-    /// bounded reader.
-    fn load_recall_rollout_tail(
-        &self,
-        params: LoadRolloutTailParams,
-    ) -> ThreadStoreFuture<'_, StoredRecallRolloutTail> {
-        Box::pin(async move {
-            self.load_rollout_tail(params)
-                .await
-                .map(StoredRecallRolloutTail::from)
         })
     }
 
