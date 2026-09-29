@@ -11,14 +11,7 @@
   particular plan path or status, branch or Git object, review state, live
   alias/symlink/binary identity, temporary path, validation receipt or hash, or
   last-reviewed timestamp.
-- `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and
-  `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` own
-  shared lead and child behavior. The exact session-selected profile config owns
-  its profile and route registry (for an Orch session,
-  `/home/lucas/.codex/orch.config.toml`); registered
-  `/home/lucas/.codex/agents/*.toml` files own role-specific behavior and verdict
-  semantics. Use narrow pointers instead of copying those rule bodies into this
-  workspace.
+- `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` own shared lead and child behavior. `/home/lucas/.codex/config.toml` is the canonical default resident runtime config and references `/home/lucas/.codex/.profile_instructions/sangoi_orchestrator_instructions.md`, which owns the Orchestrator workflow, route registry, and resident harness contract; registered `/home/lucas/.codex/agents/*.toml` files own role-specific behavior and verdict semantics. Use narrow pointers instead of copying those rule bodies into this workspace.
 
 ## Local Baseline
 
@@ -64,7 +57,8 @@
   canonical owners, contracts, and architecture; do not retain obsolete local structure
   through aliases, wrappers, dual reads, fallbacks, or whole-side conflict selection.
 - Carry affected tests and other direct followers, including stale expectations in automatically merged tests, into the same coherent resolution and propagation batch. Complete the selected resident profile's validation and review route before publishing the final `dev` candidate to `origin/dev`; that profile retains task classification, planning, Worker, Gate, lifecycle, and completion ownership.
-- Once source and manifests reconcile, use the existing guarded `prep-plan` and `plan` actions against the complete merge selection before expensive preparation and validation to expose routing or mapping gaps. `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` remain the selection owners; close a demonstrated mapping class coherently without changing full-versus-affected runtime behavior or requiring another full collection after corrections.
+- Once source and manifests reconcile, use the existing guarded `prep-plan` and `plan` actions against the complete merge selection before expensive preparation and validation to expose routing or mapping gaps. `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` remain the selection owners; close a demonstrated mapping class coherently without changing full-versus-affected runtime behavior.
+- For an admitted Cooldex upstream sync, run one initial complete validation collection for the integrated merge selection. After that collection reaches terminal completion, validate corrections with the supported focused selector derived from the corrected files or correction range, preserving affected package and contract coverage. Repeat the complete collector only when changed inputs, tooling, contracts, or evidence invalidate the prior collection.
 - Diagnose materialization, compilation, and runtime-test failures at their own owners after the current batch reaches terminal completion. Git pack or checksum failures require source-object integrity diagnosis rather than repeated test execution. Bazel external-materialization failures require inspection of output, repository, and content-cache ownership; `.bazelrc` and `.github/scripts/run_bazel_with_buildbuddy.py` are live owner anchors, not a recovery recipe. Do not authorize automatic repair, cleanup, bypass, or new wrappers.
 - Keep required full staged diff checks. Attribute whitespace to local-resolution bytes or the relevant upstream blob before correcting it; do not normalize unrelated imported snapshots or licenses merely to silence checks. Resolve generating source first, then regenerate derived conflicts through existing owners, and do not substitute task-only checks for mandatory commit checks.
 - For every admitted upstream sync, resolve the highest exact non-prerelease upstream tag matching `rust-vMAJOR.MINOR.PATCH`, set `[workspace.package].version` to that version, update Cargo-generated or mechanical followers through guarded repository routes, and validate the resulting build and version identity.
@@ -205,7 +199,7 @@ current-user rescope. -->
 <!-- Merge-safety anchor: native-Windows validation is planner-accounted and PowerShell-executed; selected runtime packages use native Nextest while WSL test preparation uses the config-owned explicit package mapper and Linux production builds remain on the guarded WSL path. -->
 ### Native-Windows bulk test procedure
 
-- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...` to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use `--changed` to select all current staged, unstaged, and ordinary untracked paths, not a delta since a prior full collection; use `--file <corrected-path>` or an appropriate correction `--range <base>..<merge>` for a narrower post-collection batch, with `<base>` set to the merge's first parent. `--changed` does not materialize arbitrary unstaged or untracked worktree bytes: the native executor consumes the index candidate, which requires worktree/index equality and no ordinary untracked source. The root owns exact task staging; Workers do not stage. Every native validation automatically uses the canonical reusable workset at literal `F:\.cache\cw\workset`. Standard and strict runtime selections send their eligible selected packages plus evidenced native binary prerequisites to native Nextest while its test filter runs only affected package tests; non-runtime selections do not acquire a native test run. `--mode full` remains the complete bulk collector. Never run Cargo or Nextest directly on native Windows, and never use the former Windows `just test` route.
+- The canonical operator entry point remains WSL: use `./scripts/cargo-guard.sh plan ...` to inspect the frozen plan and `./scripts/cargo-guard.sh verify ...` to execute it. Use `--changed` to select all current staged, unstaged, and ordinary untracked paths, not a delta since a prior full collection; use `--file <corrected-path>` or an appropriate correction `--range <base>..<merge>` for a narrower post-collection batch, with `<base>` set to the merge's first parent. `--changed` does not materialize arbitrary unstaged or untracked worktree bytes: the native executor consumes the index candidate, which requires worktree/index equality and no ordinary untracked source. The root owns exact task staging; Workers do not stage. Every native validation automatically uses the canonical reusable workset at literal `F:\.cache\cw\workset`. Standard and strict runtime selections send their eligible selected packages plus evidenced native binary prerequisites to native Nextest while its test filter runs only affected package tests; non-runtime selections do not acquire a native test run. `--mode full` remains the complete bulk collector; admitted upstream syncs follow the initial-complete-then-focused-correction cycle in the durable upstream-sync route above. Never run Cargo or Nextest directly on native Windows, and never use the former Windows `just test` route.
 - `scripts/cargo-validation.toml` and `scripts/cargo-validate.py` are the only owners of
   selection, platform classification, exclusions, the frozen manifest, and resource
   contracts. The PowerShell executor runs only manifest-authorized Windows entries; it
@@ -623,9 +617,8 @@ Codex supports running connected app-server and exec-server on different operati
 - `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and
   `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` — shared
   lead and child behavior owners.
-- Session-selected profile config — profile route registry and profile-specific
-  child-workflow owner; for an Orch session,
-  `/home/lucas/.codex/orch.config.toml`.
+- `/home/lucas/.codex/config.toml` — canonical default resident runtime config and pointer to the resident developer-instruction owner.
+- `/home/lucas/.codex/.profile_instructions/sangoi_orchestrator_instructions.md` — default Orchestrator workflow, route registry, and resident harness contract owner.
 - `/home/lucas/.codex/agents/` — registered specialist role behavior and verdict
   owners.
 - `/home/lucas/work/codex/.sangoi/reference/areas/cooldex-fork-feature-inventory.md` —
