@@ -732,7 +732,7 @@ pub(crate) async fn record_pending_input(
         TurnInput::UserInput {
             content,
             client_id,
-            acceptance_order,
+            metadata,
         } => {
             let awaiting_admission = client_id.as_deref().is_some_and(|client_id| {
                 sess.pending_user_message_admissions
@@ -754,7 +754,7 @@ pub(crate) async fn record_pending_input(
                     model_info,
                     content.as_slice(),
                     client_id.clone(),
-                    acceptance_order,
+                    metadata,
                     persist_context,
                 )
                 .await;
@@ -797,7 +797,7 @@ pub(crate) async fn record_pending_input(
                 model_info,
                 content.as_slice(),
                 client_id,
-                acceptance_order,
+                metadata,
                 persist_context,
             )
             .await;
@@ -831,6 +831,7 @@ pub(crate) async fn record_pending_input(
         TurnInput::InterAgentCommunication(communication) => {
             sess.record_inter_agent_communication(turn_context, model_info, communication)
                 .await;
+            sess.ensure_rollout_materialized(persist_context).await;
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;

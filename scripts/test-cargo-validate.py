@@ -46,6 +46,7 @@ class CargoValidateTests(unittest.TestCase):
         self.repo_root = Path(self.temp_dir.name)
         package_roots = {
             "codex-analytics": "analytics",
+            "codex-agent-message-board-client": "agent-message-board-client",
             "codex-agent-message-board-extension": "ext/agent-message-board",
             "codex-app-server": "app-server",
             "codex-app-server-protocol": "app-server-protocol",
@@ -64,6 +65,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-config-schema": "config-schema",
             "codex-core": "core",
             "codex-core-api": "core-api",
+            "codex-core-plugin-common": "core-plugin-common",
             "codex-code-mode-host": "code-mode-host",
             "codex-code-mode-protocol": "code-mode-protocol",
             "codex-code-mode-runtime": "code-mode-runtime",
@@ -83,6 +85,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-hooks": "hooks",
             "codex-http-client": "http-client",
             "codex-install-context": "install-context",
+            "codex-keyring-store": "keyring-store",
             "codex-linux-sandbox": "linux-sandbox",
             "codex-login": "login",
             "codex-mcp": "codex-mcp",
@@ -112,6 +115,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-utils-absolute-path": "utils/absolute-path",
             "codex-utils-audio": "utils/audio",
             "codex-utils-cache": "utils/cache",
+            "codex-utils-cargo-bin": "utils/cargo-bin",
             "codex-utils-fuzzy-match": "utils/fuzzy-match",
             "codex-utils-git-discovery": "utils/git-discovery",
             "codex-utils-image": "utils/image",
@@ -3549,7 +3553,12 @@ class CargoValidateTests(unittest.TestCase):
             "spawn_prep::tests|stdio_bridge::tests|token::tests|"
             "unified_exec::backends::elevated::tests|unified_exec::tests|wfp::tests|"
             "winutil::tests|wrapper::tests|windows_impl::tests|win|"
-            "setup_helper_embeds_as_invoker_manifest)(?:$|::)/))"
+            "setup_helper_embeds_as_invoker_manifest|environment_child|"
+            "large_payload_survives_windows_process_creation|"
+            "only_native_bad_or_expired_passwords_trigger_credential_repair|"
+            "runner_receipt_distinguishes_incomplete_setup_from_owner_and_removal|"
+            "runtime_repair_handles_long_directory_and_file_paths|"
+            "windows_equivalent_names_are_scrubbed_decoded_and_deduplicated)(?:$|::)/))"
         )
         self.assertIn(sandbox_exclusion, filter_expression)
         for neutral_prefix in (
@@ -3561,40 +3570,115 @@ class CargoValidateTests(unittest.TestCase):
         ):
             self.assertNotIn(neutral_prefix, filter_expression)
 
-    def test_native_aggregate_excludes_proven_elevated_windows_sandbox_tests(
+    def test_native_filters_exclude_windows_only_cases_and_preserve_neutral_tests(
         self,
     ) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
         argv = self.windows_workspace_aggregate_argv()
         filter_expression = argv[argv.index("-E") + 1]
         self.assertIsInstance(filter_expression, str)
 
         expected_tests = {
+            "codex-app-server-daemon": (
+                "captured_stdio_closes_while_child_is_alive",
+                "detached_launch_preflight_allows_residual_job",
+            ),
+            "codex-app-server": ("setup_validates_permissions_before_provisioning",),
+            "codex-cli": ("restrictive_launcher_uses_embedded_if_daemon_cannot_start",),
             "codex-core": (
                 "windows_sandbox_cli_preserves_managed_deny_reads_across_launches",
+                "windows_elevated_unified_exec_enforces_large_recursive_deny_reads",
             ),
             "codex-exec-server": (
                 "file_system_elevated_relative_read_denial_uses_policy_cwd",
+                "powershell_alias_falls_back_without_primary_runtime_over_rpc",
+            ),
+            "codex-rmcp-client": (
+                "local_stdio_initializes_without_a_console_directly_and_through_cmd",
+            ),
+            "codex-tui": ("mouse_capture_restores_console_mode_and_encoding",),
+            "codex-utils-pty": (
+                "piped_child_has_no_console_with_or_without_job_containment",
+            ),
+            "codex-windows-sandbox": (
+                "windows_equivalent_names_are_scrubbed_decoded_and_deduplicated",
+                "large_payload_survives_windows_process_creation",
+                "environment_child",
+                "only_native_bad_or_expired_passwords_trigger_credential_repair",
+                "runner_receipt_distinguishes_incomplete_setup_from_owner_and_removal",
+                "runtime_repair_handles_long_directory_and_file_paths",
             ),
         }
-        package_filters = {}
-        for package, test_names in expected_tests.items():
-            prefix = f"(package({package}) & test(/(?:^|::)(?:"
-            suffix = ")(?:$|::)/))"
-            start = filter_expression.index(prefix) + len(prefix)
-            end = filter_expression.index(suffix, start)
-            package_filter = filter_expression[start:end]
-            package_filters[package] = package_filter
-            for test_name in test_names:
-                with self.subTest(package=package, test_name=test_name):
-                    self.assertEqual(1, package_filter.split("|").count(test_name))
-
-        for variant in ("local", "remote"):
-            with self.subTest(variant=variant):
-                self.assertRegex(
-                    "file_system_elevated_relative_read_denial_uses_policy_cwd"
-                    f"::{variant}",
-                    "(?:^|::)(?:" + package_filters["codex-exec-server"] + ")(?:$|::)",
-                )
+        parameterized_tests = {
+            "codex-app-server": (
+                "setup_validates_permissions_before_provisioning::full_access_reaches_the_service",
+                "setup_validates_permissions_before_provisioning::supported_restricted_permissions_reach_the_service",
+                "setup_validates_permissions_before_provisioning::unsupported_restricted_permissions_fail_before_the_service",
+                "setup_validates_permissions_before_provisioning::legacy_full_access_skips_the_service_and_reaches_shared_setup",
+            ),
+            "codex-exec-server": (
+                "file_system_elevated_relative_read_denial_uses_policy_cwd::local",
+                "file_system_elevated_relative_read_denial_uses_policy_cwd::remote",
+                "powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_pwsh",
+                "powershell_alias_falls_back_without_primary_runtime_over_rpc::uppercase_pwsh",
+                "powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_powershell",
+                "powershell_alias_falls_back_without_primary_runtime_over_rpc::mixed_case_powershell",
+            ),
+        }
+        neutral_tests = {
+            "codex-app-server": (
+                "suite::v2::windows_sandbox_setup::startup_mxc_preference_is_resolved_before_readiness",
+            ),
+            "codex-core": (
+                "session::tests::turn_start_mcp_tests::turn_start_refreshes_dirty_mcp_reuses_clean_runtime_and_cancels_discovery",
+            ),
+            "codex-hooks": (
+                "events::session_end::tests::session_end_matches_other_reason",
+            ),
+            "codex-keyring-store": (
+                "error_kind::tests::preserves_typed_causes_without_guessing_from_messages",
+                "error_kind::tests::classifies_native_backend_errors",
+            ),
+            "codex-windows-sandbox": (
+                "launch_environment::tests::only_large_payloads_use_environment_transport",
+                "environment_transport::tests::unicode_payload_roundtrips_and_stale_chunks_are_replaced",
+                "environment_transport::tests::malformed_transport_is_rejected_and_scrubbed",
+                "environment_transport::tests::rejected_payload_preserves_environment",
+                "environment_transport::tests::native_environment_ignores_unrelated_non_unicode_and_rejects_invalid_transport",
+            ),
+        }
+        for package in sorted(expected_tests.keys() | neutral_tests.keys()):
+            command = planner.windows_nextest_packages_command(
+                config, [package], "fixture", []
+            )
+            self.assertIsNotNone(command)
+            self.assertIn(("-p", package), tuple(zip(command.argv, command.argv[1:])))
+            self.assertNotIn(("--exclude", package), tuple(zip(argv, argv[1:])))
+            selected_filter = command.argv[command.argv.index("-E") + 1]
+            self.assertEqual(
+                f"(package({package})) & ({filter_expression})", selected_filter
+            )
+            for selection, expression in (
+                ("full", filter_expression),
+                ("affected", selected_filter),
+            ):
+                with self.subTest(package=package, selection=selection):
+                    prefix = f"(package({package}) & test(/(?:^|::)(?:"
+                    if prefix not in expression:
+                        self.assertNotIn(package, expected_tests)
+                        continue
+                    start = expression.index(prefix) + len(prefix)
+                    end = expression.index(")(?:$|::)/))", start)
+                    package_filter = expression[start:end]
+                    pattern = "(?:^|::)(?:" + package_filter + ")(?:$|::)"
+                    for test_name in expected_tests.get(package, ()):
+                        self.assertEqual(1, package_filter.split("|").count(test_name))
+                        self.assertRegex(test_name, pattern)
+                    for test_name in parameterized_tests.get(package, ()):
+                        self.assertRegex(test_name, pattern)
+                    for test_name in neutral_tests.get(package, ()):
+                        self.assertNotRegex(test_name, pattern)
 
     def test_windows_sandbox_owner_selects_native_aggregate(self) -> None:
         plan = self.plan_json(
@@ -4799,6 +4883,52 @@ class CargoValidateTests(unittest.TestCase):
                     self.command_lines(plan),
                 )
 
+    def test_upstream_sync_new_package_paths_are_explicit_in_strict_mode(self) -> None:
+        cases = {
+            "codex-agent-message-board-client": (
+                "codex-rs/agent-message-board-client/src/client.rs",
+                "codex-rs/agent-message-board-client/src/lib.rs",
+                "codex-rs/agent-message-board-client/src/protocol.rs",
+                "codex-rs/agent-message-board-client/tests/remote_board.rs",
+            ),
+            "codex-core-plugin-common": (
+                "codex-rs/core-plugin-common/src/installed.rs",
+                "codex-rs/core-plugin-common/src/lib.rs",
+                "codex-rs/core-plugin-common/src/plugin_id.rs",
+                "codex-rs/core-plugin-common/src/plugin_id_tests.rs",
+            ),
+            "codex-keyring-store": (
+                "codex-rs/keyring-store/src/error_kind.rs",
+                "codex-rs/keyring-store/src/error_kind_tests.rs",
+                "codex-rs/keyring-store/src/lib.rs",
+            ),
+            "codex-utils-cargo-bin": (
+                "codex-rs/utils/cargo-bin/src/executable.rs",
+                "codex-rs/utils/cargo-bin/src/lib.rs",
+            ),
+        }
+        for package_name, paths in cases.items():
+            for file_path in paths:
+                with self.subTest(file_path=file_path):
+                    plan = self.plan_json("--file", file_path, "--mode", "strict")
+                    self.assertEqual([], plan["warnings"])
+                    self.assertEqual([package_name], plan["selected_packages"])
+                    self.assertEqual(["cli"], plan["selected_surfaces"])
+                    self.assertIn(
+                        [
+                            "./scripts/cargo-guard.sh",
+                            "cargo",
+                            "check",
+                            "-p",
+                            package_name,
+                        ],
+                        self.command_lines(plan),
+                    )
+                    self.assertIn(
+                        ["just", "clippy-strict", "-p", package_name],
+                        self.command_lines(plan),
+                    )
+
     def test_deleted_unowned_rust_path_does_not_block_current_workspace_validation(
         self,
     ) -> None:
@@ -4964,6 +5094,127 @@ class CargoValidateTests(unittest.TestCase):
         self.assertEqual(list(paths), validation_plan["changed_files"])
         self.assertIn(["just", "bazel-lock-check"], validation_commands)
         self.assertNotIn(["just", "write-app-server-schema"], validation_commands)
+
+    def test_upstream_sync_cli_inputs_select_existing_cli_surface(self) -> None:
+        for file_path in (
+            ".cargo/config.toml",
+            "codex-rs/agent-message-board-client/README.md",
+        ):
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "standard")
+                self.assertEqual([file_path], plan["changed_files"])
+                self.assertEqual([], plan["warnings"])
+                self.assertEqual(["cli"], plan["selected_surfaces"])
+                self.assertEqual(
+                    [
+                        [
+                            "./scripts/cargo-guard.sh",
+                            "cargo",
+                            "check",
+                            "-p",
+                            "codex-cli",
+                            "--bin",
+                            "codex",
+                        ]
+                    ],
+                    self.command_lines(plan),
+                )
+
+    def test_upstream_sync_bazel_inputs_select_existing_lock_check(self) -> None:
+        for file_path in (
+            "defs.bzl",
+            "patches/BUILD.bazel",
+            "patches/rules_rs_rust_debug_modes.patch",
+            "patches/rules_rs_workspace_package_version.patch",
+            "patches/rules_rust_compiler_thp.patch",
+            "patches/v8_bazel_rules.patch",
+            "third_party/v8/BUILD.bazel",
+            "third_party/v8/gnu_libcxx_shared_exception_symbols.txt",
+            "third_party/v8/rusty_v8_150_4_0.sha256",
+        ):
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "standard")
+                self.assertEqual([file_path], plan["changed_files"])
+                self.assertEqual([], plan["warnings"])
+                self.assertEqual(
+                    [["just", "bazel-lock-check"]], self.command_lines(plan)
+                )
+
+    def test_upstream_sync_v8_helper_selects_planner_and_direct_tests(self) -> None:
+        helper_path = "scripts/codex_package/v8.py"
+        direct_tests = ["python3", "scripts/codex_package/test_v8.py"]
+        helper_commands = [
+            ["python3", "-m", "py_compile", "scripts/cargo-validate.py"],
+            ["python3", "scripts/test-cargo-validate.py"],
+            ["python3", "scripts/test-cargo-validate-windows.py"],
+            ["python3", "scripts/test-clear-windows-build-cache.py"],
+            [
+                "./scripts/cargo-guard.sh",
+                "plan",
+                "--file",
+                "scripts/cargo-validate.py",
+                "--mode",
+                "standard",
+                "--no-receipt",
+            ],
+            direct_tests,
+        ]
+        for file_path, expected_commands in (
+            (helper_path, helper_commands),
+            ("scripts/codex_package/test_v8.py", [direct_tests]),
+        ):
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "standard")
+                self.assertEqual([file_path], plan["changed_files"])
+                self.assertEqual([], plan["warnings"])
+                self.assertEqual(["validation_tooling"], plan["selected_surfaces"])
+                self.assertEqual(expected_commands, self.command_lines(plan))
+
+        prep_plan = self.action_json(
+            "prep-plan", "--file", helper_path, "--mode", "full"
+        )
+        self.assertEqual([], self.command_lines(prep_plan))
+        full_plan = self.plan_json("--file", helper_path, "--mode", "full")
+        full_commands = self.command_lines(full_plan)
+        self.assertEqual(helper_commands, full_commands[: len(helper_commands)])
+        windows_argv = self.windows_workspace_aggregate_argv()
+        self.assertEqual(1, full_commands.count(windows_argv))
+        self.assertIn(
+            ("--exclude", "codex-voice-host"),
+            list(zip(windows_argv, windows_argv[1:])),
+        )
+        self.assertEqual(
+            [
+                "codex-voice-host validation is excluded and remains unvalidated, including in the full native Windows workspace aggregate"
+            ],
+            full_plan["warnings"],
+        )
+
+    def test_upstream_sync_external_inputs_remain_classification_only(self) -> None:
+        for file_path in (
+            ".github/actions/setup-ci/action.yml",
+            ".github/scripts/check_github_canary.py",
+            ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
+            ".github/scripts/publish_r2_release.py",
+            ".github/scripts/releases.py",
+            ".github/scripts/select_windows_bazel_targets.py",
+            ".github/scripts/test_releases.py",
+            ".github/scripts/test_select_windows_bazel_targets.py",
+            ".github/scripts/windows_bazel_test_durations.tsv",
+            ".github/workflows/bazel.yml",
+            ".github/workflows/r2-release.yml",
+            ".github/workflows/repo-checks.yml",
+            ".github/workflows/rust-release.yml",
+            "CHANGELOG.md",
+            "third_party/v8/README.md",
+        ):
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "standard")
+                self.assertEqual([file_path], plan["changed_files"])
+                self.assertEqual([], plan["warnings"])
+                self.assertEqual([], plan["selected_packages"])
+                self.assertEqual([], plan["selected_surfaces"])
+                self.assertEqual([], self.command_lines(plan))
 
     def test_resource_profile_env_includes_adaptive_job_contract(self) -> None:
         plan = self.plan_json(

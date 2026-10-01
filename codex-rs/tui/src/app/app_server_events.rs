@@ -78,6 +78,7 @@ impl App {
                 }
                 self.agents_overview.request_id = None;
                 self.agents_overview.refresh_pending = false;
+                self.agents_overview.initialized = false;
                 self.agents_overview.refresh_notifications.clear();
                 self.agents_overview.activity.clear();
                 self.agents_overview.last_messages.clear();
@@ -220,6 +221,18 @@ impl App {
                 .or_default();
         }
         self.track_agents_overview_notification(&notification);
+        // Retained blank sessions stay subscribed after their event channels are cleared.
+        if let ServerNotification::ThreadSettingsUpdated(settings) = &notification
+            && let Ok(thread_id) = ThreadId::from_string(&settings.thread_id)
+            && self.agents_overview.blank_sessions.contains_key(&thread_id)
+            && !self.thread_event_channels.contains_key(&thread_id)
+        {
+            self.apply_thread_settings_to_cached_session(thread_id, &settings.thread_settings)
+                .await;
+            if let Some(input) = self.agents_overview.input_states.get_mut(&thread_id) {
+                input.pending_thread_settings = Some(settings.clone());
+            }
+        }
         if matches!(
             &notification,
             ServerNotification::ThreadStarted(_)

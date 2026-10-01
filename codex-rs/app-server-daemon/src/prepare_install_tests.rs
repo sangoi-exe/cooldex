@@ -15,6 +15,7 @@ fn daemon(home: &std::path::Path) -> crate::Daemon {
     crate::Daemon {
         codex_home: home.to_path_buf(),
         owner: crate::DaemonOwner::Generic,
+        log_diagnostics: false,
         socket_path: state.join("app-server.sock"),
         pid_file: state.join("app-server.pid"),
         update_pid_file: state.join("app-server-updater.pid"),

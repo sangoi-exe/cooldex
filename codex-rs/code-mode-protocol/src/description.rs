@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::PUBLIC_TOOL_NAME;
 use crate::json_schema_types::render_json_schema_to_typescript;
+use crate::json_schema_types::render_json_schema_to_typescript_with_budget;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFERRED_NESTED_TOOLS_GUIDANCE: &str = r#"Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.
@@ -147,6 +148,9 @@ pub struct ToolDefinition {
     pub description: String,
     pub kind: CodeModeToolKind,
     pub input_schema: Option<JsonValue>,
+    /// Internal budget used while rendering the input declaration, before sending it to the host.
+    #[serde(skip)]
+    pub input_schema_max_bytes: Option<usize>,
     pub output_schema: Option<JsonValue>,
 }
 
@@ -437,7 +441,10 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
         CodeModeToolKind::Function => definition
             .input_schema
             .as_ref()
-            .map(render_json_schema_to_typescript)
+            .map(|schema| match definition.input_schema_max_bytes {
+                Some(max_bytes) => render_json_schema_to_typescript_with_budget(schema, max_bytes),
+                None => render_json_schema_to_typescript(schema),
+            })
             .unwrap_or_else(|| "unknown".to_string()),
         CodeModeToolKind::Freeform => "string".to_string(),
     };
@@ -614,6 +621,7 @@ mod tests {
                 "required": ["city"],
                 "additionalProperties": false
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": { "ok": { "type": "boolean" } },
@@ -654,6 +662,7 @@ mod tests {
                 },
                 "required": ["weather"]
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": {
@@ -690,6 +699,7 @@ mod tests {
                 "properties": {},
                 "additionalProperties": false
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(mcp_call_tool_result_schema(json!({
                 "type": "object",
                 "properties": {
@@ -729,6 +739,7 @@ mod tests {
                 description: "bar".to_string(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                input_schema_max_bytes: None,
                 output_schema: None,
             }],
             &[],
@@ -784,6 +795,7 @@ bar"
                         "properties": {},
                         "additionalProperties": false
                     })),
+                    input_schema_max_bytes: None,
                     output_schema: Some(mcp_call_tool_result_schema(json!({
                         "type": "object",
                         "properties": {},
@@ -800,6 +812,7 @@ bar"
                         "properties": {},
                         "additionalProperties": false
                     })),
+                    input_schema_max_bytes: None,
                     output_schema: Some(mcp_call_tool_result_schema(json!({
                         "type": "object",
                         "properties": {},
@@ -844,6 +857,7 @@ bar"
                     "properties": {},
                     "additionalProperties": false
                 })),
+                input_schema_max_bytes: None,
                 output_schema: Some(mcp_call_tool_result_schema(json!({
                     "type": "object",
                     "properties": {},
@@ -874,6 +888,7 @@ bar"
                 "properties": {},
                 "additionalProperties": false
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": {
@@ -908,6 +923,7 @@ bar"
                 "properties": {},
                 "additionalProperties": false
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(json!({
                 "type": "object",
                 "properties": {
@@ -941,6 +957,7 @@ bar"
                     description: "First tool".to_string(),
                     kind: first_tool.kind,
                     input_schema: first_tool.input_schema,
+                    input_schema_max_bytes: None,
                     output_schema: first_tool.output_schema,
                 },
                 ToolDefinition {
@@ -949,6 +966,7 @@ bar"
                     description: "Second tool".to_string(),
                     kind: second_tool.kind,
                     input_schema: second_tool.input_schema,
+                    input_schema_max_bytes: None,
                     output_schema: second_tool.output_schema,
                 },
             ],
@@ -981,6 +999,7 @@ bar"
                 "properties": {},
                 "additionalProperties": false
             })),
+            input_schema_max_bytes: None,
             output_schema: Some(mcp_call_tool_result_schema(json!({
                 "type": "object",
                 "properties": {},
@@ -1013,6 +1032,7 @@ bar"
                 description: "Deferred tool".to_string(),
                 kind: CodeModeToolKind::Function,
                 input_schema: None,
+                input_schema_max_bytes: None,
                 output_schema: None,
             }],
             &BTreeMap::new(),

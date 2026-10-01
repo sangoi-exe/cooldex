@@ -47,6 +47,7 @@ use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::TokenUsage;
@@ -402,6 +403,7 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
+        // Merge-safety anchor: task registration requires the same unopened reservation after asynchronous lifecycle work; upstream agent admission must not recreate a retired slot.
         let Some(turn) = active.as_mut().filter(|turn| {
             turn.task.is_none()
                 && turn.reserved_turn_id.as_deref() == Some(turn_context.sub_id.as_str())
@@ -410,7 +412,7 @@ impl Session {
             return false;
         };
         self.record_started_turn(&turn_context.sub_id).await;
-        let agent_execution_guard = self.services.agent_control.execution_guard(
+        let agent_execution_guard = self.services.agent_control.admit_turn(
             turn_context.multi_agent_version,
             &turn_context.session_source,
         );
@@ -613,7 +615,8 @@ impl Session {
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         if let Some(active_turn) = self.take_active_turn(&reason).await {
-            self.finish_turn_abort(active_turn, reason).await;
+            self.finish_turn_abort(active_turn, reason, /*error*/ None)
+                .await;
         }
     }
 
@@ -621,6 +624,7 @@ impl Session {
         self: &Arc<Self>,
         turn_id: &str,
         reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
     ) -> bool {
         let active_turn = {
             let _settings_guard = self.acquire_thread_settings_persistence().await;
@@ -651,7 +655,7 @@ impl Session {
             return false;
         };
 
-        self.finish_turn_abort(active_turn, reason).await;
+        self.finish_turn_abort(active_turn, reason, error).await;
         true
     }
 
@@ -659,6 +663,7 @@ impl Session {
         self: &Arc<Self>,
         mut active_turn: ActiveTurn,
         reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
     ) {
         let input_persisted = active_turn.input_persisted.take();
         let task = active_turn.task.take();
@@ -670,7 +675,7 @@ impl Session {
             ));
         }
         let completed_with_error = if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
+            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
                 .await
         } else {
             false
@@ -737,6 +742,7 @@ impl Session {
                 self.emit_turn_error_lifecycle(
                     turn_context.as_ref(),
                     err.to_codex_protocol_error(),
+                    err.details(),
                 )
                 .await;
                 self.track_turn_codex_error(turn_context.as_ref(), &err);
@@ -925,6 +931,7 @@ impl Session {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
+                error: None,
                 started_at,
                 completed_at,
                 duration_ms,
@@ -1003,42 +1010,38 @@ impl Session {
 
     async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
         loop {
-            let settings_guard = self.acquire_thread_settings_persistence().await;
-            let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .is_some_and(|active_turn| active_turn.finishing)
-            {
-                if !matches!(reason, TurnAbortReason::Replaced) {
-                    return None;
-                }
-                let Some(task) = active
+            let done = {
+                let _settings_guard = self.acquire_thread_settings_persistence().await;
+                let mut active = self.active_turn.lock().await;
+                if active
                     .as_ref()
-                    .and_then(|active_turn| active_turn.task.as_ref())
-                else {
-                    return None;
-                };
-                let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
-                let _ = done.as_mut().enable();
-                drop(active);
-                drop(settings_guard);
-                done.await;
-                continue;
-            }
-            if matches!(
-                reason,
-                TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-            ) && active
-                .as_ref()
-                .is_some_and(|active_turn| active_turn.task.is_some())
-            {
-                self.mark_interrupted();
-            }
-            let active_turn = active.take();
-            if let Some(task) = active_turn.as_ref().and_then(|turn| turn.task.as_ref()) {
-                task.cancellation_token.cancel();
-            }
-            return active_turn;
+                    .is_some_and(|active_turn| active_turn.finishing)
+                {
+                    if !matches!(reason, TurnAbortReason::Replaced) {
+                        return None;
+                    }
+                    let task = active.as_ref()?.task.as_ref()?;
+                    let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+                    let _ = done.as_mut().enable();
+                    done
+                } else {
+                    if matches!(
+                        reason,
+                        TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+                    ) && active
+                        .as_ref()
+                        .is_some_and(|active_turn| active_turn.task.is_some())
+                    {
+                        self.mark_interrupted();
+                    }
+                    let active_turn = active.take();
+                    if let Some(task) = active_turn.as_ref().and_then(|turn| turn.task.as_ref()) {
+                        task.cancellation_token.cancel();
+                    }
+                    return active_turn;
+                }
+            };
+            done.await;
         }
     }
 
@@ -1065,6 +1068,7 @@ impl Session {
         task: RunningTask,
         reason: TurnAbortReason,
         turn_state: &Mutex<TurnState>,
+        error: Option<ErrorEvent>,
     ) -> bool {
         let sub_id = task.turn_context.sub_id.clone();
         if !task.cancellation_token.is_cancelled() {
@@ -1192,6 +1196,7 @@ impl Session {
         let event = EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some(task.turn_context.sub_id.clone()),
             reason,
+            error,
             started_at,
             completed_at,
             duration_ms,

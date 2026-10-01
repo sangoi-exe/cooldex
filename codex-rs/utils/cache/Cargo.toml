@@ -10,8 +10,8 @@ workspace = true
 [dependencies]
 lru = { workspace = true }
 sha1 = { workspace = true }
-# Merge-safety anchor: cache runtime gating needs Tokio `rt`; locking is standard-library only.
-tokio = { workspace = true, features = ["rt"] }
+# Merge-safety anchor: runtime gating and blocking initialization need Tokio `rt` and `rt-multi-thread`; locking remains standard-library only.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::api::AgentInfo;
-use crate::agent::api::StatusSubscription;
+use crate::agent::control::StatusSubscription;
 use crate::agent::status::is_final;
 use crate::session::InputQueueActivity;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
@@ -303,6 +303,11 @@ async fn resolve_condition_targets(
     turn: &std::sync::Arc<crate::session::turn_context::TurnContext>,
     target_references: Vec<String>,
 ) -> Result<Vec<ConditionTarget>, FunctionCallError> {
+    // Merge-safety anchor: conditional V2 waits use the existing local status owner without changing reconciliation priority or canonical statuses.
+    let local_agent_control = session
+        .services
+        .local_agent_runtime
+        .control(session.session_id());
     let mut targets = Vec::with_capacity(target_references.len());
     let mut resolved_thread_ids = HashSet::with_capacity(target_references.len());
     for reference in target_references {
@@ -318,9 +323,7 @@ async fn resolve_condition_targets(
                 "targets must not resolve to the same agent".to_string(),
             ));
         }
-        let mut status_rx = session
-            .services
-            .agent_control
+        let mut status_rx = local_agent_control
             .subscribe_status(thread_id)
             .await
             .map_err(|err| {
@@ -332,10 +335,10 @@ async fn resolve_condition_targets(
         let status = match &initial_update {
             Some(Ok(agent)) => match agent.status() {
                 Some(status) => status.clone(),
-                None => session.services.agent_control.get_status(thread_id).await,
+                None => local_agent_control.get_status(thread_id).await,
             },
             Some(Err(error)) => AgentStatus::Errored(error.to_string()),
-            None => session.services.agent_control.get_status(thread_id).await,
+            None => local_agent_control.get_status(thread_id).await,
         };
         targets.push(ConditionTarget {
             reference,
@@ -474,7 +477,8 @@ async fn retire_condition_target_status_receiver(
     if target.status_rx.take().is_some() && !is_final(&target.status) {
         target.status = session
             .services
-            .agent_control
+            .local_agent_runtime
+            .control(session.session_id())
             .get_status(target.thread_id)
             .await;
     }

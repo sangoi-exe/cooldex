@@ -1255,8 +1255,17 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_turn_aborted(&mut self, payload: &TurnAbortedEvent) {
+        let terminal_error = payload.error.as_ref().map(|error| V2TurnError {
+            message: error.message.clone(),
+            codex_error_info: error.codex_error_info.clone().map(Into::into),
+            misalignment: error.misalignment.clone().map(Into::into),
+            additional_details: None,
+        });
         let apply_abort = |turn: &mut PendingTurn| {
             turn.status = TurnStatus::Interrupted;
+            if let Some(error) = terminal_error.as_ref() {
+                turn.error = Some(error.clone());
+            }
             turn.completed_at = payload.completed_at;
             turn.duration_ms = payload.duration_ms;
             ThreadHistoryTurnMetadata::from_pending_turn(turn)
@@ -1270,10 +1279,7 @@ impl ThreadHistoryBuilder {
             }
 
             if let Some(turn) = self.turns.iter_mut().find(|turn| turn.id == turn_id) {
-                turn.status = TurnStatus::Interrupted;
-                turn.completed_at = payload.completed_at;
-                turn.duration_ms = payload.duration_ms;
-                let changed_turn = ThreadHistoryTurnMetadata::from_pending_turn(turn);
+                let changed_turn = apply_abort(turn);
                 self.record_changed_turn(changed_turn);
                 return;
             }
@@ -2394,6 +2400,7 @@ mod tests {
         }];
         let command_item = CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
             model_context: None,
+            sandbox_type: None,
             id: "exec-1".to_string(),
             plugin_id: Some("sample@openai-curated".to_string()),
             script_path: Some("scripts/run.py".to_string()),
@@ -2480,6 +2487,7 @@ mod tests {
             build_turns_from_rollout_items(&items[..2])[0].items,
             vec![ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "exec-1".to_string(),
                 plugin_id: Some("sample@openai-curated".to_string()),
                 script_path: Some("scripts/run.py".to_string()),
@@ -2506,6 +2514,7 @@ mod tests {
             turns[0].items,
             vec![ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "exec-1".to_string(),
                 plugin_id: Some("sample@openai-curated".to_string()),
                 script_path: Some("scripts/run.py".to_string()),
@@ -2794,6 +2803,7 @@ mod tests {
                 turn_id: Some("turn-1".into()),
                 started_at: None,
                 reason: TurnAbortReason::Replaced,
+                error: None,
                 completed_at: None,
                 duration_ms: None,
             }),
@@ -3194,6 +3204,7 @@ mod tests {
             turns[0].items[2],
             ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "exec-1".into(),
                 plugin_id: None,
                 script_path: None,
@@ -3468,6 +3479,7 @@ mod tests {
             turns[0].items[1],
             ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "exec-declined".into(),
                 plugin_id: None,
                 script_path: None,
@@ -3578,6 +3590,7 @@ mod tests {
             turns[0].items[1],
             ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "guardian-exec".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -3652,6 +3665,7 @@ mod tests {
             turns[0].items[1],
             ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "guardian-execve".into(),
                 plugin_id: Some("sample@openai-curated".into()),
                 script_path: Some("scripts/run.py".into()),
@@ -3855,6 +3869,7 @@ mod tests {
             turns[0].items[1],
             ThreadItem::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "exec-late".into(),
                 plugin_id: None,
                 script_path: None,
@@ -4466,6 +4481,7 @@ mod tests {
                 turn_id: Some("turn-a".into()),
                 started_at: None,
                 reason: TurnAbortReason::Replaced,
+                error: None,
                 completed_at: None,
                 duration_ms: None,
             }),

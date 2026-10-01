@@ -15,6 +15,7 @@ use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -1126,6 +1127,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         .request_typed(ClientRequest::McpServerStatusList {
             request_id: AppServerRequestId::String("tui-tool-inventory".to_string()),
             params: codex_app_server_protocol::ListMcpServerStatusParams {
+                server_name: None,
                 cursor: None,
                 limit: None,
                 detail: Some(codex_app_server_protocol::McpServerStatusDetail::ToolsAndAuthOnly),
@@ -2094,7 +2096,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
             params: ThreadItemsListParams {
                 thread_id: thread_id.to_string(),
                 turn_id: None,
-                cursor: Some(cursor.clone()),
+                cursor: Some(ThreadItemsListCursor::Opaque(cursor.clone())),
                 limit: Some(crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT),
                 sort_direction: Some(SortDirection::Desc),
             },
@@ -2663,7 +2665,6 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
             /*is_first_event*/ false,
             Some("This is a test announcement".to_string()),
             /*auth_plan*/ None,
-            /*show_fast_status*/ false,
         )),
     );
     app.enqueue_primary_thread_session(started.session, started.turns)
@@ -2920,7 +2921,7 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
         ),
         (
             HistoryCapabilities::ThreadListFails,
-            vec!["recency_at", "recency_at", "recency_at", "recency_at"],
+            vec!["recency_at", "recency_at"],
         ),
     ] {
         let (mut app, _codex_home) = make_history_test_app().await?;
@@ -2962,9 +2963,10 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
                     .collect::<Vec<_>>(),
                 vec![started.session.thread_id]
             );
+            assert!(app.agents_overview.initialized);
             assert_eq!(
-                app.agents_overview.initialized,
-                capabilities != HistoryCapabilities::ThreadListFails || attempt > 0
+                app.agents_overview.discovery.has_more(),
+                capabilities == HistoryCapabilities::ThreadListFails
             );
             if attempt == 0 {
                 app.handle_app_server_event(
@@ -3296,7 +3298,7 @@ model_reasoning_effort = "low"
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*session_start_source*/ None,
@@ -3659,7 +3661,7 @@ terminal_visualization_instructions = true
             .map(|entry| &entry.owner),
         Some(&crate::worktree_browser::Owner::Unavailable(missing_owner))
     );
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*session_start_source*/ None,
@@ -3822,7 +3824,7 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     let (rec, plain, req) = (recorded_params, crate::key_hint::plain, &requests);
     let mut tui = crate::tui::test_support::make_test_tui()?;
     let (source, message, name) = (None, None, Some("Previous project".to_string()));
-    app.start_fresh_session_with_summary_hint(&mut tui, &mut server, source, message, name)
+    app.start_fresh_session(&mut tui, &mut server, source, message, name)
         .await;
     let original = app.chat_widget.thread_id().expect("original thread");
     let rollout = app.chat_widget.rollout_path().expect("original rollout");
@@ -4118,7 +4120,7 @@ fn fresh_session_applies_requested_name() -> Result<()> {
                 .await?;
                 let mut tui = crate::tui::test_support::make_test_tui()?;
 
-                app.start_fresh_session_with_summary_hint(
+                app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
                     /*session_start_source*/ None,
@@ -4296,7 +4298,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                 );
                 assert!(matches!(take_backfill_counts(&requests), (0, 0) | (0, 1)));
 
-                app.start_fresh_session_with_summary_hint(
+                app.start_fresh_session(
                     &mut tui,
                     &mut app_server,
                     /*session_start_source*/ None,
@@ -4372,7 +4374,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         .replace(&child_thread_id.to_string(), "[child]"),
                     @r###"
                       Subagents
-                      Select an agent to watch. ⌥+← previous, ⌥+→ next.
+                      Select an agent to watch. ⌥← previous, ⌥→ next.
 
 
                     › 1. • Main [default] (current)  [root]

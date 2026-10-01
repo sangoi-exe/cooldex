@@ -947,7 +947,7 @@ impl App {
                     .config_ref()
                     .experimental_realtime_ws_model
                     .clone();
-                let voices = self.realtime_voices(app_server).await;
+                let voices = self.realtime_voices(app_server).await?;
                 let voice = self.effective_realtime_voice(app_server, &voices).await?;
                 app_server
                     .thread_realtime_start(
@@ -1580,7 +1580,9 @@ impl App {
             self.chat_widget.set_token_info(/*info*/ None);
         }
         match presentation {
-            ThreadAttachPresentation::Fresh | ThreadAttachPresentation::SessionLineage => {
+            ThreadAttachPresentation::Fresh
+            | ThreadAttachPresentation::FreshWithDraft
+            | ThreadAttachPresentation::SessionLineage => {
                 self.chat_widget.handle_thread_session(session);
             }
         }
@@ -1876,10 +1878,38 @@ impl App {
             self.chat_widget
                 .remember_realtime_delegated_reasoning_turn(turn_id);
         }
+        let confirmed_message_ids = snapshot
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.items)
+            .chain(snapshot.events.iter().filter_map(|event| {
+                let ThreadBufferedEvent::Notification(notification) = event else {
+                    return None;
+                };
+                if let ServerNotification::ItemStarted(notification) = notification.as_ref() {
+                    Some(&notification.item)
+                } else if let ServerNotification::ItemCompleted(notification) =
+                    notification.as_ref()
+                {
+                    Some(&notification.item)
+                } else {
+                    None
+                }
+            }))
+            .filter_map(|item| {
+                if let ThreadItem::UserMessage { client_id, .. } = item {
+                    client_id.clone()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         let recovered_input = snapshot
             .input_state
             .as_ref()
-            .is_some_and(|input| input.recovered_queue)
+            .is_some_and(|input| {
+                input.recovered_queue || input.reconnect_pending || input.has_unconfirmed_messages()
+            })
             .then(|| snapshot.input_state.take())
             .flatten();
         self.chat_widget.restore_thread_input_state(
@@ -1906,10 +1936,12 @@ impl App {
             self.app_event_tx
                 .send(AppEvent::EndInitialHistoryReplayBuffer);
         }
-        if recovered_input.is_some() {
+        let recovered = recovered_input.is_some();
+        if recovered {
             let mode = has_resumed_collaboration_mode
                 .then(|| self.chat_widget.effective_collaboration_mode());
-            self.chat_widget.restore_reconnected_input(recovered_input);
+            self.chat_widget
+                .restore_reconnected_input(recovered_input, &confirmed_message_ids);
             if let Some(mode) = mode {
                 self.chat_widget.set_effective_collaboration_mode(mode);
             }
@@ -2021,8 +2053,13 @@ impl App {
         match event {
             ThreadBufferedEvent::Notification(notification) => {
                 self.cache_collab_receiver_threads_for_notification(notification.as_ref());
+                let tip_ready = self.turn_tips.observe(&notification, Instant::now());
                 self.chat_widget
                     .handle_server_notification(*notification, /*replay_kind*/ None);
+                // History cells queued by completion must be applied before anchoring its tip.
+                if let Some(event) = tip_ready {
+                    self.app_event_tx.send(event);
+                }
             }
             ThreadBufferedEvent::Request(request) => {
                 if self
@@ -2054,6 +2091,7 @@ impl App {
     }
 
     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
+        self.turn_tips.dismiss();
         match event {
             ThreadBufferedEvent::Notification(notification) => self
                 .chat_widget

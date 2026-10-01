@@ -866,15 +866,43 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
         .await?;
 
     test.submit_turn(TURN_1_PROMPT).await?;
-    let _ = wait_for_requests(&first_child_request).await?;
-    let _ = wait_for_requests(&second_child_request).await?;
-
-    let subagent_stop_inputs = wait_for_hook_log(
+    let subagent_stop_inputs = match wait_for_hook_log(
         test.codex_home_path(),
         "subagent_stop_hook_log.jsonl",
         /*expected_len*/ 2,
     )
-    .await?;
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let candidate_models = [
+                first_child_request.requests(),
+                second_child_request.requests(),
+            ]
+            .map(|requests| {
+                requests
+                    .into_iter()
+                    .map(|request| request.body_json()["model"].clone())
+                    .collect::<Vec<_>>()
+            });
+            let mut child_states = Vec::new();
+            for child_id in test.thread_manager.list_thread_ids().await {
+                if child_id == test.session_configured.thread_id {
+                    continue;
+                }
+                let state = match test.thread_manager.get_thread(child_id).await {
+                    Ok(thread) => Ok(thread.agent_status().await),
+                    Err(error) => Err(error.to_string()),
+                };
+                child_states.push((child_id, state));
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "SubagentStop hook-log requirement failed: candidate models by mock (not proof of service)={candidate_models:?}, existing child states={child_states:?}"
+                )
+            });
+        }
+    };
     assert_eq!(subagent_stop_inputs.len(), 2);
     assert_eq!(
         subagent_stop_inputs
@@ -2480,7 +2508,8 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
 #[test_case(None, false, true; "encrypted")]
 #[test_case(None, true, true; "plaintext")]
 #[test_case(Some("gpt-5.6-luna"), false, false; "luna encrypted leaf")]
-#[test_case(Some("gpt-5.4"), false, true; "unspecified gpt 5.4 inherits v2")]
+// Merge-safety anchor: a recognized V2-unmarked child model must inherit collaboration from its V2 parent rather than become a leaf.
+#[test_case(Some("gpt-5.5"), false, true; "unspecified gpt 5.5 inherits v2")]
 #[tokio::test]
 async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     model: Option<&str>,

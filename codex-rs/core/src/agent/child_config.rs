@@ -186,7 +186,7 @@ fn reject_full_fork_agent_type_override(agent_type: Option<&str>) -> Result<(), 
     Ok(())
 }
 
-/// Copies runtime-only turn state onto a child config before it is handed to `LocalAgentControl`.
+/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale can
 /// make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
@@ -289,7 +289,7 @@ async fn apply_requested_spawn_agent_service_tier(
 ) -> Result<(), String> {
     let service_tier = requested_service_tier
         .map(str::to_string)
-        .or_else(|| session.services.agent_control.root_service_tier());
+        .or_else(|| session.services.agent_control.service_tier());
     let Some(service_tier) = service_tier else {
         config.service_tier = None;
         return Ok(());

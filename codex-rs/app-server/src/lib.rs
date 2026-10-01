@@ -64,7 +64,7 @@ use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_install_context::LocalPackageLane;
@@ -82,6 +82,7 @@ use tracing::info;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -131,6 +132,7 @@ mod fuzzy_file_search;
 mod gateway_oauth_notifications;
 mod image_url;
 pub mod in_process;
+mod log_write_warning;
 mod mcp_refresh;
 mod message_processor;
 mod model_catalog;
@@ -175,6 +177,10 @@ enum LogFormat {
 }
 
 type StderrLogLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+fn stderr_span_events() -> FmtSpan {
+    FmtSpan::NEW | FmtSpan::CLOSE
+}
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
 ///
@@ -576,7 +582,7 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -760,28 +766,44 @@ pub async fn run_main_with_transport_options(
         });
     }
 
+    let analytics_events_client =
+        analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
+    let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
     let feedback = CodexFeedback::new();
 
     // Install a simple subscriber so `tracing` output is visible. Users can
     // control the log level with `RUST_LOG` and switch to JSON logs with
     // `LOG_FORMAT=json`.
+    // SQLx enters the caller's span for each command. Skip enter/exit records
+    // that can block its worker on stderr while holding a write transaction.
+    // Preserve span boundaries, busy/idle timings, and explicit events.
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
             .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
     };
 
+    let log_write_warning = log_write_warning::LogWriteWarningReporter::new(
+        feedback.clone(),
+        &outgoing_message_sender,
+        &config,
+    );
     let feedback_layer = feedback.logger_layer();
     let feedback_metadata_layer = feedback.metadata_layer();
-    let log_db = state_db.clone().map(log_db::start);
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, log_write_warning.clone()));
     let log_db_layer = log_db
         .clone()
         .map(|layer| layer.with_filter(log_db::default_filter()));
@@ -1018,12 +1040,6 @@ pub async fn run_main_with_transport_options(
     let recovery_file = daemon_recovery_file_path_for_runtime(&config.codex_home, &runtime_options);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
-        let analytics_events_client =
-            analytics_events_client_from_config(Arc::clone(&auth_manager), &config);
-        let outgoing_message_sender = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx,
-            analytics_events_client.clone(),
-        ));
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
@@ -1626,6 +1642,10 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
         | AppServerTransport::Off => AppServerRpcTransport::Websocket,
     }
 }
+
+#[cfg(test)]
+#[path = "stderr_logging_tests.rs"]
+mod stderr_logging_tests;
 
 #[cfg(test)]
 mod tests {

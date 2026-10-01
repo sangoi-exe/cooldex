@@ -3382,11 +3382,22 @@ public static class CargoValidateWindowsFakeCargo
                     child.Id.ToString() + "\n",
                     new UTF8Encoding(false));
             }
-            var readinessLog = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG");
-            if (!String.IsNullOrEmpty(readinessLog) && Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS") != "1")
-            {
-                File.WriteAllText(readinessLog, "ready\n", new UTF8Encoding(false));
-            }
+        }
+        var readinessLog = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG");
+        if (!String.IsNullOrEmpty(readinessLog) && Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS") != "1")
+        {
+            File.WriteAllText(readinessLog, "ready\n", new UTF8Encoding(false));
+        }
+        var stdout = Console.OpenStandardOutput();
+        var stdoutBytes = Encoding.UTF8.GetBytes("fixture stdout: caf\u00e9");
+        stdout.Write(stdoutBytes, 0, stdoutBytes.Length);
+        stdout.Flush();
+        var stderr = Console.OpenStandardError();
+        var stderrBytes = Encoding.UTF8.GetBytes("fixture stderr: \u03c0");
+        stderr.Write(stderrBytes, 0, stderrBytes.Length);
+        stderr.Flush();
+        if (longRunning || rootExitsFirst || immediateDescendant)
+        {
             if (rootExitsFirst)
             {
                 Thread.Sleep(250);
@@ -3394,14 +3405,6 @@ public static class CargoValidateWindowsFakeCargo
             else
             {
                 Thread.Sleep(30000);
-            }
-        }
-        else
-        {
-            var readinessLog = Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_READINESS_LOG");
-            if (!String.IsNullOrEmpty(readinessLog) && Environment.GetEnvironmentVariable("CARGO_VALIDATE_WINDOWS_FAKE_SUPPRESS_READINESS") != "1")
-            {
-                File.WriteAllText(readinessLog, "ready\n", new UTF8Encoding(false));
             }
         }
         int exitCode;
@@ -3726,22 +3729,35 @@ namespace Cooldex.NativeValidation
             }
         }
 
-        public Task CopyStandardOutputToAsync(Stream destination)
+        public Task CopyStandardOutputToAsync(Stream destination, Stream liveOutput)
         {
-            if (destination == null)
-            {
-                throw new ArgumentNullException("destination");
-            }
-            return standardOutput.CopyToAsync(destination);
+            return CopyOutputToAsync(standardOutput, destination, liveOutput);
         }
 
-        public Task CopyStandardErrorToAsync(Stream destination)
+        public Task CopyStandardErrorToAsync(Stream destination, Stream liveOutput)
+        {
+            return CopyOutputToAsync(standardError, destination, liveOutput);
+        }
+
+        private static async Task CopyOutputToAsync(Stream source, Stream destination, Stream liveOutput)
         {
             if (destination == null)
             {
                 throw new ArgumentNullException("destination");
             }
-            return standardError.CopyToAsync(destination);
+            if (liveOutput == null)
+            {
+                throw new ArgumentNullException("liveOutput");
+            }
+            var buffer = new byte[81920];
+            int count;
+            while ((count = await source.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) != 0)
+            {
+                await destination.WriteAsync(buffer, 0, count).ConfigureAwait(false);
+                await destination.FlushAsync().ConfigureAwait(false);
+                await liveOutput.WriteAsync(buffer, 0, count).ConfigureAwait(false);
+                await liveOutput.FlushAsync().ConfigureAwait(false);
+            }
         }
 
         public void Resume()
@@ -4282,28 +4298,6 @@ function Stop-NativeCommandContainment {
     return [pscustomobject]$record
 }
 
-function Test-ReusableCachePublication {
-    param([object[]]$CommandResults)
-
-    foreach ($command in $CommandResults) {
-        $containmentProperty = $command.PSObject.Properties["containment"]
-        if ($null -eq $containmentProperty) {
-            continue
-        }
-        $containment = $containmentProperty.Value
-        if ($null -eq $containment -or $containment.active_processes -ne 0) {
-            return $false
-        }
-        if ($null -ne $command.resource_abort) {
-            $termination = $command.resource_abort.termination
-            if ($null -eq $termination -or -not $termination.quiescent) {
-                return $false
-            }
-        }
-    }
-    return $true
-}
-
 function Invoke-ApprovedCommand {
     param(
         [pscustomobject]$Approved,
@@ -4512,8 +4506,8 @@ function Invoke-ApprovedCommand {
             $launchEnvironment
         )
         $launched = $true
-        $stdoutTask = $process.CopyStandardOutputToAsync($stdoutStream)
-        $stderrTask = $process.CopyStandardErrorToAsync($stderrStream)
+        $stdoutTask = $process.CopyStandardOutputToAsync($stdoutStream, [Console]::OpenStandardOutput())
+        $stderrTask = $process.CopyStandardErrorToAsync($stderrStream, [Console]::OpenStandardError())
         $containment.Assign($process.ProcessHandle)
         $contained = $true
         $process.Resume()
@@ -4898,6 +4892,8 @@ try {
             $script:Bootstrap = $bootstrap
             $script:Preflight.bootstrap = $bootstrap
             Write-JsonEvidence (Join-Path $script:RunPaths.evidence_dir "preflight.json") $script:Preflight
+            # Ready records prepared reusable inputs, not a command or validation result.
+            Write-ReusableCacheState $script:RunPaths $bootstrap $materialization $candidate
         } else {
             $bootstrap = $null
         }
@@ -4924,15 +4920,6 @@ try {
         }
     }
     Finalize-SourceIntegrity
-    if (
-        $script:Status -in @("success", "command-failed") -and
-        $null -ne $script:Bootstrap -and
-        $null -ne $script:Materialization -and
-        $candidate.is_bound -and
-        (Test-ReusableCachePublication $script:CommandResults.ToArray())
-    ) {
-        Write-ReusableCacheState $script:RunPaths $script:Bootstrap $script:Materialization $candidate
-    }
 } catch {
     $failure = $_.Exception.Message
     if (-not $script:SourceFinalized -and $null -ne $script:SourceSnapshotBefore) {
@@ -4987,6 +4974,8 @@ try {
             }
             $resultPath = Join-Path $script:RunPaths.evidence_dir "result.json"
             Write-JsonEvidence $resultPath $result
+            # Child stdout can end without a newline; keep the final JSON on its own line.
+            [Console]::Out.WriteLine()
             [Console]::Out.WriteLine((@{
                         schema = 1
                         status = $script:Status

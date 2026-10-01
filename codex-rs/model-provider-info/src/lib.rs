@@ -8,8 +8,8 @@
 //! API provider construction applies the process-wide managed residency policy also
 //! used by default HTTP headers.
 
-use codex_api::Provider as ApiProvider;
-use codex_api::RetryConfig as ApiRetryConfig;
+use codex_client::Provider as ApiProvider;
+use codex_client::RetryConfig as ApiRetryConfig;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::error::CodexErr;
@@ -80,7 +80,6 @@ pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 const AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME: &str = "Amazon Bedrock Runtime";
 pub const AMAZON_BEDROCK_RUNTIME_PROVIDER_ID: &str = "amazon-bedrock-runtime";
 pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
-pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID: &str = "openai.gpt-5.6-sol";
 pub const AMAZON_BEDROCK_GPT_6_SOL_MODEL_ID: &str = "openai.gpt-6-sol";
 pub const AMAZON_BEDROCK_GPT_6_LUNA_MODEL_ID: &str = "openai.gpt-6-luna";
@@ -181,10 +180,11 @@ pub struct ModelProviderInfo {
     /// Maximum time (in milliseconds) to wait for a websocket connection attempt before treating
     /// it as failed.
     pub websocket_connect_timeout_ms: Option<u64>,
-    /// Does this provider require an OpenAI API Key or ChatGPT login token? If true,
-    /// user is presented with login screen on first run, and login preference and token/key
-    /// are stored in auth.json. If false (which is the default), login screen is skipped,
-    /// and API key (if needed) comes from the "env_key" environment variable.
+    /// Does this provider require an OpenAI API key or ChatGPT login token? If true,
+    /// the user is presented with a login screen on first run, and credentials are
+    /// stored using the backend selected by `cli_auth_credentials_store`.
+    /// If false (the default), the login screen is skipped, and the API key
+    /// (if needed) comes from the environment variable specified by `env_key`.
     #[serde(default)]
     pub requires_openai_auth: bool,
     /// Whether this provider supports the Responses API WebSocket transport.
@@ -193,6 +193,11 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the standalone web-search endpoint.
     #[serde(default)]
     pub supports_standalone_web_search: bool,
+    /// Runtime-only opt-in for internal metadata, independent of the destination check.
+    /// This cannot be loaded from or written to serialized provider configuration.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub include_internal_metadata: bool,
 }
 
 /// AWS SigV4 auth configuration for a model provider.
@@ -548,6 +553,7 @@ other non-default provider fields are not supported"
             requires_openai_auth: true,
             supports_websockets: true,
             supports_standalone_web_search: true,
+            include_internal_metadata: true,
         }
     }
 
@@ -586,6 +592,7 @@ other non-default provider fields are not supported"
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            include_internal_metadata: false,
         }
     }
 
@@ -594,7 +601,6 @@ other non-default provider fields are not supported"
     ) -> ModelProviderInfo {
         let mut provider = Self::create_amazon_bedrock_provider(aws);
         provider.name = AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME.into();
-        provider.http_headers = None;
         provider
     }
 
@@ -759,6 +765,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        include_internal_metadata: false,
     }
 }
 

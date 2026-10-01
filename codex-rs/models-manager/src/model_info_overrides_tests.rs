@@ -1,16 +1,19 @@
 use crate::ModelsManagerConfig;
 use crate::manager::ModelsManager;
+use crate::manager::OpenAiModelsManager;
+use crate::manager::RefreshStrategy;
 use crate::manager::construct_model_info_from_candidates;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+use super::DEFAULT_HTTP_CLIENT_FACTORY;
 use super::TestModelsEndpoint;
 use super::openai_manager_for_tests;
 use super::remote_model;
 
-#[test]
-fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
+#[tokio::test]
+async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
     sol.use_responses_lite = true;
     let mut terra = remote_model("gpt-5.6-terra", "GPT-5.6 Terra", /*priority*/ 9);
@@ -21,6 +24,18 @@ fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     unrelated.use_responses_lite = true;
     let candidates = [sol.clone(), terra.clone(), luna.clone(), unrelated.clone()];
     let config = ModelsManagerConfig::default();
+    let manager = OpenAiModelsManager::new_without_cache(
+        TestModelsEndpoint::with_command_auth(vec![Ok(candidates.to_vec())]),
+        /*auth_manager*/ None,
+    )
+    .with_provider_catalog();
+    assert_eq!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .models,
+        candidates.to_vec()
+    );
 
     let actual = [
         construct_model_info_from_candidates("gpt-5.6-sol", &candidates, &config),
@@ -63,6 +78,21 @@ fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     expected_luna_versioned.slug = "gpt-5.6-luna-2026-07-20".to_string();
     let mut expected_luna_namespaced = expected_luna.clone();
     expected_luna_namespaced.slug = "openai/gpt-5.6-luna-2026-07-20".to_string();
+
+    assert_eq!(
+        [
+            manager.get_model_info("gpt-5.6-sol", &config).await,
+            manager.get_model_info("gpt-5.6-terra", &config).await,
+            manager.get_model_info("gpt-5.6-luna", &config).await,
+            manager.get_model_info("gpt-5.6-codex", &config).await,
+        ],
+        [
+            expected_sol.clone(),
+            expected_terra.clone(),
+            expected_luna.clone(),
+            unrelated.clone(),
+        ]
+    );
 
     let mut expected_unrelated = unrelated;
     expected_unrelated.slug = "gpt-5.6-codex-2026-07-20".to_string();

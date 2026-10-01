@@ -24,6 +24,8 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::ArchiveThreadParams;
@@ -64,6 +66,7 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use test_case::test_case;
 use tokio::sync::oneshot;
 
 // Merge-safety anchor: persisted rollout tests use codex_rollout's canonical JSONL decoder.
@@ -881,11 +884,19 @@ async fn post_compact_recovery_completion_before_blocking_tool_interrupt_remains
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryFailureToolResolution {
+    Interrupt,
+    Answer,
+}
+
+#[test_case(RecoveryFailureToolResolution::Interrupt; "interrupted")]
+#[test_case(RecoveryFailureToolResolution::Answer; "answered_without_duplicate_error")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// Merge-safety anchor: a fatal recovery-proof write remains the terminal error after the
-// already-started blocking tool is cleaned up and a later interrupt cancels the turn.
-async fn post_compact_recovery_application_failure_survives_blocking_tool_interrupt() -> Result<()>
-{
+// Merge-safety anchor: a fatal recovery-proof write remains the terminal error after the already-started blocking tool is interrupted or answered, without duplicate error delivery.
+async fn post_compact_recovery_application_failure_survives_blocking_tool_interrupt(
+    tool_resolution: RecoveryFailureToolResolution,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let (release_completed_tx, release_completed_rx) = oneshot::channel();
     let blocking_tool_args = json!({
@@ -959,12 +970,15 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
     seed_and_compact(&test.codex).await?;
     let mut recovery_proof_append = store.gate_next_recovery_proof_append();
     test.codex.start_or_steer_turn(user_turn(LIVE_USER)).await?;
-    wait_for_recovery_interrupt_event(
+    let EventMsg::RequestUserInput(request) = wait_for_recovery_interrupt_event(
         &test.codex,
         "RequestUserInput from the blocking recovery tool",
         |event| matches!(event, EventMsg::RequestUserInput(_)),
     )
-    .await;
+    .await
+    else {
+        unreachable!("predicate guarantees a request user input event");
+    };
     release_completed_tx
         .send(())
         .expect("release the completed recovery response");
@@ -982,7 +996,9 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
     .await;
     recovery_proof_append.wait_until_entered().await;
     recovery_proof_append.establish_failure();
-    test.codex.submit(Op::Interrupt).await?;
+    if matches!(tool_resolution, RecoveryFailureToolResolution::Interrupt) {
+        test.codex.submit(Op::Interrupt).await?;
+    }
     recovery_proof_append.release();
 
     let error = match wait_for_recovery_interrupt_event(
@@ -1003,6 +1019,21 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
             .starts_with("Fatal error: failed to persist post-compact recovery application proof:"),
         "the recovery persistence failure, not TurnAborted, must reach the terminal error path: {error:?}"
     );
+    if matches!(tool_resolution, RecoveryFailureToolResolution::Answer) {
+        test.codex
+            .submit(Op::UserInputAnswer {
+                id: request.turn_id,
+                response: RequestUserInputResponse {
+                    answers: std::collections::HashMap::from([(
+                        "confirm".to_string(),
+                        RequestUserInputAnswer {
+                            answers: vec!["Continue".to_string()],
+                        },
+                    )]),
+                },
+            })
+            .await?;
+    }
     let EventMsg::TurnComplete(completed) = wait_for_recovery_interrupt_event(
         &test.codex,
         "TurnComplete carrying the recovery persistence failure",
@@ -1021,14 +1052,14 @@ async fn post_compact_recovery_application_failure_survives_blocking_tool_interr
                     .next_event()
                     .await
                     .expect("event stream should remain open after the terminal error");
-                if matches!(event.msg, EventMsg::TurnAborted(_)) {
+                if matches!(event.msg, EventMsg::Error(_) | EventMsg::TurnAborted(_)) {
                     return event;
                 }
             }
         })
         .await
         .is_err(),
-        "a recovery persistence failure must not be followed by TurnAborted"
+        "a recovery persistence failure must not be followed by another Error or TurnAborted"
     );
     test.codex.submit(Op::CleanBackgroundTerminals).await?;
     Ok(())

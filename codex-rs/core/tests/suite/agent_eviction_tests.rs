@@ -132,6 +132,7 @@ async fn queued_mail_and_cancelled_eviction_keep_worker_ownership() -> Result<()
                 approval_policy: Some(codex_protocol::protocol::AskForApproval::OnRequest),
                 ..Default::default()
             },
+            reply: None,
         })
         .await?;
     timeout(Duration::from_secs(10), entered_rx).await??;

@@ -473,6 +473,16 @@ pub struct TurnPage {
     pub backwards_cursor: Option<String>,
 }
 
+/// Starting position for listing persisted items.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListItemsPosition {
+    /// Opaque cursor returned by a previous list call.
+    Cursor(String),
+    /// Exclusive item anchor within the visible non-empty turn.
+    /// Requires creation order without an update watermark.
+    ItemAnchor { item_id: String },
+}
+
 /// Parameters for listing persisted items within a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItemsParams {
@@ -482,8 +492,8 @@ pub struct ListItemsParams {
     pub turn_id: Option<String>,
     /// Whether archived threads are eligible.
     pub include_archived: bool,
-    /// Opaque cursor returned by a previous list call.
-    pub cursor: Option<String>,
+    /// Optional starting position; omitted for the first page.
+    pub position: Option<ListItemsPosition>,
     /// Maximum number of items to return.
     pub page_size: usize,
     /// Direction to sort items by the selected ordinal.
@@ -908,6 +918,10 @@ impl ThreadMetadataPatch {
     }
 
     pub fn is_empty(&self) -> bool {
+        self.updated_at.is_none() && self.is_empty_except_updated_at()
+    }
+
+    pub(crate) fn is_empty_except_updated_at(&self) -> bool {
         self.name.is_none()
             && self.rollout_path.is_none()
             && self.preview.is_none()
@@ -916,7 +930,6 @@ impl ThreadMetadataPatch {
             && self.model.is_none()
             && self.reasoning_effort.is_none()
             && self.created_at.is_none()
-            && self.updated_at.is_none()
             && self.advance_recency_at.is_none()
             && self.source.is_none()
             && self.originator.is_none()

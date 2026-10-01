@@ -1,7 +1,6 @@
 pub(crate) mod startup;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -13,9 +12,10 @@ use std::time::UNIX_EPOCH;
 
 use crate::agent::AgentIdentitySnapshot;
 use crate::agent::AgentStatus;
-use crate::agent::LocalAgentControl;
 use crate::agent::agent_status_from_event;
+use crate::agent::api::AgentConfigUpdate;
 use crate::agent::api::AgentTurnOutcome;
+use crate::agent::control::AgentControlInit;
 use crate::agent::status::is_final;
 use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
@@ -36,6 +36,7 @@ use crate::context::NetworkRuleSaved;
 use crate::context::PostCompactRecoveryContext;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::BANNED_PREFIX_SUGGESTIONS;
@@ -260,6 +261,7 @@ mod rollout_budget;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
+pub(crate) mod startup_prewarm;
 mod step_activation;
 pub(crate) mod step_context;
 pub(crate) mod step_settings;
@@ -279,6 +281,7 @@ use self::handlers::submission_loop;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
+pub(crate) use self::input_queue::UserInputMetadata;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
@@ -312,7 +315,7 @@ use crate::mcp::McpManager;
 use crate::mcp::McpThreadIdentity;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
-use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
 use crate::state::AcceptedUserInputResponse;
 use crate::state::AutoCompactWindowIds;
@@ -373,7 +376,6 @@ use codex_protocol::models::LocalImagePreparation;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
-use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -403,7 +405,6 @@ use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
 use codex_protocol::protocol::WarningEvent;
-use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
@@ -475,7 +476,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) originator: String,
-    pub(crate) agent_control: LocalAgentControl,
+    pub(crate) agent_control: AgentControlInit,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
@@ -680,6 +681,11 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        if model.trim().is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
+            ));
+        }
         let trusted_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source)
             && !matches!(conversation_history, InitialHistory::Resumed(_));
         if config
@@ -749,16 +755,6 @@ impl Session {
                 &model_info,
             )?;
             token_budget::apply_model_defaults(Arc::make_mut(&mut config), &model_info);
-            if config
-                .token_budget
-                .as_ref()
-                .is_some_and(|token_budget| token_budget.use_history_notes_extension)
-                && !model_info.supports_experimental_context
-            {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "features.token_budget.use_history_notes_extension is not supported by model `{model}`; disable it or select a model that supports experimental context"
-                )));
-            }
         }
         let configured_config = Arc::clone(&config);
         let multi_agent_version = config.multi_agent_version_override().or_else(|| {
@@ -1104,7 +1100,7 @@ pub(crate) fn new_submission_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-fn get_service_tier(
+pub(crate) fn get_service_tier(
     configured_service_tier: Option<String>,
     fast_mode_enabled: bool,
     model_info: &ModelInfo,
@@ -1850,14 +1846,9 @@ impl Session {
             .zip(metadata)
             .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
             .collect();
-        let reviewer_compaction_hash =
-            if self.guardian_context_mode == crate::context::GuardianContextMode::ThreadOwned {
-                let context = crate::guardian::GuardianReviewContext::from(turn_context);
-                let (_, reviewer) = crate::guardian::resolve_review_model(self, &context).await;
-                reviewer.comp_hash.clone()
-            } else {
-                None
-            };
+        let context = crate::guardian::GuardianReviewContext::from(turn_context);
+        let (_, reviewer) = crate::guardian::resolve_review_model(self, &context).await;
+        let reviewer_compaction_hash = reviewer.comp_hash.clone();
         {
             let mut state = self.state.lock().await;
             state.replace_annotated_history(
@@ -2010,12 +2001,14 @@ impl Session {
             // Save new environment defaults for future turns. The running turn keeps its own.
             state.session_configuration = updated;
             if root_service_tier_changed {
-                self.services.agent_control.set_root_service_tier(
-                    state
-                        .session_configuration
-                        .step_settings
-                        .service_tier
-                        .clone(),
+                self.services.agent_control.propagate_config_update(
+                    AgentConfigUpdate::ServiceTier(
+                        state
+                            .session_configuration
+                            .step_settings
+                            .service_tier
+                            .clone(),
+                    ),
                 );
             }
             let new_config = notify_config_contributors
@@ -2223,6 +2216,7 @@ impl Session {
             .map_or_else(Vec::new, |instructions| instructions.sources().collect())
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_session_startup_prewarm(
         &self,
         startup_prewarm: SessionStartupPrewarmHandle,
@@ -2650,7 +2644,7 @@ impl Session {
 
         self.services
             .agent_control
-            .notify_parent_of_terminal_turn(
+            .turn_finished(
                 AgentTurnOutcome {
                     thread_id: self.thread_id,
                     turn_id: turn_context.sub_id.clone(),
@@ -3209,6 +3203,7 @@ impl Session {
             };
             let action = ApprovalAction::RequestPermissions {
                 id: call_id.clone(),
+                environment_id: environment_selection.environment_id.clone(),
                 turn_id: turn_context.sub_id.clone(),
                 reason: args.reason.clone(),
                 permissions: requested_permissions.clone(),
@@ -3835,25 +3830,42 @@ impl Session {
             state
                 .current_time_reminder
                 .note_recorded_items(&response_items);
-            if self.guardian_context_mode == crate::context::GuardianContextMode::ThreadOwned {
-                for envelope in &mut items {
-                    if matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "assistant")
-                        || matches!(&envelope.item, ResponseItem::FunctionCall { .. })
-                        || crate::context::is_user_authorization_message(&envelope.item)
-                    {
-                        // Share accepted input order with recorded assistant messages and calls.
-                        // A call's result can arrive after a reply; it must not move the question.
-                        envelope
-                            .metadata
-                            .get_or_insert_default()
-                            .user_input_order
-                            .get_or_insert_with(|| state.history.reserve_input_order());
-                    }
+            let pending_orders = turn_context
+                .extension_data
+                .get::<retained_context::PendingAssistantMessageOrders>();
+            for envelope in &mut items {
+                if envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.compaction_output)
+                {
+                    continue;
+                }
+                if matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "assistant")
+                    || matches!(&envelope.item, ResponseItem::FunctionCall { .. })
+                    || crate::context::is_user_authorization_message(&envelope.item)
+                {
+                    let message_order = pending_orders.as_ref().and_then(|orders| {
+                        orders
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(envelope.item.id()?.as_str())
+                    });
+                    // Preserve input acceptance and source-message start order.
+                    // Synthetic messages still receive their order here.
+                    envelope
+                        .metadata
+                        .get_or_insert_default()
+                        .user_input_order
+                        .get_or_insert_with(|| {
+                            message_order.unwrap_or_else(|| state.history.reserve_input_order())
+                        });
                 }
             }
             state
                 .history
-                .record_annotated_items(&items, model_info.truncation_policy.into());
+                .record_annotated_items(&mut items, model_info.truncation_policy.into());
         }
         for image in image_preparations {
             self.services
@@ -3897,8 +3909,12 @@ impl Session {
         let world_state_item = world_state_snapshot
             .merge_patch_from(&previous_snapshot)
             .map(WorldStateItem::patch);
+        // A catalog may have left history during compaction even when its snapshot survives.
         let items = crate::context_manager::updates::merge_contextual_fragments(
-            world_state.render_diff(&previous_snapshot),
+            world_state.render_history_diff(
+                Some(&previous_snapshot),
+                self.state.lock().await.history.raw_items(),
+            ),
         );
         if !items.is_empty() {
             self.record_conversation_items(turn_context, &step_context.settings.model_info, &items)
@@ -4020,7 +4036,7 @@ impl Session {
                 SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
             )
         {
-            let root_service_tier = self.services.agent_control.root_service_tier();
+            let root_service_tier = self.services.agent_control.service_tier();
             if settings.selected().service_tier != root_service_tier {
                 let mut selected = settings.selected().clone();
                 selected.service_tier = root_service_tier;
@@ -4041,52 +4057,64 @@ impl Session {
         );
         let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
         let environments = environments.or_cancel(cancellation_token).await?;
-        let (loaded_agents_md, warnings) = self
-            .services
-            .agents_md_manager
-            .refresh(&turn_context.config, &environments)
-            .or_cancel(cancellation_token)
-            .await?;
-        self.emit_instruction_warnings(warnings).await;
-        let loaded_agents_md = loaded_agents_md?;
-        let selected_capability_roots = self
-            .resolve_selected_capability_roots_for_step(&environments)
-            .await;
-        let ready_selected_capability_roots =
-            Self::ready_selected_capability_roots(&selected_capability_roots);
-        let executor_capability_discovery = self
-            .executor_capability_discovery_for_step(
-                &turn_context.config,
-                &ready_selected_capability_roots,
-                &environments,
-            )
-            .or_cancel(cancellation_token)
-            .await?;
-        let extension_data = codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
-        extension_data.insert(selected_capability_roots.clone());
-        if let Some(discovery) = &executor_capability_discovery {
-            extension_data.insert(discovery.as_ref().clone());
-            if !discovery.sandbox_contexts().is_empty() {
-                extension_data.insert(discovery.sandbox_contexts().clone());
+        // Keep both preparation futures off caller stacks while they are live together.
+        let load_agents_md = Box::pin(async {
+            let (loaded_agents_md, warnings) = self
+                .services
+                .agents_md_manager
+                .refresh(&turn_context.config, &environments)
+                .or_cancel(cancellation_token)
+                .await?;
+            self.emit_instruction_warnings(warnings).await;
+            loaded_agents_md
+        });
+        let prepare_tools = Box::pin(async {
+            let selected_capability_roots = self
+                .resolve_selected_capability_roots_for_step(&environments)
+                .await;
+            let ready_selected_capability_roots =
+                Self::ready_selected_capability_roots(&selected_capability_roots);
+            let executor_capability_discovery = self
+                .executor_capability_discovery_for_step(
+                    &turn_context.config,
+                    &ready_selected_capability_roots,
+                    &environments,
+                )
+                .await;
+            let extension_data =
+                codex_extension_api::ExtensionData::new(turn_context.sub_id.clone());
+            if let Some(messages) = settings
+                .model_info
+                .model_messages
+                .as_ref()
+                .and_then(|messages| messages.tools.as_ref())
+                .and_then(|tools| tools.multi_agent.as_ref())
+            {
+                extension_data.insert(messages.clone());
             }
-        } else if !turn_context
-            .permission_profile_for_environments(&environments)
-            .file_system_sandbox_policy()
-            .has_full_disk_read_access()
-        {
-            let sandbox_contexts = environments
-                .turn_environments()
-                .map(|environment| {
-                    (
-                        environment.selection.environment_id.clone(),
-                        environment.sandbox_context(/*additional_permissions*/ None),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            extension_data.insert(sandbox_contexts);
-        }
-        let (mcp, prepared_recommendations) = async {
-            tokio::join!(
+            extension_data.insert(selected_capability_roots.clone());
+            if let Some(discovery) = &executor_capability_discovery {
+                extension_data.insert(discovery.as_ref().clone());
+                if !discovery.sandbox_contexts().is_empty() {
+                    extension_data.insert(discovery.sandbox_contexts().clone());
+                }
+            } else if !turn_context
+                .permission_profile_for_environments(&environments)
+                .file_system_sandbox_policy()
+                .has_full_disk_read_access()
+            {
+                let sandbox_contexts = environments
+                    .turn_environments()
+                    .map(|environment| {
+                        (
+                            environment.selection.environment_id.clone(),
+                            environment.sandbox_context(/*additional_permissions*/ None),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                extension_data.insert(sandbox_contexts);
+            }
+            let (mcp, prepared_recommendations) = tokio::join!(
                 // MCP refresh can be large; keep it off the sampling request's stack.
                 Box::pin(self.mcp_runtime_for_step(
                     turn_context.as_ref(),
@@ -4095,35 +4123,59 @@ impl Session {
                     required_plugins,
                 )),
                 turn::prepare_tool_recommendations(self.as_ref(), turn_context.as_ref()),
+            );
+            let mut selected_plugins = self
+                .services
+                .thread_extension_data
+                .get::<codex_extension_api::SelectedPluginSnapshot>()
+                .map(|snapshot| snapshot.as_ref().clone())
+                .unwrap_or_default();
+            selected_plugins.plugins.retain(|plugin| {
+                ready_selected_capability_roots
+                    .iter()
+                    .any(|root| plugin.selected_root_id.as_ref() == Some(&root.id))
+            });
+            extension_data.insert(selected_plugins.clone());
+            let tool_router = turn::built_tools(
+                self.as_ref(),
+                turn_context.as_ref(),
+                &settings.model_info,
+                &environments,
+                &mcp,
+                &extension_data,
+                prepared_recommendations,
             )
-        }
-        .or_cancel(cancellation_token)
-        .await?;
-        let mut selected_plugins = self
-            .services
-            .thread_extension_data
-            .get::<codex_extension_api::SelectedPluginSnapshot>()
-            .map(|snapshot| snapshot.as_ref().clone())
-            .unwrap_or_default();
-        selected_plugins.plugins.retain(|plugin| {
-            ready_selected_capability_roots
-                .iter()
-                .any(|root| root.id == plugin.selected_root_id)
+            .await?;
+            Ok::<_, CodexErr>((
+                selected_capability_roots,
+                executor_capability_discovery,
+                mcp,
+                tool_router,
+                selected_plugins,
+            ))
         });
-        extension_data.insert(selected_plugins.clone());
+        // Returned warnings must finish delivery even if tools fail or preparation is cancelled.
+        let (loaded_agents_md, prepared_tools) =
+            tokio::join!(load_agents_md, prepare_tools.or_cancel(cancellation_token));
+        let loaded_agents_md = loaded_agents_md?;
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+        let (
+            selected_capability_roots,
+            executor_capability_discovery,
+            mcp,
+            tool_router,
+            selected_plugins,
+        ) = prepared_tools??;
         turn_context.extension_data.insert(selected_plugins);
-        let tool_router = turn::built_tools(
-            self.as_ref(),
-            turn_context.as_ref(),
-            &settings.model_info,
-            &environments,
-            &mcp,
-            &extension_data,
-            prepared_recommendations,
-        )
-        .or_cancel(cancellation_token)
-        .await??;
         Ok(Arc::new(StepContext {
+            preempt: turn_context
+                .config
+                .features
+                .enabled(Feature::InstantInterrupt)
+                .then(CancellationToken::new),
+            realtime: self.conversation.snapshot().await,
             settings,
             token_budget,
             session_telemetry,
@@ -4152,19 +4204,47 @@ impl Session {
             )
             .await;
         let items = items.as_ref();
-        let response_item = items[0].clone();
+        let mut response_item = ResponseItemEnvelope::new(items[0].clone());
+        // A send confirmed after the pending snapshot must not reach the rollout
+        // before this boundary; older readers assign deliveries by physical order.
+        let boundary = self
+            .code_mode_message_tasks
+            .communication_boundary
+            .acquire()
+            .await
+            .unwrap_or_else(|_| unreachable!("communication boundary remains open"));
+        // Older readers assign delivered assistant messages to the next physical
+        // communication boundary, so persist earlier confirmed sends first.
+        let (order, pending) = {
+            let mut state = self.state.lock().await;
+            (
+                state.history.reserve_input_order(),
+                self.pending_code_mode_message_recordings(),
+            )
+        };
+        response_item
+            .metadata
+            .get_or_insert_default()
+            .user_input_order = Some(order);
+        for mut recording in pending {
+            let _ = recording.changed().await;
+        }
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
-            state.record_items(items.iter(), model_info.truncation_policy.into());
+            state.history.record_annotated_items(
+                std::slice::from_mut(&mut response_item),
+                model_info.truncation_policy.into(),
+            );
         }
         self.persist_rollout_items(&[
             RolloutItem::InterAgentCommunicationMetadata {
                 trigger_turn: communication.trigger_turn,
             },
-            RolloutItem::ResponseItem(response_item.into()),
+            RolloutItem::ResponseItem(response_item),
         ])
         .await;
+        drop(boundary);
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -4406,18 +4486,34 @@ impl Session {
             resume_metadata: None,
         };
 
-        let world_state_snapshot = world_state_baseline
-            .as_ref()
-            .map(|world_state| world_state.snapshot());
-        // Merge-safety anchor: derive guardian and retained-context metadata from a private
-        // compacted-history copy before the checkpoint enters the rollout; a live session exposes
-        // the replacement history only after the durable append, while no-live sessions preserve
-        // their in-memory-only path.
-        let (guardian_history, retained_context, latest_token_usage_record, resume_metadata) = {
+        // Merge-safety anchor: derive Guardian, retained-context and retained extension WorldState metadata from a private history snapshot before durable append; publish them together only after the live checkpoint succeeds, retaining the no-live in-memory path.
+        let (
+            guardian_history,
+            retained_context,
+            latest_token_usage_record,
+            resume_metadata,
+            world_state_snapshot,
+        ) = {
             let state = self.state.lock().await;
+            // A new window needs a full checkpoint, even when it contains only extension metadata and rendered context will be rebuilt on the next turn.
+            let snapshot = world_state_baseline
+                .map(|world_state| world_state.snapshot())
+                .or_else(|| {
+                    let previous = state.history.world_state_checkpoint()?;
+                    let mut retained = serde_json::Map::new();
+                    for contributor in self.services.extensions.context_contributors() {
+                        retained.extend(
+                            contributor.retain_world_state_after_compaction(&previous.state),
+                        );
+                    }
+                    (!retained.is_empty()).then(|| WorldStateSnapshot::from(&retained))
+                });
             let mut compacted_history = state.clone_history();
             compacted_history
                 .replace_compacted(items.clone(), metadata.reviewer_compaction_hash.as_deref());
+            if let Some(snapshot) = snapshot.as_ref() {
+                compacted_history.set_world_state_baseline(snapshot.clone());
+            }
             (
                 compacted_history.guardian_history_checkpoint(),
                 compacted_history.retained_context().clone(),
@@ -4427,6 +4523,7 @@ impl Session {
                     last_started_turn_id: state.last_started_turn_id.clone(),
                     previous_turn_settings: state.previous_turn_settings(),
                 },
+                snapshot,
             )
         };
         compacted_item.guardian_history = guardian_history;
@@ -5235,7 +5332,7 @@ impl Session {
                     token_usage,
                 );
             }
-            let budget_result = self.record_rollout_budget_usage(token_usage);
+            let budget_result = self.record_rollout_budget_usage(token_usage).await;
             if let Some(token_info) = token_info.as_ref() {
                 for contributor in self.services.extensions.token_usage_contributors() {
                     contributor
@@ -5371,24 +5468,36 @@ impl Session {
         model_info: &ModelInfo,
         input: &[UserInput],
         client_id: Option<String>,
-        acceptance_order: Option<u64>,
+        metadata: UserInputMetadata,
         persist_context: PersistContext,
     ) {
         // Persist the user message to history, but emit the turn item from `UserInput` so
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         let mut user_image_content_indices = HashMap::new();
-        let response_item = self.response_item_from_user_input_with_image_positions(
+        let mut response_item = self.response_item_from_user_input_with_image_positions(
             input.to_vec(),
             &mut user_image_content_indices,
         );
+        if metadata.origin == codex_history::UserInputOrigin::Heartbeat
+            && let ResponseItem::Message {
+                content,
+                internal_chat_message_metadata_passthrough: Some(metadata),
+                ..
+            } = &mut response_item
+            && matches!(content.as_slice(), [ContentItem::InputText { .. }])
+        {
+            metadata.content_item_kinds = Some(vec![ContentItemKind(
+                codex_history::HEARTBEAT_CONTENT_KIND.to_owned(),
+            )]);
+        }
         let (prepared_items, image_preparations) = self
             .prepare_annotated_conversation_items_for_history(
                 turn_context,
                 model_info,
                 vec![ResponseItemEnvelope {
                     item: response_item,
-                    metadata: acceptance_order.map(|order| CodexHarnessMetadata {
+                    metadata: metadata.acceptance_order.map(|order| CodexHarnessMetadata {
                         user_input_order: Some(order),
                         ..Default::default()
                     }),
@@ -5431,200 +5540,6 @@ impl Session {
             additional_details: Some(additional_details),
         });
         self.send_event(turn_context, event).await;
-    }
-
-    /// Injects additional user input or a standalone function-call output into the active task.
-    ///
-    /// Reservations are not steerable: only an installed ActiveTurn task may receive input.
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active task identity and its pending-input state must be captured atomically"
-    )]
-    pub(crate) async fn steer_submitted_input(
-        &self,
-        input: &mut SubmittedTurnInput,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
-        expected_turn_id: Option<&str>,
-        required_final_output_json_schema: Option<&Value>,
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-        incoming_root_turn_id: Option<Option<String>>,
-    ) -> Result<String, SteerInputError> {
-        let retained_input = match input {
-            SubmittedTurnInput::UserInput { content, .. } => content.clone(),
-            _ => Vec::new(),
-        };
-        loop {
-            let active = self.active_turn.lock().await;
-            let Some(active_turn) = active.as_ref() else {
-                return Err(SteerInputError::NoActiveTurn(retained_input));
-            };
-            let Some(active_task) = active_turn.task.as_ref() else {
-                return Err(SteerInputError::NoActiveTurn(retained_input));
-            };
-            // Merge-safety anchor: terminal slots remain non-admittable until their task
-            // notifies retirement, so a fresh input cannot overtake the terminal event.
-            if active_turn.finishing {
-                let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
-                let _ = done.as_mut().enable();
-                drop(active);
-                done.await;
-                continue;
-            }
-            let active_turn_id = active_task.turn_context.sub_id.clone();
-            if let Some(expected_turn_id) = expected_turn_id
-                && expected_turn_id != active_turn_id
-            {
-                return Err(SteerInputError::ExpectedTurnMismatch {
-                    expected: expected_turn_id.to_string(),
-                    actual: active_turn_id,
-                });
-            }
-            match active_task.kind {
-                crate::state::TaskKind::Regular => {}
-                crate::state::TaskKind::Review => {
-                    return Err(SteerInputError::ActiveTurnNotSteerable {
-                        turn_kind: NonSteerableTurnKind::Review,
-                    });
-                }
-                crate::state::TaskKind::Compact => {
-                    return Err(SteerInputError::ActiveTurnNotSteerable {
-                        turn_kind: NonSteerableTurnKind::Compact,
-                    });
-                }
-            }
-            if matches!(input, SubmittedTurnInput::UserInput { content, .. } if content.is_empty())
-            {
-                return Err(SteerInputError::EmptyInput);
-            }
-            if let Some(required_schema) = required_final_output_json_schema
-                && active_task.turn_context.final_output_json_schema.as_ref()
-                    != Some(required_schema)
-            {
-                return Err(SteerInputError::ActiveTurnOutputSchemaMismatch);
-            }
-            let (turn_input, client_user_message_id) = match input {
-                SubmittedTurnInput::UserInput { content, client_id } => {
-                    active_task
-                        .turn_context
-                        .session_telemetry
-                        .user_prompt(content);
-                    let client_id = client_id.clone();
-                    (
-                        TurnInput::UserInput {
-                            content: std::mem::take(content),
-                            client_id: client_id.clone(),
-                            acceptance_order: self.reserve_user_input_order().await,
-                        },
-                        client_id,
-                    )
-                }
-                SubmittedTurnInput::ResponseItem(item)
-                    if matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) =>
-                {
-                    let mut item = item.clone();
-                    Self::assign_missing_response_item_id(&mut item);
-                    (
-                        TurnInput::FunctionCallOutput(ResponseItemEnvelope::new(item)),
-                        None,
-                    )
-                }
-                _ => return Err(SteerInputError::EmptyInput),
-            };
-            if active_task
-                .turn_context
-                .turn_metadata_state
-                .root_turn_id()
-                .is_none()
-                && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
-            {
-                active_task
-                    .turn_context
-                    .turn_metadata_state
-                    .set_root_turn_id(incoming_root_turn_id);
-            }
-            let active_turn_context = Arc::clone(&active_task.turn_context);
-            let turn_state = Arc::clone(&active_turn.turn_state);
-            drop(active);
-            return self
-                .queue_turn_input(
-                    active_turn_context,
-                    turn_state,
-                    turn_input,
-                    additional_context,
-                    client_user_message_id,
-                    responsesapi_client_metadata,
-                    retained_input,
-                )
-                .await;
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "queued-input delivery keeps active-turn context, state, metadata, and retained input explicit"
-    )]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active-turn validation and queue insertion must remain atomic across queued delivery"
-    )]
-    async fn queue_turn_input(
-        &self,
-        active_turn_context: Arc<TurnContext>,
-        turn_state: Arc<Mutex<crate::state::TurnState>>,
-        input: TurnInput,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
-        client_user_message_id: Option<String>,
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-        retained_input: Vec<UserInput>,
-    ) -> Result<String, SteerInputError> {
-        let additional_context_input = {
-            let mut state = self.state.lock().await;
-            state.additional_context.merge(additional_context)
-        };
-        let active = self.active_turn.lock().await;
-        if let Some(active_task) = active
-            .as_ref()
-            .filter(|active_turn| active_turn.finishing)
-            .and_then(|active_turn| active_turn.task.as_ref())
-        {
-            let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
-            let _ = done.as_mut().enable();
-            drop(active);
-            done.await;
-            return Err(SteerInputError::NoActiveTurn(retained_input));
-        }
-        if !active.as_ref().is_some_and(|active_turn| {
-            !active_turn.finishing
-                && active_turn.task.as_ref().is_some_and(|task| {
-                    Arc::ptr_eq(&task.turn_context, &active_turn_context)
-                        && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-                })
-        }) {
-            return Err(SteerInputError::NoActiveTurn(retained_input));
-        }
-        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-            active_turn_context
-                .turn_metadata_state
-                .set_responsesapi_client_metadata(responsesapi_client_metadata);
-        }
-        let mut pending_input = additional_context_input
-            .into_iter()
-            .map(|item| self.annotate_client_response_item(item))
-            .map(TurnInput::ResponseItem)
-            .collect::<Vec<_>>();
-        pending_input.push(input);
-        self.input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                turn_state.as_ref(),
-                pending_input,
-            )
-            .await;
-        drop(active);
-        if let Some(client_id) = client_user_message_id.as_deref() {
-            self.pending_user_message_admissions
-                .associate_steered_by_client_id(client_id, &active_turn_context.sub_id);
-        }
-        Ok(active_turn_context.sub_id.clone())
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {

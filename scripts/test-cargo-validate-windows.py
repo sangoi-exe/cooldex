@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import selectors
 import shutil
 import stat
 import subprocess
@@ -2405,6 +2406,177 @@ class CargoValidateWindowsTests(unittest.TestCase):
             .joinpath("command-1", "cargo.exe")
             .exists()
         )
+        self.assertEqual(before, self.source_snapshot(source))
+
+    @unittest.skipUnless(
+        PWSH, "PowerShell 7 is required for the Windows executor harness"
+    )
+    def test_prepared_cache_and_live_output_survive_executor_interruption(self) -> None:
+        source, identity, before = self.create_source_fixture(
+            include_symlink=False, include_msvc_setup=True
+        )
+        fixture, digests = self.make_bootstrap_fixture()
+        manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+        )
+        self.configure_bootstrap_runtime(manifest, digests)
+        namespace = manifest["windows_runtime"]["workflow_namespace"]
+        executor_root = self.unix_path(rf"F:\.cache\{namespace}")
+        manifest_path = self.temp_path / "manifest-interruption.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        path_ownership = self._prepare_fixture_path_ownership(manifest, None, True)
+        environment = self.helper_environment(
+            fixture_opt_in=True,
+            preflight_fixture=DEFAULT_PREFLIGHT_FIXTURE,
+            preflight_fixture_opt_in=True,
+            preflight_fail_stage=None,
+            fake_create_ignored=False,
+            fake_create_untracked=False,
+            fake_create_insta_pending=False,
+            fake_long_running=True,
+            fake_root_exits_first=False,
+            fake_immediate_descendant=False,
+            fake_containment_terminate_failure=False,
+            fake_wait_for_readiness=True,
+            fake_suppress_readiness=False,
+            bootstrap_fixture=fixture,
+            bootstrap_fixture_opt_in=True,
+            source_git_config=None,
+            path_ownership=path_ownership,
+        )
+        helper = self.windows_path(HELPER).replace("'", "''")
+        native_manifest = self.windows_path(manifest_path).replace("'", "''")
+        process = subprocess.Popen(
+            [
+                PWSH,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "[Console]::Out.WriteLine($PID); [Console]::Out.Flush(); "
+                f"& '{helper}' -Manifest '{native_manifest}'",
+            ],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=environment,
+        )
+        self.assertIsNotNone(process.stdout)
+        self.assertIsNotNone(process.stderr)
+        native_pid = int(process.stdout.readline().strip())
+
+        def stop_executor() -> None:
+            stopped = subprocess.run(
+                [
+                    PWSH,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"Stop-Process -Id {native_pid} -Force -ErrorAction Stop",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(stopped.returncode, 0, msg=stopped.stderr)
+
+        samples = {
+            "stdout": "fixture stdout: café".encode(),
+            "stderr": "fixture stderr: π".encode(),
+        }
+        observed = {name: bytearray() for name in samples}
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+                deadline = time.monotonic() + 90
+                while any(samples[name] not in observed[name] for name in samples):
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, msg=observed)
+                    events = selector.select(timeout=remaining)
+                    self.assertTrue(events, msg=observed)
+                    for key, _ in events:
+                        chunk = os.read(key.fd, 4096)
+                        if chunk:
+                            observed[key.data].extend(chunk)
+                        else:
+                            selector.unregister(key.fileobj)
+                    self.assertTrue(selector.get_map(), msg=observed)
+            self.assertIsNone(process.poll(), "native output arrived only after exit")
+            state_path = executor_root / "workset" / "cache-state.json"
+            state_bytes = state_path.read_bytes()
+            state = json.loads(state_bytes)
+            self.assertEqual(state["status"], "ready")
+            self.assertEqual(state["candidate_identity"], identity)
+            self.assertEqual(state["bootstrap"]["status"], "success")
+            self.assertEqual(
+                state["candidate_materialization"],
+                {
+                    "status": "success",
+                    "materialized": True,
+                    "candidate_root": state["paths"]["candidate_root"],
+                },
+            )
+            evidence_paths = list((executor_root / "r").glob("*/e"))
+            self.assertEqual(len(evidence_paths), 1)
+            cold_evidence = evidence_paths[0]
+            child_pid = int((cold_evidence / "command-1.child-pid.txt").read_text())
+            self.assertTrue(self.native_process_is_alive(child_pid))
+            self.assertFalse((cold_evidence / "result.json").exists())
+            for name, sample in samples.items():
+                self.assertEqual(
+                    (cold_evidence / f"command-1.{name}.txt").read_bytes(), sample
+                )
+            stop_executor()
+            remaining_stdout, remaining_stderr = process.communicate(timeout=15)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertNotIn(b'"result_path"', observed["stdout"] + remaining_stdout)
+            self.assertEqual(observed["stderr"] + remaining_stderr, samples["stderr"])
+            self.assertFalse(self.native_process_is_alive(child_pid))
+            self.assertFalse((cold_evidence / "result.json").exists())
+            self.assertEqual(state_path.read_bytes(), state_bytes)
+        finally:
+            if process.poll() is None:
+                stop_executor()
+                process.communicate(timeout=15)
+            process.stdout.close()
+            process.stderr.close()
+
+        warm_manifest = self.manifest(
+            [self.command(env=self.fixture_env(), artifact_policy="none")],
+            candidate_identity=identity,
+            source_root=source,
+            namespace=namespace,
+        )
+        self.configure_bootstrap_runtime(warm_manifest, digests)
+        warm_process, warm_summary, warm_result = self.invoke(
+            warm_manifest, fixture_opt_in=True
+        )
+        self.assertEqual(warm_process.returncode, 0, msg=warm_process.stderr)
+        self.assertEqual(warm_summary["status"], "success")
+        self.assertEqual(warm_result["bootstrap"]["source"], "reused")
+        self.assertEqual(warm_result["paths"]["cache_mode"], "warm")
+        self.assertNotEqual(self.unix_path(warm_summary["evidence_dir"]), cold_evidence)
+        warm_command = self.command_result(warm_process, warm_result)
+        self.assertEqual(warm_command["exit_code"], 0)
+        self.assertTrue(
+            warm_process.stdout.startswith(samples["stdout"].decode() + "\n")
+        )
+        self.assertEqual(warm_process.stderr, samples["stderr"].decode())
+        for name, sample in samples.items():
+            self.assertEqual(
+                self.unix_path(warm_command[f"{name}_path"]).read_bytes(), sample
+            )
+            self.assertEqual(warm_command[f"{name}_byte_length"], len(sample))
+            self.assertEqual(
+                (cold_evidence / f"command-1.{name}.txt").read_bytes(), sample
+            )
         self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(

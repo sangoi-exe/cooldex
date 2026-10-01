@@ -1,3 +1,6 @@
+#[path = "agents_overview_discovery_tests.rs"]
+mod discovery;
+
 #[path = "agent_center_tests.rs"]
 mod command_center;
 
@@ -371,6 +374,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
                 (deleted, Some(deleted_thread)),
             ]),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     retained_thread.name = Some("New name".to_string());
@@ -390,6 +394,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
             last_messages: HashMap::new(),
             threads: HashMap::from([(retained, None)]),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     assert_eq!(app.agents_overview.threads, expected);
@@ -438,6 +443,7 @@ async fn shared_overview_keeps_rows_and_replays_changes_over_stale_reads() -> Re
                     threads: HashMap::new(),
                     last_messages,
                     recent_seed_complete: true,
+                    discovery: None,
                 }),
             );
             assert!(app.agents_overview.last_messages.is_empty());
@@ -628,6 +634,21 @@ async fn shared_overview_seeds_once_and_retains_locally_resumed_history() -> Res
         "agents_overview_recent_sessions",
         age.replace_all(&rendered, " [age]")
     );
+    assert!(restarted.agents_overview.discovery.has_more());
+    // Opening starts a metadata refresh; Show more queues behind it.
+    restarted.show_more_agents_overview(&app_server);
+    finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
+    finish_overview_refresh(&mut restarted, &app_server, &mut event_rx).await;
+    assert_eq!(
+        restarted
+            .agents_overview
+            .threads
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>(),
+        ids.into_iter().collect()
+    );
+    assert!(!restarted.agents_overview.discovery.has_more());
     app_server.shutdown().await?;
     Ok(())
 }
@@ -1311,7 +1332,7 @@ async fn shared_overview_shows_only_root_sessions() {
     assert!(
         rendered
             .lines()
-            .any(|line| line.contains("› ● Inspect unnamed task") && line.contains("current"))
+            .any(|line| line.contains("› ● Inspect unnamed task"))
     );
 
     app.transcript_cells.push(std::sync::Arc::new(
@@ -2439,22 +2460,22 @@ async fn command_center_attach_conflict_opens_read_only_and_retries() -> Result<
         insta::assert_snapshot!("agents_overview_attach_conflict", render_bottom_popup(&app.chat_widget, /*width*/ 96));
     });
 
-    app.handle_key_event(&mut tui, &mut server, KeyCode::Esc.into())
-        .await;
+    for key in [KeyCode::Left, KeyCode::Esc] {
+        Box::pin(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into()))).await?;
+        assert_eq!(
+            app.chat_widget
+                .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID),
+            selection
+        );
 
-    assert_eq!(
-        app.chat_widget
-            .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID),
-        selection
-    );
-
-    // Opening the displayed task returns to the same frozen snapshot without retrying.
-    Box::pin(app.handle_event(
-        &mut tui,
-        &mut server,
-        AppEvent::SelectAgentsOverviewThread { thread_id },
-    ))
-    .await?;
+        // Opening the displayed task returns to the same frozen snapshot without retrying.
+        Box::pin(app.handle_event(
+            &mut tui,
+            &mut server,
+            AppEvent::SelectAgentsOverviewThread { thread_id },
+        ))
+        .await?;
+    }
     assert!(app.chat_widget.no_modal_or_popup_active());
     assert!(app.chat_widget.is_external_writer_view());
     app.chat_widget.handle_paste(" should be ignored".into());
@@ -2531,6 +2552,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             threads: HashMap::new(),
             last_messages: HashMap::new(),
             recent_seed_complete: false,
+            discovery: None,
         }),
     ] {
         let request_id = Uuid::new_v4();
@@ -2561,6 +2583,7 @@ async fn command_center_refresh_failure_is_inline_and_clears_on_success() -> Res
             threads: HashMap::new(),
             last_messages: HashMap::new(),
             recent_seed_complete: true,
+            discovery: None,
         }),
     );
     assert_eq!(render_bottom_popup(&app.chat_widget, /*width*/ 48), before);
