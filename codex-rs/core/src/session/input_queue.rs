@@ -145,7 +145,11 @@ impl InputQueue {
         communication: InterAgentCommunication,
     ) -> bool {
         let active = active_turn.lock().await;
-        let Some(active_turn) = active.as_ref().filter(|turn| turn.task.is_some()) else {
+        // Merge-safety anchor: finalization drains pending input only once; finishing slots reject notices atomically with task and mailbox-phase admission rather than accepting input after that drain.
+        let Some(active_turn) = active
+            .as_ref()
+            .filter(|turn| turn.task.is_some() && !turn.finishing)
+        else {
             return false;
         };
         let mut turn_state = active_turn.turn_state.lock().await;

@@ -168,6 +168,141 @@ async fn steering_does_not_wait_for_realtime_history() {
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
+// Merge-safety anchor: both steering input kinds must release ActiveTurn before confirmed-delivery ordering waits, then reject a retired task without handing its input to a replacement.
+#[test_case(false; "user_input")]
+#[test_case(true; "standalone_function_output")]
+#[tokio::test]
+async fn steering_order_wait_allows_retirement_without_rerouting_input(standalone_output: bool) {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let content = vec![UserInput::Text {
+        text: "Keep this input with its admission.".to_owned(),
+        text_elements: Vec::new(),
+    }];
+    let mut input = if standalone_output {
+        SubmittedTurnInput::ResponseItem(
+            serde_json::from_value(serde_json::json!({
+                "type": "function_call_output",
+                "id": "delivery-input",
+                "name": "send_message_to_thread",
+                "namespace": "codex_app",
+                "output": "delegated work",
+            }))
+            .expect("recognized standalone delivery"),
+        )
+    } else {
+        SubmittedTurnInput::UserInput {
+            content: content.clone(),
+            client_id: Some("original-client-message".to_owned()),
+        }
+    };
+    let original_input = input.clone();
+    let boundary = session
+        .code_mode_message_tasks
+        .communication_boundary
+        .acquire()
+        .await
+        .expect("open communication boundary");
+    // Queue confirmed delivery ahead of steering; interruption can then take persistence before the delivery writer does.
+    let message = codex_history::RetainedUserMessage {
+        origin: UserInputOrigin::User,
+        turn_id: turn_context.sub_id.clone(),
+        message_id: Some("confirmed-send".to_owned()),
+        text: "May I publish?".to_owned(),
+        complete: true,
+        phase: None,
+    };
+    let (recording, _) = session.record_delivered_assistant_message(message.clone());
+    let mut steering = Box::pin(session.steer_input(
+        &mut input,
+        BTreeMap::new(),
+        Some(&turn_context.sub_id),
+        /*required_final_output_json_schema*/ None,
+        Some(HashMap::from([(
+            "workspace_kind".to_owned(),
+            "original".to_owned(),
+        )])),
+        UserInputOrigin::Heartbeat,
+        /*incoming_root_turn_id*/ None,
+    ));
+    assert!(futures::poll!(steering.as_mut()).is_pending());
+    let mut interruption = Box::pin(session.abort_turn_if_active(
+        &turn_context.sub_id,
+        TurnAbortReason::Interrupted,
+        /*error*/ None,
+    ));
+    assert!(futures::poll!(interruption.as_mut()).is_pending());
+    drop(boundary);
+    let (aborted, recorded) =
+        tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+            tokio::join!(interruption, recording)
+        })
+        .await
+        .expect("retirement and confirmed delivery must not deadlock with waiting steering");
+    assert!(aborted);
+    recorded.expect("confirmed delivery finishes despite retirement");
+
+    // Reuse the turn ID deliberately: admission must check the captured context/state, not just a string ID.
+    let replacement = session
+        .new_turn_with_default_settings(
+            turn_context.sub_id.clone(),
+            NewTurnContextOptions::default(),
+        )
+        .await;
+    session
+        .spawn_task(
+            Arc::clone(&replacement),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    assert_eq!(
+        steering.await,
+        Err(SteerInputError::NoActiveTurn(if standalone_output {
+            Vec::new()
+        } else {
+            content
+        }))
+    );
+    if standalone_output {
+        assert_eq!(input, original_input);
+    }
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0
+            .is_empty()
+    );
+    assert_eq!(replacement.turn_metadata_state.workspace_kind(), None);
+    let deliveries = session
+        .clone_history()
+        .await
+        .retained_context()
+        .ordered_entries()
+        .filter_map(|(_, entry)| match entry {
+            codex_history::RetainedContextEntry::AssistantMessage(message) => Some(message.clone()),
+            codex_history::RetainedContextEntry::UserMessage(_)
+            | codex_history::RetainedContextEntry::VerifiedAnswer(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deliveries, vec![message]);
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
 // Merge-safety anchor: the refreshed MCP runtime receives server elicitation authority changes.
 #[tokio::test]
 async fn accepted_input_applies_thread_settings() {
@@ -1052,19 +1187,55 @@ async fn steer_preserves_request_origin(
         text: "Create the worktree now.".to_owned(),
         text_elements: Vec::new(),
     }];
-    handle(
+    // Merge-safety anchor: steering retains client metadata and request provenance while its order waits for confirmed delivery, without retaining ActiveTurn.
+    let checkpoint = thread_settings::acquire_persistence_lock(&session).await;
+    let (recording, _) =
+        session.record_delivered_assistant_message(codex_history::RetainedUserMessage {
+            origin: UserInputOrigin::User,
+            turn_id: turn_context.sub_id.clone(),
+            message_id: Some("confirmed-send".to_owned()),
+            text: "May I publish?".to_owned(),
+            complete: true,
+            phase: None,
+        });
+    let mut submission = Box::pin(handle(
         &session,
-        TurnInputRequest::user_input(content.clone()).on_start(TurnStartOptions {
+        TurnInputRequest::new(SubmittedTurnInput::UserInput {
+            content: content.clone(),
+            client_id: Some("steered-client-message".to_owned()),
+        })
+        .on_start(TurnStartOptions {
             turn_trigger: request_trigger.map(str::to_owned),
             ..Default::default()
-        }),
+        })
+        .with_responses_metadata(Some(HashMap::from([(
+            "workspace_kind".to_owned(),
+            "steered-workspace".to_owned(),
+        )]))),
         TurnInputMode::Steer {
             expected_turn_id: turn_context.sub_id.clone(),
         },
         "steer-submission".to_owned(),
-    )
-    .await
-    .unwrap();
+    ));
+    assert!(futures::poll!(submission.as_mut()).is_pending());
+    assert!(
+        session.active_turn.try_lock().is_ok(),
+        "ordering waits must leave ActiveTurn available"
+    );
+    drop(checkpoint);
+    assert_eq!(
+        submission.await.unwrap(),
+        TurnInputSubmission::Steered {
+            turn_id: turn_context.sub_id.clone()
+        }
+    );
+    recording
+        .await
+        .expect("confirmed delivery finishes before steering is accepted");
+    assert_eq!(
+        turn_context.turn_metadata_state.workspace_kind().as_deref(),
+        Some("steered-workspace")
+    );
     let pending = session
         .input_queue
         .get_pending_input(&session.active_turn)
@@ -1074,9 +1245,9 @@ async fn steer_preserves_request_origin(
         pending,
         vec![TurnInput::UserInput {
             content,
-            client_id: None,
+            client_id: Some("steered-client-message".to_owned()),
             metadata: crate::session::UserInputMetadata {
-                acceptance_order: Some(0),
+                acceptance_order: Some(1),
                 origin,
             },
         }]

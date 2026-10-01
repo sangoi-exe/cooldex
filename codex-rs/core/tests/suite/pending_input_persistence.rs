@@ -1,6 +1,7 @@
 //! Exercises preparation and execution checkpoints before model requests.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -63,6 +64,7 @@ enum CheckpointPolicy {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InputKind {
     User,
+    UserSteer,
     ToolOutput,
 }
 
@@ -175,6 +177,7 @@ impl ThreadStore for GatedCheckpointStore {
 }
 
 #[test_case(CheckpointPolicy::Background, InputKind::User; "background_user_input")]
+#[test_case(CheckpointPolicy::Background, InputKind::UserSteer; "explicit_steered_user_input")]
 #[test_case(CheckpointPolicy::Synchronous, InputKind::User; "synchronous_store")]
 #[test_case(CheckpointPolicy::Background, InputKind::ToolOutput; "tool_output_stays_synchronous")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -244,10 +247,12 @@ async fn steered_input_checkpoint_controls_next_request(
     .await;
     store.armed.store(true, Ordering::SeqCst);
     let input = match input_kind {
-        InputKind::User => TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "steered input".to_string(),
-            text_elements: Vec::new(),
-        }]),
+        InputKind::User | InputKind::UserSteer => {
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "steered input".to_string(),
+                text_elements: Vec::new(),
+            }])
+        }
         InputKind::ToolOutput => {
             TurnInputRequest::new(TurnInput::ResponseItem(serde_json::from_value(json!({
                 "type": "function_call_output",
@@ -256,11 +261,27 @@ async fn steered_input_checkpoint_controls_next_request(
                 "output": "steered input",
             }))?))
         }
-    };
-    assert_eq!(
-        test.codex.start_or_steer_turn(input).await?,
-        TurnInputSubmission::Steered { turn_id }
-    );
+    }
+    .with_responses_metadata(Some(HashMap::from([(
+        "admission_marker".to_owned(),
+        "steered".to_owned(),
+    )])));
+    // Merge-safety anchor: both steering entry points and standalone outputs preserve the accepted turn and client metadata through real queue consumption and the existing checkpoint boundary.
+    if input_kind == InputKind::UserSteer {
+        assert_eq!(
+            test.codex.steer_turn(input, turn_id.clone()).await?,
+            codex_core::SteerSubmission::Steered {
+                turn_id: turn_id.clone()
+            }
+        );
+    } else {
+        assert_eq!(
+            test.codex.start_or_steer_turn(input).await?,
+            TurnInputSubmission::Steered {
+                turn_id: turn_id.clone()
+            }
+        );
+    }
     // Steering still waits for the existing inference stream to finish.
     assert!(checkpoint_requests.try_recv().is_err());
     first_completed.send(()).expect("finish original inference");
@@ -270,11 +291,12 @@ async fn steered_input_checkpoint_controls_next_request(
     assert_eq!(
         checkpoint.context,
         match input_kind {
-            InputKind::User => PersistContext::SteeredUserInput,
+            InputKind::User | InputKind::UserSteer => PersistContext::SteeredUserInput,
             InputKind::ToolOutput => PersistContext::Standard,
         }
     );
-    let should_overlap = policy == CheckpointPolicy::Background && input_kind == InputKind::User;
+    let should_overlap =
+        policy == CheckpointPolicy::Background && input_kind != InputKind::ToolOutput;
     if !should_overlap {
         assert!(
             timeout(
@@ -295,6 +317,25 @@ async fn steered_input_checkpoint_controls_next_request(
     assert_eq!(requests.len(), 2);
     assert!(!String::from_utf8_lossy(&requests[0]).contains("steered input"));
     assert!(String::from_utf8_lossy(&requests[1]).contains("steered input"));
+    let first_request: serde_json::Value = serde_json::from_slice(&requests[0])?;
+    let next_request: serde_json::Value = serde_json::from_slice(&requests[1])?;
+    assert_eq!(
+        first_request["client_metadata"]["admission_marker"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        next_request["client_metadata"]["admission_marker"],
+        "steered"
+    );
+    assert_eq!(next_request["client_metadata"]["turn_id"], turn_id);
+    assert_eq!(
+        next_request["input"]
+            .to_string()
+            .matches("steered input")
+            .count(),
+        1,
+        "accepted input must reach the same turn exactly once"
+    );
     second_completed
         .send(())
         .expect("finish follow-up inference");

@@ -703,10 +703,6 @@ impl Session {
         clippy::too_many_arguments,
         reason = "steering keeps active-turn routing, schema, client metadata, and input provenance explicit"
     )]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active task identity and its pending-input state must be captured atomically"
-    )]
     pub(crate) async fn steer_input(
         &self,
         input: &mut SubmittedTurnInput,
@@ -770,12 +766,13 @@ impl Session {
             {
                 return Err(SteerInputError::ActiveTurnOutputSchemaMismatch);
             }
+            // Merge-safety anchor: capture the installed task before releasing ActiveTurn; delivery ordering must not hold it while confirmed delivery waits for persistence. queue_turn_input revalidates this exact context and state before admission.
+            let active_turn_context = Arc::clone(&active_task.turn_context);
+            let turn_state = Arc::clone(&active_turn.turn_state);
+            drop(active);
             let (turn_input, client_user_message_id) = match input {
                 SubmittedTurnInput::UserInput { content, client_id } => {
-                    active_task
-                        .turn_context
-                        .session_telemetry
-                        .user_prompt(content);
+                    active_turn_context.session_telemetry.user_prompt(content);
                     let client_id = client_id.clone();
                     (
                         TurnInput::UserInput {
@@ -805,21 +802,16 @@ impl Session {
                 }
                 _ => return Err(SteerInputError::EmptyInput),
             };
-            if active_task
-                .turn_context
+            if active_turn_context
                 .turn_metadata_state
                 .root_turn_id()
                 .is_none()
                 && let Some(Some(incoming_root_turn_id)) = incoming_root_turn_id
             {
-                active_task
-                    .turn_context
+                active_turn_context
                     .turn_metadata_state
                     .set_root_turn_id(incoming_root_turn_id);
             }
-            let active_turn_context = Arc::clone(&active_task.turn_context);
-            let turn_state = Arc::clone(&active_turn.turn_state);
-            drop(active);
             return self
                 .queue_turn_input(
                     active_turn_context,

@@ -3376,18 +3376,14 @@ impl Session {
         let entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
-                Some(at) => {
-                    let sender = at.turn_state.lock().await.remove_pending_user_input(sub_id);
-                    match sender {
-                        Some(sender) => Some((sender, self.reserve_user_input_order().await)),
-                        None => None,
-                    }
-                }
+                Some(at) => at.turn_state.lock().await.remove_pending_user_input(sub_id),
                 None => None,
             }
         };
         match entry {
-            Some((tx_response, acceptance_order)) => {
+            Some(tx_response) => {
+                // Merge-safety anchor: claim the exact pending response under ActiveTurn, then release it before delivery ordering can wait on persistence; a replacement task must not receive this answer.
+                let acceptance_order = self.reserve_user_input_order().await;
                 tx_response
                     .send(AcceptedUserInputResponse {
                         response,

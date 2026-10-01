@@ -9,6 +9,7 @@ use super::step_settings::ResolvedStepSettings;
 use super::step_settings::StepSettings;
 use super::step_settings::StepSettingsUpdate;
 pub(crate) use super::step_settings::tests::update_selected_settings_for_test;
+use super::turn_context::NewTurnContextOptions;
 use super::turn_context::TurnEnvironment;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
@@ -12813,6 +12814,209 @@ async fn direct_task_cancellation_retires_the_active_slot() {
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     done.await;
     assert!(session.active_turn.lock().await.is_none());
+}
+
+// Merge-safety anchor: ordered user-input answers retain the claimed waiter across task retirement without holding ActiveTurn while confirmed delivery waits for persistence.
+#[tokio::test]
+async fn user_input_answer_order_wait_preserves_the_original_waiter_after_retirement() {
+    let (session, turn_context, _events) = make_session_and_context_with_rx().await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    let turn_state = session
+        .input_queue
+        .turn_state_for_sub_id(&session.active_turn, &turn_context.sub_id)
+        .await
+        .expect("original turn state");
+    let (original_sender, original_response) = tokio::sync::oneshot::channel();
+    turn_state
+        .lock()
+        .await
+        .insert_pending_user_input(turn_context.sub_id.clone(), original_sender);
+    let boundary = session
+        .code_mode_message_tasks
+        .communication_boundary
+        .acquire()
+        .await
+        .expect("open communication boundary");
+    let message = codex_history::RetainedUserMessage {
+        origin: codex_history::UserInputOrigin::User,
+        turn_id: turn_context.sub_id.clone(),
+        message_id: Some("confirmed-send".to_owned()),
+        text: "May I publish?".to_owned(),
+        complete: true,
+        phase: None,
+    };
+    let (recording, _) = session.record_delivered_assistant_message(message);
+    let response = RequestUserInputResponse {
+        answers: HashMap::from([(
+            "confirm".to_owned(),
+            codex_protocol::request_user_input::RequestUserInputAnswer {
+                answers: vec!["original answer".to_owned()],
+            },
+        )]),
+    };
+    let mut notification =
+        Box::pin(session.notify_user_input_response(&turn_context.sub_id, response.clone()));
+    assert!(futures::poll!(notification.as_mut()).is_pending());
+    let mut interruption = Box::pin(session.abort_turn_if_active(
+        &turn_context.sub_id,
+        TurnAbortReason::Interrupted,
+        /*error*/ None,
+    ));
+    assert!(futures::poll!(interruption.as_mut()).is_pending());
+    drop(boundary);
+    let (aborted, recorded) = timeout(StdDuration::from_secs(/*secs*/ 5), async {
+        tokio::join!(interruption, recording)
+    })
+    .await
+    .expect("answer ordering must not deadlock retirement and confirmed delivery");
+    assert!(aborted);
+    recorded.expect("confirmed delivery finishes");
+
+    let replacement = session
+        .new_turn_with_default_settings(
+            turn_context.sub_id.clone(),
+            NewTurnContextOptions::default(),
+        )
+        .await;
+    start_regular_never_ending_task(&session, &replacement).await;
+    let replacement_state = session
+        .input_queue
+        .turn_state_for_sub_id(&session.active_turn, &replacement.sub_id)
+        .await
+        .expect("replacement turn state");
+    let (replacement_sender, mut replacement_response) = tokio::sync::oneshot::channel();
+    replacement_state
+        .lock()
+        .await
+        .insert_pending_user_input(replacement.sub_id.clone(), replacement_sender);
+    notification.await;
+    let accepted = original_response
+        .await
+        .expect("answer belongs to the original waiter");
+    assert_eq!(
+        (accepted.response, accepted.acceptance_order),
+        (response, 1)
+    );
+    assert!(matches!(
+        replacement_response.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let response = RequestUserInputResponse {
+        answers: HashMap::from([(
+            "confirm".to_owned(),
+            codex_protocol::request_user_input::RequestUserInputAnswer {
+                answers: vec!["replacement answer".to_owned()],
+            },
+        )]),
+    };
+    session
+        .notify_user_input_response(&replacement.sub_id, response.clone())
+        .await;
+    let accepted = replacement_response
+        .await
+        .expect("replacement keeps its own pending answer");
+    assert_eq!(
+        (accepted.response, accepted.acceptance_order),
+        (response, 2)
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+// Merge-safety anchor: real task finalization rejects notices after its sole drain even when the mailbox phase remains CurrentTurn, without notifying subscribers or leaving backlog.
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "hold terminal-error publication to observe the actual finishing window after its input drain"
+)]
+async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    let (turn_state, cancellation_token, done) = {
+        let active = session.active_turn.lock().await;
+        let active_turn = active.as_ref().expect("running turn");
+        let task = active_turn.task.as_ref().expect("installed task");
+        let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+        let _ = done.as_mut().enable();
+        (
+            Arc::clone(&active_turn.turn_state),
+            task.cancellation_token.clone(),
+            done,
+        )
+    };
+    let (mut activity, _) = session
+        .input_queue
+        .subscribe_activity(Some(turn_state.as_ref()))
+        .await;
+    let notice = InterAgentCommunication::new(
+        AgentPath::root().join("worker").expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "current-turn board notice".to_owned(),
+        /*trigger_turn*/ false,
+    );
+    assert!(
+        session
+            .input_queue
+            .deliver_mailbox_communication_to_current_turn(&session.active_turn, notice.clone())
+            .await
+    );
+    assert!(
+        activity
+            .has_changed()
+            .expect("activity channel remains open")
+    );
+    activity.borrow_and_update();
+
+    // The real task runner completes, drains this notice, and then waits before publishing the terminal event.
+    let terminal_error = turn_context.terminal_error.lock().await;
+    cancellation_token.cancel();
+    timeout(StdDuration::from_secs(/*secs*/ 5), async {
+        loop {
+            let finishing = session
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.finishing);
+            let drained = turn_state.lock().await.pending_input.is_empty();
+            if finishing && drained {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task reaches finalization and drains its original input");
+    assert!(
+        turn_state
+            .lock()
+            .await
+            .accepts_mailbox_delivery_for_current_turn()
+    );
+    let late_notice = InterAgentCommunication {
+        content: "finishing-slot board notice".to_owned(),
+        ..notice
+    };
+    assert!(
+        !session
+            .input_queue
+            .deliver_mailbox_communication_to_current_turn(&session.active_turn, late_notice)
+            .await
+    );
+    assert!(
+        !activity
+            .has_changed()
+            .expect("activity channel remains open")
+    );
+    assert!(turn_state.lock().await.pending_input.is_empty());
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    drop(terminal_error);
+    timeout(StdDuration::from_secs(/*secs*/ 5), done)
+        .await
+        .expect("finishing task retires");
+    recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
