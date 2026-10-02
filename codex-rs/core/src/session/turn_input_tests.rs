@@ -15,8 +15,11 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::NonSteerableTurnKind;
@@ -168,7 +171,7 @@ async fn steering_does_not_wait_for_realtime_history() {
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
-// Merge-safety anchor: both steering input kinds must release ActiveTurn before confirmed-delivery ordering waits, then reject a retired task without handing its input to a replacement.
+// Merge-safety anchor: both steering input kinds release ActiveTurn before confirmed-delivery ordering waits, reject retired tasks without rerouting, and deliver unseen context exactly once on an accepted same-map retry.
 #[test_case(false; "user_input")]
 #[test_case(true; "standalone_function_output")]
 #[tokio::test]
@@ -206,6 +209,22 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
         }
     };
     let original_input = input.clone();
+    let additional_context = BTreeMap::from([
+        (
+            "automation_info".to_owned(),
+            AdditionalContextEntry {
+                value: "unseen run".to_owned(),
+                kind: AdditionalContextKind::Application,
+            },
+        ),
+        (
+            "browser_info".to_owned(),
+            AdditionalContextEntry {
+                value: "unseen tab".to_owned(),
+                kind: AdditionalContextKind::Untrusted,
+            },
+        ),
+    ]);
     let boundary = session
         .code_mode_message_tasks
         .communication_boundary
@@ -224,7 +243,7 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
     let (recording, _) = session.record_delivered_assistant_message(message.clone());
     let mut steering = Box::pin(session.steer_input(
         &mut input,
-        BTreeMap::new(),
+        additional_context.clone(),
         Some(&turn_context.sub_id),
         /*required_final_output_json_schema*/ None,
         Some(HashMap::from([(
@@ -273,7 +292,7 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
         Err(SteerInputError::NoActiveTurn(if standalone_output {
             Vec::new()
         } else {
-            content
+            content.clone()
         }))
     );
     if standalone_output {
@@ -300,6 +319,91 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
         })
         .collect::<Vec<_>>();
     assert_eq!(deliveries, vec![message]);
+
+    // Retry the rejected body explicitly, then consume through the production queue boundary.
+    // A second accepted same-map submission must not enqueue the fragments again.
+    for retry in 0..2 {
+        input = original_input.clone();
+        assert_eq!(
+            session
+                .steer_input(
+                    &mut input,
+                    additional_context.clone(),
+                    Some(&replacement.sub_id),
+                    /*required_final_output_json_schema*/ None,
+                    /*responsesapi_client_metadata*/ None,
+                    UserInputOrigin::Heartbeat,
+                    /*incoming_root_turn_id*/ None,
+                )
+                .await,
+            Ok(replacement.sub_id.clone())
+        );
+        let mut delivered = session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0;
+        let delivered_input = match delivered.pop().expect("accepted original body") {
+            TurnInput::UserInput {
+                content,
+                client_id,
+                metadata,
+            } => {
+                assert_eq!(metadata.origin, UserInputOrigin::Heartbeat);
+                assert!(metadata.acceptance_order.is_some());
+                SubmittedTurnInput::UserInput { content, client_id }
+            }
+            TurnInput::FunctionCallOutput(envelope) => {
+                SubmittedTurnInput::ResponseItem(envelope.item)
+            }
+            other => panic!("unexpected accepted body: {other:?}"),
+        };
+        assert_eq!(delivered_input, original_input);
+        let delivered_context = delivered
+            .into_iter()
+            .map(|item| match item {
+                TurnInput::ResponseItem(envelope) => envelope.item,
+                other => panic!("unexpected additional context: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            delivered_context,
+            if retry == 0 {
+                [
+                    (
+                        "developer",
+                        "automation_info",
+                        "<automation_info>unseen run</automation_info>",
+                    ),
+                    (
+                        "user",
+                        "browser_info",
+                        "<external_browser_info>unseen tab</external_browser_info>",
+                    ),
+                ]
+                .into_iter()
+                .map(|(role, key, text)| ResponseItem::Message {
+                    id: None,
+                    role: role.to_owned(),
+                    content: vec![ContentItem::InputText {
+                        text: text.to_owned(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: Some(
+                        InternalChatMessageMetadataPassthrough {
+                            content_item_kinds: Some(vec![ContentItemKind(format!(
+                                "additional_content.{key}"
+                            ))]),
+                            ..Default::default()
+                        },
+                    ),
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        );
+    }
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 

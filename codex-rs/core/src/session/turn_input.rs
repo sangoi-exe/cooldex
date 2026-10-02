@@ -47,7 +47,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -703,6 +702,10 @@ impl Session {
         clippy::too_many_arguments,
         reason = "steering keeps active-turn routing, schema, client metadata, and input provenance explicit"
     )]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active-turn validation, context commitment, and queue insertion must remain atomic"
+    )]
     pub(crate) async fn steer_input(
         &self,
         input: &mut SubmittedTurnInput,
@@ -766,7 +769,7 @@ impl Session {
             {
                 return Err(SteerInputError::ActiveTurnOutputSchemaMismatch);
             }
-            // Merge-safety anchor: capture the installed task before releasing ActiveTurn; delivery ordering must not hold it while confirmed delivery waits for persistence. queue_turn_input revalidates this exact context and state before admission.
+            // Merge-safety anchor: capture the installed task before releasing ActiveTurn; delivery ordering must not hold it while confirmed delivery waits for persistence. Revalidate this exact context and state before committing context or admitting input.
             let active_turn_context = Arc::clone(&active_task.turn_context);
             let turn_state = Arc::clone(&active_turn.turn_state);
             drop(active);
@@ -802,6 +805,29 @@ impl Session {
                 }
                 _ => return Err(SteerInputError::EmptyInput),
             };
+            let active = self.active_turn.lock().await;
+            if let Some(active_task) = active
+                .as_ref()
+                .filter(|active_turn| active_turn.finishing)
+                .and_then(|active_turn| active_turn.task.as_ref())
+            {
+                let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
+                let _ = done.as_mut().enable();
+                drop(active);
+                done.await;
+                return Err(SteerInputError::NoActiveTurn(retained_input));
+            }
+            if !active.as_ref().is_some_and(|active_turn| {
+                !active_turn.finishing
+                    && active_turn.task.as_ref().is_some_and(|task| {
+                        Arc::ptr_eq(&task.turn_context, &active_turn_context)
+                            && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
+                    })
+            }) {
+                return Err(SteerInputError::NoActiveTurn(retained_input));
+            }
+            // Merge-safety anchor: reject retired or replaced tasks before merging additional context; the cache and queued fragments commit under the same ActiveTurn guard.
+            let mut pending_input = merge_additional_context_input(self, additional_context).await;
             if active_turn_context
                 .turn_metadata_state
                 .root_turn_id()
@@ -812,86 +838,25 @@ impl Session {
                     .turn_metadata_state
                     .set_root_turn_id(incoming_root_turn_id);
             }
-            return self
-                .queue_turn_input(
-                    active_turn_context,
-                    turn_state,
-                    turn_input,
-                    additional_context,
-                    client_user_message_id,
-                    responsesapi_client_metadata,
-                    retained_input,
+            if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+                active_turn_context
+                    .turn_metadata_state
+                    .set_responsesapi_client_metadata(responsesapi_client_metadata);
+            }
+            pending_input.push(turn_input);
+            self.input_queue
+                .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                    turn_state.as_ref(),
+                    pending_input,
                 )
                 .await;
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "queued-input delivery keeps active-turn context, state, metadata, and retained input explicit"
-    )]
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active-turn validation and queue insertion must remain atomic across queued delivery"
-    )]
-    async fn queue_turn_input(
-        &self,
-        active_turn_context: Arc<TurnContext>,
-        turn_state: Arc<Mutex<crate::state::TurnState>>,
-        input: TurnInput,
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
-        client_user_message_id: Option<String>,
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-        retained_input: Vec<UserInput>,
-    ) -> Result<String, SteerInputError> {
-        let additional_context_input = {
-            let mut state = self.state.lock().await;
-            state.additional_context.merge(additional_context)
-        };
-        let active = self.active_turn.lock().await;
-        if let Some(active_task) = active
-            .as_ref()
-            .filter(|active_turn| active_turn.finishing)
-            .and_then(|active_turn| active_turn.task.as_ref())
-        {
-            let mut done = Box::pin(Arc::clone(&active_task.done).notified_owned());
-            let _ = done.as_mut().enable();
             drop(active);
-            done.await;
-            return Err(SteerInputError::NoActiveTurn(retained_input));
+            if let Some(client_id) = client_user_message_id.as_deref() {
+                self.pending_user_message_admissions
+                    .associate_steered_by_client_id(client_id, &active_turn_context.sub_id);
+            }
+            return Ok(active_turn_id);
         }
-        if !active.as_ref().is_some_and(|active_turn| {
-            !active_turn.finishing
-                && active_turn.task.as_ref().is_some_and(|task| {
-                    Arc::ptr_eq(&task.turn_context, &active_turn_context)
-                        && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-                })
-        }) {
-            return Err(SteerInputError::NoActiveTurn(retained_input));
-        }
-        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
-            active_turn_context
-                .turn_metadata_state
-                .set_responsesapi_client_metadata(responsesapi_client_metadata);
-        }
-        let mut pending_input = additional_context_input
-            .into_iter()
-            .map(|item| self.annotate_client_response_item(item))
-            .map(TurnInput::ResponseItem)
-            .collect::<Vec<_>>();
-        pending_input.push(input);
-        self.input_queue
-            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                turn_state.as_ref(),
-                pending_input,
-            )
-            .await;
-        drop(active);
-        if let Some(client_id) = client_user_message_id.as_deref() {
-            self.pending_user_message_admissions
-                .associate_steered_by_client_id(client_id, &active_turn_context.sub_id);
-        }
-        Ok(active_turn_context.sub_id.clone())
     }
 }
 
