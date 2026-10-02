@@ -1783,6 +1783,7 @@ enabled = false
                     .await
                     .expect("restored child world state should build")
                     .render_full()
+                    .1
                     .into_iter()
                     .map(|fragment| fragment.body())
                     .collect::<Vec<_>>();
@@ -2067,6 +2068,7 @@ enabled = false
             .await
             .expect("reloaded child world state should build")
             .render_full()
+            .1
             .into_iter()
             .map(|fragment| fragment.body())
             .collect::<Vec<_>>();

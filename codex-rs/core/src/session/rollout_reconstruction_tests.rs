@@ -479,6 +479,7 @@ async fn record_initial_history_restores_pending_post_compact_recovery() {
 
     session
         .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: session.thread_id,
             history: Arc::new(rollout_items),
             rollout_path: Some(PathBuf::from("/tmp/post-compact-recovery-resume.jsonl")),
