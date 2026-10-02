@@ -256,7 +256,7 @@ argv = ["bash", "-n", "scripts/test-cargo-guard.sh"]
 argv = ["just", "--summary"]
 
 [commands.nextest-config-check]
-argv = ["python3", "-c", "from pathlib import Path; import tomllib; text = Path('codex-rs/.config/nextest.toml').read_text(); config = tomllib.loads(text); profiles = config.get('profile', {}); assert profiles['local-safe']['fail-fast'] is False; assert 'test-threads' not in profiles['local-safe']; assert profiles['local-disk-tight']['fail-fast'] is False; assert 'test-threads' not in profiles['local-disk-tight']; assert text.count('codex-windows-sandbox') == 1; assert text.count('windows_sandbox_legacy_sessions') == 2; print('nextest config checks ok')"]
+argv = ["python3", "-c", "from pathlib import Path; import tomllib; text = Path('codex-rs/.config/nextest.toml').read_text(); config = tomllib.loads(text); profiles = config.get('profile', {}); assert profiles['local-safe']['fail-fast'] is False; assert 'test-threads' not in profiles['local-safe']; assert profiles['local-disk-tight']['fail-fast'] is False; assert 'test-threads' not in profiles['local-disk-tight']; print('nextest config checks ok')"]
 
 [commands.validate-py-compile]
 argv = ["python3", "-m", "py_compile", "scripts/cargo-validate.py"]

@@ -467,7 +467,8 @@ class CargoValidateTests(unittest.TestCase):
         pwsh_argv_path = self.repo_root / "pwsh-argv.json"
         wslpath_argv_path = self.repo_root / "wslpath-argv.jsonl"
         cargo_marker_path = self.repo_root / "cargo-was-invoked.txt"
-        pwsh_path = tool_dir / "pwsh"
+        pwsh_path = self.repo_root / "PowerShell 7" / "pwsh.exe"
+        pwsh_path.parent.mkdir(exist_ok=True)
         wslpath_path = tool_dir / "wslpath"
         cargo_path = tool_dir / "cargo"
 
@@ -3099,9 +3100,9 @@ class CargoValidateTests(unittest.TestCase):
         self.write_windows_manifest_fixture(planner, yolo)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -3130,9 +3131,9 @@ class CargoValidateTests(unittest.TestCase):
         self.write_windows_executor_tools(summary_line=failed_summary, exit_code=7)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4123,6 +4124,10 @@ class CargoValidateTests(unittest.TestCase):
         self,
     ) -> None:
         planner = load_planner_module()
+        self.assertEqual(
+            "/mnt/c/Program Files/PowerShell/7/pwsh.exe",
+            planner.WINDOWS_EXECUTOR_POWERSHELL,
+        )
         receipt_dir = self.repo_root / "windows-delegation-receipts"
         wsl_log_path = self.repo_root / "wsl-command-ran.txt"
         wsl_stub_path = self.repo_root / "wsl-command.py"
@@ -4166,9 +4171,9 @@ class CargoValidateTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4233,8 +4238,8 @@ class CargoValidateTests(unittest.TestCase):
     def test_windows_executor_setup_and_summary_failures_fail_closed(self) -> None:
         planner = load_planner_module()
         scenarios = (
-            ("missing-pwsh", None, 0, 0, "PowerShell 7"),
-            ("stale-pwsh", "valid", 0, 0, "failed to launch"),
+            ("missing-pwsh", "valid", 0, 0, "failed to launch"),
+            ("unlaunchable-pwsh", "valid", 0, 0, "failed to launch"),
             ("wslpath-failure", "valid", 0, 9, "wslpath -w"),
             ("invalid-summary", "not-json", 0, 0, "invalid Windows helper summary"),
             ("summary-process-mismatch", "valid", 7, 0, "exit_code"),
@@ -4276,19 +4281,14 @@ class CargoValidateTests(unittest.TestCase):
                     exit_code=process_exit,
                     wslpath_exit_code=wslpath_exit,
                 )
-                which = (
-                    (lambda _name: None)
-                    if summary_kind is None
-                    else (
-                        lambda name: (
-                            str(tool_dir / "missing-pwsh") if name == "pwsh" else None
-                        )
-                    )
-                    if label == "stale-pwsh"
-                    else (lambda name: str(pwsh_path) if name == "pwsh" else None)
-                )
+                if label == "missing-pwsh":
+                    pwsh_path.unlink()
+                elif label == "unlaunchable-pwsh":
+                    pwsh_path.chmod(0o644)
                 with (
-                    mock.patch.object(planner.shutil, "which", side_effect=which),
+                    mock.patch.object(
+                        planner, "WINDOWS_EXECUTOR_POWERSHELL", str(pwsh_path)
+                    ),
                     mock.patch.dict(
                         os.environ,
                         {"PATH": self.windows_fixture_path(tool_dir)},
@@ -4304,8 +4304,7 @@ class CargoValidateTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     "setup_failed"
-                    if summary_kind is None
-                    or label == "stale-pwsh"
+                    if label in {"missing-pwsh", "unlaunchable-pwsh"}
                     or wslpath_exit != 0
                     else "executed",
                     entry["coverage"],
@@ -4364,9 +4363,9 @@ class CargoValidateTests(unittest.TestCase):
         ) = self.write_windows_executor_tools(summary_line=summary_line)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4404,9 +4403,9 @@ class CargoValidateTests(unittest.TestCase):
         ) = self.write_windows_executor_tools(summary_line=success_summary)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4448,9 +4447,9 @@ class CargoValidateTests(unittest.TestCase):
         self.write_windows_executor_tools(summary_line=failed_summary, exit_code=7)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4503,9 +4502,9 @@ class CargoValidateTests(unittest.TestCase):
         self.write_windows_executor_tools(summary_line=failed_summary, exit_code=7)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4541,9 +4540,9 @@ class CargoValidateTests(unittest.TestCase):
         self.write_windows_manifest_fixture(planner, keep_going_plan)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4567,9 +4566,9 @@ class CargoValidateTests(unittest.TestCase):
         wsl_log_path.unlink(missing_ok=True)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
@@ -4606,7 +4605,13 @@ class CargoValidateTests(unittest.TestCase):
         )
         self.write_windows_manifest_fixture(planner, missing_completion_plan)
         wsl_log_path.unlink(missing_ok=True)
-        with mock.patch.object(planner.shutil, "which", return_value=None):
+        pwsh_path.unlink()
+        with (
+            mock.patch.object(planner, "WINDOWS_EXECUTOR_POWERSHELL", str(pwsh_path)),
+            mock.patch.dict(
+                os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False
+            ),
+        ):
             self.assertEqual(
                 2,
                 planner.verify_plan(
@@ -4621,7 +4626,7 @@ class CargoValidateTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertIn(
-            "requires PowerShell 7",
+            "failed to launch",
             missing_completion_entries[0]["windows_executor_error"],
         )
         self.assertEqual(
@@ -4639,9 +4644,9 @@ class CargoValidateTests(unittest.TestCase):
         wsl_log_path.unlink(missing_ok=True)
         with (
             mock.patch.object(
-                planner.shutil,
-                "which",
-                side_effect=lambda name: str(pwsh_path) if name == "pwsh" else None,
+                planner,
+                "WINDOWS_EXECUTOR_POWERSHELL",
+                str(pwsh_path),
             ),
             mock.patch.dict(
                 os.environ, {"PATH": self.windows_fixture_path(tool_dir)}, clear=False

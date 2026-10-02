@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -101,6 +100,7 @@ WINDOWS_RUNTIME_MANIFEST_KEYS = (
     WINDOWS_RUNTIME_CONFIG_KEYS
     - frozenset({"minimum_free_disk_gib", "minimum_available_memory_gib"})
 ) | frozenset({"resource_contract", "source_materialization"})
+WINDOWS_EXECUTOR_POWERSHELL = "/mnt/c/Program Files/PowerShell/7/pwsh.exe"
 WINDOWS_EXECUTOR_HELPER_PATH = Path("scripts/cargo-validate-windows.ps1")
 WINDOWS_HELPER_SUMMARY_SCHEMA = 1
 WINDOWS_HELPER_STATUS_EXIT_CODES = {
@@ -3343,11 +3343,6 @@ def wslpath_windows_path(path: Path, repo_root: Path) -> str:
 
 
 def windows_executor_argv(repo_root: Path, manifest_path: Path) -> list[str]:
-    powershell = shutil.which("pwsh.exe") or shutil.which("pwsh")
-    if not powershell:
-        raise PlannerError(
-            "Windows PowerShell execution requires PowerShell 7 resolved by pwsh.exe or pwsh"
-        )
     helper_path = (repo_root / WINDOWS_EXECUTOR_HELPER_PATH).resolve()
     if not helper_path.is_file():
         raise PlannerError(
@@ -3356,7 +3351,7 @@ def windows_executor_argv(repo_root: Path, manifest_path: Path) -> list[str]:
     helper_windows_path = wslpath_windows_path(helper_path, repo_root)
     manifest_windows_path = wslpath_windows_path(manifest_path, repo_root)
     return [
-        powershell,
+        WINDOWS_EXECUTOR_POWERSHELL,
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",

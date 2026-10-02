@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPER = REPO_ROOT / "scripts" / "cargo-validate-windows.ps1"
 PRODUCTION_CONFIG = REPO_ROOT / "scripts" / "cargo-validation.toml"
 WINDOWS_WORKSPACE_COMMAND_NAME = "windows-nextest-workspace"
-PWSH = shutil.which("pwsh.exe") or shutil.which("pwsh")
+PWSH = "/mnt/c/Program Files/PowerShell/7/pwsh.exe"
 
 
 def production_windows_workspace_argv() -> list[str]:
@@ -240,18 +240,22 @@ if (Test-Path -LiteralPath $root) {
 
 class HarnessPrerequisiteTests(unittest.TestCase):
     def test_direct_harness_fails_without_powershell(self) -> None:
-        environment = os.environ.copy()
-        environment["PATH"] = ""
         process = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve())],
+            [
+                sys.executable,
+                "-c",
+                "import runpy\n"
+                "from unittest import mock\n"
+                "with mock.patch('pathlib.Path.is_file', return_value=False):\n"
+                f"    runpy.run_path({str(Path(__file__).resolve())!r}, run_name='__main__')\n",
+            ],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env=environment,
         )
         self.assertNotEqual(process.returncode, 0)
-        self.assertIn("pwsh.exe or pwsh must be on PATH", process.stderr)
+        self.assertIn(f"PowerShell 7 executable is required: {PWSH}", process.stderr)
 
 
 class CargoValidateWindowsTests(unittest.TestCase):
@@ -1035,7 +1039,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertIn("\ufffdlocalized diagnostic", process.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fixture_lifetime_retains_evidence_until_case_cleanup(self) -> None:
         manifest = self.manifest([])
@@ -1058,7 +1063,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self._assert_native_fixture_lifetime("assert-present", {namespace}, set())
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fixture_lifetime_cleans_pre_summary_path_creation_failure(self) -> None:
         manifest = self.manifest([])
@@ -1078,7 +1084,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self._assert_native_fixture_lifetime("assert-present", {namespace}, set())
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fixture_lifetime_tracks_independent_manifest_paths(self) -> None:
         first_manifest = self.manifest([])
@@ -1117,7 +1124,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fixture_lifetime_rejects_unowned_and_canonical_paths(self) -> None:
         foreign_token = "f" * 32
@@ -1307,7 +1315,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         return process.returncode == 0
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fake_nextest_receives_direct_argv_and_runtime_f_state(self) -> None:
         fixture = self.command(env=self.fixture_env(), artifact_policy="none")
@@ -1469,7 +1478,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(telemetry["minimum_available_memory_bytes"], 64 * 1024**3)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fake_exit_status_is_preserved_in_result_evidence(self) -> None:
         process, summary, result = self.invoke(
@@ -1482,7 +1492,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(result["command_results"][0]["status"], "failed")
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_accepts_planner_owned_workspace_selection_argv(self) -> None:
         planner_argv = [
@@ -1520,7 +1531,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_accepts_planner_owned_selected_package_argv(self) -> None:
         planner_argv = [
@@ -1557,7 +1569,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_rejects_non_test_entries_before_creating_or_launching_fake_cargo(
         self,
@@ -1591,7 +1604,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_rejects_invalid_candidate_runtime_and_manifest_shape(self) -> None:
         invalid_candidate = self.manifest([self.command(env=self.fixture_env())])
@@ -1644,7 +1658,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(result["command_results"], [])
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_rejects_malformed_command_integrity_before_fake_tool_creation(
         self,
@@ -1667,7 +1682,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fake_cargo_requires_test_only_opt_in(self) -> None:
         manifest = self.manifest([self.command(env=self.fixture_env())])
@@ -1696,7 +1712,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_materializes_exact_candidate_and_preserves_source(
         self,
@@ -1796,7 +1813,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_materializes_clean_index_candidate(self) -> None:
         source, identity, before = self.create_source_fixture(stage_index_change=False)
@@ -1836,7 +1854,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_uses_scoped_wsl_source_excludes(self) -> None:
         source, identity, _ = self.create_source_fixture(include_symlink=False)
@@ -1939,7 +1958,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertTrue((source / ignored_name).is_file())
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_rechecks_candidate_after_fake_command_and_resets_per_command_state(
         self,
@@ -2028,7 +2048,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
             self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_keeps_insta_pending_artifacts_under_command_evidence(
         self,
@@ -2110,7 +2131,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_reports_post_command_integrity_failure(self) -> None:
         for command_exit, expected_exit, command_status in (
@@ -2181,7 +2203,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_reuses_selected_working_set_with_fresh_evidence_and_index_sync(
         self,
@@ -2384,7 +2407,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_requires_opt_in_before_candidate_or_fake_creation(
         self,
@@ -2409,7 +2433,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_prepared_cache_and_live_output_survive_executor_interruption(self) -> None:
         source, identity, before = self.create_source_fixture(
@@ -2580,7 +2605,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_failed_bound_command_publishes_ready_cache_for_warm_retry(self) -> None:
         source, identity, _ = self.create_source_fixture(
@@ -2637,7 +2663,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
             self.assertEqual(warm_result["paths"][name], cold_result["paths"][name])
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_warm_reuse_rejects_a_reparse_component_of_the_workset(self) -> None:
         source, identity, _ = self.create_source_fixture(
@@ -2688,7 +2715,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertIn("reparse point", warm_process.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_bound_fixture_bootstrap_prepares_pins_and_rejects_bad_inputs(self) -> None:
         source, identity, before = self.create_source_fixture(
@@ -2916,7 +2944,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 self.assertEqual(before, self.source_snapshot(source))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_rejects_reserved_or_overlong_namespace_before_run_creation(self) -> None:
         for namespace in ("CON", "n" * 65, "cw.", "cw..x"):
@@ -2933,7 +2962,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 self.assertIn("safe single namespace", process.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_residual_cache_without_canonical_workset_fails_without_cold_fallback(
         self,
@@ -2951,7 +2981,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertIn("not operator-cleared", process.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_cold_resource_rejection_keeps_the_canonical_workset_absent(self) -> None:
         first_manifest = self.manifest([self.command(env=self.fixture_env())])
@@ -3019,7 +3050,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertIn("residual state", malformed_retry.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_test_only_resource_and_writer_preflight_fails_closed(self) -> None:
         manifest = self.manifest([self.command(env=self.fixture_env())])
@@ -3144,7 +3176,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertIn("preflight fixture data requires", process.stderr)
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_yolo_bypasses_only_resource_floors_and_records_it(self) -> None:
         yolo_manifest = self.manifest([self.command(env=self.fixture_env())])
@@ -3225,7 +3258,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 self.assertTrue(preflight["execution_preflight"][0]["yolo"])
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_runtime_disk_monitor_aborts_the_fake_process_tree_without_cleanup(
         self,
@@ -3320,7 +3354,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertTrue(command["command_preflight"]["yolo"])
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_root_exit_with_contained_descendant_uses_bounded_containment_cleanup(
         self,
@@ -3354,7 +3389,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.native_process_is_alive(child_pid))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_root_exit_termination_failure_finishes_without_waiting_for_child_eof(
         self,
@@ -3402,7 +3438,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.native_process_is_alive(child_pid))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_monitor_query_error_terminates_command_and_records_command_failure(
         self,
@@ -3436,7 +3473,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.native_process_is_alive(child_pid))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_fake_readiness_timeout_terminates_the_contained_command(self) -> None:
         process, summary, result = self.invoke(
@@ -3471,7 +3509,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.native_process_is_alive(child_pid))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_suspended_launch_enrolls_immediate_descendant_before_termination(
         self,
@@ -3508,7 +3547,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(self.native_process_is_alive(child_pid))
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_native_mutex_busy_and_abandoned_fail_closed(self) -> None:
         manifest = self.manifest([self.command(env=self.fixture_env())])
@@ -3589,7 +3629,8 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertFalse(expected_run_root.exists())
 
     @unittest.skipUnless(
-        PWSH, "PowerShell 7 is required for the Windows executor harness"
+        Path(PWSH).is_file(),
+        "PowerShell 7 is required for the Windows executor harness",
     )
     def test_candidate_accepts_ignored_untracked_file_after_fake_command(self) -> None:
         source, identity, before = self.create_source_fixture(include_symlink=False)
@@ -3637,7 +3678,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if PWSH is None:
-        print("pwsh.exe or pwsh must be on PATH", file=sys.stderr)
+    if not Path(PWSH).is_file():
+        print(f"PowerShell 7 executable is required: {PWSH}", file=sys.stderr)
         raise SystemExit(1)
     unittest.main()
