@@ -131,14 +131,13 @@ impl PidBackend {
             )
         {
             command.arg("--managed-daemon");
-        } else if managed_app_server {
-            if let Some(recovery_file) = self.daemon_recovery_file_path() {
-                match fs::remove_file(&recovery_file).await {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        tracing::warn!(path = %recovery_file.display(), %err, "failed to clear daemon recovery state before legacy launch");
-                    }
+        } else if managed_app_server && let Some(recovery_file) = self.daemon_recovery_file_path() {
+            // Merge-safety anchor: legacy launch clears the backend's lane-specific recovery path, not a path inferred from the pid file.
+            match fs::remove_file(&recovery_file).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(path = %recovery_file.display(), %err, "failed to clear daemon recovery state before legacy launch");
                 }
             }
         }

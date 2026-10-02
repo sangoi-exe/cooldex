@@ -437,6 +437,7 @@ async fn responses_client_stream_request_sends_routing_fields_ahead_of_large_inp
         tool_choice: "auto".into(),
         parallel_tool_calls: false,
         reasoning: None,
+        max_output_tokens: None,
         store: false,
         stream: true,
         stream_options: None,
