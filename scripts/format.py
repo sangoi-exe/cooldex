@@ -41,7 +41,16 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
+    # Merge-safety anchor: route Rust formatting through the canonical Cargo guard while preserving upstream fmt arguments and cwd.
+    args = [
+        "bash",
+        str(REPO_ROOT / "scripts" / "cargo-guard.sh"),
+        "cargo",
+        "fmt",
+        "--",
+        "--config",
+        "imports_granularity=Item",
+    ]
     if check:
         args.append("--check")
     command = Command(tuple(args), REPO_ROOT / "codex-rs")

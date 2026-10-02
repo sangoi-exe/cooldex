@@ -243,6 +243,9 @@ profile = "build"
 [commands.bazel-lock-check]
 argv = ["just", "bazel-lock-check"]
 
+[commands.fmt-check]
+argv = ["just", "fmt-check"]
+
 [commands.guard-syntax]
 argv = ["bash", "-n", "scripts/cargo-guard.sh"]
 
@@ -496,6 +499,12 @@ surfaces = ["cli"]
 flags = ["runtime"]
 
 [[path_rules]]
+patterns = ["codex-rs/cloud-client/**"]
+packages = ["codex-cloud-client"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
 patterns = ["codex-rs/cloud-config/**"]
 packages = ["codex-cloud-config"]
 surfaces = ["cli"]
@@ -547,6 +556,17 @@ surfaces = ["cli"]
 [[path_rules]]
 patterns = ["codex-rs/utils/process/**"]
 packages = ["codex-utils-process"]
+surfaces = ["cli"]
+flags = ["runtime"]
+
+[[path_rules]]
+patterns = [
+  "codex-rs/ansi-escape/**",
+  "codex-rs/ext/git-attribution/**",
+  "codex-rs/file-search/**",
+  "codex-rs/utils/sleep-inhibitor/**",
+  "codex-rs/utils/stream-parser/**",
+]
 surfaces = ["cli"]
 flags = ["runtime"]
 
@@ -666,6 +686,7 @@ wsl_runtime_packages = ["codex-shell-escalation"]
 # classified even though the defaults policy excludes its validation.
 [[path_rules]]
 patterns = [
+  "codex-rs/file-search/**",
   "codex-rs/uds/**",
   "codex-rs/utils/path-utils/**",
   "codex-rs/utils/pty/**",
@@ -675,6 +696,7 @@ patterns = [
 surfaces = ["cli"]
 flags = ["runtime"]
 wsl_runtime_packages = [
+  "codex-file-search",
   "codex-uds",
   "codex-utils-path",
   "codex-utils-pty",
@@ -758,17 +780,45 @@ patterns = [
   ".github/actions/setup-ci/action.yml",
   ".github/scripts/check_github_canary.py",
   ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
+  ".github/scripts/npm_alpha_tag.py",
   ".github/scripts/publish_r2_release.py",
   ".github/scripts/releases.py",
   ".github/scripts/select_windows_bazel_targets.py",
   ".github/scripts/test_releases.py",
   ".github/scripts/test_select_windows_bazel_targets.py",
   ".github/scripts/windows_bazel_test_durations.tsv",
+  ".github/scripts/voice_windows_tools.py",
   ".github/workflows/bazel.yml",
+  ".github/workflows/issue-labeler.yml",
   ".github/workflows/r2-release.yml",
   ".github/workflows/repo-checks.yml",
+  ".github/workflows/rust-ci-full.yml",
+  ".github/workflows/rust-ci.yml",
   ".github/workflows/rust-release.yml",
+  ".github/workflows/rust-release-argument-comment-lint.yml",
   ".github/workflows/rust-release-prepare.yml",
+]
+
+[[path_rules]]
+patterns = ["codex-rs/.cargo/audit.toml", "codex-rs/deny.toml"]
+
+[[path_rules]]
+patterns = [
+  "sdk/typescript/src/exec.ts",
+  "sdk/typescript/src/index.ts",
+  "sdk/typescript/src/thread.ts",
+  "sdk/typescript/src/turnOptions.ts",
+  "sdk/typescript/tests/run.test.ts",
+]
+
+[[path_rules]]
+patterns = [
+  "tools/argument-comment-lint/Cargo.lock",
+  "tools/argument-comment-lint/Cargo.toml",
+  "tools/argument-comment-lint/README.md",
+  "tools/argument-comment-lint/rust-toolchain",
+  "tools/argument-comment-lint/ui/uncommented_literal.stderr",
+  "tools/argument-comment-lint/wrapper_common.py",
 ]
 
 [[path_rules]]
@@ -784,6 +834,11 @@ generators = ["write-app-server-schema"]
 
 [[path_rules]]
 patterns = ["sdk/python/tests/test_artifact_workflow_and_binaries.py"]
+
+[[path_rules]]
+patterns = ["scripts/format.py"]
+surfaces = ["validation_tooling"]
+commands = ["fmt-check"]
 
 [[path_rules]]
 patterns = ["scripts/cargo-validate.py", "scripts/cargo-validation.toml", "scripts/test-cargo-validate.py", "scripts/cargo-validate-windows.ps1", "scripts/test-cargo-validate-windows.py", "scripts/codex_package/v8.py"]

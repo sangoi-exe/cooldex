@@ -6,15 +6,15 @@ Scenario: Astra starts in one workspace, switches for the next step of the activ
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=c8eef2e483066305):
-        - namespace/functions; hash=906c295965901be6
+00:additional_tools/developer (3; hash=a54e67018899e049):
+        - namespace/functions; hash=dead25325ac79c67
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=bbb39107b1c55af4
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=b263e3c84ad07c37
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents

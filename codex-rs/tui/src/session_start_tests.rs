@@ -37,7 +37,10 @@ async fn start_session(
 #[tokio::test]
 async fn archived_session_requires_confirmation_before_resume_or_fork() -> Result<()> {
     for action in [
-        SessionStartAction::Resume(ResumeModelSettings::RestoreFromThread),
+        SessionStartAction::Resume(
+            ResumeModelSettings::RestoreFromThread,
+            crate::resume_permissions::ResumePermissions::default(),
+        ),
         SessionStartAction::Fork(crate::app_server_session::ForkPermissionMode::InheritSaved),
     ] {
         let codex_home = TempDir::new()?;
@@ -135,7 +138,7 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
             (9, false, true)
         );
         match action {
-            SessionStartAction::Resume(_) => {
+            SessionStartAction::Resume(..) => {
                 assert_eq!(started.session.thread_id, target.thread_id)
             }
             SessionStartAction::Fork(_) => {
@@ -154,7 +157,10 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
             &mut app_server,
             &config,
             &target,
-            SessionStartAction::Resume(ResumeModelSettings::RestoreFromThread),
+            SessionStartAction::Resume(
+                ResumeModelSettings::RestoreFromThread,
+                crate::resume_permissions::ResumePermissions::default(),
+            ),
             async || panic!("active sessions must not prompt"),
         )
         .await?

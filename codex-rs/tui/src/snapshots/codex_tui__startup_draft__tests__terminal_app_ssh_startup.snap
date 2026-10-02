@@ -7,7 +7,7 @@ terminal_app_over_ssh=false, owned=true
   >_ OpenAI Codex (v<VERSION>)
      loading
 
-  Pull up a prompt.
+
 
 
 
@@ -24,8 +24,6 @@ terminal_app_over_ssh=true, owned=false
 
   >_ OpenAI Codex (v<VERSION>)
      loading
-
-  Pull up a prompt.
 
 
 › Ask Codex to do anything

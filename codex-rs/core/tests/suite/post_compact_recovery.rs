@@ -391,7 +391,7 @@ impl ThreadStore for GatedRecoveryProofStore {
 
     delegate_recovery_proof_store_methods! {
         fn create_thread(params: CreateThreadParams) -> ();
-        fn resume_thread(params: ResumeThreadParams) -> ();
+        fn resume_thread(params: ResumeThreadParams) -> Arc<Vec<RolloutItem>>;
         fn discard_thread(thread_id: ThreadId) -> ();
         fn load_history(params: LoadThreadHistoryParams) -> StoredThreadHistory;
         fn read_thread(params: ReadThreadParams) -> StoredThread;

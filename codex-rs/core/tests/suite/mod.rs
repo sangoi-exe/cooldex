@@ -37,6 +37,7 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
     })
 };
 
+mod abort_lifecycle;
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
 mod additional_context;
@@ -55,6 +56,8 @@ mod approvals;
 mod audio_truncation;
 mod auth_recovery_policy;
 mod auto_review;
+#[path = "bedrock_multi_agent_tests.rs"]
+mod bedrock_multi_agent;
 mod catalog_permission_messages;
 mod cli_stream;
 mod client;
@@ -127,7 +130,6 @@ mod mcp_auth_refresh;
 mod mcp_ema_config;
 mod mcp_extension_protocol;
 mod mcp_optional_startup_grace;
-#[cfg(unix)]
 mod mcp_refresh_cleanup;
 mod mcp_startup_refresh_http_proxy;
 mod mcp_subagent_elicitation;
@@ -210,6 +212,7 @@ mod step_settings;
 mod step_settings_snapshots;
 mod stream_error_allows_next_turn;
 mod stream_no_completed;
+mod subagent_dynamic_tools;
 mod subagent_notifications;
 mod subagent_service_tier;
 mod token_budget;
@@ -222,6 +225,7 @@ mod truncation;
 #[path = "turn_error_details_tests.rs"]
 mod turn_error_details;
 mod turn_input_submission;
+mod turn_phase_trace;
 mod turn_slot_lifecycle;
 mod turn_state;
 mod unified_exec;

@@ -6,15 +6,15 @@ Scenario: Astra continues after new user input yields a running code cell, then 
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=a6721b3cb9f383da):
-        - namespace/functions; hash=ac0520d3de172d2b
+00:additional_tools/developer (3; hash=b035de0e31ab087e):
+        - namespace/functions; hash=a0b6a7ae1ecf9f28
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=bbb39107b1c55af4
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=b263e3c84ad07c37
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents

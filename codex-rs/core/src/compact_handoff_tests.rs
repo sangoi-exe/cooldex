@@ -101,6 +101,13 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
         )
         .await;
 
+    session
+        .record_user_goal_update(crate::context::UserGoalUpdate::Set {
+            objective: Some("captured goal".to_string()),
+            status: None,
+        })
+        .await
+        .expect("record captured goal");
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
     let settings = PreCompactHandoffSettings::from_step_context(&step_context);
@@ -132,6 +139,20 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
             .is_current_for(&session, &settings)
             .await
             .expect("source match")
+    );
+
+    session
+        .record_user_goal_update(crate::context::UserGoalUpdate::Clear)
+        .await
+        .expect("record appended native goal update");
+    assert!(source.is_current_for(&session, &settings).await.unwrap());
+    let mut changed_settings = settings.clone();
+    changed_settings.service_tier = Some("changed settings".to_string());
+    assert!(
+        !source
+            .is_current_for(&session, &changed_settings)
+            .await
+            .unwrap()
     );
 
     session
@@ -577,6 +598,7 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
+                input_goal_ids: Default::default(),
                 message: "summary".to_string(),
                 window_number,
                 window_ids,

@@ -39,6 +39,8 @@ mod codex_thread;
 // Merge-safety anchor: pre-compaction handoff remains a private operation-local owner rather
 // than a second durable recovery state or normal sampling path.
 mod compact_handoff;
+mod turn_extension_data;
+pub use turn_extension_data::WithTurnExtensionData;
 mod compact_model_fallback;
 mod compact_remote_history;
 mod compact_remote_v2;
@@ -55,6 +57,7 @@ pub use codex_protocol::protocol::EnvironmentConfig;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;
 pub use codex_thread::CodexThreadSettingsOverrides;
+pub use codex_thread::ConfigRefreshOutcome;
 pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
@@ -152,6 +155,7 @@ pub use codex_prompts as review_prompts;
 mod thread_manager;
 pub(crate) mod web_search;
 pub(crate) mod windows_sandbox_read_grants;
+pub use thread_manager::AgentTreeShutdown;
 pub use thread_manager::ForkSnapshot;
 pub use thread_manager::InternalSessionParent;
 pub use thread_manager::NewThread;

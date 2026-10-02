@@ -48,6 +48,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-analytics": "analytics",
             "codex-agent-message-board-client": "agent-message-board-client",
             "codex-agent-message-board-extension": "ext/agent-message-board",
+            "codex-ansi-escape": "ansi-escape",
             "codex-app-server": "app-server",
             "codex-app-server-protocol": "app-server-protocol",
             "codex-app-server-transport": "app-server-transport",
@@ -59,6 +60,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-bwrap": "bwrap",
             "codex-chatgpt": "chatgpt",
             "codex-cli": "cli",
+            "codex-cloud-client": "cloud-client",
             "codex-cloud-config": "cloud-config",
             "codex-cloud-tasks": "cloud-tasks",
             "codex-config": "config",
@@ -75,7 +77,9 @@ class CargoValidateTests(unittest.TestCase):
             "codex-extension-items": "ext/items",
             "codex-features": "features",
             "codex-feedback": "feedback",
+            "codex-file-search": "file-search",
             "codex-file-system": "file-system",
+            "codex-git-attribution": "ext/git-attribution",
             "codex-git-utils": "git-utils",
             "codex-guardian-context": "guardian-context",
             "codex-guardian-reviewer": "ext/guardian-reviewer",
@@ -123,6 +127,8 @@ class CargoValidateTests(unittest.TestCase):
             "codex-utils-process": "utils/process",
             "codex-utils-pty": "utils/pty",
             "codex-utils-sandbox-summary": "utils/sandbox-summary",
+            "codex-utils-sleep-inhibitor": "utils/sleep-inhibitor",
+            "codex-utils-stream-parser": "utils/stream-parser",
             "codex-utils-string": "utils/string",
             "codex-v8-poc": "v8-poc",
             "codex-voice-host": "voice-host",
@@ -146,11 +152,25 @@ class CargoValidateTests(unittest.TestCase):
                     "targets": [
                         {
                             "test": has_runnable_targets,
-                            "doctest": has_runnable_targets,
+                            "doctest": has_runnable_targets
+                            and package_name
+                            not in {
+                                "codex-ansi-escape",
+                                "codex-cloud-client",
+                                "codex-file-search",
+                                "codex-git-attribution",
+                                "codex-utils-sleep-inhibitor",
+                                "codex-utils-stream-parser",
+                            },
                         }
                     ],
                 }
             )
+            if package_name == "codex-file-search":
+                packages[-1]["targets"][0]["kind"] = ["lib"]
+                packages[-1]["targets"].append(
+                    {"kind": ["bin"], "test": True, "doctest": False}
+                )
 
         (self.repo_root / "codex-rs" / "core" / "src" / "config").mkdir(parents=True)
         (self.repo_root / "codex-rs" / "core" / "src" / "config" / "mod.rs").write_text(
@@ -1647,6 +1667,113 @@ class CargoValidateTests(unittest.TestCase):
             commands,
         )
 
+    def test_upstream_sync_known_library_paths_select_explicit_native_runtime(
+        self,
+    ) -> None:
+        cases = (
+            ("codex-ansi-escape", "codex-rs/ansi-escape/Cargo.toml"),
+            ("codex-ansi-escape", "codex-rs/ansi-escape/src/ansi_escape_tests.rs"),
+            ("codex-ansi-escape", "codex-rs/ansi-escape/src/lib.rs"),
+            (
+                "codex-git-attribution",
+                "codex-rs/ext/git-attribution/src/world_state.rs",
+            ),
+            ("codex-file-search", "codex-rs/file-search/src/lib.rs"),
+            ("codex-file-search", "codex-rs/file-search/src/matcher_tests.rs"),
+            ("codex-file-search", "codex-rs/file-search/src/snapshot.rs"),
+            (
+                "codex-utils-sleep-inhibitor",
+                "codex-rs/utils/sleep-inhibitor/Cargo.toml",
+            ),
+            (
+                "codex-utils-stream-parser",
+                "codex-rs/utils/stream-parser/src/inline_hidden_tag.rs",
+            ),
+        )
+        workspace_argv = self.windows_workspace_aggregate_argv()
+        workspace_filter = workspace_argv[workspace_argv.index("-E") + 1]
+        for package, file_path in cases:
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "strict")
+                self.assertEqual([], plan["warnings"])
+                self.assertEqual([package], plan["selected_packages"])
+                self.assertEqual(["cli"], plan["selected_surfaces"])
+                commands = self.command_lines(plan)
+                self.assertIn(
+                    ["./scripts/cargo-guard.sh", "cargo", "check", "-p", package],
+                    commands,
+                )
+                windows_command = next(
+                    command
+                    for command in plan["commands"]
+                    if command["kind"] == "windows-nextest-packages"
+                )
+                windows_argv = windows_command["argv"]
+                self.assertEqual(["-p", package], windows_argv[-2:])
+                self.assertEqual(
+                    f"(package({package})) & ({workspace_filter})",
+                    windows_argv[windows_argv.index("-E") + 1],
+                )
+                if package != "codex-file-search":
+                    for command in commands:
+                        if command[:2] == ["./scripts/cargo-guard.sh", "cargo"]:
+                            self.assertNotIn("test", command)
+                            self.assertNotIn("--tests", command)
+
+    def test_cloud_client_paths_select_explicit_portable_runtime(self) -> None:
+        for file_path in (
+            "codex-rs/cloud-client/README.md",
+            "codex-rs/cloud-client/Cargo.toml",
+            "codex-rs/cloud-client/src/lib.rs",
+        ):
+            for mode in ("standard", "strict"):
+                with self.subTest(file_path=file_path, mode=mode):
+                    plan = self.plan_json("--file", file_path, "--mode", mode)
+                    self.assertEqual([], plan["warnings"])
+                    self.assertEqual(["codex-cloud-client"], plan["selected_packages"])
+                    self.assertEqual(["cli"], plan["selected_surfaces"])
+                    commands = self.command_lines(plan)
+                    self.assertIn(
+                        [
+                            "./scripts/cargo-guard.sh",
+                            "cargo",
+                            "check",
+                            "-p",
+                            "codex-cloud-client",
+                        ],
+                        commands,
+                    )
+                    windows_command = next(
+                        command
+                        for command in plan["commands"]
+                        if command["kind"] == "windows-nextest-packages"
+                    )
+                    self.assertEqual(
+                        ["-p", "codex-cloud-client"], windows_command["argv"][-2:]
+                    )
+                    windows_argv = windows_command["argv"]
+                    workspace_argv = self.windows_workspace_aggregate_argv()
+                    workspace_filter = workspace_argv[workspace_argv.index("-E") + 1]
+                    self.assertEqual(
+                        f"(package(codex-cloud-client)) & ({workspace_filter})",
+                        windows_argv[windows_argv.index("-E") + 1],
+                    )
+                    for command in commands:
+                        if command[:2] == ["./scripts/cargo-guard.sh", "cargo"]:
+                            self.assertNotIn("test", command)
+                            self.assertNotIn("--tests", command)
+
+        full_plan = self.plan_json(
+            "--file", "codex-rs/cloud-client/src/lib.rs", "--mode", "full"
+        )
+        self.assertEqual(["codex-cloud-client"], full_plan["selected_packages"])
+        self.assertEqual(
+            1,
+            self.command_lines(full_plan).count(
+                self.windows_workspace_aggregate_argv()
+            ),
+        )
+
     def test_doctest_only_package_keeps_runtime_without_test_target_build(self) -> None:
         metadata = json.loads(self.metadata_path.read_text())
         cloud_config = next(
@@ -1812,6 +1939,7 @@ class CargoValidateTests(unittest.TestCase):
         native_exclusion = '  "--exclude",\n  "codex-voice-host",\n'
         runtime_packages = (
             "wsl_runtime_packages = [\n"
+            '  "codex-file-search",\n'
             '  "codex-uds",\n'
             '  "codex-utils-path",\n'
             '  "codex-utils-pty",\n'
@@ -1820,6 +1948,7 @@ class CargoValidateTests(unittest.TestCase):
         )
         runtime_packages_before_exclusion = (
             "wsl_runtime_packages = [\n"
+            '  "codex-file-search",\n'
             '  "codex-uds",\n'
             '  "codex-utils-path",\n'
             '  "codex-utils-pty",\n'
@@ -3796,6 +3925,7 @@ class CargoValidateTests(unittest.TestCase):
     ) -> None:
         files = (
             "codex-rs/core/Cargo.toml",
+            "codex-rs/file-search/Cargo.toml",
             "codex-rs/uds/Cargo.toml",
             "codex-rs/linux-sandbox/Cargo.toml",
             "codex-rs/shell-escalation/Cargo.toml",
@@ -3812,11 +3942,13 @@ class CargoValidateTests(unittest.TestCase):
         }
         packages = (
             "codex-core",
+            "codex-file-search",
             "codex-uds",
             "codex-linux-sandbox",
             "codex-shell-escalation",
         )
         wsl_runtime_packages = {
+            "codex-file-search",
             "codex-uds",
             "codex-linux-sandbox",
             "codex-shell-escalation",
@@ -5151,6 +5283,9 @@ class CargoValidateTests(unittest.TestCase):
             "scripts/test-remote-env.sh",
             "scripts/install/install.sh",
             "sdk/python/unmapped.py",
+            "sdk/typescript/src/unmapped.ts",
+            "codex-rs/.cargo/unmapped.toml",
+            "tools/argument-comment-lint/unmapped.py",
         ):
             for action in ("plan", "verify"):
                 with self.subTest(file_path=file_path, action=action):
@@ -5290,6 +5425,18 @@ class CargoValidateTests(unittest.TestCase):
                     [["just", "bazel-lock-check"]], self.command_lines(plan)
                 )
 
+    def test_formatter_source_selects_existing_non_mutating_native_check(self) -> None:
+        file_path = "scripts/format.py"
+        plan = self.plan_json("--file", file_path, "--mode", "standard")
+        self.assertEqual([file_path], plan["changed_files"])
+        self.assertEqual([], plan["warnings"])
+        self.assertEqual([], plan["selected_packages"])
+        self.assertEqual(["validation_tooling"], plan["selected_surfaces"])
+        self.assertEqual([["just", "fmt-check"]], self.command_lines(plan))
+
+        prep_plan = self.action_json("prep-plan", "--file", file_path, "--mode", "full")
+        self.assertEqual([], self.command_lines(prep_plan))
+
     def test_upstream_sync_v8_helper_selects_planner_and_direct_tests(self) -> None:
         helper_path = "scripts/codex_package/v8.py"
         direct_tests = ["python3", "scripts/codex_package/test_v8.py"]
@@ -5344,16 +5491,35 @@ class CargoValidateTests(unittest.TestCase):
             ".github/actions/setup-ci/action.yml",
             ".github/scripts/check_github_canary.py",
             ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
+            ".github/scripts/npm_alpha_tag.py",
             ".github/scripts/publish_r2_release.py",
             ".github/scripts/releases.py",
             ".github/scripts/select_windows_bazel_targets.py",
             ".github/scripts/test_releases.py",
             ".github/scripts/test_select_windows_bazel_targets.py",
             ".github/scripts/windows_bazel_test_durations.tsv",
+            ".github/scripts/voice_windows_tools.py",
             ".github/workflows/bazel.yml",
+            ".github/workflows/issue-labeler.yml",
             ".github/workflows/r2-release.yml",
             ".github/workflows/repo-checks.yml",
+            ".github/workflows/rust-ci-full.yml",
+            ".github/workflows/rust-ci.yml",
             ".github/workflows/rust-release.yml",
+            ".github/workflows/rust-release-argument-comment-lint.yml",
+            "codex-rs/.cargo/audit.toml",
+            "codex-rs/deny.toml",
+            "sdk/typescript/src/exec.ts",
+            "sdk/typescript/src/index.ts",
+            "sdk/typescript/src/thread.ts",
+            "sdk/typescript/src/turnOptions.ts",
+            "sdk/typescript/tests/run.test.ts",
+            "tools/argument-comment-lint/Cargo.lock",
+            "tools/argument-comment-lint/Cargo.toml",
+            "tools/argument-comment-lint/README.md",
+            "tools/argument-comment-lint/rust-toolchain",
+            "tools/argument-comment-lint/ui/uncommented_literal.stderr",
+            "tools/argument-comment-lint/wrapper_common.py",
             "CHANGELOG.md",
             "third_party/v8/README.md",
         ):

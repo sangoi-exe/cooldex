@@ -1,4 +1,5 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateHash;
 use super::WorldStateSection;
 use super::multi_agent_usage_hint::MultiAgentUsageHintState;
@@ -51,7 +52,7 @@ impl MultiAgentModeState {
     }
 
     pub(crate) fn with_usage_hint(mut self, usage_hint: &MultiAgentUsageHintState) -> Self {
-        self.usage_hint_hash = Some(usage_hint.snapshot());
+        self.usage_hint_hash = Some(usage_hint.fingerprint.clone());
         self
     }
 }
@@ -59,10 +60,6 @@ impl MultiAgentModeState {
 impl WorldStateSection for MultiAgentModeState {
     const ID: &'static str = "multi_agent_mode";
     type Snapshot = Self;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        self.clone()
-    }
 
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer" && MultiAgentModeInstructions::matches_text(text)
@@ -79,14 +76,14 @@ impl WorldStateSection for MultiAgentModeState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
         let (mode, explanation) = match (&self.mode, previous) {
             (Some(mode), PreviousSectionState::Known(previous))
                 if previous.mode.as_ref() == Some(mode)
                     && previous.explanation == self.explanation
                     && previous.usage_hint_hash == self.usage_hint_hash =>
             {
-                return None;
+                return (None, None);
             }
             (Some(mode), _) => (mode.clone(), self.explanation.clone()),
             (None, PreviousSectionState::Known(previous))
@@ -95,11 +92,14 @@ impl WorldStateSection for MultiAgentModeState {
                 (MultiAgentMode::ExplicitRequestOnly, None)
             }
             (None, PreviousSectionState::Unknown) => (MultiAgentMode::ExplicitRequestOnly, None),
-            (None, PreviousSectionState::Absent | PreviousSectionState::Known(_)) => return None,
+            (None, PreviousSectionState::Absent | PreviousSectionState::Known(_)) => {
+                return (Some(self.clone()), None);
+            }
         };
 
-        MultiAgentModeInstructions::new(mode, explanation.as_deref())
-            .map(|instructions| Box::new(instructions) as Box<dyn ContextualUserFragment>)
+        let fragment = MultiAgentModeInstructions::new(mode, explanation.as_deref())
+            .map(|instructions| Box::new(instructions) as Box<dyn ContextualUserFragment>);
+        (Some(self.clone()), fragment)
     }
 }
 

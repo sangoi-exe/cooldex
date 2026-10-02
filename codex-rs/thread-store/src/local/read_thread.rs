@@ -275,7 +275,7 @@ fn reject_paginated_history(
     Ok(())
 }
 
-async fn resolve_requested_rollout_path(
+pub(super) async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
@@ -330,17 +330,24 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    let before = super::history_revision::read(&path).await;
+    // Merge-safety anchor: complete paginated replay uses the selected leaf path and its frozen lineage, paired with the same source revision used for writer-owned resume validation.
     let items = match thread.history_mode {
         ThreadHistoryMode::Legacy => load_history_items(&path).await?,
         ThreadHistoryMode::Paginated => {
             store
-                .resolve_rollout_lineage(thread_id)
+                .resolve_rollout_lineage(thread_id, Some(path.clone()))
                 .await?
                 .load_history()
                 .await?
         }
     };
-    thread.history = Some(StoredThreadHistory { thread_id, items });
+    let after = super::history_revision::read(&path).await;
+    thread.history = Some(StoredThreadHistory {
+        revision: before.filter(|revision| Some(revision) == after.as_ref()),
+        thread_id,
+        items,
+    });
     Ok(())
 }
 

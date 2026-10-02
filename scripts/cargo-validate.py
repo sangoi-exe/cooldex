@@ -2289,10 +2289,7 @@ def classify_file(
     deleted_rust_source = (
         rust_source
         and file_path.startswith("codex-rs/")
-        and (
-            is_git_deleted_path(repo_root, file_path)
-            or deleted_selected_path
-        )
+        and (is_git_deleted_path(repo_root, file_path) or deleted_selected_path)
     )
     if (
         rust_source

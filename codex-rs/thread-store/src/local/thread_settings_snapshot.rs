@@ -59,7 +59,9 @@ pub(super) async fn load_latest_thread_settings_snapshot(
         }));
     }
 
-    let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+    let lineage = store
+        .resolve_rollout_lineage(params.thread_id, Some(path))
+        .await?;
     let mut latest_snapshot = None;
     for segment in lineage.segments() {
         if let Some(snapshot) = scan_segment_for_latest_thread_settings(

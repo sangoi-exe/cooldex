@@ -102,7 +102,12 @@ impl PreCompactHandoffSource {
         let current = sess
             .snapshot_pre_compact_handoff_input(&settings.model_info)
             .await?;
-        Ok(self.input == current.input && self.base_instructions == current.base_instructions)
+        // The captured source, including existing goals, must remain an unchanged prefix; only native host-annotated goal updates may have been appended meanwhile.
+        Ok(self.base_instructions == current.base_instructions
+            && current.input.starts_with(&self.input)
+            && current.input[self.input.len()..]
+                .iter()
+                .all(|item| crate::context::UserGoalUpdate::message_text(item).is_some()))
     }
 
     fn synthesis_prompt(&self) -> Prompt {
