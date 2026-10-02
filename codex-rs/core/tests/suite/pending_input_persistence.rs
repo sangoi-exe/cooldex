@@ -319,15 +319,23 @@ async fn steered_input_checkpoint_controls_next_request(
     assert!(String::from_utf8_lossy(&requests[1]).contains("steered input"));
     let first_request: serde_json::Value = serde_json::from_slice(&requests[0])?;
     let next_request: serde_json::Value = serde_json::from_slice(&requests[1])?;
+    let first_turn_metadata: serde_json::Value = serde_json::from_str(
+        first_request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("first request must carry structured turn metadata"),
+    )?;
+    let next_turn_metadata: serde_json::Value = serde_json::from_str(
+        next_request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .expect("next request must carry structured turn metadata"),
+    )?;
     assert_eq!(
-        first_request["client_metadata"]["admission_marker"],
+        first_turn_metadata["admission_marker"],
         serde_json::Value::Null
     );
-    assert_eq!(
-        next_request["client_metadata"]["admission_marker"],
-        "steered"
-    );
-    assert_eq!(next_request["client_metadata"]["turn_id"], turn_id);
+    assert_eq!(next_turn_metadata["admission_marker"], "steered");
+    assert_eq!(first_turn_metadata["turn_id"], turn_id);
+    assert_eq!(next_turn_metadata["turn_id"], turn_id);
     assert_eq!(
         next_request["input"]
             .to_string()
