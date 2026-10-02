@@ -336,6 +336,7 @@ class RevisionPath:
 
 @dataclass
 class PathSelectionEvidence:
+    saw_changed_deleted: bool = False
     saw_revision_deleted: bool = False
     saw_revision_non_deleted: bool = False
     saw_explicit_file: bool = False
@@ -2263,7 +2264,15 @@ def classify_file(
     if cargo_manifest:
         selection.flags.add("manifest_changed")
 
-    if not rust_source and not file_rule_matched:
+    path_evidence = selection.path_evidence.get(file_path)
+    deleted_selected_path = (
+        path_evidence is not None
+        and (path_evidence.saw_changed_deleted or path_evidence.saw_revision_deleted)
+        and not path_evidence.saw_revision_non_deleted
+        and not path_evidence.saw_explicit_file
+        and not os.path.lexists(repo_root / file_path)
+    )
+    if not rust_source and not file_rule_matched and not deleted_selected_path:
         selection.unmapped_durable_paths.append(file_path)
 
     if package and (rust_source or cargo_manifest):
@@ -2282,13 +2291,7 @@ def classify_file(
         and file_path.startswith("codex-rs/")
         and (
             is_git_deleted_path(repo_root, file_path)
-            or (
-                (path_evidence := selection.path_evidence.get(file_path)) is not None
-                and path_evidence.saw_revision_deleted
-                and not path_evidence.saw_revision_non_deleted
-                and not path_evidence.saw_explicit_file
-                and not os.path.lexists(repo_root / file_path)
-            )
+            or deleted_selected_path
         )
     )
     if (
@@ -4654,7 +4657,15 @@ def main(argv: list[str]) -> int:
         seen: set[str] = set()
         path_evidence: dict[str, PathSelectionEvidence] = {}
         if args.changed:
-            add_selected_files(files, seen, git_changed_files(repo_root), repo_root)
+            changed_files = git_changed_files(repo_root)
+            add_selected_files(files, seen, changed_files, repo_root)
+            for file_path in changed_files:
+                if not os.path.lexists(repo_root / file_path) and is_git_deleted_path(
+                    repo_root, file_path
+                ):
+                    path_evidence.setdefault(
+                        file_path, PathSelectionEvidence()
+                    ).saw_changed_deleted = True
         for revision in args.commits:
             add_revision_files(
                 files,

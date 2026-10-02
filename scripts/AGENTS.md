@@ -71,20 +71,12 @@ and planner warnings retain the unvalidated limitation. -->
 - Root `AGENTS.md` `Guarded Rust Validation` and `Native-Windows bulk test procedure`
   own all-batch terminal collection before failure investigation/correction plus the
   exact-match retry and fresh-collection requirements.
-<!-- Merge-safety anchor: keep selector provenance and this local validation map aligned so committed package deletions remain plannable without weakening unknown-path failures. -->
-- `cargo-validate.py` owns changed-surface selectors: `--changed`, `--commit`,
-  `--range`, `--file`, and `--surface`. `--range` follows
-  status-aware `git diff --name-status <rev-range>` output; `--commit` uses the
-  matching non-merge commit view and must direct merge commits to
-  `--range <base>..<merge>`. Revision selectors retain deletion provenance for
-  committed package removals, select the destination of rename/copy records,
-  and fail loud on malformed status records. A historical deletion cannot
-  override a revision re-add, a current path, or an explicit `--file` selector.
-  `--json` is machine-readable output, not a selector-input schema.
+<!-- Merge-safety anchor: keep selector provenance and this local validation map aligned so proven Git deletions remain plannable without weakening unknown-path failures. -->
+- `cargo-validate.py` owns changed-surface selectors: `--changed`, `--commit`, `--range`, `--file`, and `--surface`. `--range` follows status-aware `git diff --name-status <rev-range>` output; `--commit` uses the matching non-merge commit view and must direct merge commits to `--range <base>..<merge>`. Revision selectors retain deletion provenance, select the destination of rename/copy records, and fail loud on malformed status records. An absent unmapped durable path is accounted for only when its deletion is proven by the selected revision or current `--changed` Git state; it needs no retired live mapping. For that unmapped durable-path accounting, deletion cannot override a revision re-add, a current path, or an explicit `--file` selector, and absence alone is not proof. Existing live mappings and package selection remain authoritative. `--json` is machine-readable output, not a selector-input schema.
 - `--changed` selects all current cached, unstaged, and ordinary untracked worktree changes rather than changes since a prior full collection; use `--file` or an appropriate correction `--range` for a narrower batch. It does not turn arbitrary worktree bytes into a native candidate: `cargo-validate-windows.ps1` consumes the index candidate and requires worktree/index equality with no ordinary untracked source, and the root owns exact task staging while Workers do not stage.
 - `cargo-guard.sh` preserves successful `-p/--package` caches and cleans only the failed package with `cargo clean -p <package>` after package-targeted failures or disk emergencies; broad clean stays limited to clean-required pressure without package targets.
 - When changing validation command selection, resource profiles, receipt semantics, cleanup behavior, or target-cache behavior, update the matching script tests and root Atlas/validation notes if validation truth changes.
-- `cargo-validate.py` and `cargo-validation.toml` should fail loud on unknown durable surfaces instead of silently skipping them.
+- `cargo-validate.py` and `cargo-validation.toml` should fail loud on unknown live durable surfaces and explicit unmapped durable `--file` inputs instead of silently skipping them.
 - Runtime receipts belong under `.sangoi/validation`; scripts should not write validation receipts or helper state under `codex-rs/target`.
 - Ignore generated Python caches such as `__pycache__/`. Do not stage cache files when editing script sources or tests.
 - `scripts/codex_package/README.md` is package documentation, not an agent-instruction owner.

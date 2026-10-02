@@ -4984,6 +4984,167 @@ class CargoValidateTests(unittest.TestCase):
         self.assertNotEqual(0, process.returncode)
         self.assertIn("not owned by a Cargo workspace package", process.stderr)
 
+    def test_revision_selectors_account_for_retired_durable_paths(self) -> None:
+        retired_paths = ["scripts/removed-tool.py", "scripts/test-removed-tool.py"]
+        for file_path in retired_paths:
+            path = self.repo_root / file_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# removed tooling\n")
+        self.init_git_repo()
+        base_commit = self.commit_all("initial tooling")
+        for file_path in retired_paths:
+            (self.repo_root / file_path).unlink()
+        (self.repo_root / "scripts" / "cargo-validate.py").write_text(
+            "# current planner\n"
+        )
+        deletion_commit = self.commit_all("retire tooling and update planner")
+
+        for selectors in (
+            ["--range", f"{base_commit}..{deletion_commit}"],
+            ["--commit", deletion_commit],
+        ):
+            with self.subTest(selectors=selectors):
+                plan = self.plan_json(*selectors, "--mode", "standard")
+                self.assertEqual(
+                    ["scripts/cargo-validate.py", *retired_paths], plan["changed_files"]
+                )
+                self.assertEqual(["validation_tooling"], plan["selected_surfaces"])
+                self.assertIn(
+                    ["python3", "scripts/test-cargo-validate.py"],
+                    self.command_lines(plan),
+                )
+
+    def test_changed_selector_accounts_for_staged_and_unstaged_durable_deletions(
+        self,
+    ) -> None:
+        retired_paths = ["scripts/removed-tool.py", "scripts/test-removed-tool.py"]
+        for file_path in retired_paths:
+            path = self.repo_root / file_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# removed tooling\n")
+        self.init_git_repo()
+        self.commit_all("initial tooling")
+        for file_path in retired_paths:
+            (self.repo_root / file_path).unlink()
+        subprocess.run(
+            ["git", "add", "--", retired_paths[0]], cwd=self.repo_root, check=True
+        )
+
+        plan = self.plan_json("--changed", "--mode", "standard")
+        self.assertEqual(retired_paths, plan["changed_files"])
+        self.assertEqual([], self.command_lines(plan))
+
+        for file_path in retired_paths:
+            with self.subTest(explicit_file=file_path):
+                process = self.run_planner(
+                    "plan",
+                    "--changed",
+                    "--file",
+                    file_path,
+                    "--mode",
+                    "standard",
+                    "--no-receipt",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--metadata-json",
+                    str(self.metadata_path),
+                    "--config",
+                    str(PRODUCTION_CONFIG),
+                    check=False,
+                )
+                self.assertEqual(2, process.returncode)
+                self.assertIn("changed durable paths do not map", process.stderr)
+                self.assertIn(file_path, process.stderr)
+
+        (self.repo_root / retired_paths[0]).write_text("# live unknown tooling\n")
+        process = self.run_planner(
+            "plan",
+            "--changed",
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
+            check=False,
+        )
+        self.assertEqual(2, process.returncode)
+        self.assertIn("changed durable paths do not map", process.stderr)
+        self.assertIn(retired_paths[0], process.stderr)
+
+    def test_durable_deletion_provenance_does_not_override_readd_or_explicit_file(
+        self,
+    ) -> None:
+        file_path = "scripts/unknown-tool.py"
+        path = self.repo_root / file_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# original tooling\n")
+        self.init_git_repo()
+        base_commit = self.commit_all("initial tooling")
+        path.unlink()
+        deletion_commit = self.commit_all("delete tooling")
+        deletion_selectors = ["--range", f"{base_commit}..{deletion_commit}"]
+
+        for selectors in (
+            ["--file", file_path],
+            [*deletion_selectors, "--file", file_path],
+        ):
+            with self.subTest(selectors=selectors):
+                process = self.run_planner(
+                    "plan",
+                    *selectors,
+                    "--no-receipt",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--metadata-json",
+                    str(self.metadata_path),
+                    "--config",
+                    str(PRODUCTION_CONFIG),
+                    check=False,
+                )
+                self.assertEqual(2, process.returncode)
+                self.assertIn("changed durable paths do not map", process.stderr)
+                self.assertIn(file_path, process.stderr)
+
+        path.write_text("# readded tooling\n")
+        process = self.run_planner(
+            "plan",
+            *deletion_selectors,
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
+            check=False,
+        )
+        self.assertEqual(2, process.returncode)
+        self.assertIn("changed durable paths do not map", process.stderr)
+        self.assertIn(file_path, process.stderr)
+
+        readd_commit = self.commit_all("readd tooling")
+        path.unlink()
+        self.commit_all("delete readded tooling")
+        process = self.run_planner(
+            "plan",
+            *deletion_selectors,
+            "--commit",
+            readd_commit,
+            "--no-receipt",
+            "--repo-root",
+            str(self.repo_root),
+            "--metadata-json",
+            str(self.metadata_path),
+            "--config",
+            str(PRODUCTION_CONFIG),
+            check=False,
+        )
+        self.assertEqual(2, process.returncode)
+        self.assertIn("changed durable paths do not map", process.stderr)
+        self.assertIn(file_path, process.stderr)
+
     def test_unmapped_durable_paths_fail_loudly_for_plan_and_verify(self) -> None:
         for file_path in (
             ".github/workflows/unmapped.yml",
