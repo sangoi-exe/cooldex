@@ -196,6 +196,12 @@ current-user rescope. -->
   resource and safety boundaries remain in force. This sequencing rule does not
   change validator implementation or CLI availability.
 
+### Local snapshot command override
+
+- The imported upstream snapshot examples below remain provenance text; this local override owns usable commands. From the repository root, use `./scripts/cargo-guard.sh cargo insta pending-snapshots --manifest-path codex-rs/tui/Cargo.toml` to list pending TUI snapshots and `./scripts/cargo-guard.sh cargo insta show --manifest-path codex-rs/tui/Cargo.toml codex-rs/tui/path/to/file.snap.new` to preview a specific snapshot. Replace the placeholder with the real repository-relative snapshot path. Do not use `-p codex-tui` with these cargo-insta subcommands.
+- Only when intentionally accepting all pending snapshots in the TUI crate, run `./scripts/cargo-guard.sh cargo insta accept --manifest-path codex-rs/tui/Cargo.toml`. Snapshot generation still uses the supported guarded test route.
+- Whenever `scripts/cargo-guard.sh` changes, check current command interfaces with non-mutating help or plan commands and reconcile affected command examples and documentation, including this file and `scripts/AGENTS.md`; passing script tests alone does not establish that documented commands remain usable.
+
 <!-- Merge-safety anchor: native-Windows bulk validation is planner-accounted and PowerShell-executed; matching guarded WSL passes may settle failed or ambiguous portable-test acceptance without changing native outcomes, while normal WSL preparation uses the config-owned package mapper and Linux production builds remain on the guarded WSL path. -->
 ### Native-Windows bulk test procedure
 
@@ -229,17 +235,10 @@ but the planner must exclude only its validation and visibly retain its unvalida
   `RUST_MIN_STACK=8388608`, and keep `PYTHONPYCACHEPREFIX` below that run's `TEMP`
   directory in `F:\.cache`.
 - The canonical workset co-locates the Cargo target directory and Cargo intermediate build directory at the canonical target root below the Windows cache root; C: must not hold either output class.
-- The supported WSL access path mounts Windows volumes read-only. Native `pwsh.exe` or
-  `pwsh` is the technical mechanism for Windows-side writes, not a user prohibition or
-  extra permission checkpoint. Maintained Cargo/Nextest execution, candidate
-  materialization, and cache cleanup remain owned by checked-in
-  `scripts/cargo-validate-windows.ps1` and `scripts/clear-windows-build-cache.ps1`;
-  a bounded diagnostic need not be checked in. Do not write directly to `/mnt/f`.
-  Installation, destructive actions, and privileged work retain their separate
-  authorization boundaries. Fail loud when neither PowerShell 7 command is available.
+- The supported WSL access path mounts Windows volumes read-only. Native PowerShell is the technical mechanism for Windows-side writes, not a user prohibition or extra permission checkpoint. Maintained Cargo/Nextest execution and candidate materialization remain owned by checked-in `scripts/cargo-validate-windows.ps1`; a bounded diagnostic need not be checked in. For direct diagnostics, use the quoted absolute `/mnt/c/Program Files/PowerShell/7/pwsh.exe` path without changing shell or PATH, installing tools, or adding a wrapper. Fail loud if it is unavailable. Do not write directly to `/mnt/f`. Installation, destructive actions, and privileged work retain their separate authorization boundaries.
 - Source synchronization updates only changed tracked source needed to match the frozen index candidate; unchanged source and compatible Cargo, Nextest, and tool caches remain in place. Same-HEAD and supported committed-HEAD transitions preserve unchanged staged-tail source. Changed code relies on the normal build system to rebuild affected artifacts; do not delete or prune the cache merely because a crate, test, or package changed. A missing, residual, corrupt, source-mismatched, tool-incompatible, or otherwise unusable canonical workset must report the actual blocker. Never use a different or latest root, silently fall back to cold preparation, or automatically delete or prune the cache. After synchronization, tracked-source/index mismatch and ordinary untracked files still fail, while post-test ignored outputs may remain; the root source-invariance check remains independent. Receipts must bind the candidate, command, platform, executor, and terminal result.
 - Runtime disk monitoring aborts the contained native command tree before accepting quiescence when configured absolute or percentage free-space thresholds are crossed. It records truthful failure and termination evidence and performs no cleanup.
-- For Windows space pressure, `scripts/clear-windows-build-cache.ps1` is the only cleanup path and is operator-authorized destructive cleanup only; validation never invokes it. Its default is preflight; deletion requires `-Delete`, proof that no Windows or WSL writer exists, literal `F:\.cache` as the target, preservation of that root, and JSON stdout captured outside the target. Deleted content is unrecoverable; do not issue a manual partial cleanup command.
+- Windows cache cleanup belongs only to the current user as a manual operation. Agents must not perform or script it; validation never deletes or prunes the Windows cache. For Windows space pressure or unusable cache state, report the actual blocker and leave cleanup to the current user. This does not change the guarded WSL cleanup contract.
 - The root-wide sequencing rule applies to every admitted native batch—including
   diagnostic, prep, initial, retry, focused, and full runs: it continues through
   errors to terminal completion before failure investigation or correction. Retry
@@ -656,7 +655,7 @@ handler owners; canonical statuses stay full. -->
 - `/home/lucas/work/codex/codex-rs/app-server-daemon/` — lane state, subordinate managed package, lifecycle, and pinning owner.
 - `/home/lucas/work/codex/codex-rs/app-server-transport/` — lane socket, startup-lock, and recovery-path owner.
 - `/home/lucas/work/codex/codex-rs/app-server/`, `/home/lucas/work/codex/codex-rs/cli/`, and `/home/lucas/work/codex/codex-rs/tui/` — direct app-server, CLI, and TUI lane followers.
-- `/home/lucas/work/codex/scripts/cargo-validate-windows.ps1` and `/home/lucas/work/codex/scripts/clear-windows-build-cache.ps1` — native-Windows manifest executor and exact `F:\.cache` cleanup owner.
+- `/home/lucas/work/codex/scripts/cargo-validate-windows.ps1` — native-Windows manifest executor; Windows cache cleanup remains a current-user manual operation.
 - `/home/lucas/work/codex/scripts/install/install.sh` — release installer owner.
 - `/home/lucas/work/codex/codex-rs/ext/computer-use/AGENTS.md` — Computer Use extension crate, vendored payload provenance, and current package-local MCP/Sky owner.
 - `/home/lucas/work/codex/codex-rs/tui/src/bottom_pane/AGENTS.md` — TUI bottom-pane

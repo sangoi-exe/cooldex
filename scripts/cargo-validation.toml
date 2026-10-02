@@ -267,9 +267,6 @@ argv = ["python3", "scripts/codex_package/test_v8.py"]
 [commands.validate-windows-tests]
 argv = ["python3", "scripts/test-cargo-validate-windows.py"]
 
-[commands.clear-windows-build-cache-tests]
-argv = ["python3", "scripts/test-clear-windows-build-cache.py"]
-
 # Merge-safety anchor: full native aggregation and selected-package execution share
 # the pinned V8 sandbox feature, platform exclusions, and test filter through this
 # command owner; workspace-only Cargo arguments remain out of selected-package argv.
@@ -789,14 +786,9 @@ generators = ["write-app-server-schema"]
 patterns = ["sdk/python/tests/test_artifact_workflow_and_binaries.py"]
 
 [[path_rules]]
-patterns = ["scripts/clear-windows-build-cache.ps1", "scripts/test-clear-windows-build-cache.py"]
-surfaces = ["validation_tooling"]
-commands = ["clear-windows-build-cache-tests"]
-
-[[path_rules]]
 patterns = ["scripts/cargo-validate.py", "scripts/cargo-validation.toml", "scripts/test-cargo-validate.py", "scripts/cargo-validate-windows.ps1", "scripts/test-cargo-validate-windows.py", "scripts/codex_package/v8.py"]
 surfaces = ["validation_tooling"]
-commands = ["validate-py-compile", "validate-tests", "validate-windows-tests", "clear-windows-build-cache-tests", "validate-plan-self"]
+commands = ["validate-py-compile", "validate-tests", "validate-windows-tests", "validate-plan-self"]
 
 [[path_rules]]
 patterns = ["scripts/codex_package/v8.py", "scripts/codex_package/test_v8.py"]

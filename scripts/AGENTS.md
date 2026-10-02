@@ -11,7 +11,6 @@
 - `scripts/cargo-validation.toml` - validation/prep command map, resource profiles, generator commands, and package/surface routing.
 - `scripts/test-cargo-guard.sh` and `scripts/test-cargo-validate.py` - local regression coverage for the guard and planner.
 - `scripts/cargo-validate-windows.ps1` and `scripts/test-cargo-validate-windows.py` - native-Windows manifest executor and its deterministic PowerShell/fake-tool coverage.
-- `scripts/clear-windows-build-cache.ps1` and `scripts/test-clear-windows-build-cache.py` - exact `F:\.cache` cleanup seam and regression coverage.
 - `scripts/cooldex/rust-blast-radius-guard.py` - Rust reachability/impact-map helper for unresolved impact questions.
 - `scripts/cooldex/test-rust-blast-radius-guard-items.py` - Python regression coverage for blast-radius item resolution and report-summary behavior.
 - `scripts/codex_package/` - Python package/release layout helpers and tests.
@@ -22,12 +21,12 @@
 ## Durable Notes
 
 - Keep Cargo/build-like validation behavior centralized in `cargo-guard.sh`, `cargo-validate.py`, and `cargo-validation.toml`; do not add parallel ad hoc validation wrappers.
-<!-- Merge-safety anchor: native-Windows execution remains a thin checked-in PowerShell backend for the planner-owned manifest; selected runtime packages use native Nextest while WSL runtime and test preparation follow the config-owned explicit package mapper, with WSL guard dispatch and exact F-cache cleanup kept separate. -->
+<!-- Merge-safety anchor: native-Windows execution remains a thin checked-in PowerShell backend for the planner-owned manifest; selected runtime packages use native Nextest while WSL runtime and test preparation follow the config-owned explicit package mapper, with WSL guard dispatch separate and no native validation cleanup. -->
 - `cargo-validation.toml` and `cargo-validate.py` own the frozen manifest, platform
   partitions, explicit exclusions, and the native-Windows 16-build-job/8-test-thread
   resource contract. The executor fixes native test-child `RUST_MIN_STACK` at `8388608`
-  (8 MiB). `cargo-guard.sh` owns WSL dispatch; the PowerShell helpers own native Windows
-  execution, writes, and cleanup, not a second partitioning policy.
+  (8 MiB). `cargo-guard.sh` owns WSL dispatch; the PowerShell executor owns native Windows
+  execution and writes, not cleanup or a second partitioning policy.
 <!-- Merge-safety anchor: native Nextest dev/test opt1 configuration remains literal command arguments with limited symbols, debug assertions, and overflow checks; WSL codegen remains unchanged. -->
 - `commands.windows-nextest-workspace` owns the exact native `--config` pairs for `profile.dev` and `profile.test` (`opt-level=1`, `debug="limited"`, `debug-assertions=true`, and `overflow-checks=true`); selected package commands derive common native policy, platform exclusions, features, and the test filter from that canonical argv, while `native_binary_prerequisites` contributes only evidenced helper-producing build packages without expanding the affected test filter.
 <!-- Merge-safety anchor: voice source remains workspace-owned, while only
@@ -39,22 +38,15 @@ and planner warnings retain the unvalidated limitation. -->
 - Native Windows Cargo/Nextest is valid only through the WSL guard, frozen manifest, and
   checked-in PowerShell executor. Direct Windows Cargo/Nextest and the former Windows
   `just test` route are invalid.
-- The supported WSL access path mounts Windows volumes read-only. Native `pwsh.exe` or
-  `pwsh` is the technical mechanism for Windows-side writes, not a user prohibition or
-  extra permission checkpoint. The checked-in executor and cleanup scripts retain
-  ownership of maintained native Cargo/Nextest, candidate materialization, and destructive
-  cleanup; a bounded diagnostic need not be checked in. Installation, destructive actions,
-  and privileged work retain their separate authorization boundaries.
-- For a direct WSL-to-PowerShell diagnostic, resolve an available `pwsh.exe` or `pwsh` first and quote PowerShell source so Bash cannot expand `$...` expressions, such as by passing the PowerShell program in Bash single quotes. Do not hardcode an installation path or add a wrapper or install path; this remains a bounded diagnostic and does not create a direct native Cargo/Nextest route.
+- The supported WSL access path mounts Windows volumes read-only. Native PowerShell is the technical mechanism for Windows-side writes, not a user prohibition or extra permission checkpoint. The checked-in executor owns maintained native Cargo/Nextest and candidate materialization; a bounded diagnostic need not be checked in. Installation, destructive actions, and privileged work retain their separate authorization boundaries.
+- For a direct WSL-to-PowerShell diagnostic, use `"/mnt/c/Program Files/PowerShell/7/pwsh.exe"` and quote PowerShell source so Bash cannot expand `$...` expressions, such as by passing the PowerShell program in Bash single quotes. Fail loud if that executable is unavailable; do not change shell or PATH, install tools, or add a wrapper. This remains a bounded diagnostic and does not create a direct native Cargo/Nextest route.
 - Every native validation uses the one canonical reusable workset at `F:\.cache\cw\workset`. Its persistent candidate, target, Cargo/Rustup homes, helper, tool, and compatible cache state remain in place; each execution creates fresh evidence and short temporary paths below literal `F:\.cache`. Missing, residual, corrupt, source-mismatched, or tool-incompatible canonical state fails loud. Validation never chooses another root, falls back to cold preparation, or deletes or prunes the cache. C: toolchains are read-only inputs, and WSL must not write directly to `/mnt/f`.
 - `cargo-validate-windows.ps1` publishes reusable-input readiness after successful candidate materialization and bootstrap, before approved validation commands; this is not a validation verdict. Its native pipe copy forwards available stdout/stderr through the existing outer runner while preserving complete per-command logs and the final JSON summary. Root `AGENTS.md` owns the interrupted-run reuse and terminal-collection contract.
 - The canonical workset co-locates the Cargo target directory and Cargo intermediate build directory at its canonical target root. A rejected cold admission may retain only its non-reparse run-evidence shape and retry without cleanup; any other residual state without the canonical workset fails loud.
 - `Invoke-ApprovedCommand` in `cargo-validate-windows.ps1` owns the native Python
   prerequisite, child-only PATH/`true.exe`/color/stack settings, and run-local bytecode
   cache. Root `AGENTS.md` owns the corresponding operator contract.
-<!-- Merge-safety anchor: the literal-root cleanup authority treats admitted nested
-junctions as leaf entries and never traverses or deletes through their targets. -->
-- `clear-windows-build-cache.ps1` is the only Windows cache cleanup path and is operator-authorized destructive cleanup only: validation never invokes it. Preflight is the default, `-Delete` requires proven WSL/Windows quiescence, and it may delete only captured direct children of literal `F:\.cache` while preserving the root, removing admitted nested junctions as leaf entries, and emitting JSON outside it.
+- Windows cache cleanup belongs only to the current user as a manual operation. Agents must not perform or script it; validation never deletes or prunes the Windows cache. Report space pressure or unusable cache state without cleanup. The WSL cleanup contract remains unchanged.
 - The standalone installer's default GitHub Release repository is
   `sangoi-exe/cooldex`. The `releases.openai.com` source remains an explicit
   opt-in path; keep its upstream URLs and behavior separate from the Cooldex

@@ -3976,27 +3976,16 @@ class CargoValidateTests(unittest.TestCase):
                     ["python3", "scripts/test-cargo-validate-windows.py"], commands
                 )
 
-    def test_windows_cleanup_harness_selects_cleanup_regression(self) -> None:
-        cleanup_test_argv = ["python3", "scripts/test-clear-windows-build-cache.py"]
-        for file_path in (
-            "scripts/clear-windows-build-cache.ps1",
-            "scripts/test-clear-windows-build-cache.py",
-        ):
-            with self.subTest(file_path=file_path):
-                plan = self.plan_json("--file", file_path, "--mode", "standard")
-                self.assertEqual(["validation_tooling"], plan["selected_surfaces"])
-                self.assertIn(cleanup_test_argv, self.command_lines(plan))
-
-        map_plan = self.plan_json(
+    def test_validation_map_selects_planner_and_windows_executor_tests(self) -> None:
+        plan = self.plan_json(
             "--file", "scripts/cargo-validation.toml", "--mode", "standard"
         )
-        map_commands = self.command_lines(map_plan)
+        commands = self.command_lines(plan)
         for argv in (
             ["python3", "scripts/test-cargo-validate.py"],
             ["python3", "scripts/test-cargo-validate-windows.py"],
-            cleanup_test_argv,
         ):
-            self.assertIn(argv, map_commands)
+            self.assertIn(argv, commands)
 
     def test_verify_delegates_windows_aggregate_by_direct_powershell_argv(
         self,
@@ -5147,7 +5136,6 @@ class CargoValidateTests(unittest.TestCase):
             ["python3", "-m", "py_compile", "scripts/cargo-validate.py"],
             ["python3", "scripts/test-cargo-validate.py"],
             ["python3", "scripts/test-cargo-validate-windows.py"],
-            ["python3", "scripts/test-clear-windows-build-cache.py"],
             [
                 "./scripts/cargo-guard.sh",
                 "plan",
