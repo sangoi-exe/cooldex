@@ -706,6 +706,7 @@ impl CodexThread {
                     mode: TurnInputMode::StartOrSteer,
                     reply: reply_tx,
                 },
+                turn_extension_init: None,
                 trace,
                 parent_turn_id: None,
                 root_turn_id: None,
