@@ -891,6 +891,12 @@ async fn ensure_v2_agent_loaded_preserves_committed_settings(parent_owned: bool)
         .registry
         .agent_identity_snapshot_for_thread(child_id)
         .expect("child birth identity");
+    let birth_binding = child
+        .session
+        .get_config()
+        .await
+        .agent_usage_hint_binding
+        .clone();
     child
         .session
         .update_settings(SessionSettingsUpdate {
@@ -906,11 +912,21 @@ async fn ensure_v2_agent_loaded_preserves_committed_settings(parent_owned: bool)
         .await
         .expect("commit child settings");
     let committed_identity = child.session.agent_identity_snapshot().await;
-    assert_eq!(committed_identity.model, "gpt-5.4");
+    let committed_settings = child.session.thread_settings_snapshot().await;
+    assert_eq!(committed_settings.model, "gpt-5.4");
+    assert_eq!(
+        committed_settings.reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+    assert_eq!(
+        committed_settings.reasoning_summary,
+        Some(ReasoningSummary::Concise),
+    );
+    assert_eq!(committed_settings.service_tier.as_deref(), Some("priority"));
     assert_ne!(committed_identity, birth_identity);
     assert_eq!(
-        committed_identity.agent_usage_hint_binding,
-        birth_identity.agent_usage_hint_binding,
+        child.session.get_config().await.agent_usage_hint_binding,
+        birth_binding,
     );
 
     control
@@ -933,6 +949,14 @@ async fn ensure_v2_agent_loaded_preserves_committed_settings(parent_owned: bool)
     assert_eq!(
         child.session.agent_identity_snapshot().await,
         committed_identity,
+    );
+    assert_eq!(
+        child.session.thread_settings_snapshot().await,
+        committed_settings,
+    );
+    assert_eq!(
+        child.session.get_config().await.agent_usage_hint_binding,
+        birth_binding,
     );
     assert_eq!(
         control
