@@ -169,7 +169,68 @@ async fn idle_mail_survives_eviction_and_preserves_followup_order() -> Result<()
     test.submit_turn("send after followup").await?;
     ThreadIdle::wait(&test.codex).await;
     release_tx.send(())?;
-    wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    // Merge-safety anchor: temporary fixture-local observation retains the helper's per-event timeout and panic.
+    let mut observed_events = Vec::new();
+    let completion = std::panic::AssertUnwindSafe(wait_for_event(&resumed, |event| {
+        observed_events.push(event.clone());
+        matches!(event, EventMsg::TurnComplete(_))
+    }))
+    .catch_unwind()
+    .await;
+    if let Err(panic) = completion {
+        eprintln!(
+            "mailbox recipient status: {:?}",
+            resumed.agent_status().await
+        );
+        for event in &observed_events {
+            eprintln!("mailbox recipient event type: {event}");
+            if matches!(
+                event,
+                EventMsg::Error(_)
+                    | EventMsg::Warning(_)
+                    | EventMsg::AgentMessage(_)
+                    | EventMsg::TurnStarted(_)
+                    | EventMsg::TurnComplete(_)
+                    | EventMsg::CollabWaitingBegin(_)
+                    | EventMsg::CollabWaitingEnd(_)
+            ) {
+                eprintln!("mailbox recipient event: {event:?}");
+            }
+            let item = match event {
+                EventMsg::ItemStarted(event) => Some(&event.item),
+                EventMsg::ItemCompleted(event) => Some(&event.item),
+                _ => None,
+            };
+            if let Some(codex_protocol::items::TurnItem::CollabAgentToolCall(item)) = item {
+                eprintln!("mailbox recipient collaboration item: {item:?}");
+            }
+        }
+        for (index, request) in core_test_support::responses::received_responses_requests(&server)
+            .await
+            .iter()
+            .enumerate()
+        {
+            let body = request.body_json();
+            let inputs = body["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    matches!(
+                        item["type"].as_str(),
+                        Some("agent_message" | "function_call" | "function_call_output")
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "mailbox request {index}: model={}, has_followup={}, wait_note_output={:?}, fixture_inputs={inputs:?}",
+                body["model"],
+                request.body_contains_text(FOLLOWUP),
+                request.function_call_output_text("wait-note")
+            );
+        }
+        std::panic::resume_unwind(panic);
+    }
     ThreadIdle::wait(&resumed).await;
     let request = delivered
         .requests()
