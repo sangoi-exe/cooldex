@@ -1185,6 +1185,7 @@ fn resumed_usage_hint_binding_uses_only_the_first_canonical_session_meta() -> Re
         git: None,
     });
     let history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: child_thread_id,
         history: Arc::new(vec![
             child_meta_without_binding,
@@ -1196,6 +1197,7 @@ fn resumed_usage_hint_binding_uses_only_the_first_canonical_session_meta() -> Re
     assert_eq!(history.get_resumed_agent_usage_hint_binding(), Some(None));
 
     let missing_canonical_meta = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: child_thread_id,
         history: Arc::new(vec![
             RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
