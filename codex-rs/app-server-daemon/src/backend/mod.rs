@@ -18,6 +18,7 @@ pub enum BackendKind {
     Pid,
 }
 
+// Merge-safety anchor: PID and update backends share CODEX_HOME while carrying the selected local package lane as their daemon owner.
 #[derive(Debug, Clone)]
 pub(crate) struct BackendPaths {
     pub(crate) codex_home: PathBuf,

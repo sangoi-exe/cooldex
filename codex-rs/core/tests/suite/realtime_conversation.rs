@@ -4734,6 +4734,7 @@ async fn inbound_handoff_request_starts_turn_and_promotes_its_artifact() -> Resu
     .await;
     assert_eq!(session_updated, "sess_inbound");
 
+    // Merge-safety anchor: this handoff fixture observes both the callback and routed TurnStarted without assuming their event order.
     let turn_id = timeout(Duration::from_secs(10), async {
         let mut saw_handoff = false;
         let mut turn_id = None;

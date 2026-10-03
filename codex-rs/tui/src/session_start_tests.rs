@@ -81,6 +81,7 @@ async fn archived_session_requires_confirmation_before_resume_or_fork() -> Resul
                 endpoint: endpoint.clone(),
             },
             crate::AppServerTarget::Remote { endpoint },
+            // Merge-safety anchor: private-child cancellation shares command-center outcomes with daemon and remote targets, not embedded exit.
             crate::AppServerTarget::InstanceChild,
             crate::AppServerTarget::Embedded,
         ] {

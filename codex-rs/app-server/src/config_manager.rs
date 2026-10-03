@@ -324,6 +324,7 @@ impl ConfigManager {
     ) -> std::io::Result<Config> {
         match self.load_latest_config(fallback_cwd).await {
             Ok(config) => Ok(config),
+            // Merge-safety anchor: a missing explicitly selected profile is terminal even when non-strict startup may otherwise use defaults.
             Err(error) if self.strict_config || crate::is_nonrecoverable_config_error(&error) => {
                 Err(error)
             }

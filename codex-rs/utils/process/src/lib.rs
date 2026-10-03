@@ -14,6 +14,7 @@ use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 
+// Merge-safety anchor: local runtime owners share process identity and signaling primitives; PID reuse is checked against boot ID and start ticks.
 /// A Linux PID paired with its boot ID and `/proc` start ticks.
 ///
 /// Consumers must compare the PID, boot ID, and start ticks before treating a

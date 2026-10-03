@@ -509,6 +509,7 @@ fn release_selection_unstable(daemon: &Daemon, trigger: UpdateTrigger<'_>) -> Re
 }
 
 fn selected_release(daemon: &Daemon) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    // Merge-safety anchor: pinned local lanes reject public updates; generic release selection uses the daemon-owned managed root.
     anyhow::ensure!(
         daemon.local_package_lane().is_none(),
         "local package lanes are pinned and do not support public daemon updates"

@@ -456,6 +456,7 @@ fn manual_update_daemon(home: &TempDir) -> (Daemon, String) {
     )
 }
 
+// Merge-safety anchor: generic daemon fixtures select their native managed release while pinned local lanes reject public update selection.
 #[cfg(unix)]
 #[test]
 fn local_package_lane_is_rejected_from_public_update_selection() {
@@ -481,6 +482,7 @@ fn local_package_lane_is_rejected_from_public_update_selection() {
     assert!(!super::manual_update::supported(&local).expect("local update support"));
 }
 
+// Merge-safety anchor: local-lane update guidance remains promotion-owned rather than offering the generic public updater.
 #[cfg(unix)]
 #[tokio::test]
 async fn unsupported_manual_update_guidance_distinguishes_local_package_lanes() {

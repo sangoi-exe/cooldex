@@ -18,6 +18,7 @@ mod new_context_window;
 pub(crate) mod new_context_window_spec;
 mod plan;
 pub(crate) mod plan_spec;
+// Merge-safety anchor: the recall island remains attached to the native tool-handler module owner.
 mod recall;
 mod request_permissions;
 mod request_plugin_install;
@@ -68,6 +69,7 @@ pub use mcp_resource::ListMcpResourcesHandler;
 pub use mcp_resource::ReadMcpResourceHandler;
 pub use new_context_window::NewContextWindowHandler;
 pub use plan::PlanHandler;
+// Merge-safety anchor: native tool registration consumes the recall handler through this export.
 pub use recall::RecallHandler;
 pub(crate) use request_permissions::RequestPermissionsEnvironmentArgs;
 pub use request_permissions::RequestPermissionsHandler;

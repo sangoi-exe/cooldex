@@ -201,6 +201,7 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
     )
     .await?;
 
+    // Merge-safety anchor: the removed skill-approval path stays absent; the fixture consumes completion once and asserts the turn sandbox still applies.
     let approval = wait_for_exec_approval_or_turn_complete(&test).await;
     assert!(
         approval.is_none(),

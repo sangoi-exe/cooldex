@@ -161,6 +161,7 @@ async fn concurrent_preparation_preserves_warnings_and_errors(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_global_read_keeps_instructions_until_recovery() -> Result<()> {
+    // Merge-safety anchor: the read-failure fixture admits symlink support before testing retention and recovery of global instructions.
     let home = Arc::new(TempDir::new()?);
     let source = home.path().join(GLOBAL_AGENTS_FILENAME);
     if !create_symlink_loop_if_supported(&source) {
@@ -379,6 +380,7 @@ async fn interrupting_a_provider_read_allows_the_next_turn_to_refresh() -> Resul
     let home = Arc::new(TempDir::new()?);
     write_global_file(&home, GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
     let provider = Arc::new(GatedProvider {
+        // Merge-safety anchor: the gated refresh provider explicitly includes global instructions under the effective-policy constructor.
         inner: CodexHomeUserInstructionsProvider::new(
             home.path().to_path_buf().abs(),
             codex_home::GlobalInstructionsMode::Include,

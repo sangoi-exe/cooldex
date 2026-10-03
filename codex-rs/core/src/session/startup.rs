@@ -65,6 +65,7 @@ impl SessionStartup {
             }
         } else {
             if let Some(session) = self.session.get() {
+                // Merge-safety anchor: failed startup aborts the native runtime rather than retiring an active turn as successfully completed.
                 super::handlers::shutdown_session_runtime(
                     session,
                     super::handlers::ActiveTurnShutdown::Abort,

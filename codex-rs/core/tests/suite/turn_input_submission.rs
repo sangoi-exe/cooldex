@@ -672,6 +672,7 @@ async fn recover_turn_if_idle_preserves_id_and_resumes_plan_mode() {
     assert!(user_input_groups[0][0].starts_with("<environment_context>"));
 }
 
+// Merge-safety anchor: internal-continuation fixtures wait for native ThreadIdle admission while retaining origin-turn metadata and no new user authorization.
 /// Internal continuation creates a new turn without adding user authorization.
 #[tokio::test]
 async fn continue_turn_if_idle_starts_new_turn_with_internal_input() {

@@ -821,6 +821,7 @@ async fn thread_start_response_includes_loaded_instruction_sources() -> Result<(
     Ok(())
 }
 
+// Merge-safety anchor: native thread-start fixtures assert global instruction sources and model context against each thread's effective config.
 #[tokio::test]
 async fn thread_start_binds_global_instructions_to_each_effective_config() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;

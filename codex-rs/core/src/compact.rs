@@ -108,9 +108,11 @@ pub(crate) struct CompactedHistoryInstallation {
 
 impl CompactedHistoryMetadata {
     pub(crate) fn with_prepared_handoff(
-        self,
+        mut self,
         prepared_handoff: PreparedPreCompactHandoff,
     ) -> CompactedHistoryInstallation {
+        // Merge-safety anchor: only goals in the frozen handoff source are consumed; host goal updates accepted during preparation must survive ordinary replacement history.
+        self.input_goal_ids = prepared_handoff.source().input_goal_ids();
         CompactedHistoryInstallation {
             metadata: self,
             prepared_handoff: Some(prepared_handoff),

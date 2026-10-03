@@ -5010,7 +5010,6 @@ impl Session {
         // handoff/recovery checkpoint as every other compaction route.
         let turn_context = step_context.turn.as_ref();
         let history = self.clone_history().await;
-        let input_goal_ids = crate::context::UserGoalUpdate::message_ids(history.raw_items());
         let retained_client_developer_messages =
             if self.enabled(Feature::RetainClientDeveloperMessages) {
                 crate::compact_remote_v2::truncate_retained_messages_for_remote_compaction(
@@ -5046,7 +5045,7 @@ impl Session {
             .collect();
         let turn_context_item = step_context.to_turn_context_item();
         let metadata = CompactedHistoryMetadata {
-            input_goal_ids,
+            input_goal_ids: Default::default(),
             message: String::new(),
             window_number,
             window_ids,

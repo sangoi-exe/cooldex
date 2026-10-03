@@ -48,6 +48,7 @@ pub(crate) use managed_developer_instructions::ManagedDeveloperInstructionsState
 pub(crate) use managed_developer_instructions::validate_managed_developer_instructions;
 pub(crate) use model::ModelInstructionsState;
 pub(crate) use model_catalog::ModelCatalogState;
+// Merge-safety anchor: session world-state snapshots consume the fork's effective multi-agent policy, including its explanation.
 pub(crate) use multi_agent_mode::EffectiveMultiAgentMode;
 pub(crate) use multi_agent_mode::MultiAgentModeState;
 pub(crate) use multi_agent_usage_hint::MultiAgentUsageHintState;

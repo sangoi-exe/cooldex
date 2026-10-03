@@ -109,6 +109,7 @@ struct ThreadRevertRuntimeSnapshot {
     client_mcp_extensions: ClientMcpExtensions,
 }
 
+// Merge-safety anchor: start, resume, fork, and revert bind global instructions to their effective config, not a shared startup setting.
 fn global_user_instructions_provider(config: &Config) -> Arc<dyn UserInstructionsProvider> {
     Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),

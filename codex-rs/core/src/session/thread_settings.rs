@@ -16,6 +16,7 @@ use codex_thread_store::ThreadStoreResult;
 use tokio::sync::SemaphorePermit;
 
 impl Session {
+    // Merge-safety anchor: settings, goal, and compaction publication serialize through the existing thread-settings persistence permit.
     /// Acquires the shared permit before persistent publication or forced lifecycle retirement
     /// admission.
     pub(crate) async fn acquire_thread_settings_persistence(&self) -> SemaphorePermit<'_> {

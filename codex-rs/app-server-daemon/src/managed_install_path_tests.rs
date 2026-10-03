@@ -1,6 +1,7 @@
 use codex_install_context::LocalPackageLane;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: shared-home fixtures retain distinct managed roots and executable selections for each local package lane.
 #[test]
 fn local_package_lanes_have_distinct_managed_roots() {
     let home = tempfile::TempDir::new().expect("home");

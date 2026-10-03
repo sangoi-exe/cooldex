@@ -21,6 +21,7 @@ use crate::LoadThreadHistoryParams;
 use crate::StoredThreadHistory;
 use crate::ThreadStoreError;
 
+// Merge-safety anchor: complete-history fixtures preserve frozen ancestry ordinals across archived and compressed rollouts without replaying excluded suffixes.
 #[tokio::test]
 async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
     let home = TempDir::new().expect("temp dir");
@@ -382,6 +383,7 @@ async fn assert_invalid_lineage(store: &LocalThreadStore, thread_id: ThreadId, d
             include_archived: false,
         })
         .await
+        // Merge-safety anchor: loading authoritative history rejects the same invalid lineage as direct lineage resolution.
         .expect_err("complete history should reject invalid lineage");
     assert!(err.to_string().contains(detail), "{err}");
 }

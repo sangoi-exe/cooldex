@@ -1,5 +1,6 @@
 // Merge-safety anchor: pre-compaction handoff synthesis is operation-local so generated text
 // never changes live history, recovery state, rollout state, or normal continuation ownership.
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::ResponseStream;
@@ -12,6 +13,7 @@ use crate::session::step_context::StepContext;
 use codex_async_utils::OrCancelExt;
 use codex_history::HandoffPreparation;
 use codex_otel::SessionTelemetry;
+use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -79,6 +81,10 @@ pub(crate) struct PreCompactHandoffSource {
 }
 
 impl PreCompactHandoffSource {
+    pub(crate) fn input_goal_ids(&self) -> HashSet<ResponseItemId> {
+        crate::context::UserGoalUpdate::message_ids(self.input.iter())
+    }
+
     pub(crate) fn from_snapshot(
         snapshot: PreCompactHandoffInputSnapshot,
         settings: PreCompactHandoffSettings,

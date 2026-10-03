@@ -929,6 +929,7 @@ mod tests {
                 .output()
                 .await
                 .expect("isolated AWS refresh test should run");
+            // Merge-safety anchor: only this isolated test fixture retries bounded Windows sharing-violation cleanup, not provider operations.
             let mut cleanup_attempts = 0;
             loop {
                 match std::fs::remove_dir_all(&counter) {

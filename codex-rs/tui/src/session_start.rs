@@ -106,6 +106,7 @@ pub(crate) async fn complete_session_start(
             return Ok(match app_server_target {
                 crate::AppServerTarget::LocalDaemon { .. }
                 | crate::AppServerTarget::Remote { .. }
+                // Merge-safety anchor: cancelling an archived-session start in a private instance child returns to the command center.
                 | crate::AppServerTarget::InstanceChild => SessionStartOutcome::CommandCenter,
                 crate::AppServerTarget::Embedded => SessionStartOutcome::Exit,
             });

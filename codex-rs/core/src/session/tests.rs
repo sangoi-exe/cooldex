@@ -4011,8 +4011,12 @@ async fn record_initial_history_reconstructs_forked_transcript() {
     );
 }
 
+#[test_case(false; "unchanged goal boundary")]
+#[test_case(true; "clear after frozen handoff input")]
 #[tokio::test]
-async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_state() {
+async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_state(
+    with_late_clear: bool,
+) {
     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
         CodexAuth::from_api_key("Test API Key"),
         Vec::new(),
@@ -4021,6 +4025,13 @@ async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_stat
     .await;
     let cancellation_token = CancellationToken::new();
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    session
+        .record_user_goal_update(crate::context::UserGoalUpdate::Set {
+            objective: Some("captured rollover goal".to_string()),
+            status: None,
+        })
+        .await
+        .expect("record goal before frozen handoff input");
     let world_state = Arc::new(
         session
             .build_world_state_for_step(&step_context)
@@ -4033,6 +4044,24 @@ async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_stat
             .expect("persistence-disabled preparation must stay boundary-only");
     let rollout_path =
         attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+    // This update precedes rollover's later live-history snapshot but follows the frozen handoff input.
+    let late_goal = if with_late_clear {
+        session
+            .record_user_goal_update(crate::context::UserGoalUpdate::Clear)
+            .await
+            .expect("record clear after frozen handoff input");
+        Some(
+            session
+                .clone_history()
+                .await
+                .raw_items()
+                .last()
+                .expect("accepted clear must be ordinary history")
+                .clone(),
+        )
+    } else {
+        None
+    };
     let thread_id = ThreadId::new();
     let token_usage_record = TokenUsageRecord {
         thread_id,
@@ -4062,6 +4091,36 @@ async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_stat
     );
     assert!(live_history.raw_items().next().is_some());
     assert!(live_history.raw_items().all(|item| item.id().is_some()));
+    let prompt_items = live_history
+        .clone()
+        .for_prompt(&turn_context.model_info().input_modalities);
+    let prompt_goals = prompt_items
+        .iter()
+        .filter(|item| crate::context::UserGoalUpdate::message_text(item).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(prompt_goals, late_goal.iter().cloned().collect::<Vec<_>>());
+    let boundary_id = live_history
+        .raw_items()
+        .last()
+        .unwrap()
+        .id()
+        .unwrap()
+        .to_string();
+    if let Some(late_goal) = late_goal.as_ref() {
+        assert_eq!(live_history.raw_items().last(), Some(late_goal));
+    }
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .post_compact_recovery
+            .pending_identity()
+            .unwrap()
+            .boundary_item_id,
+        boundary_id
+    );
 
     session.flush_rollout().await.expect("rollout should flush");
     let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
@@ -4096,14 +4155,30 @@ async fn start_new_context_window_with_prepared_handoff_persists_checkpoint_stat
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::EventMsg(_) => None,
     });
-    let mut expected_history = live_history.annotated_items().to_vec();
-    // Compaction's parallel metadata vector represents absent entries as default metadata.
-    for envelope in &mut expected_history {
-        envelope.metadata.get_or_insert_default();
-    }
     assert_eq!(
         persisted_compacted.and_then(|compacted| compacted.replacement_history.clone()),
-        Some(expected_history)
+        Some(live_history.annotated_items().to_vec())
+    );
+    assert_eq!(
+        persisted_compacted
+            .unwrap()
+            .post_compact_recovery
+            .as_ref()
+            .unwrap()
+            .boundary_item_id,
+        boundary_id
+    );
+    let replayed = session
+        .reconstruct_history_from_rollout(turn_context.as_ref(), &resumed.history)
+        .await;
+    assert_eq!(replayed.history.as_slice(), live_history.annotated_items());
+    assert_eq!(
+        replayed
+            .post_compact_recovery
+            .pending_identity()
+            .unwrap()
+            .boundary_item_id,
+        boundary_id
     );
     assert_eq!(
         persisted_compacted.map(|compacted| {

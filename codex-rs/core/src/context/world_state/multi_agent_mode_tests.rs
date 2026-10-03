@@ -6,6 +6,7 @@ use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use pretty_assertions::assert_eq;
 
+// Merge-safety anchor: mode fixtures construct effective policy snapshots so explanation changes remain part of contextual rendering.
 fn state(mode: Option<MultiAgentMode>) -> MultiAgentModeState {
     MultiAgentModeState::new(
         mode.map(|mode| EffectiveMultiAgentMode::new(mode, /*explanation*/ None)),
@@ -164,6 +165,7 @@ fn catalog_role_updates_remain_separate_from_active_mode() {
     );
 }
 
+// Merge-safety anchor: custom policy and explanation fixtures retain the fork's 400-token bounds in both snapshots and rendered context.
 #[test]
 fn custom_mode_is_bounded_before_snapshot_and_rendering() {
     let state = state(Some(MultiAgentMode::Custom("custom mode ".repeat(1_000))));
