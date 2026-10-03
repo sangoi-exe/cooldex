@@ -413,41 +413,11 @@ async fn load_agent_model_context(
 }
 
 impl LocalAgentControl {
-    /// Restore persisted V2 agent identities without reopening their runtimes.
-    #[cfg(test)]
-    pub(crate) async fn restore_v2_agent_metadata(
-        &self,
-        config: &Config,
-        root_thread_id: ThreadId,
-    ) {
-        let _ = self
-            .restore_v2_agent_metadata_inner(
-                config,
-                root_thread_id,
-                /*restore_identity_snapshots*/ false,
-            )
-            .await;
-    }
-
     /// Restore V2 descendants for a resumed root without consulting mutable role files.
     pub(crate) async fn restore_v2_root_agent_metadata(
         &self,
         config: &Config,
         root_thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        self.restore_v2_agent_metadata_inner(
-            config,
-            root_thread_id,
-            /*restore_identity_snapshots*/ true,
-        )
-        .await
-    }
-
-    async fn restore_v2_agent_metadata_inner(
-        &self,
-        config: &Config,
-        root_thread_id: ThreadId,
-        restore_identity_snapshots: bool,
     ) -> CodexResult<()> {
         let registry = &self.runtime.registry;
         registry.register_root_thread(root_thread_id);
@@ -499,11 +469,8 @@ impl LocalAgentControl {
             }
             let restore_result = async {
                 let stored_thread = stored_thread?;
-                let identity_snapshot = if restore_identity_snapshots {
-                    restore_v2_identity_snapshot(&state, config, &stored_thread).await?
-                } else {
-                    None
-                };
+                let identity_snapshot =
+                    restore_v2_identity_snapshot(&state, config, &stored_thread).await?;
                 let stored_agent_path = stored_thread
                     .agent_path
                     .as_deref()

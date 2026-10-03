@@ -4361,6 +4361,10 @@ impl Session {
                 .get_or_insert_default()
                 .compaction_model_hash = metadata.compaction_model_hash;
         }
+        // Merge-safety anchor: the forced MCP checkpoint gives every nonempty replacement a metadata sidecar; materialize its native default slots before cloning so live and persisted envelopes remain identical.
+        for envelope in &mut items {
+            envelope.metadata.get_or_insert_default();
+        }
         let handoff_preparation = prepared_handoff
             .as_ref()
             .map(PreparedPreCompactHandoff::handoff_preparation)
