@@ -34,6 +34,7 @@ use crate::session::SessionSettingsUpdate;
 use crate::session::multi_agents::full_history_usage_hint_binding;
 use crate::session::multi_agents::usage_hint_text_for_turn;
 use crate::session::step_context::StepContext;
+use crate::session::step_settings::StepSettingsUpdate;
 use crate::thread_manager::ForkSnapshot;
 use crate::thread_manager::StartThreadOptions;
 use crate::tools::handlers::multi_agents_common::thread_spawn_source;
@@ -846,6 +847,100 @@ async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
         FullHistoryUsageHintSource::Configured,
     )
     .await;
+}
+
+// Merge-safety anchor: loaded V2 admission retains legitimate committed settings without replacing the immutable child birth binding.
+#[test_case::test_case(false; "sender")]
+#[test_case::test_case(true; "parent")]
+#[tokio::test]
+async fn ensure_v2_agent_loaded_preserves_committed_settings(parent_owned: bool) {
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("enable multi-agent v2");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("enable SQLite");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, root) = harness.start_thread().await;
+    let control = &root
+        .session
+        .services
+        .local_agent_runtime
+        .control(root.session.session_id());
+    let child_id = spawn_v2_reload_test_child(
+        control,
+        harness.config.clone(),
+        &root,
+        "worker",
+        /*agent_role*/ None,
+        /*fork_mode*/ None,
+    )
+    .await
+    .thread_id;
+    let child = harness
+        .manager
+        .get_thread(child_id)
+        .await
+        .expect("loaded child");
+    persist_thread_for_tree_resume(&child, "child persisted").await;
+    let birth_identity = control
+        .runtime
+        .registry
+        .agent_identity_snapshot_for_thread(child_id)
+        .expect("child birth identity");
+    child
+        .session
+        .update_settings(SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                model: Some("gpt-5.4".to_string()),
+                effort: Some(Some(ReasoningEffort::Low)),
+                reasoning_summary: Some(ReasoningSummary::Concise),
+                service_tier: Some(Some("priority".to_string())),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("commit child settings");
+    let committed_identity = child.session.agent_identity_snapshot().await;
+    assert_eq!(committed_identity.model, "gpt-5.4");
+    assert_ne!(committed_identity, birth_identity);
+    assert_eq!(
+        committed_identity.agent_usage_hint_binding,
+        birth_identity.agent_usage_hint_binding,
+    );
+
+    control
+        .ensure_v2_agent_loaded(
+            harness.config.clone(),
+            child_id,
+            parent_owned.then(|| Arc::clone(&root)),
+        )
+        .await
+        .expect("loaded child should accept committed settings");
+
+    assert!(Arc::ptr_eq(
+        &child,
+        &harness
+            .manager
+            .get_thread(child_id)
+            .await
+            .expect("same child"),
+    ));
+    assert_eq!(
+        child.session.agent_identity_snapshot().await,
+        committed_identity,
+    );
+    assert_eq!(
+        control
+            .runtime
+            .registry
+            .agent_identity_snapshot_for_thread(child_id),
+        Some(birth_identity),
+    );
 }
 
 #[tokio::test]

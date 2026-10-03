@@ -369,14 +369,14 @@ async fn restore_v2_identity_snapshot(
     )))
 }
 
-async fn verify_loaded_v2_agent_identity(
+async fn verify_restored_v2_child_identity(
     loaded_thread: &CodexThread,
     thread_id: ThreadId,
     identity_snapshot: &AgentIdentitySnapshot,
 ) -> CodexResult<()> {
     if loaded_thread.session.agent_identity_snapshot().await != *identity_snapshot {
         return Err(CodexErr::InvalidRequest(format!(
-            "agent {thread_id} is loaded with an identity that does not match its live identity snapshot; spawn a new agent before sending follow-up work"
+            "agent {thread_id} was restored with an identity that does not match its birth identity snapshot"
         )));
     }
     Ok(())
@@ -637,12 +637,8 @@ impl LocalAgentControl {
                 )));
             }
         }
-        let loaded_thread = state.get_thread(thread_id).await.ok();
-        if owner_thread_id.is_none()
-            && loaded_thread
-                .as_ref()
-                .is_some_and(|thread| thread.multi_agent_version() != Some(MultiAgentVersion::V2))
-        {
+        // Merge-safety anchor: loaded admission preserves committed settings; child birth identity is restoration evidence, not a follow-up equality guard.
+        if owner_thread_id.is_none() && state.get_thread(thread_id).await.is_ok() {
             self.touch_loaded_v2_residency(&state, thread_id).await;
             return Ok(());
         }
@@ -656,17 +652,14 @@ impl LocalAgentControl {
             .registry
             .agent_identity_snapshot_for_thread(thread_id)
         {
-            Some(identity_snapshot) => identity_snapshot,
+            Some(identity_snapshot) => Some(identity_snapshot),
             None if agent_metadata
                 .agent_path
                 .as_ref()
                 .is_some_and(AgentPath::is_root)
                 && owner_thread_id.is_none() =>
             {
-                if loaded_thread.is_some() {
-                    return Ok(());
-                }
-                return Err(CodexErr::ThreadNotFound(thread_id));
+                None
             }
             None => {
                 return Err(CodexErr::InvalidRequest(format!(
@@ -674,13 +667,6 @@ impl LocalAgentControl {
                 )));
             }
         };
-        if owner_thread_id.is_none()
-            && let Some(loaded_thread) = loaded_thread
-        {
-            verify_loaded_v2_agent_identity(&loaded_thread, thread_id, &identity_snapshot).await?;
-            self.touch_loaded_v2_residency(&state, thread_id).await;
-            return Ok(());
-        }
         let mut environment_selections = self.runtime.registry.evicted_environments(thread_id);
 
         let stored_thread = state
@@ -724,7 +710,6 @@ impl LocalAgentControl {
             }
             if let Ok(thread) = state.get_thread(thread_id).await {
                 self.validate_loaded_v2_child(&thread, parent_thread_id)?;
-                verify_loaded_v2_agent_identity(&thread, thread_id, &identity_snapshot).await?;
                 self.touch_loaded_v2_residency(&state, thread_id).await;
                 return Ok(());
             }
@@ -759,9 +744,10 @@ impl LocalAgentControl {
                 })?;
             config.model_provider_id = stored_model_provider;
         }
-        // Cold V2 reload must restore the persisted birth identity, not reinterpret a mutable
-        // role file. The role can drift or disappear after the child was first spawned.
-        identity_snapshot.apply(&mut config, &mut session_source)?;
+        // Merge-safety anchor: child reload restores birth identity without reinterpreting mutable role files; registered roots use native history restoration without a child identity.
+        if let Some(identity_snapshot) = &identity_snapshot {
+            identity_snapshot.apply(&mut config, &mut session_source)?;
+        }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
             .or(stored_parent_thread_id);
@@ -909,12 +895,14 @@ impl LocalAgentControl {
                 if let Some(parent_thread_id) = owner_thread_id {
                     self.validate_loaded_v2_child(&reloaded_thread.thread, parent_thread_id)?;
                 }
-                verify_loaded_v2_agent_identity(
-                    &reloaded_thread.thread,
-                    thread_id,
-                    &identity_snapshot,
-                )
-                .await?;
+                if let Some(identity_snapshot) = &identity_snapshot {
+                    verify_restored_v2_child_identity(
+                        &reloaded_thread.thread,
+                        thread_id,
+                        identity_snapshot,
+                    )
+                    .await?;
+                }
                 self.runtime.registry.clear_evicted_environments(thread_id);
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
@@ -927,7 +915,6 @@ impl LocalAgentControl {
                     }
                     self.runtime.registry.clear_evicted_environments(thread_id);
                     drop(residency_slot);
-                    verify_loaded_v2_agent_identity(&thread, thread_id, &identity_snapshot).await?;
                     self.touch_loaded_v2_residency(&state, thread_id).await;
                     return Ok(());
                 }

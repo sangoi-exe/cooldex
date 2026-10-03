@@ -147,6 +147,14 @@ async fn snapshot_preserves_admitted_history_base_instructions_and_source_identi
         .expect("record appended native goal update");
     assert!(source.is_current_for(&session, &settings).await.unwrap());
     let mut changed_settings = settings.clone();
+    changed_settings.cyber_access_program = Some(CyberAccessProgram::DaybreakBlue);
+    assert!(
+        !source
+            .is_current_for(&session, &changed_settings)
+            .await
+            .unwrap()
+    );
+    let mut changed_settings = settings.clone();
     changed_settings.service_tier = Some("changed settings".to_string());
     assert!(
         !source
@@ -299,7 +307,8 @@ fn handoff_outcomes_expose_content_free_persisted_preparation() {
 
 #[tokio::test]
 async fn synthesis_prompt_is_tool_free_without_output_token_limit_and_uses_frozen_settings() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context.cyber_access_program = Some(CyberAccessProgram::DaybreakBlue);
     let turn_context = Arc::new(turn_context);
     let step_context =
         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
@@ -316,6 +325,14 @@ async fn synthesis_prompt_is_tool_free_without_output_token_limit_and_uses_froze
     assert!(prompt.tools.is_empty());
     assert!(!prompt.parallel_tool_calls);
     assert_eq!(prompt.max_output_tokens, None);
+    assert_eq!(
+        settings.cyber_access_program,
+        Some(CyberAccessProgram::DaybreakBlue)
+    );
+    assert_eq!(
+        prompt.cyber_access_program,
+        Some(CyberAccessProgram::DaybreakBlue)
+    );
     assert_eq!(source.settings, settings);
     assert!(prompt.input.last().is_some_and(|item| {
         matches!(item, ResponseItem::Message { role, content, .. }

@@ -3713,10 +3713,13 @@ class CargoValidateTests(unittest.TestCase):
             "codex-app-server-daemon": (
                 "captured_stdio_closes_while_child_is_alive",
                 "detached_launch_preflight_allows_residual_job",
+                "managed_children_launch_in_workdir_without_changing_private_state_directory",
             ),
             "codex-app-server": ("setup_validates_permissions_before_provisioning",),
             "codex-cli": ("restrictive_launcher_uses_embedded_if_daemon_cannot_start",),
             "codex-core": (
+                "windows_elevated_approved_git_pull_preserves_deny_read",
+                "windows_elevated_powershell_preserves_relative_paths",
                 "windows_sandbox_cli_preserves_managed_deny_reads_across_launches",
                 "windows_elevated_unified_exec_enforces_large_recursive_deny_reads",
             ),

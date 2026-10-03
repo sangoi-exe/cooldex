@@ -6240,7 +6240,18 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
             )
             .await
             .expect("install compaction checkpoint");
-        if let Some(accepted_goal) = accepted_goal {
+        if let Some(mut accepted_goal) = accepted_goal {
+            // The native forced checkpoint annotates the final retained late goal without changing its identity or content.
+            accepted_goal
+                .metadata
+                .get_or_insert_default()
+                .mcp_attribution = Some(McpAttribution {
+                status: McpAttributionStatus::AttributionError,
+                error_reason: Some(
+                    codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
+                ),
+                sources: Vec::new(),
+            });
             let live_history = session.clone_history().await.annotated_items().to_vec();
             assert_eq!(&live_history[1..], &[accepted_goal]);
             let boundary_id = live_history.last().unwrap().item.id().unwrap().to_string();

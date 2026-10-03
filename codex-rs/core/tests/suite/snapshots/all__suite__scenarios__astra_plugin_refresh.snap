@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/scenarios.rs
+assertion_line: 1601
 expression: "context_snapshot::format_request_history_snapshot(\"Astra checks for Notes, refreshes its installed plugin without restarting, and uses the new skill and Code Mode MCP tool across turns.\",\n&mock.requests(),\n&ContextSnapshotOptions::default().include_request_settings(),)"
 ---
 Scenario: Astra checks for Notes, refreshes its installed plugin without restarting, and uses the new skill and Code Mode MCP tool across turns.
@@ -16,15 +17,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=a1bfbfab4176467b):
-        - namespace/functions; hash=e7db0a45c4ec3157
+00:additional_tools/developer (3; hash=9ee5197c41814b78):
+        - namespace/functions; hash=3c69b82990ffe4f8
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=b263e3c84ad07c37
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=d700675fb2316963
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -110,15 +111,15 @@ Settings:
 ## Window 2 (after request 2: input diverged at item 00)
 Settings: same as window 1
 -- request 3 (turn) --
-00:additional_tools/developer (3; hash=7810769c6e12d379):
-        - namespace/functions; hash=8c17932a39355f2d
+00:additional_tools/developer (3; hash=77e90d704441d25e):
+        - namespace/functions; hash=a2f577e73378ee06
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=b263e3c84ad07c37
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=d700675fb2316963
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents

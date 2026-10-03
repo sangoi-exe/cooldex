@@ -9,7 +9,6 @@ use crate::context::PostCompactRecoveryContext;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
-use crate::session::step_settings::ResolvedStepSettings;
 use codex_async_utils::OrCancelExt;
 use codex_history::HandoffPreparation;
 use codex_otel::SessionTelemetry;
@@ -22,6 +21,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_rollout_trace::InferenceTraceContext;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -38,19 +38,18 @@ pub(crate) struct PreCompactHandoffSettings {
     reasoning_effort: Option<ReasoningEffortConfig>,
     reasoning_summary: ReasoningSummaryConfig,
     service_tier: Option<String>,
+    cyber_access_program: Option<CyberAccessProgram>,
 }
 
 impl PreCompactHandoffSettings {
     pub(crate) fn from_step_context(step_context: &StepContext) -> Self {
-        Self::from_resolved_step_settings(&step_context.settings)
-    }
-
-    pub(crate) fn from_resolved_step_settings(settings: &ResolvedStepSettings) -> Self {
+        let settings = &step_context.settings;
         Self {
             model_info: Arc::clone(&settings.model_info),
             reasoning_effort: settings.reasoning_effort().cloned(),
             reasoning_summary: settings.reasoning_summary,
             service_tier: settings.service_tier.clone(),
+            cyber_access_program: step_context.turn.cyber_access_program,
         }
     }
 }
@@ -129,7 +128,7 @@ impl PreCompactHandoffSource {
             output_schema: None,
             output_schema_strict: true,
             max_output_tokens: None,
-            cyber_access_program: None,
+            cyber_access_program: self.settings.cyber_access_program,
         }
     }
 }
