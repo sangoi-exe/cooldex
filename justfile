@@ -12,6 +12,7 @@ python := if os_family() == "windows" { "python" } else { "python3" }
 
 # Merge-safety anchor: build-like Cargo just recipes route through
 # scripts/cargo-guard.sh so resource limits, cleanup, and receipts stay centralized.
+# Local package input builds prepare the exact Codex V8 pair before guarded Cargo.
 
 # Display help
 help:
@@ -151,7 +152,30 @@ build-codex-bin:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build -p codex-cli --bin codex
 
 build-local-codex-package-inputs:
-    CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-build}" bash ../scripts/cargo-guard.sh cargo build --target x86_64-unknown-linux-gnu -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-computer-use-extension --bin codex-computer-use-mcp
+    #!/usr/bin/env python3
+    import os
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(os.environ["CODEX_REPO_ROOT"])
+    sys.path.insert(0, str(repo_root / "scripts"))
+    from codex_package.targets import TARGET_SPECS
+    from codex_package.v8 import resolve_codex_v8_cargo_env
+
+    spec = TARGET_SPECS["x86_64-unknown-linux-gnu"]
+    os.environ.update(resolve_codex_v8_cargo_env(
+        spec,
+        cache_root=Path.home() / ".cache" / "codex" / "cargo-validation" / "rusty-v8",
+    ))
+    os.environ["CARGO_GUARD_RESOURCE_PROFILE"] = os.environ.get("CARGO_GUARD_RESOURCE_PROFILE") or "build"
+    os.execvp("bash", [
+        "bash", str(repo_root / "scripts" / "cargo-guard.sh"),
+        "cargo", "build", "--target", spec.target,
+        "-p", "codex-cli", "--bin", "codex",
+        "-p", "codex-code-mode-host", "--bin", "codex-code-mode-host",
+        "-p", "codex-bwrap", "--bin", "bwrap",
+        "-p", "codex-computer-use-extension", "--bin", "codex-computer-use-mcp",
+    ])
 
 check-codex-bin:
     CARGO_GUARD_RESOURCE_PROFILE="${CARGO_GUARD_RESOURCE_PROFILE:-check}" bash ../scripts/cargo-guard.sh cargo check -p codex-cli --bin codex

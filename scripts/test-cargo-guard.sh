@@ -38,6 +38,13 @@ log_file="${FAKE_CARGO_LOG:?FAKE_CARGO_LOG is required}"
         "${CARGO_TARGET_DIR:-unset}"
 } >>"${log_file}"
 
+if [[ "${FAKE_CARGO_LOG_V8:-0}" == "1" ]]; then
+    printf 'cargo-v8|command=%s|archive=%s|binding=%s\n' \
+        "${1:-}" \
+        "${RUSTY_V8_ARCHIVE:-unset}" \
+        "${RUSTY_V8_SRC_BINDING_PATH:-unset}" >>"${log_file}"
+fi
+
 if [[ -n "${FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE:-}" ]]; then
     mkdir -p -- "$(dirname -- "${FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE}")"
     if [[ -n "${CARGO_GUARD_TELEMETRY_PATH:-}" && -f "${CARGO_GUARD_TELEMETRY_PATH}" ]]; then
@@ -194,6 +201,32 @@ fi
 exec "${REAL_PYTHON3:?REAL_PYTHON3 is required}" "$@"
 EOF_FAKE_PYTHON3
 chmod +x "${FAKE_BIN}/python3"
+
+# Control artifact availability, not resolver policy, for the actual local-input recipe.
+V8_FIXTURE_DIR="${TMP_ROOT}/v8-fixture"
+mkdir -p -- "${V8_FIXTURE_DIR}"
+cat >"${V8_FIXTURE_DIR}/sitecustomize.py" <<'EOF_V8_FIXTURE'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["FAKE_CARGO_GUARD_PATH"]).parent))
+from codex_package import v8
+
+
+def fetch_artifacts(spec, *, cache_root):
+    with Path(os.environ["FAKE_CARGO_LOG"]).open("a") as log:
+        log.write(f"v8|target={spec.target}|cache={cache_root}\n")
+    if os.environ.get("FAKE_V8_FETCH_FAIL") == "1":
+        raise RuntimeError("forced V8 preparation failure")
+    return v8.RustyV8ArtifactPair(
+        archive=cache_root / "archive.a.gz",
+        binding=cache_root / "binding.rs",
+    )
+
+
+v8.fetch_codex_v8_artifacts = fetch_artifacts
+EOF_V8_FIXTURE
 export PATH="${FAKE_BIN}:${PATH}"
 export REAL_PYTHON3
 
@@ -261,6 +294,7 @@ begin_case() {
     unset FAKE_CARGO_COMMAND_STATUS FAKE_CARGO_COMMAND_SLEEP FAKE_CARGO_CLEAN_STATUS FAKE_CARGO_CLEAN_DESCENDANT_STATUS_FILE FAKE_CARGO_TELEMETRY_LINE_COUNT_FILE FAKE_CARGO_BREAK_TELEMETRY_AFTER_START
     unset FAKE_CARGO_NESTED_GUARD FAKE_CARGO_NESTED_OUTPUT
     unset FAKE_PYTHON_PLANNER_MODE FAKE_PYTHON_PLANNER_NESTED_OUTPUT
+    unset FAKE_CARGO_LOG_V8 FAKE_V8_FETCH_FAIL RUSTY_V8_ARCHIVE RUSTY_V8_SRC_BINDING_PATH V8_FROM_SOURCE
     unset FAKE_PS_FORCE_BAD_PGID FAKE_PS_FAIL_PROCESS_LIST
     unset FAKE_CARGO_DESCENDANT_FILE FAKE_PS_PGID_SEQUENCE_FILE FAKE_PS_PROCESS_LIST_FILE
     unset RUST_MIN_STACK RUST_TEST_THREADS NEXTEST_TEST_THREADS CARGO_BUILD_JOBS CARGO_TARGET_DIR CARGO_GUARD_RESOURCE_PROFILE NEXTEST_PROFILE
@@ -610,6 +644,53 @@ expect_command_ok just test
 unset NEXTEST_PROFILE
 assert_file_contains "${CURRENT_OUT}" 'resource-profile: workspace_nextest_tight'
 assert_file_contains "${CURRENT_LOG}" 'args=nextest run --profile local-disk-tight --build-jobs 3 --test-threads 1 '
+
+begin_case
+export FAKE_CARGO_LOG_V8=1
+PYTHONPATH="${V8_FIXTURE_DIR}" expect_command_ok just build-local-codex-package-inputs
+assert_file_contains "${CURRENT_LOG}" "cargo-v8\|command=build\|archive=${CURRENT_HOME}/[.]cache/codex/cargo-validation/rusty-v8/archive[.]a[.]gz\|binding=${CURRENT_HOME}/[.]cache/codex/cargo-validation/rusty-v8/binding[.]rs"
+assert_file_contains "${CURRENT_LOG}" "v8\|target=x86_64-unknown-linux-gnu\|cache=${CURRENT_HOME}/[.]cache/codex/cargo-validation/rusty-v8"
+assert_order 'v8\|target=' 'args=build '
+assert_file_contains "${CURRENT_LOG}" 'args=build --target x86_64-unknown-linux-gnu -p codex-cli --bin codex -p codex-code-mode-host --bin codex-code-mode-host -p codex-bwrap --bin bwrap -p codex-computer-use-extension --bin codex-computer-use-mcp \|jobs=4\|'
+assert_file_contains "${CURRENT_OUT}" 'resource-profile: build'
+assert_file_contains "${CURRENT_OUT}" 'cargo-build-jobs: selected=4 cap=12 '
+assert_clean_count 0
+
+begin_case
+export FAKE_V8_FETCH_FAIL=1
+if PYTHONPATH="${V8_FIXTURE_DIR}" run_command just build-local-codex-package-inputs; then
+    fail 'expected V8 preparation failure to stop the local input recipe'
+fi
+assert_file_contains "${CURRENT_OUT}" 'forced V8 preparation failure'
+assert_file_contains "${CURRENT_LOG}" 'v8\|target=x86_64-unknown-linux-gnu'
+assert_file_not_contains "${CURRENT_LOG}" 'cargo\|'
+
+begin_case
+export RUSTY_V8_ARCHIVE="${TMP_ROOT}/explicit archive.a.gz"
+if PYTHONPATH="${V8_FIXTURE_DIR}" run_command just build-local-codex-package-inputs; then
+    fail 'expected an incomplete V8 override pair to stop the local input recipe'
+fi
+assert_file_contains "${CURRENT_OUT}" 'RUSTY_V8_ARCHIVE and RUSTY_V8_SRC_BINDING_PATH set together'
+assert_file_empty "${CURRENT_LOG}"
+
+begin_case
+export FAKE_CARGO_LOG_V8=1
+export RUSTY_V8_ARCHIVE="${TMP_ROOT}/explicit archive.a.gz"
+export RUSTY_V8_SRC_BINDING_PATH="${TMP_ROOT}/explicit binding.rs"
+export CARGO_GUARD_RESOURCE_PROFILE=check
+PYTHONPATH="${V8_FIXTURE_DIR}" expect_command_ok just build-local-codex-package-inputs
+assert_file_contains "${CURRENT_LOG}" "cargo-v8\|command=build\|archive=${TMP_ROOT}/explicit archive[.]a[.]gz\|binding=${TMP_ROOT}/explicit binding[.]rs"
+assert_file_not_contains "${CURRENT_LOG}" 'v8\|target='
+assert_file_contains "${CURRENT_OUT}" 'resource-profile: check'
+assert_file_contains "${CURRENT_LOG}" 'args=build --target x86_64-unknown-linux-gnu .*\|jobs=4\|'
+
+begin_case
+export FAKE_CARGO_LOG_V8=1
+export V8_FROM_SOURCE=1
+PYTHONPATH="${V8_FIXTURE_DIR}" expect_command_ok just build-local-codex-package-inputs
+assert_file_not_contains "${CURRENT_LOG}" 'v8\|target='
+assert_file_contains "${CURRENT_LOG}" 'cargo-v8\|command=build\|archive=unset\|binding=unset'
+assert_file_contains "${CURRENT_LOG}" 'args=build --target x86_64-unknown-linux-gnu '
 
 begin_case
 helper_log="$(dirname -- "${CURRENT_LOG}")/tui-with-exec-server.log"
