@@ -300,7 +300,7 @@ handler owners; canonical statuses stay full. -->
   — current owners for token-efficient V2 fan-in, body-free list presentation, and full
   canonical statuses.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`, `/home/lucas/work/codex/scripts/cargo-validation.toml`, and `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust execution, validation policy, and impact-inventory owners.
-- `/home/lucas/work/codex/justfile` / `build-local-codex-package-inputs` — guarded complete local source-input owner for the CLI, Code Mode host, bwrap, and Computer Use MCP.
+- `/home/lucas/work/codex/justfile` / `build-local-codex-package-inputs` — complete local source-input owner for the CLI, Code Mode host, bwrap, and Computer Use MCP; prepares the exact GNU V8 archive/binding pair through `scripts/codex_package/v8.py` before guarded Cargo.
 - `/home/lucas/work/codex/scripts/build_codex_package.py` and `/home/lucas/work/codex/scripts/codex_package/` — one-complete-package assembly and layout-validation owners.
 - `/home/lucas/work/codex/codex-rs/install-context/` — typed local-lane recognition and package-resource lookup owner.
 - `/home/lucas/work/codex/codex-rs/app-server-daemon/` — lane state, subordinate managed package, lifecycle, and pinning owner.
