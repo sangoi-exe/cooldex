@@ -3727,10 +3727,6 @@ pub struct ExecCommandEndEvent {
     #[ts(optional)]
     pub interaction_input: Option<String>,
 
-    /// Captured stdout
-    pub stdout: String,
-    /// Captured stderr
-    pub stderr: String,
     /// Captured aggregated output
     #[serde(default)]
     pub aggregated_output: String,
@@ -3739,8 +3735,6 @@ pub struct ExecCommandEndEvent {
     /// The duration of the command execution.
     #[ts(type = "string")]
     pub duration: Duration,
-    /// Formatted output from the command, as seen by the model.
-    pub formatted_output: String,
     /// Completion status for this command execution.
     pub status: ExecCommandStatus,
 }
@@ -5827,12 +5821,9 @@ mod tests {
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
                 status: CommandExecutionStatus::InProgress,
-                stdout: None,
-                stderr: None,
                 aggregated_output: None,
                 exit_code: None,
                 duration: None,
-                formatted_output: None,
             }),
         };
         let completed = ItemCompletedEvent {
@@ -5855,12 +5846,9 @@ mod tests {
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
                 status: CommandExecutionStatus::Completed,
-                stdout: Some("done\n".into()),
-                stderr: Some(String::new()),
                 aggregated_output: Some("done\n".into()),
                 exit_code: Some(0),
                 duration: Some(Duration::from_millis(5)),
-                formatted_output: Some("done\n".into()),
             }),
         };
 

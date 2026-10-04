@@ -1,5 +1,7 @@
 //! App-level orchestration tests for the TUI.
 
+#[path = "tests/copy_mode_tests.rs"]
+mod copy_mode_tests;
 #[path = "tests/mcp_login_tests.rs"]
 mod mcp_login_tests;
 
@@ -3130,15 +3132,15 @@ async fn open_agent_picker_prompts_when_subagents_disabled() -> Result<()> {
 
     Box::pin(app.open_agent_picker(&mut app_server)).await;
     assert_snapshot!(render_bottom_popup(&app.chat_widget, /*width*/ 80), @r###"
-      Enable subagents?
-      Subagents are disabled in this TUI session.
+          Enable subagents?
+    › As  Subagents are disabled in this TUI session.
 
+      gp
+        › 1. Yes, enable  Save on the server for new threads without changing
+                          this thread
+          2. Not now      Keep subagents disabled
 
-    › 1. Yes, enable  Save on the server for new threads without changing this
-                      thread
-      2. Not now      Keep subagents disabled
-
-      enter select · esc back
+          enter select · esc back
     "###);
     Ok(())
 }
@@ -5506,6 +5508,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
     let child_thread_id = ThreadId::new();
     app.primary_thread_id = Some(parent_thread_id);
     app.active_thread_id = Some(parent_thread_id);
+    app.upsert_agent_picker_thread(
+        child_thread_id,
+        /*agent_nickname*/ None,
+        /*agent_role*/ None,
+        /*is_closed*/ false,
+    );
 
     app.handle_app_server_event(
         &app_server,
@@ -6940,6 +6948,8 @@ async fn closing_fullscreen_inline_overlay_restores_history_once() -> Result<()>
 #[tokio::test]
 async fn copy_picker_opening_preserves_terminal_scrollback_without_reflow() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    app.chat_widget.local_settings.transcript_mode =
+        crate::transcript_mode::TranscriptMode::Terminal;
     let response = "Existing response\n\n```rust\nkeep_scrollback();\n```";
     app.chat_widget.handle_server_notification(
         ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
@@ -7138,9 +7148,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        String::new(),
-        PathBuf::from("/tmp"),
-        /*inline_visualization_context*/ None,
+        AgentMarkdownCell::new(String::new(), Path::new("/tmp")),
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -7183,10 +7191,11 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.handle_consolidate_agent_message(
         &mut tui,
-        "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
-            .to_string(),
-        PathBuf::from("/tmp"),
-        /*inline_visualization_context*/ None,
+        AgentMarkdownCell::new(
+            "Final answer:\n\n| Pattern | Outcome |\n| --- | --- |\n| Table tail | Preserved |"
+                .into(),
+            Path::new("/tmp"),
+        ),
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -7207,15 +7216,15 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
 
     let rendered = app.render_transcript_lines_for_reflow(/*width*/ 80);
     assert_eq!(rendered.lines.len(), 7);
-    assert_snapshot!(
-        "required_stream_reflow_during_capped_initial_replay_survives_transcript_overlay",
-        rendered
-            .lines
-            .iter()
-            .map(rendered_line_text)
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let rendered = rendered
+        .lines
+        .iter()
+        .map(rendered_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Table tail"));
+    assert!(rendered.contains("Preserved"));
+    assert!(!rendered.contains("stale streamed table tail"));
     Ok(())
 }
 

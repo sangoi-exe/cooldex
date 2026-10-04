@@ -57,6 +57,8 @@ impl App {
                     | AppEvent::CopyWarning(_)
                     | AppEvent::UpdateWarnings { .. }
                     | AppEvent::CopySelection { .. }
+                    | AppEvent::SelectTranscriptCopy { .. }
+                    | AppEvent::TranscriptCopyClosed
                     | AppEvent::ConfirmDaemonUpdate(_)
                     | AppEvent::RunDaemonUpdate(_)
                     | AppEvent::InsertHistoryCell(_)
@@ -395,6 +397,17 @@ impl App {
                         .set_queue_autosend_suppressed(/*suppressed*/ false);
                     self.chat_widget.maybe_send_next_queued_input();
                 }
+            }
+            AppEvent::TranscriptCopyClosed => {
+                self.chat_widget.maybe_send_next_queued_input();
+            }
+            AppEvent::SelectTranscriptCopy { guard } => {
+                let size = tui.prepare_draw_size()?;
+                self.render_owned_transcript(tui, size)?;
+                if !self.transcript_view.begin_copy_mode(&self.transcript_cells, Some(guard)) {
+                    self.chat_widget.add_info_message("Nothing to copy".into(), /*hint*/ None);
+                }
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::CopySelection { text, label, format } => {
                 let result = tui.clipboard.copy(text, format, tui.frame_requester());
@@ -884,6 +897,7 @@ impl App {
             }
             AppEvent::ConsolidateAgentMessage {
                 source,
+                copy_source,
                 cwd,
                 inline_visualization_context,
                 scrollback_reflow,
@@ -891,9 +905,7 @@ impl App {
             } => {
                 self.handle_consolidate_agent_message(
                     tui,
-                    source,
-                    cwd,
-                    inline_visualization_context,
+                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(source, &cwd, inline_visualization_context).with_copy_source(copy_source),
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;
@@ -2895,6 +2907,7 @@ impl App {
                 }
             }
             AppEvent::HideAgentsOverviewThread { thread_id } => {
+                self.prepare_agents_overview_removal(&HashSet::from([thread_id]));
                 self.agents_overview.hidden_threads.insert(thread_id);
                 self.repaint_agents_overview();
             }
@@ -3233,6 +3246,9 @@ impl App {
             }
             AppEvent::TerminalTitleSetupCancelled => {
                 self.chat_widget.cancel_terminal_title_setup();
+            }
+            AppEvent::PersistAgentsOverviewGrouping(grouping) => {
+                self.persist_agents_overview_grouping(grouping).await;
             }
             AppEvent::SyntaxThemeSelected { name } => {
                 let edit = crate::legacy_core::config::edit::syntax_theme_edit(&name);

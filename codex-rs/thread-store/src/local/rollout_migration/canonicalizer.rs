@@ -24,6 +24,7 @@ use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout::RolloutItem;
 use codex_rollout::RolloutLine;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -280,10 +281,7 @@ impl LegacyRolloutCanonicalizer {
                     }
                 } else {
                     let item = RolloutItem::EventMsg(event);
-                    if codex_rollout::is_persisted_rollout_item(&item, ThreadHistoryMode::Paginated)
-                    {
-                        self.write_item(writer, &timestamp, item).await?;
-                    }
+                    self.write_item(writer, &timestamp, item).await?;
                 }
             }
             item @ RolloutItem::InterAgentCommunication(_) => {
@@ -469,6 +467,12 @@ impl LegacyRolloutCanonicalizer {
         timestamp: &str,
         item: RolloutItem,
     ) -> ThreadStoreResult<()> {
+        let item = match codex_rollout::persisted_rollout_item(&item, ThreadHistoryMode::Paginated)
+        {
+            Some(Cow::Borrowed(_)) => item,
+            Some(Cow::Owned(item)) => item,
+            None => return Ok(()),
+        };
         let mut bytes = serde_json::to_vec(&RolloutLine {
             timestamp: timestamp.to_string(),
             ordinal: Some(self.next_ordinal),

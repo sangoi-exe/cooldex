@@ -5493,6 +5493,7 @@ class CargoValidateTests(unittest.TestCase):
             ".github/actions/setup-ci/action.yml",
             ".github/scripts/check_github_canary.py",
             ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
+            ".github/scripts/macos-signing/sign_macos_code.sh",
             ".github/scripts/npm_alpha_tag.py",
             ".github/scripts/publish_r2_release.py",
             ".github/scripts/releases.py",

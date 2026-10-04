@@ -2,6 +2,7 @@ use super::super::test_support::render_section_cases;
 use super::*;
 use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::test_support::FragmentSectionTestExt as _;
 use codex_protocol::models::ResponseItem;
 use codex_utils_output_truncation::approx_token_count;
 use pretty_assertions::assert_eq;
@@ -71,21 +72,21 @@ fn persisted_mode_is_restored_only_when_missing_from_history() {
 
     assert_eq!(
         world_state
-            .render_history_diff(/*previous*/ None, std::slice::from_ref(&retained))
+            .render_history_fragment_diff(/*previous*/ None, std::slice::from_ref(&retained))
             .1
             .len(),
         1,
     );
     assert_eq!(
         world_state
-            .render_history_diff(Some(&snapshot), &[])
+            .render_history_fragment_diff(Some(&snapshot), &[])
             .1
             .len(),
         1
     );
     assert!(
         world_state
-            .render_history_diff(Some(&snapshot), &[retained])
+            .render_history_fragment_diff(Some(&snapshot), &[retained])
             .1
             .is_empty()
     );
@@ -104,7 +105,7 @@ fn unchanged_mode_is_reemitted_after_usage_hint_migration() {
     ));
 
     let instructions = current
-        .render_diff(PreviousSectionState::Known(&previous))
+        .render_fragment_diff(PreviousSectionState::Known(&previous))
         .1
         .expect("unchanged mode should follow migrated usage instructions");
 
@@ -135,7 +136,7 @@ fn catalog_role_updates_remain_separate_from_active_mode() {
     let mut previous = WorldState::default();
     previous.add_section(previous_hint);
     previous.add_section(previous_mode);
-    let (previous_snapshot, previous_fragments) = previous.render_full();
+    let (previous_snapshot, previous_fragments) = previous.render_full_fragments();
     let history = previous_fragments
         .into_iter()
         .map(ContextualUserFragment::into_boxed_response_item)
@@ -148,7 +149,7 @@ fn catalog_role_updates_remain_separate_from_active_mode() {
     current.add_section(current_hint);
     current.add_section(current_mode);
 
-    let updates = crate::context_manager::updates::merge_contextual_fragments(
+    let updates = crate::context_manager::updates::merge_world_state_updates(
         current
             .render_history_diff(Some(&previous_snapshot), &history)
             .1,
@@ -170,7 +171,7 @@ fn catalog_role_updates_remain_separate_from_active_mode() {
 fn custom_mode_is_bounded_before_snapshot_and_rendering() {
     let state = state(Some(MultiAgentMode::Custom("custom mode ".repeat(1_000))));
     let Some(MultiAgentMode::Custom(snapshot_mode)) = state
-        .render_diff(PreviousSectionState::Absent)
+        .render_fragment_diff(PreviousSectionState::Absent)
         .0
         .unwrap()
         .mode
@@ -180,7 +181,7 @@ fn custom_mode_is_bounded_before_snapshot_and_rendering() {
     assert!(approx_token_count(&snapshot_mode) <= 400);
 
     let rendered = state
-        .render_diff(PreviousSectionState::Absent)
+        .render_fragment_diff(PreviousSectionState::Absent)
         .1
         .expect("custom mode should render")
         .render();

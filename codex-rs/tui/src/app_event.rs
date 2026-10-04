@@ -474,6 +474,14 @@ pub(crate) enum AppEvent {
         destination: TranscriptExportDestination,
     },
 
+    /// Select a response or block directly in the owned transcript.
+    SelectTranscriptCopy {
+        guard: Arc<crate::copy_input_guard::CopyInputGuard>,
+    },
+
+    /// Retry queued input after the transcript copy owner is released.
+    TranscriptCopyClosed,
+
     /// Copy text through the session clipboard worker.
     CopySelection {
         text: Arc<str>,
@@ -1166,6 +1174,7 @@ pub(crate) enum AppEvent {
     /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
         source: String,
+        copy_source: Option<String>,
         cwd: PathBuf,
         inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,
@@ -1585,6 +1594,9 @@ pub(crate) enum AppEvent {
     },
     /// Dismiss the terminal-title setup UI without changing config.
     TerminalTitleSetupCancelled,
+
+    /// Remember the Command Center grouping across launches.
+    PersistAgentsOverviewGrouping(codex_config::types::AgentsOverviewGrouping),
 
     /// Save the transcript renderer preference for the next launch only.
     FullscreenTranscriptSelected {
