@@ -608,7 +608,6 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 "resource_profile": "windows_nextest",
                 "cold_minimum_free_disk_gib": 120,
                 "warm_minimum_free_disk_gib": 5,
-                "minimum_available_memory_gib": 30,
                 "cargo_build_jobs": 16,
                 "nextest_test_threads": 8,
                 "monitor": True,
@@ -1355,7 +1354,6 @@ class CargoValidateWindowsTests(unittest.TestCase):
                 "resource_profile": "windows_nextest",
                 "cold_minimum_free_disk_gib": 120,
                 "warm_minimum_free_disk_gib": 5,
-                "minimum_available_memory_gib": 30,
                 "cargo_build_jobs": 16,
                 "nextest_test_threads": 8,
                 "monitor": True,
@@ -1395,7 +1393,6 @@ class CargoValidateWindowsTests(unittest.TestCase):
             all(
                 not check["yolo"]
                 and not check["bypassed_free_disk_floor"]
-                and not check["bypassed_available_memory_floor"]
                 for check in preflight["execution_preflight"]
             )
         )
@@ -3058,7 +3055,17 @@ class CargoValidateWindowsTests(unittest.TestCase):
         manifest["windows_runtime"]["source_materialization"]["wsl_distro_name"] = (
             "FixtureDistro"
         )
-        success, summary, result = self.invoke(manifest, fixture_opt_in=True)
+        available_memory_bytes = 29 * 1024**3
+        success, summary, result = self.invoke(
+            manifest,
+            fixture_opt_in=True,
+            preflight_fixture={
+                **DEFAULT_PREFLIGHT_FIXTURE,
+                "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES": str(
+                    available_memory_bytes
+                ),
+            },
+        )
         self.assertEqual(success.returncode, 0, msg=success.stderr)
         self.assertEqual(summary["status"], "success")
         evidence_dir = self.unix_path(str(summary["evidence_dir"]))
@@ -3068,6 +3075,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
         self.assertTrue(
             all(
                 check["source"] == "test-only-fixture"
+                and check["status"] == "passed"
+                and not check["yolo"]
+                and check["available_memory_bytes"] == available_memory_bytes
                 for check in preflight["execution_preflight"]
             )
         )
@@ -3087,16 +3097,6 @@ class CargoValidateWindowsTests(unittest.TestCase):
                     "CARGO_VALIDATE_WINDOWS_TEST_DISK_FREE_BYTES": str(119 * 1024**3),
                 },
                 "free bytes",
-            ),
-            (
-                "memory",
-                {
-                    **DEFAULT_PREFLIGHT_FIXTURE,
-                    "CARGO_VALIDATE_WINDOWS_TEST_AVAILABLE_MEMORY_BYTES": str(
-                        29 * 1024**3
-                    ),
-                },
-                "available Windows physical memory",
             ),
             (
                 "native-writer",
@@ -3179,7 +3179,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         Path(PWSH).is_file(),
         "PowerShell 7 is required for the Windows executor harness",
     )
-    def test_yolo_bypasses_only_resource_floors_and_records_it(self) -> None:
+    def test_yolo_bypasses_only_disk_floors_and_records_it(self) -> None:
         yolo_manifest = self.manifest([self.command(env=self.fixture_env())])
         yolo_manifest["flags"].append("yolo")
         low_resources = {
@@ -3203,11 +3203,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
             all(
                 check["yolo"]
                 and check["bypassed_free_disk_floor"]
-                and check["bypassed_available_memory_floor"]
                 and check["free_disk_bytes"] == 119 * 1024**3
                 and check["required_free_disk_bytes"] == 120 * 1024**3
                 and check["available_memory_bytes"] == 29 * 1024**3
-                and check["required_available_memory_bytes"] == 30 * 1024**3
                 for check in preflight["execution_preflight"]
             )
         )
@@ -3216,8 +3214,9 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
         self.assertTrue(command_result["command_preflight"]["yolo"])
         self.assertTrue(command_result["command_preflight"]["bypassed_free_disk_floor"])
-        self.assertTrue(
-            command_result["command_preflight"]["bypassed_available_memory_floor"]
+        self.assertEqual(
+            command_result["command_preflight"]["available_memory_bytes"],
+            29 * 1024**3,
         )
 
         for label, fixture, expected in (

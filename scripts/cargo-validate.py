@@ -52,7 +52,6 @@ WINDOWS_RUNTIME_CONFIG_KEYS = frozenset(
         "cache_root",
         "workflow_namespace",
         "minimum_free_disk_gib",
-        "minimum_available_memory_gib",
         "target",
         "rust_toolchain",
         "nextest_version",
@@ -68,7 +67,6 @@ WINDOWS_RUNTIME_CONFIG_KEYS = frozenset(
 WINDOWS_RUNTIME_CACHE_ROOT = r"F:\.cache"
 WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB = 120
 WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB = 5
-WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB = 30
 WINDOWS_RUNTIME_TARGET = "x86_64-pc-windows-msvc"
 WINDOWS_RUNTIME_URL_FIELDS = (
     "nextest_url",
@@ -88,7 +86,6 @@ WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS = frozenset(
         "resource_profile",
         "cold_minimum_free_disk_gib",
         "warm_minimum_free_disk_gib",
-        "minimum_available_memory_gib",
         "cargo_build_jobs",
         "nextest_test_threads",
         "monitor",
@@ -98,7 +95,7 @@ WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS = frozenset(
 )
 WINDOWS_RUNTIME_MANIFEST_KEYS = (
     WINDOWS_RUNTIME_CONFIG_KEYS
-    - frozenset({"minimum_free_disk_gib", "minimum_available_memory_gib"})
+    - frozenset({"minimum_free_disk_gib"})
 ) | frozenset({"resource_contract", "source_materialization"})
 WINDOWS_EXECUTOR_POWERSHELL = "/mnt/c/Program Files/PowerShell/7/pwsh.exe"
 WINDOWS_EXECUTOR_HELPER_PATH = Path("scripts/cargo-validate-windows.ps1")
@@ -629,17 +626,6 @@ def windows_resource_contract_from_config(
             f"{WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB}"
         )
 
-    minimum_available_memory_gib = runtime["minimum_available_memory_gib"]
-    validate_positive_int(
-        minimum_available_memory_gib,
-        "cargo-validation.toml [windows_runtime].minimum_available_memory_gib",
-    )
-    if minimum_available_memory_gib < WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB:
-        raise PlannerError(
-            "cargo-validation.toml [windows_runtime].minimum_available_memory_gib "
-            f"must be at least {WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB}"
-        )
-
     if profile.get("monitor") is not True:
         raise PlannerError(
             f"{context}.monitor must be true for the native runtime disk abort"
@@ -655,7 +641,6 @@ def windows_resource_contract_from_config(
         "resource_profile": WINDOWS_NEXTEST_PROFILE,
         "cold_minimum_free_disk_gib": cold_minimum_free_disk_gib,
         "warm_minimum_free_disk_gib": warm_minimum_free_disk_gib,
-        "minimum_available_memory_gib": minimum_available_memory_gib,
         "cargo_build_jobs": cargo_build_jobs,
         "nextest_test_threads": nextest_test_threads,
         "monitor": True,
@@ -671,7 +656,7 @@ def validate_windows_runtime_resource_contract(value: Any, context: str) -> None
         raise PlannerError(
             f"{context} must define exactly "
             "resource_profile, cold_minimum_free_disk_gib, warm_minimum_free_disk_gib, "
-            "minimum_available_memory_gib, cargo_build_jobs, nextest_test_threads, monitor, "
+            "cargo_build_jobs, nextest_test_threads, monitor, "
             "abort_free_gib, and abort_free_pct"
         )
     if value["resource_profile"] != WINDOWS_NEXTEST_PROFILE:
@@ -681,10 +666,6 @@ def validate_windows_runtime_resource_contract(value: Any, context: str) -> None
     for field_name, floor in (
         ("cold_minimum_free_disk_gib", WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB),
         ("warm_minimum_free_disk_gib", WINDOWS_RUNTIME_WARM_MINIMUM_FREE_DISK_GIB),
-        (
-            "minimum_available_memory_gib",
-            WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB,
-        ),
     ):
         validate_positive_int(value[field_name], f"{context}.{field_name}")
         if value[field_name] < floor:
@@ -737,10 +718,6 @@ def validate_windows_runtime_values(
             )
     for field_name, floor in (
         ("minimum_free_disk_gib", WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB),
-        (
-            "minimum_available_memory_gib",
-            WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB,
-        ),
     ):
         value = runtime[field_name]
         if not isinstance(value, int) or isinstance(value, bool):
@@ -810,7 +787,7 @@ def project_windows_runtime(
     projected = {
         field_name: value
         for field_name, value in runtime.items()
-        if field_name not in {"minimum_free_disk_gib", "minimum_available_memory_gib"}
+        if field_name != "minimum_free_disk_gib"
     }
     projected["resource_contract"] = windows_resource_contract_from_config(
         config, runtime, resource_profile_context
@@ -848,13 +825,10 @@ def validate_windows_runtime_manifest(
     static_runtime = {
         field_name: runtime[field_name]
         for field_name in WINDOWS_RUNTIME_CONFIG_KEYS
-        if field_name not in {"minimum_free_disk_gib", "minimum_available_memory_gib"}
+        if field_name != "minimum_free_disk_gib"
     }
     static_runtime["minimum_free_disk_gib"] = resource_contract[
         "cold_minimum_free_disk_gib"
-    ]
-    static_runtime["minimum_available_memory_gib"] = resource_contract[
-        "minimum_available_memory_gib"
     ]
     validate_windows_runtime_values(
         static_runtime,
@@ -2986,7 +2960,7 @@ def build_plan(
     if yolo:
         selection.flags.add("yolo")
         selection.warnings.append(
-            "--yolo bypasses only native Windows RAM and disk preflight floors; it does not disable the native runtime disk abort or trigger automatic cleanup"
+            "--yolo bypasses only native Windows disk preflight floors; it does not disable the native runtime disk abort or trigger automatic cleanup"
         )
     windows_runtime = (
         project_windows_runtime(config, repo_root) if has_windows_command else None
@@ -4557,7 +4531,7 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--yolo",
         action="store_true",
-        help="bypass only native Windows RAM and disk preflight floors for a validation plan with native Windows commands",
+        help="bypass only native Windows disk preflight floors for a validation plan with native Windows commands",
     )
     parser.add_argument(
         "--telemetry-level",

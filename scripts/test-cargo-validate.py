@@ -2886,17 +2886,12 @@ class CargoValidateTests(unittest.TestCase):
                 **{
                     key: value
                     for key, value in self.windows_runtime_config().items()
-                    if key
-                    not in {
-                        "minimum_free_disk_gib",
-                        "minimum_available_memory_gib",
-                    }
+                    if key != "minimum_free_disk_gib"
                 },
                 "resource_contract": {
                     "resource_profile": "windows_nextest",
                     "cold_minimum_free_disk_gib": 120,
                     "warm_minimum_free_disk_gib": windows_profile["reserve_free_gib"],
-                    "minimum_available_memory_gib": 30,
                     "cargo_build_jobs": windows_profile["cargo_jobs_max"],
                     "nextest_test_threads": windows_profile["test_threads"],
                     "monitor": windows_profile["monitor"],
@@ -3052,7 +3047,7 @@ class CargoValidateTests(unittest.TestCase):
         warning = next(
             warning
             for warning in rendered["warnings"]
-            if warning.startswith("--yolo bypasses only native Windows RAM and disk")
+            if warning.startswith("--yolo bypasses only native Windows disk")
         )
         self.assertIn("does not disable the native runtime disk abort", warning)
         self.assertIn("automatic cleanup", warning)
@@ -3230,10 +3225,6 @@ class CargoValidateTests(unittest.TestCase):
                 "minimum_free_disk_gib",
                 planner.WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB - 1,
             ),
-            "memory minimum": (
-                "minimum_available_memory_gib",
-                planner.WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB - 1,
-            ),
             "toolchain": (
                 "rust_toolchain",
                 f"0.0.0-{runtime['target']}",
@@ -3289,9 +3280,6 @@ class CargoValidateTests(unittest.TestCase):
         runtime["minimum_free_disk_gib"] = (
             planner.WINDOWS_RUNTIME_MINIMUM_FREE_DISK_GIB + 1
         )
-        runtime["minimum_available_memory_gib"] = (
-            planner.WINDOWS_RUNTIME_MINIMUM_AVAILABLE_MEMORY_GIB + 1
-        )
         nextest_version = "0.9.104"
         runtime["nextest_version"] = nextest_version
         runtime["nextest_url"] = planner.windows_runtime_release_urls(
@@ -3331,7 +3319,6 @@ class CargoValidateTests(unittest.TestCase):
                 "resource_profile": "windows_nextest",
                 "cold_minimum_free_disk_gib": runtime["minimum_free_disk_gib"],
                 "warm_minimum_free_disk_gib": warm_minimum_free_disk_gib,
-                "minimum_available_memory_gib": runtime["minimum_available_memory_gib"],
                 "cargo_build_jobs": cargo_build_jobs,
                 "nextest_test_threads": nextest_test_threads,
                 "monitor": True,
@@ -3482,9 +3469,6 @@ class CargoValidateTests(unittest.TestCase):
                     "minimum_free_disk_gib"
                 ],
                 "warm_minimum_free_disk_gib": profile["reserve_free_gib"],
-                "minimum_available_memory_gib": production_config["windows_runtime"][
-                    "minimum_available_memory_gib"
-                ],
                 "cargo_build_jobs": profile["cargo_jobs_max"],
                 "nextest_test_threads": profile["test_threads"],
                 "monitor": profile["monitor"],

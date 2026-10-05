@@ -413,7 +413,7 @@ function Get-WindowsRuntime {
     }
 
     $resource = Get-RequiredMap $runtime["resource_contract"] "windows_runtime.resource_contract"
-    Assert-ExactKeys $resource @("resource_profile", "cold_minimum_free_disk_gib", "warm_minimum_free_disk_gib", "minimum_available_memory_gib", "cargo_build_jobs", "nextest_test_threads", "monitor", "abort_free_gib", "abort_free_pct") "windows_runtime.resource_contract"
+    Assert-ExactKeys $resource @("resource_profile", "cold_minimum_free_disk_gib", "warm_minimum_free_disk_gib", "cargo_build_jobs", "nextest_test_threads", "monitor", "abort_free_gib", "abort_free_pct") "windows_runtime.resource_contract"
     $resourceProfile = Get-RequiredString $resource["resource_profile"] "windows_runtime.resource_contract.resource_profile"
     if ($resourceProfile -cne "windows_nextest") {
         Fail-Manifest "windows_runtime.resource_contract.resource_profile must be windows_nextest"
@@ -425,10 +425,6 @@ function Get-WindowsRuntime {
     $warmMinimumFreeDisk = Get-RequiredPositiveInt $resource["warm_minimum_free_disk_gib"] "windows_runtime.resource_contract.warm_minimum_free_disk_gib"
     if ($warmMinimumFreeDisk -lt 5) {
         Fail-Manifest "windows_runtime.resource_contract.warm_minimum_free_disk_gib must be at least 5"
-    }
-    $minimumMemory = Get-RequiredPositiveInt $resource["minimum_available_memory_gib"] "windows_runtime.resource_contract.minimum_available_memory_gib"
-    if ($minimumMemory -lt 30) {
-        Fail-Manifest "windows_runtime.resource_contract.minimum_available_memory_gib must be at least 30"
     }
     if ($resource["monitor"] -isnot [bool] -or -not $resource["monitor"]) {
         Fail-Manifest "windows_runtime.resource_contract.monitor must be true"
@@ -442,7 +438,6 @@ function Get-WindowsRuntime {
         resource_profile = $resourceProfile
         cold_minimum_free_disk_gib = $coldMinimumFreeDisk
         warm_minimum_free_disk_gib = $warmMinimumFreeDisk
-        minimum_available_memory_gib = $minimumMemory
         cargo_build_jobs = Get-RequiredPositiveInt $resource["cargo_build_jobs"] "windows_runtime.resource_contract.cargo_build_jobs"
         nextest_test_threads = Get-RequiredPositiveInt $resource["nextest_test_threads"] "windows_runtime.resource_contract.nextest_test_threads"
         monitor = $true
@@ -1379,10 +1374,8 @@ function Invoke-ExecutionPreflight {
         free_disk_bytes = $null
         required_free_disk_bytes = $null
         available_memory_bytes = $null
-        required_available_memory_bytes = $null
         yolo = $Yolo
         bypassed_free_disk_floor = $false
-        bypassed_available_memory_floor = $false
         native_processes = $null
         wsl_processes = $null
         error = $null
@@ -1401,25 +1394,16 @@ function Invoke-ExecutionPreflight {
             Fail-Manifest "native execution preflight received an unsupported cache mode: $($Paths.cache_mode)"
         }
         [uint64]$requiredDisk = [uint64]$selectedDiskFloor * $gib
-        [uint64]$requiredMemory = [uint64]$Runtime.resource_contract.minimum_available_memory_gib * $gib
         [uint64]$freeDisk = Get-WindowsDriveFreeBytes $TestFixture
         [uint64]$availableMemory = Get-WindowsAvailablePhysicalMemoryBytes $TestFixture
         $check.free_disk_bytes = $freeDisk
         $check.required_free_disk_bytes = $requiredDisk
         $check.available_memory_bytes = $availableMemory
-        $check.required_available_memory_bytes = $requiredMemory
         if ($freeDisk -lt $requiredDisk) {
             if ($Yolo) {
                 $check.bypassed_free_disk_floor = $true
             } else {
                 Fail-Manifest "F: free bytes $freeDisk are below the required $requiredDisk"
-            }
-        }
-        if ($availableMemory -lt $requiredMemory) {
-            if ($Yolo) {
-                $check.bypassed_available_memory_floor = $true
-            } else {
-                Fail-Manifest "available Windows physical memory $availableMemory is below the required $requiredMemory"
             }
         }
         $check.native_processes = Get-NativeWriterSummary $TestFixture

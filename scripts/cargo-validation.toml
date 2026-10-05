@@ -24,7 +24,6 @@ dir = ".sangoi/validation"
 cache_root = 'F:\.cache'
 workflow_namespace = "cw"
 minimum_free_disk_gib = 120
-minimum_available_memory_gib = 30
 target = "x86_64-pc-windows-msvc"
 rust_toolchain = "1.95.0-x86_64-pc-windows-msvc"
 nextest_version = "0.9.103"
