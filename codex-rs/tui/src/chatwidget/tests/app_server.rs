@@ -212,6 +212,9 @@ fn open_safety_buffering_retry_confirmation(
             Ok(AppEvent::RetrySafetyBufferedTurn { .. }) => {
                 panic!("retry must wait for confirmation");
             }
+            Ok(AppEvent::SafetyBufferingChoiceSelected { .. }) => {
+                panic!("retry selection must wait for confirmation before saving");
+            }
             Ok(_) => continue,
             Err(err) => panic!("expected safety-buffering confirmation event: {err}"),
         }
@@ -248,6 +251,9 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     let opened_url = loop {
         match rx.try_recv() {
             Ok(AppEvent::OpenUrlInBrowser { url }) => break url,
+            Ok(AppEvent::SafetyBufferingChoiceSelected { .. }) => {
+                panic!("learn more must not remember a choice");
+            }
             Ok(_) => continue,
             Err(err) => panic!("expected learn-more URL event: {err}"),
         }
@@ -273,8 +279,12 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let mut saved_choice = None;
     let (event_thread_id, event_turn_id, model, turn, prompt) = loop {
         match rx.try_recv() {
+            Ok(AppEvent::SafetyBufferingChoiceSelected { choice, .. }) => {
+                saved_choice = Some(choice);
+            }
             Ok(AppEvent::RetrySafetyBufferedTurn {
                 thread_id,
                 turn_id,
@@ -287,6 +297,10 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
         }
     };
     assert_eq!(event_thread_id, thread_id);
+    assert_eq!(
+        saved_choice,
+        Some(codex_config::types::SafetyBufferingChoice::RetryWithFasterModel)
+    );
     assert_eq!(event_turn_id, turn_id);
     assert_eq!(model, "faster-model");
     assert_matches!(turn, Op::UserTurn { .. });
@@ -295,6 +309,168 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
         !render_bottom_popup(&chat, /*width*/ 80)
             .contains("Press enter to confirm or esc to go back")
     );
+}
+
+#[tokio::test]
+async fn safety_buffering_remembered_wait_is_preselected_and_saved_only_on_selection() {
+    use codex_config::types::SafetyBufferingChoice;
+
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.local_settings.tui.safety_buffering_last_choice =
+        Some(SafetyBufferingChoice::DismissAndKeepWaiting);
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        None,
+    );
+    assert_chatwidget_snapshot!(
+        "safety_buffering_remembered_wait",
+        render_bottom_popup(&chat, 80)
+    );
+    assert_chatwidget_snapshot!(
+        "safety_buffering_remembered_wait_narrow",
+        render_bottom_popup(&chat, 40)
+    );
+    chat.handle_key_event(KeyCode::Enter.into());
+    let mut choices = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AppEvent::SafetyBufferingChoiceSelected { choice, .. } => choices.push(choice),
+            AppEvent::ConfirmSafetyBufferedRetry { .. }
+            | AppEvent::RetrySafetyBufferedTurn { .. } => {
+                panic!("waiting must not retry");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(choices, vec![SafetyBufferingChoice::DismissAndKeepWaiting]);
+    assert!(chat.can_retry_safety_buffered_turn(turn_id));
+    assert!(op_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn safety_buffering_auto_apply_uses_only_an_offered_saved_action_once() {
+    use codex_config::types::SafetyBufferingChoice;
+
+    for choice in [
+        None,
+        Some(SafetyBufferingChoice::DismissAndKeepWaiting),
+        Some(SafetyBufferingChoice::RetryWithFasterModel),
+    ] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+        chat.local_settings.tui.safety_buffering_last_choice = choice;
+        chat.local_settings.tui.safety_buffering_auto_apply = true;
+        let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+        let model_before = chat.config_ref().model.clone();
+        let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+        for _ in 0..2 {
+            chat.handle_server_notification(
+                ServerNotification::ModelSafetyBufferingUpdated(notification.clone()),
+                None,
+            );
+        }
+        for faster_model in [None, Some("faster-model")] {
+            chat.handle_server_notification(
+                ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+                    thread_id,
+                    turn_id,
+                    faster_model,
+                )),
+                None,
+            );
+        }
+        let popup = render_bottom_popup(&chat, 80);
+        assert_eq!(popup.contains("Dismiss and keep waiting"), choice.is_none());
+        assert_eq!(chat.config_ref().model, model_before);
+        assert!(chat.can_retry_safety_buffered_turn(turn_id));
+        let mut retries = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::RetrySafetyBufferedTurn {
+                    model,
+                    thread_id: retry_thread,
+                    turn_id: retry_turn,
+                    ..
+                } => {
+                    retries += 1;
+                    assert_eq!(model, "faster-model");
+                    assert_eq!(retry_thread, thread_id);
+                    assert_eq!(retry_turn, turn_id);
+                }
+                AppEvent::ConfirmSafetyBufferedRetry { .. }
+                | AppEvent::SafetyBufferingChoiceSelected { .. } => {
+                    panic!("automatic actions must not ask or save a new choice");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            retries,
+            usize::from(choice == Some(SafetyBufferingChoice::RetryWithFasterModel))
+        );
+        assert!(op_rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn safety_buffering_remembered_retry_still_requires_confirmation() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.local_settings.tui.safety_buffering_last_choice =
+        Some(codex_config::types::SafetyBufferingChoice::RetryWithFasterModel);
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        None,
+    );
+    open_safety_buffering_retry_confirmation(&mut chat, &mut rx);
+    chat.handle_key_event(KeyCode::Esc.into());
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(
+            event,
+            AppEvent::RetrySafetyBufferedTurn { .. }
+                | AppEvent::SafetyBufferingChoiceSelected { .. }
+        ));
+    }
+    assert!(op_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn safety_buffering_unavailable_saved_retry_keeps_menu_and_preference() {
+    use codex_config::types::SafetyBufferingChoice;
+
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
+    chat.local_settings.tui.safety_buffering_last_choice =
+        Some(SafetyBufferingChoice::RetryWithFasterModel);
+    chat.local_settings.tui.safety_buffering_auto_apply = true;
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id, turn_id, None,
+        )),
+        None,
+    );
+    let popup = render_bottom_popup(&chat, 80);
+    assert!(popup.contains("Dismiss and keep waiting"));
+    assert!(!popup.contains("Retry with a faster model"));
+    assert_eq!(
+        chat.local_settings.tui.safety_buffering_last_choice,
+        Some(SafetyBufferingChoice::RetryWithFasterModel)
+    );
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(
+            event,
+            AppEvent::RetrySafetyBufferedTurn { .. }
+                | AppEvent::SafetyBufferingChoiceSelected { .. }
+        ));
+    }
 }
 
 #[tokio::test]
@@ -317,9 +493,21 @@ async fn safety_buffering_retry_confirmation_can_keep_waiting() {
         assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Stop this attempt and retry?"));
         assert!(chat.can_retry_safety_buffered_turn(turn_id));
         assert!(op_rx.try_recv().is_err());
+        let mut choices = Vec::new();
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::RetrySafetyBufferedTurn { .. }));
+            if let AppEvent::SafetyBufferingChoiceSelected { choice, .. } = event {
+                choices.push(choice);
+            }
         }
+        assert_eq!(
+            choices,
+            if key == KeyCode::Enter {
+                vec![codex_config::types::SafetyBufferingChoice::DismissAndKeepWaiting]
+            } else {
+                Vec::new()
+            }
+        );
     }
 }
 
@@ -354,6 +542,9 @@ async fn safety_buffering_retry_confirmation_closes_when_turn_completes() {
 #[tokio::test]
 async fn safety_buffering_does_not_offer_retry_in_side_conversation() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.tui.safety_buffering_last_choice =
+        Some(codex_config::types::SafetyBufferingChoice::RetryWithFasterModel);
+    chat.local_settings.tui.safety_buffering_auto_apply = true;
     chat.set_side_conversation_active(/*active*/ true);
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
 

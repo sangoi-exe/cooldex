@@ -1169,6 +1169,19 @@ impl App {
                     }
                 }
             }
+            // Merge-safety anchor: queued preference selections remain bound to the active buffered turn.
+            AppEvent::SafetyBufferingChoiceSelected {
+                thread_id,
+                turn_id,
+                choice,
+            } => {
+                if self.active_thread_id == Some(thread_id)
+                    && self.chat_widget.thread_id() == Some(thread_id)
+                    && self.chat_widget.can_retry_safety_buffered_turn(&turn_id)
+                {
+                    self.save_safety_buffering_choice(choice).await;
+                }
+            }
             AppEvent::ConfirmSafetyBufferedRetry {
                 thread_id,
                 turn_id,

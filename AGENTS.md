@@ -269,6 +269,10 @@ but the planner must exclude only its validation and visibly retain its unvalida
 
 ## Cooldex Root Atlas
 
+<!-- Merge-safety anchor: capacity retries share the existing stream budget, while remembered safety-buffering actions stay client-owned and use the active user configuration destination. -->
+- `codex-rs/protocol/src/error.rs` and `codex-rs/core/src/responses_retry.rs` — shared capacity/backoff policy and bounded stream retries; independent HTTP and remote V2 compaction budgets remain unchanged.
+- `codex-rs/config/src/types.rs`, `codex-rs/tui/src/local_settings.rs`, `codex-rs/tui/src/chatwidget/safety_buffering.rs`, and `codex-rs/tui/src/app/safety_buffering.rs` — typed remembered safety actions, semantic preselection or optional automatic application, active-user-file persistence, and the existing interrupt/fork/resubmit path.
+
 - `/home/lucas/work/codex/AGENTS.md` — fork-local durable workspace policy and stable root owner map.
 - `/home/lucas/.codex/.base_instructions/sangoi_base_instructions.md` and
   `/home/lucas/.codex/.base_instructions/sangoi_subagent_instructions.md` — shared

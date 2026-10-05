@@ -67,6 +67,23 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Deliberately selected action for a safety-buffered request.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SafetyBufferingChoice {
+    DismissAndKeepWaiting,
+    RetryWithFasterModel,
+}
+
+impl SafetyBufferingChoice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DismissAndKeepWaiting => "dismiss-and-keep-waiting",
+            Self::RetryWithFasterModel => "retry-with-faster-model",
+        }
+    }
+}
+
 /// Last selected grouping in Agent Command Center.
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
@@ -972,6 +989,16 @@ pub struct Tui {
     /// Last selected grouping in Agent Command Center.
     #[serde(default)]
     pub agents_overview_grouping: AgentsOverviewGrouping,
+
+    // Merge-safety anchor: remember semantic safety-buffering actions, not dynamic picker indices.
+    /// Last deliberately selected wait action or confirmed retry; unset means no preference.
+    #[serde(default)]
+    pub safety_buffering_last_choice: Option<SafetyBufferingChoice>,
+
+    /// Apply an offered remembered safety-buffering action without asking again.
+    /// Defaults to false, which only preselects the remembered action.
+    #[serde(default)]
+    pub safety_buffering_auto_apply: bool,
 
     /// Working directory to use when resuming or forking a session.
     /// When unset, prompt if the current and session directories differ.

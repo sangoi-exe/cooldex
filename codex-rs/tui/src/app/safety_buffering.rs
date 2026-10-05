@@ -22,6 +22,38 @@ pub(super) struct SafetyBufferedRetry {
 }
 
 impl App {
+    // Merge-safety anchor: persist the client choice to the selected user file before updating live preferences.
+    pub(super) async fn save_safety_buffering_choice(
+        &mut self,
+        choice: codex_config::types::SafetyBufferingChoice,
+    ) {
+        use crate::config_update::format_config_error;
+        use crate::legacy_core::config::edit::ConfigEdit;
+        use crate::legacy_core::config::edit::ConfigEditsBuilder;
+
+        let result =
+            ConfigEditsBuilder::for_config_path(self.local_settings.user_config_path.as_path())
+                .with_edits([ConfigEdit::SetPath {
+                    segments: vec!["tui".into(), "safety_buffering_last_choice".into()],
+                    value: toml_edit::value(choice.as_str()),
+                }])
+                .apply()
+                .await;
+        match result {
+            Ok(()) => {
+                self.local_settings.tui.safety_buffering_last_choice = Some(choice);
+                self.chat_widget
+                    .local_settings
+                    .tui
+                    .safety_buffering_last_choice = Some(choice);
+            }
+            Err(error) => self.chat_widget.add_error_message(format!(
+                "Failed to save safety-buffering choice: {}",
+                format_config_error(&error),
+            )),
+        }
+    }
+
     pub(super) async fn retry_safety_buffered_turn(
         &mut self,
         tui: &mut tui::Tui,

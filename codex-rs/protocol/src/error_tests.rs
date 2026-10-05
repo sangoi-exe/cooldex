@@ -39,7 +39,7 @@ async fn codex_err_debug_preserves_legacy_shape() {
 #[test]
 fn retryability_preserves_error_details_distinctions() {
     let errors = [
-        (CodexErr::ServerOverloaded, false),
+        (CodexErr::ServerOverloaded, true),
         (CodexErr::new(CodexErrorDetails::ContentFilter), true),
         (
             CodexErr::new(CodexErrorDetails::RateLimitExceeded("retry later".into())),
@@ -70,6 +70,8 @@ fn retryability_preserves_error_details_distinctions() {
             false,
         ),
         (CodexErr::InternalServerError, true),
+        (CodexErr::QuotaExceeded, false),
+        (CodexErr::UsageNotIncluded, false),
     ];
 
     for (err, expected) in errors {
@@ -112,6 +114,25 @@ fn retry_delay_distinguishes_server_advice_backoff_and_terminal_errors() {
         ),
         (None, Some(advice)),
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn overload_uses_local_backoff_unless_server_advice_is_present() {
+    for (retry_count, expected_millis) in [(1, 180..220), (3, 720..880)] {
+        let delay = CodexErr::ServerOverloaded
+            .retry_delay(retry_count)
+            .expect("overload should retry with local backoff");
+        assert!(expected_millis.contains(&delay.as_millis()));
+    }
+    assert_eq!(CodexErr::ServerOverloaded.server_retry_delay(), None);
+
+    let advice = RetryAfter::from_delay(Duration::from_secs(10)).expect("retry deadline");
+    let error = CodexErr::ServerOverloaded.with_retry_after(advice);
+    assert_eq!(error.retry_delay(1), Some(Duration::from_secs(10)));
+    assert_eq!(error.retry_delay(3), Some(Duration::from_secs(10)));
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(error.retry_delay(1), Some(Duration::ZERO));
+    assert_eq!(error.retry_delay(3), Some(Duration::ZERO));
 }
 
 fn rate_limit_snapshot() -> RateLimitSnapshot {

@@ -873,6 +873,10 @@ pub struct Config {
     /// Last selected grouping in Agent Command Center.
     pub tui_agents_overview_grouping: codex_config::types::AgentsOverviewGrouping,
 
+    // Merge-safety anchor: carry client-owned safety-buffering preferences through local config reloads.
+    pub tui_safety_buffering_last_choice: Option<codex_config::types::SafetyBufferingChoice>,
+    pub tui_safety_buffering_auto_apply: bool,
+
     /// Working directory to use when resuming or forking a session.
     /// When unset, prompt if the current and session directories differ.
     pub tui_resume_cwd: Option<ResumeCwdMode>,
@@ -4827,6 +4831,8 @@ impl Config {
                 .and_then(|t| t.session_picker_view)
                 .unwrap_or_default(),
             tui_agents_overview_grouping: cfg.tui.as_ref().map(|t| t.agents_overview_grouping).unwrap_or_default(),
+            tui_safety_buffering_last_choice: cfg.tui.as_ref().and_then(|t| t.safety_buffering_last_choice),
+            tui_safety_buffering_auto_apply: cfg.tui.as_ref().is_some_and(|t| t.safety_buffering_auto_apply),
             tui_resume_cwd: cfg.tui.as_ref().and_then(|t| t.resume_cwd),
             terminal_resize_reflow,
             tui_keymap: cfg

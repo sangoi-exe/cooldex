@@ -1336,6 +1336,8 @@ fn config_toml_deserializes_model_availability_nux() {
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,
             agents_overview_grouping: Default::default(),
+            safety_buffering_last_choice: None,
+            safety_buffering_auto_apply: false,
             resume_cwd: None,
             keymap: TuiKeymap::default(),
             model_availability_nux: ModelAvailabilityNuxConfig {
@@ -4544,12 +4546,43 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             pet_anchor: TuiPetAnchor::Composer,
             session_picker_view: None,
             agents_overview_grouping: Default::default(),
+            safety_buffering_last_choice: None,
+            safety_buffering_auto_apply: false,
             resume_cwd: None,
             keymap: TuiKeymap::default(),
             model_availability_nux: ModelAvailabilityNuxConfig::default(),
             terminal_resize_reflow_max_rows: None,
         }
     );
+}
+
+#[tokio::test]
+async fn runtime_config_projects_safety_buffering_preferences() -> anyhow::Result<()> {
+    use codex_config::types::SafetyBufferingChoice;
+
+    for (text, choice, automatic) in [
+        ("", None, false),
+        (
+            "[tui]\nsafety_buffering_last_choice = 'dismiss-and-keep-waiting'",
+            Some(SafetyBufferingChoice::DismissAndKeepWaiting),
+            false,
+        ),
+        (
+            "[tui]\nsafety_buffering_last_choice = 'retry-with-faster-model'\nsafety_buffering_auto_apply = true",
+            Some(SafetyBufferingChoice::RetryWithFasterModel),
+            true,
+        ),
+    ] {
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(text)?,
+            ConfigOverrides::default(),
+            tempdir()?.abs(),
+        )
+        .await?;
+        assert_eq!(config.tui_safety_buffering_last_choice, choice);
+        assert_eq!(config.tui_safety_buffering_auto_apply, automatic);
+    }
+    Ok(())
 }
 
 #[tokio::test]

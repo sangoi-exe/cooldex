@@ -473,6 +473,15 @@ impl App {
             .await?;
         self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All)?;
         self.local_settings = self.local_settings.reloaded(&config);
+        // Merge-safety anchor: these client-owned actions must refresh on the current widget, not just replacements.
+        self.chat_widget
+            .local_settings
+            .tui
+            .safety_buffering_last_choice = self.local_settings.tui.safety_buffering_last_choice;
+        self.chat_widget
+            .local_settings
+            .tui
+            .safety_buffering_auto_apply = self.local_settings.tui.safety_buffering_auto_apply;
         self.refresh_server_version_overview_notice(CODEX_CLI_VERSION);
         // Other preferences have runtime caches and are adopted when the widget is replaced.
         self.chat_widget

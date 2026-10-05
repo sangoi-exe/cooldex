@@ -83,6 +83,9 @@ impl LocalSettings {
                 pet_anchor: config.tui_pet_anchor,
                 session_picker_view: Some(config.tui_session_picker_view),
                 agents_overview_grouping: config.tui_agents_overview_grouping,
+                // Merge-safety anchor: bootstrap and legacy config adapters retain the same remembered safety actions.
+                safety_buffering_last_choice: config.tui_safety_buffering_last_choice,
+                safety_buffering_auto_apply: config.tui_safety_buffering_auto_apply,
                 resume_cwd: config.tui_resume_cwd,
                 keymap: config.tui_keymap.clone(),
                 model_availability_nux: config.model_availability_nux.clone(),

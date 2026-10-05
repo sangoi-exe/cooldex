@@ -2,6 +2,34 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn safety_buffering_preferences_default_and_round_trip() {
+    let defaults: Tui = toml::from_str("").unwrap();
+    assert_eq!(defaults.safety_buffering_last_choice, None);
+    assert!(!defaults.safety_buffering_auto_apply);
+    for (value, choice) in [
+        (
+            "dismiss-and-keep-waiting",
+            SafetyBufferingChoice::DismissAndKeepWaiting,
+        ),
+        (
+            "retry-with-faster-model",
+            SafetyBufferingChoice::RetryWithFasterModel,
+        ),
+    ] {
+        let tui: Tui = toml::from_str(&format!(
+            "safety_buffering_last_choice = '{value}'\nsafety_buffering_auto_apply = true"
+        ))
+        .unwrap();
+        assert_eq!(tui.safety_buffering_last_choice, Some(choice));
+        assert!(tui.safety_buffering_auto_apply);
+        assert_eq!(choice.as_str(), value);
+        let serialized = toml::to_string(&tui).unwrap();
+        assert_eq!(toml::from_str::<Tui>(&serialized).unwrap(), tui);
+    }
+    assert!(toml::from_str::<Tui>("safety_buffering_last_choice = 'learn-more'").is_err());
+}
+
+#[test]
 fn mouse_scroll_speed_accepts_integer_and_fractional_multipliers() {
     for (value, expected) in [("1", 1.0), ("0.5", 0.5), ("3.0", 3.0)] {
         let tui: Tui = toml::from_str(&format!("mouse_scroll_speed = {value}")).unwrap();

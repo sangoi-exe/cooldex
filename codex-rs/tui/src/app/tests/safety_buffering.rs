@@ -42,6 +42,7 @@ const SAFETY_RETRY_THREAD_NAME: &str = "Safety retry source";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SafetyRetryScenario {
     Once,
+    Automatic,
     RetryTwice,
     PendingPermissions,
     InterruptedPrevious,
@@ -716,6 +717,23 @@ computer_use = false
         assert_eq!(user_message_count(&source, committed_steer), 1);
     }
 
+    if scenario == SafetyRetryScenario::Automatic {
+        app.chat_widget
+            .local_settings
+            .tui
+            .safety_buffering_last_choice =
+            Some(codex_config::types::SafetyBufferingChoice::RetryWithFasterModel);
+        app.chat_widget
+            .local_settings
+            .tui
+            .safety_buffering_auto_apply = true;
+        app.local_settings.tui.safety_buffering_last_choice = app
+            .chat_widget
+            .local_settings
+            .tui
+            .safety_buffering_last_choice;
+        app.local_settings.tui.safety_buffering_auto_apply = true;
+    }
     app.handle_app_server_event(
         &app_server,
         AppServerEvent::ServerNotification(Box::new(
@@ -749,6 +767,24 @@ computer_use = false
                 .expect("source thread should have a rollout path"),
         )?;
     }
+
+    let automatic_retry = if scenario == SafetyRetryScenario::Automatic {
+        let popup = crate::chatwidget::tests::helpers::render_bottom_popup(&app.chat_widget, 80);
+        assert!(!popup.contains("Stop this attempt and retry?"));
+        assert!(!popup.contains("Dismiss and keep waiting"));
+        Some(loop {
+            match app_event_rx.try_recv() {
+                Ok(event @ AppEvent::RetrySafetyBufferedTurn { .. }) => break event,
+                Ok(AppEvent::ConfirmSafetyBufferedRetry { .. }) => {
+                    panic!("automatic retry must bypass confirmation");
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("expected automatic retry event: {err}"),
+            }
+        })
+    } else {
+        None
+    };
 
     let primary_thread_id = ThreadId::new();
     app.primary_thread_id = Some(primary_thread_id);
@@ -882,18 +918,22 @@ computer_use = false
         .await;
     }
 
-    Box::pin(app.retry_safety_buffered_turn(
-        &mut tui,
-        &mut app_server,
-        SafetyBufferedRetry {
-            thread_id: source_thread_id,
-            turn_id: active_turn_id.clone(),
-            model: FASTER_MODEL.to_string(),
-            turn: active_turn,
-            prompt: UserMessage::from(RETRY_PROMPT),
-        },
-    ))
-    .await;
+    if let Some(event) = automatic_retry {
+        Box::pin(app.handle_event(&mut tui, &mut app_server, event)).await?;
+    } else {
+        Box::pin(app.retry_safety_buffered_turn(
+            &mut tui,
+            &mut app_server,
+            SafetyBufferedRetry {
+                thread_id: source_thread_id,
+                turn_id: active_turn_id.clone(),
+                model: FASTER_MODEL.to_string(),
+                turn: active_turn,
+                prompt: UserMessage::from(RETRY_PROMPT),
+            },
+        ))
+        .await;
+    }
     assert_eq!(app.voice_owner_thread_id(), Some(voice_owner));
 
     if scenario == SafetyRetryScenario::UnsupportedPermissions {
@@ -1195,6 +1235,18 @@ computer_use = false
     app_server.shutdown().await?;
     server.shutdown().await;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safety_retry_automatically_dispatches_the_existing_fork_and_low_effort_path() -> Result<()>
+{
+    run_safety_retry(
+        Some(PREVIOUS_PROMPT),
+        /*failing_draft*/ None,
+        /*committed_steer*/ None,
+        SafetyRetryScenario::Automatic,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

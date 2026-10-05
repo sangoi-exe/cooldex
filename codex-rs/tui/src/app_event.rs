@@ -405,6 +405,14 @@ pub(crate) enum AppEvent {
         op: AppCommand,
     },
 
+    // Merge-safety anchor: only deliberate wait selections and confirmed manual retries persist a choice.
+    /// Remember a deliberately selected safety-buffering action for the current turn.
+    SafetyBufferingChoiceSelected {
+        thread_id: ThreadId,
+        turn_id: String,
+        choice: codex_config::types::SafetyBufferingChoice,
+    },
+
     /// Confirm retrying a safety-buffered turn with the server-selected model.
     ConfirmSafetyBufferedRetry {
         thread_id: ThreadId,

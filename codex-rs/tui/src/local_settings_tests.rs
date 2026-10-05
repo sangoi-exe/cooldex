@@ -44,6 +44,9 @@ async fn launch_screen_mode_survives_configuration_reload() -> anyhow::Result<()
         reloaded_config.tui_right_click_paste = RightClickPaste::Off;
         reloaded_config.tui_alternate_screen = AltScreenMode::Never;
         reloaded_config.tui_theme = Some("nord".into());
+        reloaded_config.tui_safety_buffering_last_choice =
+            Some(codex_config::types::SafetyBufferingChoice::RetryWithFasterModel);
+        reloaded_config.tui_safety_buffering_auto_apply = true;
         let mut expected = LocalSettings::from(&reloaded_config);
         expected.transcript_mode = expected_mode;
         expected.tui.alternate_screen = expected_alt;
@@ -114,6 +117,8 @@ right_click_paste = "off"
 vim_mode_default = true
 terminal_resize_reflow_max_rows = 0
 session_picker_view = "comfortable"
+safety_buffering_last_choice = "dismiss-and-keep-waiting"
+safety_buffering_auto_apply = true
 [tui.effects]
 shimmer = false
 [tui.rendering]
@@ -151,6 +156,15 @@ fast_default_opt_out = true
             .await?;
         assert_eq!(config.startup_warnings, Vec::<String>::new());
         assert_eq!(config.tui_mouse_scroll_speed, Some(1.5));
+        assert_eq!(
+            config.tui_safety_buffering_last_choice,
+            (!config_text.is_empty())
+                .then_some(codex_config::types::SafetyBufferingChoice::DismissAndKeepWaiting)
+        );
+        assert_eq!(
+            config.tui_safety_buffering_auto_apply,
+            !config_text.is_empty()
+        );
         let bootstrap = crate::legacy_core::config::load_config_toml_with_layer_stack(
             home.path(),
             /*cwd*/ None,

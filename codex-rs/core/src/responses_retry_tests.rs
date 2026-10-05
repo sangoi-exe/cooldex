@@ -7,11 +7,60 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use codex_http_client::RetryAfter;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing_test::internal::MockWriter;
+
+#[test_case::test_case(0; "disabled")]
+#[test_case::test_case(2; "configured_budget")]
+#[test_case::test_case(5; "default_budget")]
+#[tokio::test(start_paused = true)]
+async fn overload_local_backoff_respects_stream_retry_budget(max_retries: u64) {
+    let (session, turn_context) = make_session_and_context().await;
+    let step_context = StepContext::for_test(Arc::new(turn_context));
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState::default();
+
+    for retry_count in 1..=max_retries {
+        let started = Instant::now();
+        handle_response_stream_error(
+            &mut retry_state,
+            max_retries,
+            CodexErr::ServerOverloaded,
+            &mut client_session,
+            &session,
+            &step_context,
+            ResponsesStreamRequest::Sampling,
+        )
+        .await
+        .expect("overload should retry within the configured budget");
+        assert_eq!(retry_state.retries, retry_count);
+        let base_millis = 200 * 2_u128.pow((retry_count - 1) as u32);
+        let elapsed_millis = (Instant::now() - started).as_millis();
+        // Tokio rounds deadlines up to the next millisecond.
+        assert!((base_millis * 9 / 10..=base_millis * 11 / 10).contains(&elapsed_millis));
+    }
+
+    let error = handle_response_stream_error(
+        &mut retry_state,
+        max_retries,
+        CodexErr::ServerOverloaded,
+        &mut client_session,
+        &session,
+        &step_context,
+        ResponsesStreamRequest::Sampling,
+    )
+    .await
+    .expect_err("overload must stop at the configured budget");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::ServerOverloaded
+    ));
+    assert_eq!(retry_state.retries, max_retries);
+}
 
 #[tokio::test]
 async fn sampling_retry_logs_stream_error_context() {
@@ -51,12 +100,14 @@ async fn sampling_retry_logs_stream_error_context() {
 }
 
 /// Time spent reporting a retry must count toward the server's original deadline.
+#[test_case::test_case(CodexErr::InternalServerError; "internal_server_error")]
+#[test_case::test_case(CodexErr::ServerOverloaded; "overload")]
 #[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
     reason = "test holds the event-delivery lock to delay notification while virtual time advances"
 )]
-async fn stream_retry_preserves_deadline_across_delayed_notification() {
+async fn stream_retry_preserves_deadline_across_delayed_notification(error: CodexErr) {
     let (mut session, turn_context) = make_session_and_context().await;
     let step_context = StepContext::for_test(Arc::new(turn_context));
     session.realtime_history = Some(Mutex::new(RealtimeHistoryState::default()));
@@ -76,7 +127,7 @@ async fn stream_retry_preserves_deadline_across_delayed_notification() {
     let retry = handle_response_stream_error(
         &mut retry_state,
         /*max_retries*/ 2,
-        CodexErr::InternalServerError.with_retry_after(advice),
+        error.with_retry_after(advice),
         &mut client_session,
         &session,
         &step_context,

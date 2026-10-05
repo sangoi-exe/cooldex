@@ -413,10 +413,10 @@ impl CodexErr {
             | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::BioPolicy { .. }
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
-            CodexErrorDetails::ServerOverloaded | CodexErrorDetails::RetryLimit(_) => {
-                self.server_retry_delay()
-            }
-            CodexErrorDetails::Stream(..)
+            CodexErrorDetails::RetryLimit(_) => self.server_retry_delay(),
+            // Merge-safety anchor: overloads use existing local backoff without mapped advice; callers retain their retry budgets and mapped advice remains authoritative.
+            CodexErrorDetails::ServerOverloaded
+            | CodexErrorDetails::Stream(..)
             | CodexErrorDetails::ContentFilter
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout

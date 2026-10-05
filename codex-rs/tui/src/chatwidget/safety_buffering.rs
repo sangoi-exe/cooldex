@@ -4,6 +4,7 @@
 use super::*;
 use crate::wrapping::word_wrap_lines;
 use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+use codex_config::types::SafetyBufferingChoice;
 
 const SAFETY_BUFFERING_PROMPT_VIEW_ID: &str = "safety-buffering-prompt";
 const SAFETY_BUFFERING_LEARN_MORE_URL: &str = "https://help.openai.com/en/articles/20001326";
@@ -33,6 +34,7 @@ struct ActiveSafetyBuffering {
     turn_id: String,
     last_prompt_had_retry: bool,
     agent_message_started: bool,
+    automatic_action_applied: bool,
 }
 
 #[derive(Debug, Default)]
@@ -160,12 +162,16 @@ impl ChatWidget {
             .active
             .as_ref()
             .filter(|active| active.turn_id == turn_id);
-        let should_show_prompt =
-            previous_active.is_none_or(|active| active.last_prompt_had_retry != can_offer_retry);
+        // Merge-safety anchor: automatic choices use the same active-turn eligibility and one-prompt owner.
+        let automatic_action_applied =
+            previous_active.is_some_and(|active| active.automatic_action_applied);
+        let should_show_prompt = !automatic_action_applied
+            && previous_active.is_none_or(|active| active.last_prompt_had_retry != can_offer_retry);
         self.safety_buffering.active = Some(ActiveSafetyBuffering {
             turn_id: turn_id.clone(),
             last_prompt_had_retry: can_offer_retry,
             agent_message_started: false,
+            automatic_action_applied,
         });
 
         let status_details = if can_offer_retry {
@@ -187,11 +193,53 @@ impl ChatWidget {
         self.bottom_pane
             .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
 
+        let last_choice = self.local_settings.tui.safety_buffering_last_choice;
+        if self.local_settings.tui.safety_buffering_auto_apply {
+            match last_choice {
+                Some(SafetyBufferingChoice::DismissAndKeepWaiting) => {
+                    if let Some(active) = self.safety_buffering.active.as_mut() {
+                        active.automatic_action_applied = true;
+                    }
+                    return;
+                }
+                Some(SafetyBufferingChoice::RetryWithFasterModel) if can_offer_retry => {
+                    if let (Some(model), Some(turn), Some(prompt), Some(thread_id)) = (
+                        faster_model.as_ref(),
+                        retry_turn.as_ref(),
+                        retry_prompt.as_ref(),
+                        thread_id,
+                    ) {
+                        if let Some(active) = self.safety_buffering.active.as_mut() {
+                            active.automatic_action_applied = true;
+                        }
+                        self.app_event_tx.send(AppEvent::RetrySafetyBufferedTurn {
+                            thread_id,
+                            turn_id,
+                            model: model.clone(),
+                            turn: turn.clone(),
+                            prompt: prompt.clone(),
+                        });
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let initial_selected_idx = match last_choice {
+            Some(SafetyBufferingChoice::DismissAndKeepWaiting) => {
+                Some(usize::from(can_offer_retry))
+            }
+            Some(SafetyBufferingChoice::RetryWithFasterModel) if can_offer_retry => Some(0),
+            _ => None,
+        };
+
         let mut header = vec![Line::from(SAFETY_BUFFERING_HEADER).bold()];
         if can_offer_retry {
             header.push(Line::from(SAFETY_BUFFERING_MESSAGE_WITH_RETRY).dim());
         }
         let mut items = Vec::new();
+        let wait_turn_id = turn_id.clone();
         if let (Some(faster_model), Some(turn), Some(prompt), Some(thread_id)) =
             (faster_model, retry_turn, retry_prompt, thread_id)
         {
@@ -213,6 +261,15 @@ impl ChatWidget {
         items.extend([
             SelectionItem {
                 name: "Dismiss and keep waiting".to_string(),
+                actions: vec![Box::new(move |tx| {
+                    if let Some(thread_id) = thread_id {
+                        tx.send(AppEvent::SafetyBufferingChoiceSelected {
+                            thread_id,
+                            turn_id: wait_turn_id.clone(),
+                            choice: SafetyBufferingChoice::DismissAndKeepWaiting,
+                        });
+                    }
+                })],
                 dismiss_on_select: true,
                 ..Default::default()
             },
@@ -232,6 +289,7 @@ impl ChatWidget {
             footer_note: Some(Line::from(SAFETY_BUFFERING_FOOTER).dim()),
             footer_hint: Some(Line::default()),
             items,
+            initial_selected_idx,
             ..SelectionViewParams::picker()
         });
     }
@@ -257,6 +315,7 @@ impl ChatWidget {
             .unwrap_or_else(|| model.clone());
         self.bottom_pane
             .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+        let wait_turn_id = turn_id.clone();
         self.bottom_pane.show_selection_view(SelectionViewParams {
             view_id: Some(SAFETY_BUFFERING_PROMPT_VIEW_ID),
             header: Box::new(SafetyBufferingHeader(vec![
@@ -270,12 +329,24 @@ impl ChatWidget {
             items: vec![
                 SelectionItem {
                     name: "Keep waiting".to_string(),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SafetyBufferingChoiceSelected {
+                            thread_id,
+                            turn_id: wait_turn_id.clone(),
+                            choice: SafetyBufferingChoice::DismissAndKeepWaiting,
+                        });
+                    })],
                     dismiss_on_select: true,
                     ..Default::default()
                 },
                 SelectionItem {
                     name: "Stop and retry".to_string(),
                     actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SafetyBufferingChoiceSelected {
+                            thread_id,
+                            turn_id: turn_id.clone(),
+                            choice: SafetyBufferingChoice::RetryWithFasterModel,
+                        });
                         tx.send(AppEvent::RetrySafetyBufferedTurn {
                             thread_id,
                             turn_id: turn_id.clone(),
