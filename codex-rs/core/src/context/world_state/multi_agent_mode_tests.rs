@@ -191,7 +191,7 @@ fn custom_mode_is_bounded_before_snapshot_and_rendering() {
         MultiAgentMode::Proactive,
         "long explanation ".repeat(1_000).as_str(),
     );
-    let (snapshot, fragment) = explained.render_diff(PreviousSectionState::Absent);
+    let (snapshot, fragment) = explained.render_fragment_diff(PreviousSectionState::Absent);
     let snapshot = snapshot.expect("explained mode should update its snapshot");
     assert!(
         snapshot

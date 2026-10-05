@@ -1901,7 +1901,7 @@ enabled = false
                     )
                     .await
                     .expect("restored child world state should build")
-                    .render_full()
+                    .render_full_fragments()
                     .1
                     .into_iter()
                     .map(|fragment| fragment.body())
@@ -2186,7 +2186,7 @@ enabled = false
             .build_world_state_for_step(step_context.as_ref())
             .await
             .expect("reloaded child world state should build")
-            .render_full()
+            .render_full_fragments()
             .1
             .into_iter()
             .map(|fragment| fragment.body())
