@@ -63,8 +63,11 @@ pub(super) async fn prepare_fresh_startup_config(
     harness_overrides: &ConfigOverrides,
     environments: &EnvironmentManager,
 ) -> Result<FreshStartupDefaults> {
+    // Merge-safety anchor: InstanceChild retains the local workspace cwd for server-owned defaults.
     let defaults_cwd = match app_server_target {
-        AppServerTarget::Embedded | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
+        AppServerTarget::Embedded
+        | AppServerTarget::InstanceChild
+        | AppServerTarget::LocalDaemon { .. } => config.cwd.as_path(),
         AppServerTarget::Remote { .. } => {
             app_server.remote_cwd_override().unwrap_or(Path::new("."))
         }

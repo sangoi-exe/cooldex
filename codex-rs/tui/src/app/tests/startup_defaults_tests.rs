@@ -445,7 +445,14 @@ requires_openai_auth = false
 
 #[tokio::test]
 async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Result<()> {
-    for (remote, override_cwd) in [(false, false), (true, false), (true, true)] {
+    // Merge-safety anchor: exercise InstanceChild's local defaults selection with the recorded server.
+    for (target, override_cwd) in [
+        (AppServerTarget::Embedded, false),
+        (AppServerTarget::InstanceChild, false),
+        (remote_target(), false),
+        (remote_target(), true),
+    ] {
+        let remote = target.uses_remote_workspace();
         let client_home = tempdir()?;
         let server_home = tempdir()?;
         let destination = tempdir()?;
@@ -495,11 +502,6 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
             server.start_thread(&config).await?;
         }
         assert!(config.config_layer_stack.is_projectless());
-        let target = if remote {
-            remote_target()
-        } else {
-            AppServerTarget::Embedded
-        };
         let bootstrap = server.bootstrap(&config).await?;
         assert_eq!(bootstrap.default_model, "stale-client-model");
         let defaults_read = prepare_fresh_startup_config(
@@ -540,6 +542,9 @@ async fn fresh_startup_reads_destination_and_cleared_model_uses_catalog() -> Res
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), if remote { 1 } else { 2 });
         let latest = starts.last().unwrap();
+        if !remote {
+            assert_eq!(latest["cwd"], destination.path().display().to_string());
+        }
         assert_eq!(latest["model"], serde_json::Value::Null);
         assert!(latest["config"].get("model_reasoning_effort").is_none());
         for start in &starts {

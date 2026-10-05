@@ -369,7 +369,7 @@ fn post_compact_recovery_current_projections_ignore_internal_metadata() {
     });
 
     assert!(
-        crate::policy::is_persisted_rollout_item(&item, ThreadHistoryMode::Paginated),
+        crate::policy::persisted_rollout_item(&item, ThreadHistoryMode::Paginated).is_some(),
         "the application proof must remain canonical persisted history"
     );
     assert_eq!(
