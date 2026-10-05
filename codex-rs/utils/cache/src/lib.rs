@@ -10,7 +10,7 @@ use lru::LruCache;
 use sha1::Digest;
 use sha1::Sha1;
 
-/// Merge-safety anchor: cache synchronization uses `std::sync::Mutex` and `OnceLock`; Tokio gates storage and provides blocking initialization regions.
+/// Merge-safety anchor: cache synchronization uses `std::sync::Mutex` and `OnceLock` directly, without Tokio scheduler handoff that can retire a subprocess's creator thread; Tokio only gates storage.
 ///
 /// A minimal LRU cache protected by a standard mutex.
 /// Cache storage is disabled outside a Tokio runtime.
@@ -131,14 +131,14 @@ where
     /// Returns the cached value, initializing it outside the global cache lock.
     ///
     /// Concurrent callers share initialization while the entry remains cached.
-    /// An in-flight entry can be evicted and initialized again, so factories must
-    /// be deterministic. Initialization and same-key waits use a blocking region.
+    /// An in-flight entry can be evicted and initialized again, so factories must be deterministic.
+    /// Initialization and same-key waits remain synchronous without Tokio scheduler handoff.
     pub fn get_or_init(&self, key: K, value: impl FnOnce() -> V) -> V {
         let entry = self.get_or_insert_with(key, || Arc::new(OnceLock::new()));
         if let Some(value) = entry.get() {
             return value.clone();
         }
-        tokio::task::block_in_place(|| entry.get_or_init(value).clone())
+        entry.get_or_init(value).clone()
     }
 }
 

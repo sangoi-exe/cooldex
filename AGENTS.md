@@ -101,6 +101,9 @@
 
 ## Product Architecture
 
+<!-- Merge-safety anchor: cache locking and initialization must not hand off the Tokio scheduler core; creator-thread retirement can deliver Linux PDEATHSIG to its subprocesses while the runtime remains alive. -->
+- `codex-rs/utils/cache/src/lib.rs` owns `BlockingLruCache`. Preserve direct standard-library mutex locking and synchronous `OnceLock` initialization outside the global cache lock, shared initialization for a resident cell, and deterministic replacement after eviction. Do not reintroduce `block_in_place` or another cache-origin scheduler handoff, and do not remove `PDEATHSIG` to mask creator-thread retirement.
+
 <!-- Merge-safety anchor: full-history V2 usage-hint identity persists a typed birth binding;
 do not reconstruct it from mutable configuration, hashes, thread settings, events, or rendered context. -->
 - `SessionMeta.agent_usage_hint_binding` is the canonical birth binding for durable
@@ -300,6 +303,7 @@ handler owners; canonical statuses stay full. -->
   — current owners for token-efficient V2 fan-in, body-free list presentation, and full
   canonical statuses.
 - `/home/lucas/work/codex/scripts/cargo-guard.sh`, `/home/lucas/work/codex/scripts/cargo-validation.toml`, and `/home/lucas/work/codex/scripts/cooldex/rust-blast-radius-guard.py` — guarded Rust execution, validation policy, and impact-inventory owners.
+- `/home/lucas/work/codex/codex-rs/utils/cache/src/lib.rs` and `/home/lucas/work/codex/codex-rs/utils/cache/Cargo.toml` — synchronous cache locking and outside-lock shared initialization without Tokio scheduler handoff; preserve the creator-thread lifetime seam during upstream merges.
 - `/home/lucas/work/codex/justfile` / `build-local-codex-package-inputs` — complete local source-input owner for the CLI, Code Mode host, bwrap, and Computer Use MCP; prepares the exact GNU V8 archive/binding pair through `scripts/codex_package/v8.py` before guarded Cargo.
 - `/home/lucas/work/codex/scripts/build_codex_package.py` and `/home/lucas/work/codex/scripts/codex_package/` — one-complete-package assembly and layout-validation owners.
 - `/home/lucas/work/codex/codex-rs/install-context/` — typed local-lane recognition and package-resource lookup owner.
