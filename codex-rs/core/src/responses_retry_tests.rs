@@ -22,6 +22,11 @@ async fn overload_local_backoff_respects_stream_retry_budget(max_retries: u64) {
     let (session, turn_context) = make_session_and_context().await;
     let step_context = StepContext::for_test(Arc::new(turn_context));
     let mut client_session = session.services.model_client.new_session();
+    // Isolate the final HTTPS phase: exhausting the initial WebSocket budget permits fallback.
+    assert!(client_session.try_switch_fallback_transport(
+        &step_context.turn.session_telemetry,
+        step_context.turn.model_info(),
+    ));
     let mut retry_state = ResponsesStreamRetryState::default();
 
     for retry_count in 1..=max_retries {
