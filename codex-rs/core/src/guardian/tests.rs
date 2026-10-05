@@ -3135,8 +3135,14 @@ async fn guardian_review_retries_transient_session_failure_then_approves() -> an
     let request_log = mount_sse_sequence(
         &server,
         vec![
+            // Exhaust the reviewer's one inner stream retry before testing the outer retry.
             sse_failed(
                 "resp-session-failure",
+                "server_is_overloaded",
+                "temporary reviewer overload",
+            ),
+            sse_failed(
+                "resp-session-retry-failure",
                 "server_is_overloaded",
                 "temporary reviewer overload",
             ),
@@ -3171,7 +3177,7 @@ async fn guardian_review_retries_transient_session_failure_then_approves() -> an
         metadata.guardian_session_kind,
         Some(codex_analytics::GuardianReviewSessionKind::TrunkReused)
     ));
-    assert_eq!(request_log.requests().len(), 2);
+    assert_eq!(request_log.requests().len(), 3);
     Ok(())
 }
 
