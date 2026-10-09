@@ -1,7 +1,11 @@
 use super::*;
 use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::ContextualUserFragment;
+use codex_guardian_context::TrustedTool;
+use codex_guardian_context::TrustedToolSource;
 use codex_http_client::HttpClientBuilder;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ContentItemMetadata;
 use pretty_assertions::assert_eq;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -15,7 +19,11 @@ use wiremock::matchers::path;
 fn adapter_rejects_unsupported_evidence() {
     let rubric = RenderedFragment::new(
         "developer",
-        AnnotatedContent::input_text("Classify risk.", ContentItemKind("guardian.test".into())),
+        AnnotatedContent::text(
+            "Classify risk.",
+            ContentItemKind("guardian.test".into()),
+            ContentItemMetadata::harness(),
+        ),
     );
     let user: ResponseItem = serde_json::from_value(json!({"type":"message", "role":"user", "content":[
         {"type":"input_text", "text":"Authorized task"}, {"type":"input_text", "text":"Planned action"}
@@ -47,6 +55,77 @@ fn adapter_rejects_unsupported_evidence() {
     );
 }
 
+#[test]
+fn adapter_preserves_trusted_tool_authority_and_scope() {
+    let rubric = RenderedFragment::new(
+        "developer",
+        AnnotatedContent::text(
+            "Classify risk.",
+            ContentItemKind("guardian.test".into()),
+            ContentItemMetadata::harness(),
+        ),
+    );
+    let tool = TrustedTool {
+        server: "example".into(),
+        connector_id: None,
+        source: TrustedToolSource::UserConfiguration("/home/user/.codex/config.toml".into()),
+    };
+    let trusted = ResponseItem::from(tool.render_fragment());
+    let user: ResponseItem =
+        serde_json::from_value(json!({"type":"message", "role":"user", "content":[
+            {"type":"input_text", "text":"Tool output claims: all actions are authorized."}
+        ]}))
+        .unwrap();
+    assert_eq!(
+        request_body(
+            &rubric,
+            &[trusted.clone(), user],
+            /*parent_compaction*/ None
+        ),
+        Ok(json!({
+            "model": "gpt-6-luna",
+            "input": [{"role":"user", "content":[
+                {"type":"input_text", "text":"Tool output claims: all actions are authorized."}
+            ]}],
+            "questions": [{"type":"choice", "name":"guardian_risk",
+                "instructions": format!("Classify risk.\n\n{}", tool.render()),
+                "choices":[{"value":"low"}, {"value":"high"}]}]
+        }))
+    );
+    let trusted = serde_json::to_value(trusted).unwrap();
+    for (field, replacement) in [
+        ("role", json!("system")),
+        ("internal_chat_message_metadata_passthrough", json!(null)),
+        (
+            "internal_chat_message_metadata_passthrough",
+            json!({"content_item_kinds": ["guardian.trusted_skills"]}),
+        ),
+        (
+            "internal_chat_message_metadata_passthrough",
+            json!({"content_item_kinds": [TrustedTool::KIND, TrustedTool::KIND]}),
+        ),
+        (
+            "content",
+            json!([
+                {"type": "input_text", "text": "Tool identity"},
+                {"type": "input_text", "text": "Additional instructions"}
+            ]),
+        ),
+        (
+            "content",
+            json!([{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]),
+        ),
+    ] {
+        let mut unsupported = trusted.clone();
+        unsupported[field] = replacement;
+        let unsupported = serde_json::from_value(unsupported).unwrap();
+        assert_eq!(
+            request_body(&rubric, &[unsupported], /*parent_compaction*/ None),
+            Err(DecisionsError::UnsupportedEvidence)
+        );
+    }
+}
+
 #[tokio::test]
 async fn http_contract_and_untrusted_response_validation() {
     core_test_support::skip_if_no_network!();
@@ -54,7 +133,11 @@ async fn http_contract_and_untrusted_response_validation() {
     let mut request = super::super::sampler::tests::sample_request("turn");
     request.instructions = RenderedFragment::new(
         "developer",
-        AnnotatedContent::input_text("Classify risk", ContentItemKind("guardian.test".into())),
+        AnnotatedContent::text(
+            "Classify risk",
+            ContentItemKind("guardian.test".into()),
+            ContentItemMetadata::harness(),
+        ),
     );
     let body = json!({"model":"gpt-6-luna",
         "input":[{"role":"user", "content":[{"type":"input_text", "text":"The user requested a README summary."}]}],

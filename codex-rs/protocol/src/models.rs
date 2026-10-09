@@ -50,8 +50,11 @@ pub use executed_tool_calls::ToolResultSource;
 pub use executed_tool_calls::ToolResultSources;
 pub use executed_tool_calls::bound_executed_tool_calls_for_message;
 pub use executed_tool_calls::executed_tool_call_metadata_bytes;
-pub use executed_tool_calls::normalize_executed_tool_call_arguments;
+pub use executed_tool_calls::normalize_executed_tool_call_completeness;
 pub use item_metadata::ContentItemKind;
+pub use item_metadata::ContentItemMetadata;
+pub use item_metadata::ContentItemNamespace;
+pub use item_metadata::ContentItemProvenance;
 
 /// Controls the per-command sandbox override requested by a shell-like tool call.
 #[derive(
@@ -937,7 +940,7 @@ pub const DEFAULT_IMAGE_DETAIL: ImageDetail = ImageDetail::High;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
-/// Classifies an assistant message as interim commentary or final answer text.
+/// Classifies assistant text as commentary, a partial answer, or a terminal answer.
 ///
 /// Providers do not emit this consistently, so callers must treat `None` as
 /// "phase unknown" and keep compatibility behavior for legacy models.
@@ -947,7 +950,9 @@ pub enum MessagePhase {
     /// Additional tool calls or assistant output may follow before turn
     /// completion.
     Commentary,
-    /// The assistant's terminal answer text for the current turn.
+    /// Stable answer text that may be followed by more assistant output or tools.
+    PartialAnswer,
+    /// The assistant's declared terminal answer text for the current turn.
     FinalAnswer,
 }
 
@@ -972,6 +977,12 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[schemars(skip)]
     #[ts(skip)]
     pub content_item_kinds: Option<Vec<ContentItemKind>>,
+    /// Positional source attribution for `content`; missing historical entries are Unknown.
+    #[serde_as(deserialize_as = "serde_with::DefaultOnError")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    #[ts(skip)]
+    pub content_item_metadata: Option<Vec<ContentItemMetadata>>,
     // Ignore input values so requests and rollout reloads cannot fake tool call records.
     // A resumed thread can record new calls, but cannot prove old calls from this payload.
     /// Host-owned Code Mode cell shared by its `exec` and subsequent `wait` outputs.
@@ -984,7 +995,8 @@ pub struct InternalChatMessageMetadataPassthrough {
     #[schemars(skip)]
     #[ts(skip)]
     pub executed_tool_calls: Option<Vec<ExecutedToolCall>>,
-    /// Whether the host recorded the complete call inventory without losing calls or arguments.
+    /// Whether the host recorded the complete ordered call inventory without losing calls or names.
+    /// Recorded arguments may be truncated independently of this claim.
     /// For a direct tool output this covers its single invocation; with `cell_id`, it covers
     /// the Code Mode cell across its outputs. Neither case describes tool success.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
@@ -1256,6 +1268,30 @@ pub enum ResponseItem {
 }
 
 impl ResponseItem {
+    /// Returns the wire type name for this response item.
+    pub fn item_type(&self) -> &'static str {
+        match self {
+            Self::AdditionalTools { .. } => "additional_tools",
+            Self::Message { .. } => "message",
+            Self::AgentMessage { .. } => "agent_message",
+            Self::Reasoning { .. } => "reasoning",
+            Self::LocalShellCall { .. } => "local_shell_call",
+            Self::FunctionCall { .. } => "function_call",
+            Self::ToolSearchCall { .. } => "tool_search_call",
+            Self::FunctionCallOutput { .. } => "function_call_output",
+            Self::CustomToolCall { .. } => "custom_tool_call",
+            Self::CustomToolCallOutput { .. } => "custom_tool_call_output",
+            Self::ToolSearchOutput { .. } => "tool_search_output",
+            Self::WebSearchCall { .. } => "web_search_call",
+            Self::ImageGenerationCall { .. } => "image_generation_call",
+            Self::Compaction { .. } => "compaction",
+            Self::ConfigurationUpdate { .. } => "configuration_update",
+            Self::CompactionTrigger { .. } => "compaction_trigger",
+            Self::ContextCompaction { .. } => "context_compaction",
+            Self::Other => "other",
+        }
+    }
+
     /// Returns whether this item is an ordinary user-role message.
     pub fn is_user_message(&self) -> bool {
         matches!(self, Self::Message { role, .. } if role == "user")
@@ -1382,7 +1418,7 @@ impl ResponseItem {
         }
     }
 
-    /// Removes content item classifications while preserving other passthrough metadata.
+    /// Removes content item classifications and attribution, preserving other metadata.
     pub fn clear_content_item_kinds(&mut self) {
         let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut() else {
             return;
@@ -1392,8 +1428,21 @@ impl ResponseItem {
         };
 
         metadata_value.content_item_kinds = None;
+        metadata_value.content_item_metadata = None;
         if metadata_value == &InternalChatMessageMetadataPassthrough::default() {
             *metadata = None;
+        }
+    }
+
+    /// Removes per-content attribution for endpoints that do not yet accept it.
+    pub fn clear_content_item_metadata(&mut self) {
+        if let Some(metadata) = self.internal_chat_message_metadata_passthrough_mut()
+            && let Some(value) = metadata
+        {
+            value.content_item_metadata = None;
+            if value == &InternalChatMessageMetadataPassthrough::default() {
+                *metadata = None;
+            }
         }
     }
 
@@ -2518,27 +2567,38 @@ mod tests {
     }
 
     #[test]
-    fn response_input_message_conversion_preserves_phase() {
-        let item = ResponseItem::from(ResponseInputItem::Message {
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "still working".to_string(),
-            }],
-            phase: Some(MessagePhase::Commentary),
-        });
-
-        assert_eq!(
-            item,
-            ResponseItem::Message {
+    fn response_input_message_conversion_preserves_phase() -> Result<()> {
+        for phase in [
+            None,
+            Some(MessagePhase::Commentary),
+            Some(MessagePhase::PartialAnswer),
+            Some(MessagePhase::FinalAnswer),
+        ] {
+            let input = ResponseInputItem::Message {
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "answer text".to_string(),
+                }],
+                phase: phase.clone(),
+            };
+            let wire = serde_json::to_value(input)?;
+            let item = ResponseItem::from(serde_json::from_value::<ResponseInputItem>(wire)?);
+            let expected = ResponseItem::Message {
                 id: None,
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
-                    text: "still working".to_string(),
+                    text: "answer text".to_string(),
                 }],
-                phase: Some(MessagePhase::Commentary),
+                phase,
                 internal_chat_message_metadata_passthrough: None,
-            }
-        );
+            };
+            assert_eq!(item, expected);
+            assert_eq!(
+                serde_json::from_value::<ResponseItem>(serde_json::to_value(item)?)?,
+                expected
+            );
+        }
+        Ok(())
     }
 
     #[test]

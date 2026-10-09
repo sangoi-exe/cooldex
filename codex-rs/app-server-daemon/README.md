@@ -49,9 +49,11 @@ Eligible managed daemons check for updates after five minutes, then hourly by
 default. Edit `CODEX_HOME/app-server-daemon/settings.json` to change this:
 
 ```json
-{"remoteControlEnabled": false,
- "shutdownGraceSeconds": 60,
- "updater": {"autoUpdateEnabled": false, "updateIntervalMinutes": 120}}
+{
+  "remoteControlEnabled": false,
+  "shutdownGraceSeconds": 60,
+  "updater": { "autoUpdateEnabled": false, "updateIntervalMinutes": 120 }
+}
 ```
 
 Positive minute intervals have no configured cap. `daemon restart` applies the

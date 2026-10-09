@@ -47,9 +47,24 @@ impl SessionTask for CompactTask {
             conversation.id = %session.thread_id,
             turn.id = %ctx.sub_id,
         );
+        // Preparation errors must reach the task runner, which reports them to the client.
+        session.emit_turn_started(&ctx, TaskKind::Compact).await;
+        let step_context = session
+            .capture_step_context(Arc::clone(&ctx), &cancellation_token)
+            .await?;
+        let world_state = Arc::new(
+            session
+                .build_world_state_for_step(&step_context, /*new_window*/ true)
+                .await?,
+        );
         if ctx.config.features.enabled(Feature::TokenBudget) {
-            crate::compact_token_budget::run_manual_compact_task(session, ctx, &cancellation_token)
-                .await?;
+            crate::compact_token_budget::run_manual_compact_task(
+                session,
+                step_context,
+                world_state,
+                &cancellation_token,
+            )
+            .await?;
             return Ok(Default::default());
         }
 
@@ -62,7 +77,8 @@ impl SessionTask for CompactTask {
                 );
                 crate::compact_remote_v2::run_remote_compact_task(
                     session.clone(),
-                    Arc::clone(&ctx),
+                    step_context,
+                    world_state,
                     &cancellation_token,
                 )
                 .await
@@ -85,7 +101,8 @@ impl SessionTask for CompactTask {
                 }];
                 crate::compact::run_compact_task(
                     session.clone(),
-                    Arc::clone(&ctx),
+                    step_context,
+                    world_state,
                     input,
                     &cancellation_token,
                 )

@@ -4,6 +4,7 @@ use anyhow::Result;
 use codex_core::ForkSnapshot;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_features::Feature;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_model_provider::RemoteCompactionSupport;
@@ -56,23 +57,23 @@ pub(super) fn tool_call_metadata(mut item: Value) -> Value {
 #[test_case(false; "http")]
 #[test_case(true; "websocket")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn message_budget_sheds_inventory_without_changing_tool_results_or_history(
+async fn message_budget_sheds_arguments_without_losing_inventory_completeness(
     websocket: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let message_limit = 15 * 1024 * 1024;
     let call_count = 16;
     // Each argument fits 8 KiB and all observations fit Direct's 1 MiB budget.
-    // Only the final message budget should shed this inventory. HTTP includes
+    // Only the final message budget should shed recorded arguments. HTTP includes
     // the original call arguments; a WebSocket delta already has those upstream.
     let arguments = json!({"plan": [{"step": "x".repeat(7 * 1024), "status": "in_progress"}]});
     assert!(arguments.to_string().len() < 8 * 1024);
     assert!(call_count * arguments.to_string().len() < 1024 * 1024);
     let next_arguments = json!({"plan": [{"step": "done", "status": "completed"}]});
-    let instruction_bytes = message_limit - if websocket { 64 * 1024 } else { 192 * 1024 };
-    let instructions = "padding ".repeat(instruction_bytes / 8);
+    // An output schema stays in every wire request, including WebSocket deltas.
+    let padding_bytes = message_limit - if websocket { 64 * 1024 } else { 192 * 1024 };
+    let schema_description = "padding ".repeat(padding_bytes / 8);
     let mut builder = test_codex().with_config(move |config| {
-        config.base_instructions = Some(instructions);
         config.model_context_window = Some(20_000_000);
         config.model_auto_compact_token_limit = Some(20_000_000);
         config
@@ -142,7 +143,27 @@ async fn message_budget_sheds_inventory_without_changing_tool_results_or_history
             .build_with_auto_env(http_server.as_ref().expect("HTTP test server"))
             .await?
     };
-    test.submit_turn("Update the plan, then finish it").await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Update the plan, then finish it".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .on_start(TurnStartOptions {
+                final_output_json_schema: Some(json!({
+                    "type": "object",
+                    "description": schema_description,
+                    "properties": {},
+                    "additionalProperties": false,
+                })),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     let requests = if let Some(server) = &websocket_server {
         let connection = server.single_connection();
         assert_eq!(connection.len(), 4);
@@ -167,11 +188,11 @@ async fn message_budget_sheds_inventory_without_changing_tool_results_or_history
     }
     for (index, request) in requests.iter().enumerate() {
         assert_eq!(
-            request["instructions"]
+            request["text"]["format"]["schema"]["description"]
                 .as_str()
-                .expect("request instructions")
+                .expect("request schema description")
                 .len(),
-            instruction_bytes
+            padding_bytes
         );
         let request_bytes = serde_json::to_vec(request)?.len();
         assert!(
@@ -263,6 +284,7 @@ async fn message_budget_sheds_inventory_without_changing_tool_results_or_history
                             "max_bytes": max_bytes,
                         }},
                     }],
+                    "tool_calls_complete": true,
                 })
             );
             truncated_arguments += 1;
@@ -516,6 +538,8 @@ async fn direct_function_and_tool_search_mark_complete_attempts(
     // These calls exceed the old request budget but stay below Direct's retained-history limit.
     let budget_arguments =
         json!({"plan": [{"step": "x".repeat(7 * 1024), "status": "in_progress"}]});
+    let oversized_arguments =
+        json!({"plan": [{"step": "x".repeat(9 * 1024), "status": "in_progress"}]});
     let budget_arguments_json = budget_arguments.to_string();
     assert!(budget_arguments_json.len() < 8 * 1024);
     if budget_calls > 0 {
@@ -527,7 +551,7 @@ async fn direct_function_and_tool_search_mark_complete_attempts(
         events.push(ev_function_call(
             "plan-oversized",
             "update_plan",
-            &json!({"plan": [{"step": "x".repeat(9 * 1024), "status": "in_progress"}]}).to_string(),
+            &oversized_arguments.to_string(),
         ));
     }
     for index in 0..budget_calls {
@@ -603,12 +627,13 @@ async fn direct_function_and_tool_search_mark_complete_attempts(
         assert_eq!(output["output"], json!("Plan updated"));
         let metadata = tool_call_metadata(output);
         metadata_bytes += serde_json::to_vec(&metadata)?.len();
-        assert!(
-            metadata["executed_tool_calls"][0]["arguments"]
-                .get("_codex_executed_tool_call_truncated")
-                .is_some()
+        assert_eq!(
+            metadata,
+            json!({
+                "executed_tool_calls": [{"name": "update_plan", "arguments": oversized_arguments}],
+                "tool_calls_complete": true,
+            }),
         );
-        assert!(metadata.get("tool_calls_complete").is_none());
     }
     for index in 0..budget_calls {
         let output = request.function_call_output(&format!("plan-budget-{index}"));

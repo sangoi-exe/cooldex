@@ -42,6 +42,8 @@ use tonic::Code;
 #[cfg(unix)]
 use tonic::transport::Server;
 
+#[path = "grpc/admission_tests.rs"]
+mod admission_tests;
 #[path = "support/host.rs"]
 mod host;
 #[path = "support/large_tool_delegate.rs"]
@@ -50,6 +52,8 @@ mod large_tool_delegate;
 mod network_policy_tests;
 #[path = "support/recording_delegate.rs"]
 mod recording_delegate;
+#[path = "grpc/session_recovery_tests.rs"]
+mod session_recovery_tests;
 
 use host::HostHarness;
 use large_tool_delegate::LargeToolResultDelegate;

@@ -95,6 +95,7 @@ async fn safety_buffering_failed_save_preserves_live_choice() -> anyhow::Result<
 fn turn(id: &str, status: TurnStatus) -> Turn {
     Turn {
         id: id.to_string(),
+        root_turn_id: None,
         items: Vec::new(),
         items_view: TurnItemsView::Full,
         status,

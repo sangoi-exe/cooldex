@@ -308,8 +308,6 @@ argv = [
   "--exclude",
   "codex-linux-sandbox",
   "--exclude",
-  "codex-shell-escalation",
-  "--exclude",
   "codex-windows-sandbox-service",
   "--exclude",
   "codex-voice-host",
@@ -673,13 +671,6 @@ patterns = [
 ]
 surfaces = ["cli"]
 
-[[path_rules]]
-patterns = ["codex-rs/shell-escalation/**"]
-packages = ["codex-shell-escalation"]
-surfaces = ["cli"]
-flags = ["runtime"]
-wsl_runtime_packages = ["codex-shell-escalation"]
-
 # Merge-safety anchor: WSL runtime and test preparation are explicit for
 # Linux/Unix package owners in every mode; voice source remains explicitly
 # classified even though the defaults policy excludes its validation.
@@ -737,14 +728,22 @@ commands = ["bazel-lock-check"]
 
 [[path_rules]]
 patterns = [
+  ".bazelrc",
+  ".bazelversion",
   "BUILD.bazel",
+  "bazel/rules/BUILD.bazel",
+  "bazel/rules/runtime_package.bzl",
+  "codex-rs/BUILD.bazel",
   "codex-rs/**/BUILD.bazel",
   "MODULE.bazel",
   "defs.bzl",
   "patches/BUILD.bazel",
+  "patches/mxc-sdk_utf8_resources.patch",
   "patches/rules_rs_rust_debug_modes.patch",
   "patches/rules_rs_workspace_package_version.patch",
   "patches/rules_rust_compiler_thp.patch",
+  "patches/rules_rust_process_wrapper_param_file.patch",
+  "patches/rules_rust_release_build_script_profile.patch",
   "patches/v8_bazel_rules.patch",
   "third_party/v8/BUILD.bazel",
   "third_party/v8/gnu_libcxx_shared_exception_symbols.txt",
@@ -776,13 +775,23 @@ patterns = ["AGENTS.md", "scripts/AGENTS.md"]
 
 [[path_rules]]
 patterns = [
+  ".github/actions/build-bazel-package-binaries/action.yml",
+  ".github/actions/build-bazel-release/action.yml",
+  ".github/actions/build-cargo-package-binaries/action.yml",
+  ".github/actions/build-codex-packages/action.yml",
+  ".github/actions/setup-bazel-ci/action.yml",
   ".github/actions/setup-ci/action.yml",
+  ".github/actions/setup-rusty-v8/action.yml",
+  ".github/actions/windows-code-sign/action.yml",
+  ".github/scripts/build-codex-package-archive.sh",
   ".github/scripts/check_github_canary.py",
   ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
   ".github/scripts/macos-signing/sign_macos_code.sh",
+  ".github/scripts/macos-signing/test_sign_macos_cli_package.py",
   ".github/scripts/npm_alpha_tag.py",
   ".github/scripts/publish_r2_release.py",
   ".github/scripts/releases.py",
+  ".github/scripts/run-bazel-ci.sh",
   ".github/scripts/select_windows_bazel_targets.py",
   ".github/scripts/test_releases.py",
   ".github/scripts/test_select_windows_bazel_targets.py",
@@ -797,6 +806,7 @@ patterns = [
   ".github/workflows/rust-release.yml",
   ".github/workflows/rust-release-argument-comment-lint.yml",
   ".github/workflows/rust-release-prepare.yml",
+  ".github/workflows/rust-release-windows.yml",
 ]
 
 [[path_rules]]
@@ -822,7 +832,30 @@ patterns = [
 ]
 
 [[path_rules]]
-patterns = ["CHANGELOG.md", "third_party/v8/README.md"]
+patterns = [
+  "CHANGELOG.md",
+  "codex-rs/docs/bazel.md",
+  "codex-rs/docs/protocol_v1.md",
+  "scripts/codex_package/README.md",
+  "sdk/python/docs/api-reference.md",
+  "third_party/v8/README.md",
+]
+
+[[path_rules]]
+patterns = [
+  "scripts/codex_package/cli.py",
+  "scripts/codex_package/dotslash.py",
+  "scripts/codex_package/layout.py",
+  "scripts/codex_package/smoke_tests/fixtures.py",
+  "scripts/codex_package/smoke_tests/test_codex_package.py",
+  "scripts/codex_package/symbols.py",
+  "scripts/codex_package/targets.py",
+  "scripts/codex_package/test_layout.py",
+  "scripts/install/install.ps1",
+]
+
+[[path_rules]]
+patterns = ["third_party/voice/BUILD.bazel", "third_party/voice/native.bzl"]
 
 [[path_rules]]
 patterns = ["scripts/check-module-bazel-lock.sh"]
@@ -833,7 +866,7 @@ patterns = ["sdk/python/scripts/update_sdk_artifacts.py", "sdk/python/src/openai
 generators = ["write-app-server-schema"]
 
 [[path_rules]]
-patterns = ["sdk/python/tests/test_artifact_workflow_and_binaries.py"]
+patterns = ["sdk/python/tests/test_app_server_turn_controls.py", "sdk/python/tests/test_artifact_workflow_and_binaries.py"]
 
 [[path_rules]]
 patterns = ["scripts/format.py"]

@@ -11,13 +11,13 @@ from .layout import build_package_dir
 from .layout import prepare_package_dir
 from .layout import validate_package_dir
 from .ripgrep import resolve_rg_bin
+from .symbols import strip_binary
 from .targets import PACKAGE_VARIANTS
 from .targets import TARGET_SPECS
 from .targets import PackageInputs
 from .targets import default_target
 from .targets import resolve_computer_use_input_pair
 from .targets import resolve_input_path
-from .zsh import resolve_zsh_bin
 from .version import read_workspace_version
 
 
@@ -46,6 +46,10 @@ def parse_package_version(value: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    return create_parser().parse_args()
+
+
+def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build a canonical Codex package directory and optional archive.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -107,6 +111,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--strip",
+        choices=("auto", "all", "none"),
+        default="auto",
+        help=(
+            "Strip Unix first-party package binaries: auto strips source-built "
+            "release-profile inputs, all also strips other profiles and prebuilt "
+            "inputs, none preserves symbols. "
+            "Original inputs and third-party resources are never modified."
+        ),
+    )
+    parser.add_argument(
+        "--strip-tool",
+        help="Target-compatible strip executable override, for example llvm-strip.",
+    )
+    parser.add_argument(
         "--entrypoint-bin",
         type=Path,
         help=(
@@ -146,20 +165,6 @@ def parse_args() -> argparse.Namespace:
             "Requires --computer-use-mcp-bin."
         ),
     )
-    zsh_source = parser.add_mutually_exclusive_group()
-    zsh_source.add_argument(
-        "--zsh-manifest",
-        type=Path,
-        help=(
-            "Optional DotSlash manifest for the patched zsh fork instead of "
-            "scripts/codex_package/codex-zsh."
-        ),
-    )
-    zsh_source.add_argument(
-        "--zsh-bin",
-        type=Path,
-        help="Optional prebuilt zsh executable instead of fetching from a manifest.",
-    )
     parser.add_argument(
         "--codex-command-runner-bin",
         type=Path,
@@ -186,12 +191,19 @@ def parse_args() -> argparse.Namespace:
             "scripts/codex_package/rg."
         ),
     )
-    return parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = parse_args()
+    package_dir = assemble_package(args)
+    archive_package(package_dir, args)
+    return 0
 
 
 # Merge-safety anchor: the complete local GNU x86-64 MCP/Sky pair stays unpacked-only so proprietary Sky bytes cannot enter an archive output.
-def main() -> int:
-    args = parse_args()
+def assemble_package(args: argparse.Namespace) -> Path:
+    """Build the directory before optional downstream additions and archiving."""
     spec = TARGET_SPECS[getattr(args, "target", None) or default_target()]
     variant = PACKAGE_VARIANTS[args.variant]
     computer_use_mcp_bin, sky_bin = resolve_computer_use_input_pair(
@@ -245,7 +257,6 @@ def main() -> int:
         entrypoint_bin=source_outputs.entrypoint_bin,
         code_mode_host_bin=source_outputs.code_mode_host_bin,
         rg_bin=resolve_rg_bin(spec, args.rg_bin),
-        zsh_bin=resolve_zsh_bin(spec, args.zsh_manifest, zsh_bin=args.zsh_bin),
         bwrap_bin=source_outputs.bwrap_bin,
         codex_command_runner_bin=source_outputs.codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
@@ -254,21 +265,32 @@ def main() -> int:
     )
     prepare_package_dir(package_dir, force=args.force)
     build_package_dir(package_dir, args.package_version, variant, spec, inputs)
+    for filename, prebuilt in (
+        (variant.entrypoint_name(spec), args.entrypoint_bin),
+        (f"codex-code-mode-host{spec.exe_suffix}", args.code_mode_host_bin),
+    ):
+        if args.strip == "all" or (
+            args.strip == "auto"
+            and args.cargo_profile == "release"
+            and prebuilt is None
+        ):
+            strip_binary(package_dir / "bin" / filename, spec, tool=args.strip_tool)
     validate_package_dir(
         package_dir,
         variant,
         spec,
-        include_zsh=inputs.zsh_bin is not None,
         include_computer_use=inputs.computer_use_mcp_bin is not None,
     )
+    return package_dir
 
+
+def archive_package(package_dir: Path, args: argparse.Namespace) -> None:
     for archive_output in args.archive_output:
         archive_path = archive_output.resolve()
         write_archive(package_dir, archive_path, force=args.force)
         print(f"Built Codex package archive at {archive_path}")
 
     print(f"Built Codex package directory at {package_dir}")
-    return 0
 
 
 def resolve_optional_input_path(

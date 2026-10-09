@@ -19,6 +19,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::ToolSpec;
+use std::num::NonZeroUsize;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -119,7 +120,7 @@ fn reject_v2_full_history_identity_overrides(
     }
 
     Err(FunctionCallError::RespondToModel(format!(
-        "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({}) or set fork_turns to none or a positive integer",
+        "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({}) or set fork_turns to none",
         overrides.join(", ")
     )))
 }
@@ -228,6 +229,7 @@ async fn handle_spawn_agent(
                 root_turn_id: turn.turn_metadata_state.root_turn_id(),
                 turn_trigger: turn.turn_metadata_state.current_turn_trigger(),
                 environments: Some(step_context.environments.clone()),
+                disabled_plugin_ids: Some(turn.disabled_plugin_ids.clone()),
                 multi_agent_v2_usage_hints,
                 cyber_access_program: turn.cyber_access_program,
             },
@@ -238,6 +240,8 @@ async fn handle_spawn_agent(
                 &turn.session_telemetry,
                 turn.config.apps_mcp_product_sku.as_deref(),
                 &err,
+                &call_id,
+                &turn.sub_id,
                 fork_mode.as_ref(),
                 MultiAgentVersion::V2,
             );
@@ -253,6 +257,8 @@ async fn handle_spawn_agent(
         &session,
         turn,
         SubAgentActivityItem {
+            model: Some(agent_snapshot.model.clone()),
+            reasoning_effort: agent_snapshot.reasoning_effort.clone(),
             id: call_id,
             agent_thread_id: new_thread_id,
             agent_path: new_agent_path.clone(),
@@ -320,22 +326,14 @@ impl SpawnAgentArgs {
         if fork_turns.eq_ignore_ascii_case("none") {
             return Ok(None);
         }
-        if fork_turns.eq_ignore_ascii_case("all") {
+        // Accept legacy turn counts without limiting the inherited history.
+        if fork_turns.eq_ignore_ascii_case("all") || fork_turns.parse::<NonZeroUsize>().is_ok() {
             return Ok(Some(SpawnAgentForkMode::FullHistory));
         }
 
-        let last_n_turns = fork_turns.parse::<usize>().map_err(|_| {
-            FunctionCallError::RespondToModel(
-                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
-            )
-        })?;
-        if last_n_turns == 0 {
-            return Err(FunctionCallError::RespondToModel(
-                "fork_turns must be `none`, `all`, or a positive integer string".to_string(),
-            ));
-        }
-
-        Ok(Some(SpawnAgentForkMode::LastNTurns(last_n_turns)))
+        Err(FunctionCallError::RespondToModel(
+            "fork_turns must be `none` or `all`".to_string(),
+        ))
     }
 }
 

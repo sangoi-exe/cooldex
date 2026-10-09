@@ -1391,8 +1391,7 @@ class CargoValidateWindowsTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                not check["yolo"]
-                and not check["bypassed_free_disk_floor"]
+                not check["yolo"] and not check["bypassed_free_disk_floor"]
                 for check in preflight["execution_preflight"]
             )
         )

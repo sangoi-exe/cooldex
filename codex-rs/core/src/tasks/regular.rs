@@ -44,7 +44,8 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        sess.emit_turn_started(&ctx).await;
+        // Merge-safety anchor: publish one attributed start before cancellable regular-task preparation.
+        sess.emit_turn_started(&ctx, TaskKind::Regular).await;
         let run_turn_span = trace_span!("run_turn");
         let prewarmed_client_session = async {
             // Regular-start contributors run once, after the task is visible and interruptible.

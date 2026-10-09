@@ -53,7 +53,7 @@ use core_test_support::responses::strip_metadata_from_json;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -99,6 +99,8 @@ const REQUESTED_MODEL: &str = "gpt-5.6-luna";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const V2_DEFAULT_MODEL: &str = "gpt-5.6-terra";
 const V2_DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
+const V2_REQUESTED_MODEL: &str = "gpt-5.6-sol";
+const V2_REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const CATALOG_MARKED_USAGE_HINT_MODEL: &str = "gpt-6-astra";
 const CONFIGURED_CHILD_INSTRUCTIONS: &str = "Use the configured V2 child snapshot.";
 const ROLE_MODEL: &str = "gpt-5.5";
@@ -968,7 +970,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -1244,16 +1246,13 @@ async fn submit_turn_with_trigger(test: &TestCodex, prompt: &str, trigger: &str)
 #[derive(Clone, Copy, Debug)]
 enum GrandchildParentContext {
     FullHistory,
-    LastTurn,
     NoHistory,
     Compacted,
 }
 
 #[test_case(GrandchildParentContext::FullHistory, ThreadHistoryMode::Legacy; "legacy full history")]
-#[test_case(GrandchildParentContext::LastTurn, ThreadHistoryMode::Legacy; "legacy last turn")]
 #[test_case(GrandchildParentContext::NoHistory, ThreadHistoryMode::Legacy; "legacy no history")]
 #[test_case(GrandchildParentContext::FullHistory, ThreadHistoryMode::Paginated; "paginated full history")]
-#[test_case(GrandchildParentContext::LastTurn, ThreadHistoryMode::Paginated; "paginated last turn")]
 #[test_case(GrandchildParentContext::NoHistory, ThreadHistoryMode::Paginated; "paginated no history")]
 #[test_case(GrandchildParentContext::Compacted, ThreadHistoryMode::Legacy; "legacy full history after compaction")]
 #[test_case(GrandchildParentContext::Compacted, ThreadHistoryMode::Paginated; "paginated full history after compaction")]
@@ -1277,7 +1276,6 @@ async fn grandchild_full_fork_preserves_context_baseline(
     let server = start_mock_server().await;
     let (parent_fork_turns, compact_parent) = match parent_context {
         GrandchildParentContext::FullHistory => ("all", false),
-        GrandchildParentContext::LastTurn => ("1", false),
         GrandchildParentContext::NoHistory => ("none", false),
         GrandchildParentContext::Compacted => ("all", true),
     };
@@ -1577,14 +1575,12 @@ async fn grandchild_full_fork_preserves_context_baseline(
                 .count(),
         )
     });
-    // Full-history children retain the effective parent identity. Partial and
-    // no-history children rebuild from the configured child snapshot, which is
+    // Full-history children retain the effective parent identity. No-history
+    // children rebuild from the configured child snapshot, which is
     // intentionally absent in this fixture.
     let expected_context_counts = match parent_context {
         GrandchildParentContext::FullHistory | GrandchildParentContext::Compacted => [(1, 1); 3],
-        GrandchildParentContext::LastTurn | GrandchildParentContext::NoHistory => {
-            [(1, 1), (0, 1), (0, 1)]
-        }
+        GrandchildParentContext::NoHistory => [(1, 1), (0, 1), (0, 1)],
     };
     assert_eq!(
         context_counts, expected_context_counts,
@@ -2033,7 +2029,7 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
             );
         } else {
             let parent_instructions = parent_instructions
-                .expect("non-Lite parent request should carry top-level instructions");
+                .expect("non-Lite parent request should carry base instructions in input");
             assert_eq!(child_request.instructions_text(), parent_instructions);
             assert_ne!(
                 child_request.instructions_text(),
@@ -2153,12 +2149,15 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     Ok(())
 }
 
-#[test_case("none", false; "no history")]
-#[test_case("1", true; "partial history")]
+// Merge-safety anchor: upstream numeric fork values mean full history, so inherited instructions remain parent-owned; only fresh children resolve the configured snapshot.
+#[test_case("none", false, CONFIGURED_CHILD_INSTRUCTIONS; "no history")]
+#[test_case("1", true, "parent config base instructions"; "legacy one turn inherits full history")]
+#[test_case("3", true, "parent config base instructions"; "legacy three turns inherit full history")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_v2_non_full_history_child_uses_configured_instruction_snapshot(
+async fn spawned_v2_child_uses_instruction_snapshot_for_selected_history(
     fork_turns: &str,
     expects_parent_turn: bool,
+    expected_instructions: &str,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2189,10 +2188,7 @@ async fn spawned_v2_non_full_history_child_uses_configured_instruction_snapshot(
     .await?;
 
     let child_request = wait_for_child_request(&child_request_log).await?;
-    assert_eq!(
-        child_request.instructions_text(),
-        CONFIGURED_CHILD_INSTRUCTIONS
-    );
+    assert_eq!(child_request.instructions_text(), expected_instructions);
     assert_eq!(
         child_request.body_contains_text(TURN_1_PROMPT),
         expects_parent_turn
@@ -2201,8 +2197,13 @@ async fn spawned_v2_non_full_history_child_uses_configured_instruction_snapshot(
     Ok(())
 }
 
+#[test_case(V2_DEFAULT_MODEL, None; "explicit model")]
+#[test_case(V2_REQUESTED_MODEL, Some(V2_REQUESTED_REASONING_EFFORT); "explicit model and reasoning effort")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_v2_no_history_child_uses_final_model_default_instructions() -> Result<()> {
+async fn spawned_v2_no_history_child_uses_final_model_default_instructions(
+    model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2212,7 +2213,8 @@ async fn spawned_v2_no_history_child_uses_final_model_default_instructions() -> 
         json!({
             "message": CHILD_PROMPT,
             "task_name": "worker",
-            "model": V2_DEFAULT_MODEL,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
             "fork_turns": "none",
         }),
         /*child_response_delay*/ None,
@@ -2231,32 +2233,20 @@ async fn spawned_v2_no_history_child_uses_final_model_default_instructions() -> 
     .await?;
 
     let child_request = wait_for_child_request(&child_request_log).await?;
-    assert_eq!(child_request.body_json()["model"], V2_DEFAULT_MODEL);
+    assert_eq!(child_request.body_json()["model"], model);
+    if let Some(reasoning_effort) = reasoning_effort {
+        assert_eq!(
+            child_request.body_json()["reasoning"]["effort"],
+            reasoning_effort.as_str()
+        );
+    }
     let final_model_info = bundled_models_response()?
         .models
         .into_iter()
-        .find(|model| model.slug == V2_DEFAULT_MODEL)
+        .find(|model_info| model_info.slug == model)
         .expect("final child model should exist in the bundled catalog");
     let expected_instructions = render_model_instructions(&final_model_info);
-    let child_body = child_request.body_json();
-    let sent_instructions = child_body["instructions"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            child_body["input"].as_array().and_then(|items| {
-                items.iter().find_map(|item| {
-                    (item["role"] == "developer")
-                        .then(|| item["content"].as_array())
-                        .flatten()
-                        .and_then(|content| {
-                            content
-                                .iter()
-                                .find_map(|entry| entry["text"].as_str().map(str::to_string))
-                        })
-                })
-            })
-        })
-        .expect("child request should carry resolved base instructions");
+    let sent_instructions = child_request.instructions_text();
     assert_eq!(sent_instructions, expected_instructions);
     assert_ne!(sent_instructions, "parent config base instructions");
 
@@ -2508,15 +2498,21 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
     Ok(())
 }
 
-#[test_case(None, false, true; "encrypted")]
-#[test_case(None, true, true; "plaintext")]
-#[test_case(Some("gpt-5.6-luna"), false, false; "luna encrypted leaf")]
-// Merge-safety anchor: a recognized V2-unmarked child model must inherit collaboration from its V2 parent rather than become a leaf.
-#[test_case(Some("gpt-5.5"), false, true; "unspecified gpt 5.5 inherits v2")]
+// Merge-safety anchor: a recognized V2-unmarked child model inherits collaboration from its V2 parent; explicit identity changes use fresh no-history children.
+#[test_case(None, None, Some(ReasoningEffort::Ultra), Some("medium"), false, ThreadHistoryMode::Legacy, true; "encrypted")]
+#[test_case(None, None, Some(ReasoningEffort::Ultra), Some("medium"), true, ThreadHistoryMode::Paginated, true; "plaintext")]
+#[test_case(Some("gpt-5.6-luna"), None, Some(ReasoningEffort::Ultra), Some("medium"), false, ThreadHistoryMode::Legacy, false; "luna encrypted leaf")]
+#[test_case(Some("gpt-5.5"), Some(ReasoningEffort::High), Some(ReasoningEffort::Ultra), Some("high"), false, ThreadHistoryMode::Paginated, true; "unspecified gpt 5.5 inherits v2")]
+#[test_case(None, None, Some(ReasoningEffort::Persistent), Some("disabled"), false, ThreadHistoryMode::Paginated, true; "inherited persistent effort")]
+#[test_case(None, None, None, None, false, ThreadHistoryMode::Legacy, true; "unknown model without effort default")]
 #[tokio::test]
 async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     model: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
+    parent_reasoning_effort: Option<ReasoningEffort>,
+    expected_reasoning_effort: Option<&str>,
     plaintext: bool,
+    history_mode: ThreadHistoryMode,
     expects_collaboration_tools: bool,
 ) -> Result<()> {
     let output: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
@@ -2545,6 +2541,9 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     if let Some(model) = model {
         spawn_args["model"] = json!(model);
         spawn_args["fork_turns"] = json!("none");
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        spawn_args["reasoning_effort"] = json!(reasoning_effort);
     }
     let spawn_args = serde_json::to_string(&spawn_args)?;
     let mut spawn_event = ev_function_call_with_namespace(
@@ -2594,8 +2593,10 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
         "koffing"
     };
     let mut builder = test_codex()
+        .with_history_mode(history_mode)
         .with_model(parent_model)
         .with_config(move |config| {
+            config.model_reasoning_effort = parent_reasoning_effort;
             config
                 .features
                 .enable(Feature::Collab)
@@ -2614,8 +2615,31 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     let test = builder.build(&server).await?;
     let root_thread_id = test.session_configured.thread_id;
 
-    test.submit_turn(TURN_1_PROMPT).await?;
-
+    test.submit_text_turn(TURN_1_PROMPT).await?;
+    test.codex.ensure_rollout_materialized().await;
+    test.codex.flush_rollout().await?;
+    let rollout = codex_rollout::RolloutRecorder::get_rollout_history(
+        &test.codex.rollout_path().expect("parent rollout path"),
+    )
+    .await?;
+    let settings = rollout
+        .get_rollout_items()
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(completed)) => match &completed.item {
+                TurnItem::SubAgentActivity(activity) if activity.id == SPAWN_CALL_ID => {
+                    Some((activity.model.clone(), activity.reasoning_effort.clone()))
+                }
+                _ => None,
+            },
+            RolloutItem::EventMsg(EventMsg::SubAgentActivity(activity))
+                if activity.event_id == SPAWN_CALL_ID =>
+            {
+                Some((activity.model.clone(), activity.reasoning_effort.clone()))
+            }
+            _ => None,
+        })
+        .expect("persisted spawn activity");
     // The response mock records candidate requests before its request matcher runs, so wait for
     // the child request instead of assuming the latest recorded request is already it.
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -2632,6 +2656,25 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
         }
         sleep(Duration::from_millis(10)).await;
     };
+    let child_body = child_request.body_json();
+    let expected_settings = (
+        Some(model.unwrap_or(parent_model)),
+        expected_reasoning_effort,
+    );
+    assert_eq!(
+        (
+            settings.0.as_deref(),
+            settings.1.as_ref().map(ReasoningEffort::as_str),
+        ),
+        expected_settings,
+    );
+    assert_eq!(
+        (
+            child_body["model"].as_str(),
+            child_body["reasoning"]["effort"].as_str(),
+        ),
+        expected_settings,
+    );
     let content = if plaintext {
         vec![json!({
             "type": "input_text",
@@ -3075,6 +3118,8 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         assert_eq!(
             completed_item,
             &SubAgentActivityItem {
+                model: None,
+                reasoning_effort: None,
                 id: format!("subagent-completed-{child_turn_id}"),
                 kind: SubAgentActivityKind::Completed,
                 agent_thread_id: child_thread_id,
@@ -3091,8 +3136,12 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     Ok(())
 }
 
+#[test_case(false; "live")]
+#[test_case(true; "reloaded_sleep")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> Result<()> {
+async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn(
+    reload_sleeping_worker: bool,
+) -> Result<()> {
     const SPAWN_WORKER_PROMPT: &str = "spawn the completion-routing worker";
     const SPAWN_REQUESTER_PROMPT: &str = "spawn the completion-routing requester";
     const READ_RESULT_PROMPT: &str = "read the completion-routing worker result";
@@ -3174,7 +3223,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
 
     submit_turn_with_trigger(&test, SPAWN_WORKER_PROMPT, "automation_cron_scheduled").await?;
     let worker_thread_id = created_threads.recv().await?;
-    let worker_thread = test.thread_manager.get_thread(worker_thread_id).await?;
+    let mut worker_thread = test.thread_manager.get_thread(worker_thread_id).await?;
     wait_for_event(worker_thread.as_ref(), |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -3292,7 +3341,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
     })
     .await;
 
-    let worker_followup_turn_id = worker_followup_request
+    let mut worker_followup_turn_id = worker_followup_request
         .requests()
         .into_iter()
         .find_map(|request| {
@@ -3314,6 +3363,52 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
             })
         })
         .expect("worker follow-up model request");
+    if reload_sleeping_worker {
+        worker_thread.shutdown_and_wait().await?;
+        test.thread_manager.remove_thread(&worker_thread_id).await;
+        test.thread_manager
+            .ensure_multi_agent_v2_child_loaded(worker_thread_id)
+            .await?;
+        worker_thread = test.thread_manager.get_thread(worker_thread_id).await?;
+        // Simulate the extension restoring durable sleep; Core owns the
+        // queue-only wake and completion routing exercised below.
+        worker_thread
+            .thread_extension_data()
+            .insert(codex_extension_items::sleep::SleepItem {
+                id: "peer-worker-sleep".to_string(),
+                duration_ms: 60_000,
+            });
+        let wake_request = mount_sse_once_match(
+            &server,
+            |request: &wiremock::Request| body_contains(request, "wake sleeping peer work"),
+            sse(vec![
+                ev_response_created("resp-peer-worker-wake"),
+                ev_assistant_message("msg-peer-worker-wake", "peer follow-up finished"),
+                ev_completed("resp-peer-worker-wake"),
+            ]),
+        )
+        .await;
+        worker_thread
+            .submit(Op::InterAgentCommunication {
+                communication: codex_protocol::protocol::InterAgentCommunication::new(
+                    codex_protocol::AgentPath::root(),
+                    codex_protocol::AgentPath::try_from("/root/worker").expect("worker path"),
+                    Vec::new(),
+                    "wake sleeping peer work".to_string(),
+                    /*trigger_turn*/ false,
+                ),
+                start_options: TurnStartOptions::default(),
+            })
+            .await?;
+        worker_followup_turn_id =
+            wait_for_event_match(worker_thread.as_ref(), |event| match event {
+                EventMsg::TurnComplete(completed) => Some(completed.turn_id.clone()),
+                _ => None,
+            })
+            .await;
+        let request = wake_request.single_request();
+        assert_parent_turn(&request.body_json(), Some(&requester_turn_id))?;
+    }
     let completed = timeout(
         Duration::from_secs(5),
         wait_for_event_match(requester_thread.as_ref(), |event| match event {
@@ -3323,6 +3418,7 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
                     TurnItem::SubAgentActivity(activity)
                         if activity.kind == SubAgentActivityKind::Completed
                             && activity.agent_thread_id == worker_thread_id
+                            && activity.id == format!("subagent-completed-{worker_followup_turn_id}")
                 ) =>
             {
                 Some(completed.clone())
@@ -3340,6 +3436,8 @@ async fn multi_agent_v2_peer_followup_completion_notifies_initiating_turn() -> R
             requester_thread_id,
             requester_turn_id,
             SubAgentActivityItem {
+                model: None,
+                reasoning_effort: None,
                 id: format!("subagent-completed-{worker_followup_turn_id}"),
                 kind: SubAgentActivityKind::Completed,
                 agent_thread_id: worker_thread_id,

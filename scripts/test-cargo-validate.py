@@ -105,7 +105,6 @@ class CargoValidateTests(unittest.TestCase):
             "codex-rmcp-client": "rmcp-client",
             "codex-sandboxing": "sandboxing",
             "codex-secrets": "secrets",
-            "codex-shell-escalation": "shell-escalation",
             "codex-skills": "skills",
             "codex-test-binary-support": "test-binary-support",
             "codex-terminal-detection": "terminal-detection",
@@ -1859,7 +1858,6 @@ class CargoValidateTests(unittest.TestCase):
             ("codex-memories-read", "codex-rs/memories/read/Cargo.toml"),
             ("codex-mermaid", "codex-rs/mermaid/Cargo.toml"),
             ("codex-secrets", "codex-rs/secrets/Cargo.toml"),
-            ("codex-shell-escalation", "codex-rs/shell-escalation/Cargo.toml"),
             ("codex-skills", "codex-rs/skills/Cargo.toml"),
             (
                 "codex-terminal-detection",
@@ -3642,7 +3640,6 @@ class CargoValidateTests(unittest.TestCase):
         for excluded_package in (
             "codex-bwrap",
             "codex-linux-sandbox",
-            "codex-shell-escalation",
             "codex-windows-sandbox-service",
         ):
             self.assertIn(("--exclude", excluded_package), argument_pairs)
@@ -3910,7 +3907,6 @@ class CargoValidateTests(unittest.TestCase):
             "codex-rs/file-search/Cargo.toml",
             "codex-rs/uds/Cargo.toml",
             "codex-rs/linux-sandbox/Cargo.toml",
-            "codex-rs/shell-escalation/Cargo.toml",
         )
         file_args = tuple(
             argument for file_path in files for argument in ("--file", file_path)
@@ -3927,13 +3923,11 @@ class CargoValidateTests(unittest.TestCase):
             "codex-file-search",
             "codex-uds",
             "codex-linux-sandbox",
-            "codex-shell-escalation",
         )
         wsl_runtime_packages = {
             "codex-file-search",
             "codex-uds",
             "codex-linux-sandbox",
-            "codex-shell-escalation",
         }
 
         for plan in plans.values():
@@ -5393,11 +5387,19 @@ class CargoValidateTests(unittest.TestCase):
 
     def test_upstream_sync_bazel_inputs_select_existing_lock_check(self) -> None:
         for file_path in (
+            ".bazelrc",
+            ".bazelversion",
+            "bazel/rules/BUILD.bazel",
+            "bazel/rules/runtime_package.bzl",
+            "codex-rs/BUILD.bazel",
             "defs.bzl",
             "patches/BUILD.bazel",
+            "patches/mxc-sdk_utf8_resources.patch",
             "patches/rules_rs_rust_debug_modes.patch",
             "patches/rules_rs_workspace_package_version.patch",
             "patches/rules_rust_compiler_thp.patch",
+            "patches/rules_rust_process_wrapper_param_file.patch",
+            "patches/rules_rust_release_build_script_profile.patch",
             "patches/v8_bazel_rules.patch",
             "third_party/v8/BUILD.bazel",
             "third_party/v8/gnu_libcxx_shared_exception_symbols.txt",
@@ -5474,13 +5476,23 @@ class CargoValidateTests(unittest.TestCase):
 
     def test_upstream_sync_external_inputs_remain_classification_only(self) -> None:
         for file_path in (
+            ".github/actions/build-bazel-package-binaries/action.yml",
+            ".github/actions/build-bazel-release/action.yml",
+            ".github/actions/build-cargo-package-binaries/action.yml",
+            ".github/actions/build-codex-packages/action.yml",
+            ".github/actions/setup-bazel-ci/action.yml",
             ".github/actions/setup-ci/action.yml",
+            ".github/actions/setup-rusty-v8/action.yml",
+            ".github/actions/windows-code-sign/action.yml",
+            ".github/scripts/build-codex-package-archive.sh",
             ".github/scripts/check_github_canary.py",
             ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
             ".github/scripts/macos-signing/sign_macos_code.sh",
+            ".github/scripts/macos-signing/test_sign_macos_cli_package.py",
             ".github/scripts/npm_alpha_tag.py",
             ".github/scripts/publish_r2_release.py",
             ".github/scripts/releases.py",
+            ".github/scripts/run-bazel-ci.sh",
             ".github/scripts/select_windows_bazel_targets.py",
             ".github/scripts/test_releases.py",
             ".github/scripts/test_select_windows_bazel_targets.py",
@@ -5494,8 +5506,23 @@ class CargoValidateTests(unittest.TestCase):
             ".github/workflows/rust-ci.yml",
             ".github/workflows/rust-release.yml",
             ".github/workflows/rust-release-argument-comment-lint.yml",
+            ".github/workflows/rust-release-windows.yml",
             "codex-rs/.cargo/audit.toml",
             "codex-rs/deny.toml",
+            "codex-rs/docs/bazel.md",
+            "codex-rs/docs/protocol_v1.md",
+            "scripts/codex_package/README.md",
+            "scripts/codex_package/cli.py",
+            "scripts/codex_package/dotslash.py",
+            "scripts/codex_package/layout.py",
+            "scripts/codex_package/smoke_tests/fixtures.py",
+            "scripts/codex_package/smoke_tests/test_codex_package.py",
+            "scripts/codex_package/symbols.py",
+            "scripts/codex_package/targets.py",
+            "scripts/codex_package/test_layout.py",
+            "scripts/install/install.ps1",
+            "sdk/python/docs/api-reference.md",
+            "sdk/python/tests/test_app_server_turn_controls.py",
             "sdk/typescript/src/exec.ts",
             "sdk/typescript/src/index.ts",
             "sdk/typescript/src/thread.ts",
@@ -5509,6 +5536,8 @@ class CargoValidateTests(unittest.TestCase):
             "tools/argument-comment-lint/wrapper_common.py",
             "CHANGELOG.md",
             "third_party/v8/README.md",
+            "third_party/voice/BUILD.bazel",
+            "third_party/voice/native.bzl",
         ):
             with self.subTest(file_path=file_path):
                 plan = self.plan_json("--file", file_path, "--mode", "standard")

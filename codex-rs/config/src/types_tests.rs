@@ -2,6 +2,7 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+// Merge-safety anchor: remembered safety choices retain typed defaults, invalid-choice rejection, and TOML round-trip coverage.
 fn safety_buffering_preferences_default_and_round_trip() {
     let defaults: Tui = toml::from_str("").unwrap();
     assert_eq!(defaults.safety_buffering_last_choice, None);
@@ -27,6 +28,60 @@ fn safety_buffering_preferences_default_and_round_trip() {
         assert_eq!(toml::from_str::<Tui>(&serialized).unwrap(), tui);
     }
     assert!(toml::from_str::<Tui>("safety_buffering_last_choice = 'learn-more'").is_err());
+}
+
+#[test]
+fn plugin_activation_inherits_defaults_without_explicit_enablement() {
+    for default_enabled in [None, Some(false), Some(true)] {
+        let default_config = default_enabled.map_or_else(String::new, |enabled| {
+            format!("[_default]\nenabled = {enabled}\n")
+        });
+        let config: PluginsConfigToml = toml::from_str(&format!(
+            r#"{default_config}
+["empty@market"]
+["mcp@market".mcp_servers.example]
+enabled = false
+["approval@market".mcp_servers.example]
+default_tools_approval_mode = "approve"
+["enabled@market"]
+enabled = true
+["disabled@market"]
+enabled = false
+"#
+        ))
+        .expect("plugin activation config");
+        assert_eq!(
+            [
+                "empty@market",
+                "mcp@market",
+                "approval@market",
+                "enabled@market",
+                "disabled@market"
+            ]
+            .map(|plugin_id| config.plugins[plugin_id].enabled),
+            [None, None, None, Some(true), Some(false)],
+        );
+        assert_eq!(
+            [
+                "missing@market",
+                "empty@market",
+                "mcp@market",
+                "approval@market",
+                "enabled@market",
+                "disabled@market"
+            ]
+            .map(|plugin_id| config.allows_plugin(plugin_id)),
+            match default_enabled {
+                None => [true, true, true, true, true, true],
+                Some(false) => [false, false, false, false, true, false],
+                Some(true) => [true, true, true, true, true, false],
+            },
+        );
+        let round_trip: PluginsConfigToml =
+            toml::from_str(&toml::to_string(&config).expect("serialize plugin config"))
+                .expect("deserialize plugin config");
+        assert_eq!(round_trip, config);
+    }
 }
 
 #[test]

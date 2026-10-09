@@ -668,20 +668,16 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         ]
     );
     assert!(Arc::ptr_eq(&before.turn, &after.turn));
-    assert_eq!(
-        turn.to_turn_context_item().summary,
-        ReasoningSummary::Concise
-    );
-    // Even after the live update, an already-captured request retains its own
-    // summary setting in the durable context.
+    // Merge-safety anchor: prepared rollover keeps frozen request settings separate from the native persisted-summary placeholder and renders a fresh captured-step replacement baseline.
+    // Request settings stay captured above; upstream durable context intentionally records only the retired summary placeholder.
     for step in [&before, &during, &after] {
-        let world_state = session
+        session
             .record_context_updates_and_set_reference_context_item(step)
             .await
             .expect("record captured settings");
         assert_eq!(
             session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
+            Some(ReasoningSummary::None),
         );
         let cancellation_token = CancellationToken::new();
         let prepared_handoff = crate::compact_handoff::prepare_pre_compact_handoff(
@@ -691,13 +687,19 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
         )
         .await
         .expect("prepare boundary-only handoff");
+        let world_state = Arc::new(
+            session
+                .build_world_state_for_step(step, /*new_window*/ true)
+                .await
+                .expect("build fresh replacement world state from captured settings"),
+        );
         session
             .start_new_context_window_with_prepared_handoff(step, world_state, prepared_handoff)
             .await
             .expect("start new context window");
         assert_eq!(
             session.reference_context_item().await.unwrap().summary,
-            step.settings.reasoning_summary,
+            Some(ReasoningSummary::None),
         );
     }
     assert_eq!(after.settings.model_info.as_ref(), &expected_destination);
@@ -1079,11 +1081,8 @@ async fn activation_must_match_the_retained_turn_authority(change: ManagedPolicy
     model_info.slug = "step-settings-policy-destination".to_string();
     let mut selected = current.selected().clone();
     selected.collaboration_mode.settings.model = model_info.slug.clone();
-    let destination = ResolvedStepSettings::new(
-        Arc::new(selected),
-        Arc::new(model_info),
-        session.features.enabled(Feature::FastMode),
-    );
+    let destination =
+        ResolvedStepSettings::new(Arc::new(selected), Arc::new(model_info), &session.features);
     let mut live = session.state.lock().await.session_configuration.clone();
     live.original_config_do_not_use = Arc::clone(&prepared.config);
     assert_eq!(

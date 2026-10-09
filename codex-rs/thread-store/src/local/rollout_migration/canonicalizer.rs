@@ -348,6 +348,7 @@ impl LegacyRolloutCanonicalizer {
             writer,
             timestamp,
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id,
                 root_turn_id: None,
                 trace_id: None,
@@ -377,6 +378,7 @@ impl LegacyRolloutCanonicalizer {
             writer,
             timestamp,
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id,
                 last_agent_message: None,
                 error: None,

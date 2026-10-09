@@ -8,6 +8,8 @@ use crate::context::ContextualUserFragment;
 use crate::context::multi_agent_mode_instructions::MultiAgentModeInstructions;
 use crate::context::multi_agent_mode_instructions::bounded_mode_and_explanation;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::models::ContentItemMetadata;
+use codex_protocol::models::ContentItemNamespace;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -32,6 +34,8 @@ pub(crate) struct MultiAgentModeState {
     explanation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage_hint_hash: Option<WorldStateHash>,
+    #[serde(skip)]
+    namespace: Option<ContentItemNamespace>,
 }
 
 impl MultiAgentModeState {
@@ -41,6 +45,7 @@ impl MultiAgentModeState {
                 mode: None,
                 explanation: None,
                 usage_hint_hash: None,
+                namespace: None,
             };
         };
         let (mode, explanation) =
@@ -49,7 +54,13 @@ impl MultiAgentModeState {
             mode: Some(mode),
             explanation,
             usage_hint_hash: None,
+            namespace: None,
         }
+    }
+
+    pub(crate) fn with_namespace(mut self, namespace: ContentItemNamespace) -> Self {
+        self.namespace = Some(namespace);
+        self
     }
 
     pub(crate) fn with_usage_hint(mut self, usage_hint: &MultiAgentUsageHintState) -> Self {
@@ -98,8 +109,12 @@ impl WorldStateSection for MultiAgentModeState {
             }
         };
 
-        let fragment = MultiAgentModeInstructions::new(mode, explanation.as_deref())
-            .map(|instructions| Box::new(instructions) as Box<dyn ContextualUserFragment>);
+        let fragment =
+            MultiAgentModeInstructions::new(mode, explanation.as_deref()).map(|instructions| {
+                Box::new(
+                    instructions.with_metadata(ContentItemMetadata::tool(self.namespace.clone())),
+                ) as Box<dyn ContextualUserFragment>
+            });
         (
             Some(self.clone()),
             WorldStateUpdate::optional_boxed_fragment(fragment),

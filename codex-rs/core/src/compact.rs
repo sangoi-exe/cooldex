@@ -8,10 +8,13 @@ use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::compact_handoff::PreparedPreCompactHandoff;
 use crate::compact_handoff::prepare_pre_compact_handoff;
+use crate::context::BaseInstructionsFragment;
 use crate::context::CompactionSummary;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
+use crate::context::world_state::split_prefix_updates;
+use crate::context_manager::updates::merge_world_state_updates;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -43,6 +46,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ResponseInputItem;
@@ -62,23 +66,6 @@ use tracing::error;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
-
-/// Controls whether compaction replacement history must include initial context.
-///
-/// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
-/// clear `reference_context_item`, so the next regular turn will fully reinject initial context
-/// after compaction.
-///
-/// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
-/// compaction summary as the last item in history after mid-turn compaction; we therefore inject
-/// initial context into the replacement history just above the last real user message.
-pub(crate) enum InitialContextInjection {
-    BeforeLastUserMessage {
-        world_state: Arc<WorldState>,
-        step_context: Arc<StepContext>,
-    },
-    DoNotInject,
-}
 
 // Merge-safety anchor: prepared auto-compaction reserves recovery/durability before
 // persistence while the completed response supplies upstream provenance.
@@ -129,38 +116,47 @@ impl From<CompactedHistoryMetadata> for CompactedHistoryInstallation {
     }
 }
 
-// Merge-safety anchor: rendered context keeps its captured snapshot and explicit prepared-window IDs paired through installation.
-pub(crate) async fn build_compaction_initial_context(
+// Merge-safety anchor: rendered replacement context keeps its captured snapshot and reserved window identity paired through durable installation.
+/// Renders the window prefix and ordinary context with their comparison baseline.
+pub(crate) async fn build_compaction_replacement_history(
     sess: &Session,
-    initial_context_injection: &InitialContextInjection,
+    step_context: &StepContext,
+    world_state: &WorldState,
     window_ids: AutoCompactWindowIds,
-) -> (Vec<ResponseItemEnvelope>, Option<WorldStateSnapshot>) {
-    // Return the rendered state with its items so history and its baseline stay identical.
-    match initial_context_injection {
-        InitialContextInjection::BeforeLastUserMessage {
-            world_state,
-            step_context,
-        } => {
-            let (items, snapshot) = sess
-                .build_initial_context_with_world_state_for_window(
-                    step_context,
-                    world_state.as_ref(),
-                    window_ids,
-                )
-                .await;
-            (
-                items.into_iter().map(ResponseItemEnvelope::new).collect(),
-                Some(snapshot),
-            )
-        }
-        InitialContextInjection::DoNotInject => (Vec::new(), None),
-    }
+    compacted_history: Vec<ResponseItemEnvelope>,
+) -> (Vec<ResponseItemEnvelope>, WorldStateSnapshot) {
+    let (updates, snapshot) = sess
+        .build_initial_context_with_world_state_for_window(step_context, world_state, window_ids)
+        .await;
+    let (prefix, context) = split_prefix_updates(updates);
+    let context = merge_world_state_updates(context);
+    (
+        assemble_compaction_history(compacted_history, prefix, context),
+        snapshot,
+    )
+}
+
+fn assemble_compaction_history(
+    compacted_history: Vec<ResponseItemEnvelope>,
+    prefix: Vec<ResponseItem>,
+    context: Vec<ResponseItem>,
+) -> Vec<ResponseItemEnvelope> {
+    let history = insert_initial_context_before_last_real_user_or_summary(
+        compacted_history,
+        context.into_iter().map(ResponseItemEnvelope::new).collect(),
+    );
+    prefix
+        .into_iter()
+        .map(ResponseItemEnvelope::new)
+        .chain(history)
+        .collect()
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
-    initial_context_injection: InitialContextInjection,
+    replacement_step_context: Arc<StepContext>,
+    world_state: Arc<WorldState>,
     reason: CompactionReason,
     phase: CompactionPhase,
     cancellation_token: &CancellationToken,
@@ -181,11 +177,15 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         step_context,
+        replacement_step_context,
         input,
-        initial_context_injection,
-        CompactionTrigger::Auto,
-        reason,
-        phase,
+        world_state,
+        CompactionTurnMetadata::new(
+            CompactionTrigger::Auto,
+            reason,
+            CompactionImplementation::Responses,
+            phase,
+        ),
         cancellation_token,
     )
     .await?;
@@ -194,45 +194,42 @@ pub(crate) async fn run_inline_auto_compact_task(
 
 pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
-    turn_context: Arc<TurnContext>,
+    step_context: Arc<StepContext>,
+    world_state: Arc<WorldState>,
     input: Vec<UserInput>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
-    let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), cancellation_token)
-        .await?;
-    sess.emit_turn_started(turn_context.as_ref()).await;
     run_compact_task_inner(
         sess,
+        Arc::clone(&step_context),
         step_context,
         input,
-        InitialContextInjection::DoNotInject,
-        CompactionTrigger::Manual,
-        CompactionReason::UserRequested,
-        CompactionPhase::StandaloneTurn,
+        world_state,
+        CompactionTurnMetadata::new(
+            CompactionTrigger::Manual,
+            CompactionReason::UserRequested,
+            CompactionImplementation::Responses,
+            CompactionPhase::StandaloneTurn,
+        ),
         cancellation_token,
     )
     .await?;
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "compaction preserves explicit input, trigger, reason, phase, and cancellation ownership"
-)]
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
+    replacement_step_context: Arc<StepContext>,
     input: Vec<UserInput>,
-    initial_context_injection: InitialContextInjection,
-    trigger: CompactionTrigger,
-    reason: CompactionReason,
-    phase: CompactionPhase,
+    world_state: Arc<WorldState>,
+    compaction_metadata: CompactionTurnMetadata,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = Arc::clone(&step_context.turn);
-    let compaction_metadata =
-        CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
+    let trigger = compaction_metadata.trigger();
+    let reason = compaction_metadata.reason();
+    let phase = compaction_metadata.phase();
     let attempt = CompactionAnalyticsAttempt::begin(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -263,8 +260,9 @@ async fn run_compact_task_inner(
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         step_context,
+        replacement_step_context,
         input,
-        initial_context_injection,
+        world_state,
         compaction_metadata,
         prepared_handoff,
         cancellation_token,
@@ -311,11 +309,16 @@ async fn run_compact_task_inner(
     result.map(|_| ())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "local compaction keeps frozen source, replacement context, prepared handoff, and cancellation ownership explicit"
+)]
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
+    replacement_step_context: Arc<StepContext>,
     input: Vec<UserInput>,
-    initial_context_injection: InitialContextInjection,
+    world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
     prepared_handoff: PreparedPreCompactHandoff,
     cancellation_token: &CancellationToken,
@@ -331,26 +334,36 @@ async fn run_compact_task_inner_impl(
     let mut history = frozen_history.clone();
     history.record_items(
         &[initial_input_for_turn.into()],
-        turn_context.model_info().truncation_policy.into(),
+        step_context.settings.model_info.truncation_policy.into(),
     );
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
-    // request tracking) survives retries within this compact turn.
-    let mut client_session = sess.services.model_client.new_session();
+    // Merge-safety anchor: local summarization reuses one operation-local maintenance session across retries without consuming or publishing the normal turn's transport state.
+    let mut client_session = sess.services.model_client.new_maintenance_session();
     let compaction_response = loop {
         // Clone is required because of the loop
         let mut turn_input = history
             .clone()
-            .for_prompt(&turn_context.model_info().input_modalities);
+            .for_prompt(&step_context.settings.model_info.input_modalities);
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);
         let turn_input_len = turn_input.len();
+        let base_instructions = if turn_input
+            .iter()
+            .any(BaseInstructionsFragment::matches_item)
+        {
+            BaseInstructions {
+                text: String::new(),
+                provenance: None,
+            }
+        } else {
+            sess.get_prompt_base_instructions().await
+        };
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_prompt_base_instructions().await,
+            base_instructions,
             cyber_access_program: turn_context.cyber_access_program,
             ..Default::default()
         };
@@ -359,7 +372,7 @@ async fn run_compact_task_inner_impl(
             .await;
         let attempt_result = drain_to_completed(
             &sess,
-            turn_context.as_ref(),
+            step_context.as_ref(),
             &mut client_session,
             &responses_metadata,
             &prompt,
@@ -450,23 +463,18 @@ async fn run_compact_task_inner_impl(
     }
     let (window_number, window_ids) = sess.prepare_auto_compact_window().await;
 
-    let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection, window_ids)
-            .await;
-    if !initial_context.is_empty() {
-        new_history =
-            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
-    }
-    let reference_context_item = match initial_context_injection {
-        InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
-            Some(step_context.to_turn_context_item())
-        }
-    };
+    let (new_history, world_state_baseline) = build_compaction_replacement_history(
+        sess.as_ref(),
+        &replacement_step_context,
+        &world_state,
+        window_ids,
+        new_history,
+    )
+    .await;
     sess.replace_compacted_history_for_task(
         cancellation_token,
         new_history,
-        reference_context_item,
+        replacement_step_context.to_turn_context_item(),
         world_state_baseline,
         CompactedHistoryMetadata {
             input_goal_ids,
@@ -474,13 +482,14 @@ async fn run_compact_task_inner_impl(
             window_number,
             window_ids,
             compaction_response_id: Some(compaction_response.response_id),
-            compaction_model_hash: turn_context.model_info().comp_hash.clone(),
+            compaction_model_hash: step_context.settings.model_info.comp_hash.clone(),
             reviewer_compaction_hash: None,
         }
         .with_prepared_handoff(prepared_handoff),
     )
     .await?;
-    sess.recompute_token_usage(turn_context).await;
+    sess.recompute_token_usage(&replacement_step_context.turn)
+        .await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
@@ -803,6 +812,9 @@ fn build_compacted_history_with_limit(
                 content.clone()
             } else {
                 // Rebuild only the text fallback; never clone discarded media.
+                if let Some(metadata) = &mut passthrough {
+                    metadata.content_item_metadata = None;
+                }
                 if let Some(kinds) = passthrough
                     .as_mut()
                     .and_then(|metadata| metadata.content_item_kinds.as_mut())
@@ -863,23 +875,24 @@ struct CompactionResponse {
 
 async fn drain_to_completed(
     sess: &Session,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<CompactionResponse> {
+    let turn_context = step_context.turn.as_ref();
     let mut stream = client_session
         .stream(
             prompt,
-            turn_context.model_info(),
-            &turn_context.session_telemetry,
+            &step_context.settings.model_info,
+            &step_context.session_telemetry,
             sess.reasoning_effort_for_request(
-                &turn_context.initial_settings,
+                &step_context.settings,
                 RequestEffortUsage::Compaction,
             )
             .await,
-            turn_context.reasoning_summary(),
-            turn_context.config.service_tier.clone(),
+            step_context.settings.reasoning_summary,
+            step_context.settings.service_tier.clone(),
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.

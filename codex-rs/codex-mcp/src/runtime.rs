@@ -75,6 +75,13 @@ pub enum McpStartupPolicy {
     LazyWhenCached,
 }
 
+/// A host-requested tool result and its identity in the published MCP catalog.
+pub struct McpToolCallResult {
+    pub result: CallToolResult,
+    /// None when no retained binding identifies the tool. This is not MCP wire metadata.
+    pub source_tool_namespace: Option<String>,
+}
+
 /// Configuration and owning-thread state needed to materialize an MCP runtime.
 pub struct McpRuntimeInput {
     pub startup_policy: McpStartupPolicy,
@@ -83,6 +90,7 @@ pub struct McpRuntimeInput {
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
     pub mcp_servers: HashMap<String, EffectiveMcpServer>,
     pub submit_id: String,
+    /// Unbounded sources receive abandonment notifications; bounded sources retain request-only behavior.
     pub tx_event: Option<Sender<Event>>,
     pub startup_cancellation_token: CancellationToken,
     pub runtime_context: McpRuntimeContext,
@@ -642,6 +650,18 @@ impl McpRuntime {
         self.latest_connections().list_all_tools().await
     }
 
+    pub async fn latest_read_resource(
+        &self,
+        server: &str,
+        params: ReadResourceRequestParams,
+    ) -> anyhow::Result<ReadResourceResult> {
+        self.latest_connections()
+            .read_resource(server, params)
+            .await
+    }
+
+    /// Calls a tool for the host and reports its callable namespace from the same runtime.
+    /// Missing cached identity never blocks execution; its namespace remains unknown.
     #[allow(clippy::too_many_arguments)]
     pub async fn latest_call_tool(
         &self,
@@ -652,8 +672,23 @@ impl McpRuntime {
         meta: Option<serde_json::Value>,
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
-    ) -> anyhow::Result<CallToolResult> {
-        self.latest_connections()
+    ) -> anyhow::Result<McpToolCallResult> {
+        let current = self.current.load_full();
+        // Attribution must never delay a successful call. The binding is immutable;
+        // if it does not describe this host-only tool, keep its namespace unknown.
+        let namespace = current
+            .cached_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|cached| cached.binding.upgrade())
+            .and_then(|binding| {
+                binding
+                    .tool_info(server, tool)
+                    .map(|info| info.callable_namespace.clone())
+            });
+        let result = current
+            .connections
             .call_tool(
                 server,
                 tool,
@@ -663,17 +698,11 @@ impl McpRuntime {
                 requested_timeout,
                 wait_for_server,
             )
-            .await
-    }
-
-    pub async fn latest_read_resource(
-        &self,
-        server: &str,
-        params: ReadResourceRequestParams,
-    ) -> anyhow::Result<ReadResourceResult> {
-        self.latest_connections()
-            .read_resource(server, params)
-            .await
+            .await?;
+        Ok(McpToolCallResult {
+            result,
+            source_tool_namespace: namespace,
+        })
     }
 
     pub async fn latest_wait_for_server_ready(&self, server: &str, timeout: Duration) -> bool {
@@ -778,13 +807,40 @@ impl McpRuntime {
     }
 
     pub async fn shutdown(&self) {
+        self.elicitation_router.close().await;
         self.latest_connections().shutdown().await;
     }
 }
 
+/// Opaque sandbox state forwarded unchanged to `codex sandbox --sandbox-state-json`.
+/// Servers advertise `codex/sandbox-state-meta` to receive it on tool calls.
+///
+/// `codexExecutable` is the one field servers may interpret: invoke that absolute
+/// path with `sandbox --sandbox-state-json <the original JSON object> -- <command>`.
+/// Do not deserialize and reconstruct the opaque state in a consumer: doing so
+/// can discard future policy fields. The state describes the issuing call, so a
+/// long-lived subprocess must retain its launch state and must not be reused for
+/// a different policy without an explicit lifecycle decision.
+///
+/// MCP probes the host's existing re-exec binary once to verify this contract.
+/// Standalone binaries without the capability omit it; HTTP and remote-executor
+/// servers receive no host-local path even when the host has a full CLI.
+/// Older clients omit the field and older CLI consumers ignore it when decoding.
+/// Servers that require it must fail closed or require an explicit operator
+/// opt-out, never silently search PATH or execute an unsandboxed command.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxState {
+    /// Absolute path to a full Codex CLI on the MCP server's host, supporting
+    /// `sandbox --sandbox-state-json`. Consumers may read this field to launch
+    /// the CLI, but must forward the entire state unchanged.
+    ///
+    /// Absent for older clients, embeddings without a full CLI, and transports
+    /// or remote environments where a usable server-host executable is unknown.
+    /// Also omitted when the OS path cannot be represented as a JSON string.
+    /// Absence does not authorize an unsandboxed fallback or a PATH lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_executable: Option<PathBuf>,
     pub permission_profile: PermissionProfile,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub sandbox_cwd: PathUri,
@@ -1159,6 +1215,7 @@ mod tests {
         )
         .expect("current directory should convert to a URI");
         let sandbox_state = SandboxState {
+            codex_executable: None,
             permission_profile: PermissionProfile::workspace_write(),
             codex_linux_sandbox_exe: None,
             sandbox_cwd,
@@ -1202,10 +1259,20 @@ mod tests {
         );
 
         let deserialized: SandboxState =
-            serde_json::from_value(serialized).expect("deserialize sandbox state");
+            serde_json::from_value(serialized.clone()).expect("deserialize legacy sandbox state");
+        assert_eq!(deserialized, sandbox_state);
+
+        let executable = std::env::current_exe().expect("absolute executable path");
+        let mut extended = serialized;
+        extended["codexExecutable"] = serde_json::json!(executable);
+        extended["futureField"] = serde_json::json!({"preservedByOpaqueConsumers": true});
+        let deserialized: SandboxState = serde_json::from_value(extended).expect("extended state");
         assert_eq!(
-            deserialized.permission_profile,
-            sandbox_state.permission_profile
+            deserialized,
+            SandboxState {
+                codex_executable: Some(executable),
+                ..sandbox_state
+            }
         );
     }
 

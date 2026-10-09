@@ -20,6 +20,8 @@ use image::ImageBuffer;
 use image::ImageFormat;
 use image::Rgba;
 use pretty_assertions::assert_eq;
+use serde_json::from_value;
+use serde_json::json;
 
 use super::*;
 
@@ -101,6 +103,7 @@ async fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
 
     prepare_response_items(
         "image-preparation-thread",
+        /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
         ImageResizeNoticeMode::Disabled,
@@ -137,6 +140,7 @@ async fn preparation_preserves_small_image_bytes_and_replaces_remote_urls() {
                     content_item_kinds: Some(vec![ContentItemKind(
                         "images.preparation_error".to_string()
                     )]),
+                    content_item_metadata: from_value(json!([{"harness_injected": true}])).unwrap(),
                     ..Default::default()
                 }
             ),
@@ -187,6 +191,7 @@ async fn detail_policies_apply_the_expected_budgets() {
 
         let metadata = prepare_response_items(
             "image-preparation-thread",
+            /*ephemeral*/ false,
             &mut items,
             ImagePreparationMode::DetailBased,
             ImageResizeNoticeMode::Disabled,
@@ -241,6 +246,7 @@ async fn preparation_reports_tool_output_item_id() {
     }];
     let metadata = prepare_response_items(
         "image-preparation-thread",
+        /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
         ImageResizeNoticeMode::Disabled,
@@ -278,6 +284,7 @@ async fn upload_failure_keeps_resized_image_inline() {
 
     prepare_response_items(
         "image-preparation-thread",
+        /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
         ImageResizeNoticeMode::Disabled,
@@ -379,6 +386,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
 
     prepare_response_items(
         "image-preparation-thread",
+        /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
         ImageResizeNoticeMode::Enabled,
@@ -408,6 +416,8 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
                 ContentItemKind("images.preparation_error".to_string()),
                 ContentItemKind("user.image".to_string()),
             ]),
+            content_item_metadata: from_value(json!([{}, {}, {"harness_injected": true}, {}]))
+                .unwrap(),
             ..Default::default()
         }),
     );
@@ -462,6 +472,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
                     content_item_kinds: Some(vec![ContentItemKind(
                         "images.resize_notice".to_string()
                     )]),
+                    content_item_metadata: from_value(json!([{"harness_injected": true}])).unwrap(),
                     ..Default::default()
                 },
             ),
@@ -515,6 +526,7 @@ async fn resize_notices_count_file_backed_images_and_skip_failed_images() {
                     content_item_kinds: Some(vec![ContentItemKind(
                         "images.resize_notice".to_string()
                     )]),
+                    content_item_metadata: from_value(json!([{"harness_injected": true}])).unwrap(),
                     ..Default::default()
                 },
             ),
@@ -567,6 +579,7 @@ async fn preparation_replaces_only_failed_tool_images_and_preserves_metadata() {
 
     prepare_response_items(
         "image-preparation-thread",
+        /*ephemeral*/ false,
         &mut items,
         ImagePreparationMode::DetailBased,
         ImageResizeNoticeMode::Disabled,

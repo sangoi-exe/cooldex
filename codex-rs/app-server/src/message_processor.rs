@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -397,7 +398,7 @@ impl MessageProcessor {
             outgoing.clone(),
         );
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads = Arc::new(Mutex::new(HashMap::new()));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
@@ -468,11 +469,8 @@ impl MessageProcessor {
             rpc_transport,
             Arc::clone(&user_verification),
         );
-        let marketplace_processor = MarketplaceRequestProcessor::new(
-            Arc::clone(&config),
-            config_manager.clone(),
-            Arc::clone(&thread_manager),
-        );
+        let marketplace_processor =
+            MarketplaceRequestProcessor::new(config_manager.clone(), Arc::clone(&thread_manager));
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
@@ -1614,7 +1612,8 @@ impl MessageProcessor {
                 self.catalog_processor.skills_config_write(params).await
             }
             ClientRequest::PluginInstall { params, .. } => {
-                self.plugin_processor.plugin_install(params).await
+                // Keep installation and auth setup state off the shared request dispatcher stack.
+                Box::pin(self.plugin_processor.plugin_install(params)).await
             }
             ClientRequest::PluginUninstall { params, .. } => {
                 self.plugin_processor.plugin_uninstall(params).await

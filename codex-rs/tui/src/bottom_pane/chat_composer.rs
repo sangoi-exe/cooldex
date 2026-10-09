@@ -248,7 +248,8 @@
 //! Submission flushes expired characters and buffers before classifying Enter, independent of
 //! UI flush ticks. `disable_paste_burst` bypasses detection; setting it flushes and clears in-flight state.
 //! Mouse edits flush pending typing; selection and copy behavior lives in [`mouse`]. Confirmed
-//! copies clear the selection while preserving the draft and cursor.
+//! copies clear the selection while preserving the draft and cursor. Footer text uses a separate
+//! read-only selection owner over its final rendered cells.
 //!
 //! See `codex-rs/tui/src/bottom_pane/paste_burst.rs` for the detailed state machine.
 //!
@@ -760,6 +761,7 @@ impl ChatComposer {
                 external_editor_key: default_keymap
                     .primary_hint(KeymapContext::Global, "open_external_editor"),
                 warning_notice_area: std::cell::Cell::default(),
+                selection_revision: std::cell::Cell::default(),
                 show_warnings_key: default_keymap
                     .primary_hint(KeymapContext::Global, "open_warnings"),
                 show_transcript_key: default_keymap
@@ -4137,7 +4139,7 @@ impl ChatComposer {
                     description,
                     insert_text: format!("${skill_name}"),
                     search_terms,
-                    path: Some(skill.path.to_string_lossy().into_owned()),
+                    path: Some(skill.path.as_str().to_owned()),
                     category_tag: Some("[Skill]".to_string()),
                     sort_rank: 1,
                 });
@@ -4811,6 +4813,16 @@ impl ChatComposer {
         self.footer.warning_notice_area.set(warning_area);
         if let Some((warning_area, line)) = warning_notice {
             line.render(warning_area, buf);
+        }
+        if let Some(selection) = options.rendered_selection
+            && !self.popup_active()
+            && options.footer.is_none_or(|footer| !footer.is_interactive)
+        {
+            let revision = (options.warning_count, self.footer_props().is_task_running);
+            let changed = self.footer.selection_revision.replace(revision) != revision;
+            let mut selection = selection.borrow_mut();
+            selection.register(status.intersection(buf.area), changed);
+            selection.register(footer_rect.intersection(buf.area), changed);
         }
         let style = user_message_style();
         Block::default().style(style).render(composer_rect, buf);
@@ -6886,7 +6898,7 @@ mod tests {
             short_description: None,
             interface: None,
             dependencies: None,
-            path: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs(),
+            path: test_path_buf(&format!("/tmp/{name}/SKILL.md")).abs().into(),
             scope: crate::test_support::skill_scope_user(),
             enabled: true,
             plugin_id: None,
@@ -6912,7 +6924,7 @@ mod tests {
         }
     }
 
-    fn test_plugin_summary(name: &str, description: &str) -> PluginCapabilitySummary {
+    pub(super) fn test_plugin_summary(name: &str, description: &str) -> PluginCapabilitySummary {
         PluginCapabilitySummary {
             config_name: format!("{name}@test"),
             display_name: name.to_string(),
@@ -7538,7 +7550,7 @@ mod tests {
             short_description: None,
             interface: None,
             dependencies: None,
-            path: skill_path.clone(),
+            path: skill_path.clone().into(),
             scope: crate::test_support::skill_scope_user(),
             enabled: true,
             plugin_id: None,
@@ -7583,7 +7595,7 @@ mod tests {
                 default_prompt: None,
             }),
             dependencies: None,
-            path: skill_path.clone(),
+            path: skill_path.clone().into(),
             scope: crate::test_support::skill_scope_repo(),
             enabled: true,
             plugin_id: Some("google-calendar@debug".to_string()),
@@ -7918,7 +7930,9 @@ mod tests {
                         default_prompt: None,
                     }),
                     dependencies: None,
-                    path: test_path_buf("/tmp/repo/google-calendar/SKILL.md").abs(),
+                    path: test_path_buf("/tmp/repo/google-calendar/SKILL.md")
+                        .abs()
+                        .into(),
                     scope: crate::test_support::skill_scope_repo(),
                     enabled: true,
                     plugin_id: None,

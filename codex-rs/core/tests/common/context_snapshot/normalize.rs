@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 const GUARDIAN_INSTRUCTIONS_PREFIX: &str = "You are judging one planned coding-agent action.";
+const GUARDIAN_PROVENANCE_PREFIX: &str = "# Transcript provenance\n";
 
 #[derive(Clone, Copy)]
 pub(super) enum TextSource<'a> {
@@ -298,12 +299,14 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
     let prefixes: &[(&str, &str)] = match source {
         TextSource::ModelInstructions => &[
             (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
             ("", "MODEL_INSTRUCTIONS"),
         ],
         // Merge-safety anchor: context snapshots render the transient recovery carriers by their
         // runtime markers and never revive the retired raw-recall carrier label.
         TextSource::Message("developer") => &[
             (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
             ("<post_compact_recovery>", "POST_COMPACT_RECOVERY"),
         ],
         TextSource::Message("assistant") => &[("<post_compact_handoff>", "POST_COMPACT_HANDOFF")],

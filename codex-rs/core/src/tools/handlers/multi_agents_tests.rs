@@ -342,6 +342,7 @@ async fn complete_multi_agent_v2_wait_target(
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: child_turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: Some(final_message.to_string()),
@@ -369,6 +370,7 @@ async fn error_multi_agent_v2_wait_target(
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: child_turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: None,
@@ -584,6 +586,8 @@ async fn spawn_agent_limit_failure_emits_bounded_metric() {
             ))
             .collect::<BTreeMap<_, _>>(),
         BTreeMap::from([
+            ("detail".to_string(), "registry_capacity".to_string()),
+            ("error_kind".to_string(), "agent_limit_reached".to_string()),
             ("fork_mode".to_string(), "none".to_string()),
             ("multi_agent_version".to_string(), "v1".to_string()),
             ("product_sku".to_string(), "codex".to_string()),
@@ -729,7 +733,7 @@ async fn multi_agent_v2_full_history_rejects_every_identity_override_before_spaw
         assert_eq!(
             err,
             FunctionCallError::RespondToModel(format!(
-                "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({field}) or set fork_turns to none or a positive integer"
+                "Full-history forks inherit agent_type, model, reasoning_effort, and service_tier from the parent; remove these identity overrides ({field}) or set fork_turns to none"
             ))
         );
     }
@@ -1281,7 +1285,7 @@ async fn spawn_agent_full_history_fork_inherits_root_service_tier() {
 
 // Merge-safety anchor: V2 tier fixtures use a recognized priority-capable model without a default tier so explicit selection and parent inheritance remain observable.
 #[tokio::test]
-async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
+async fn multi_agent_v2_spawn_without_history_accepts_explicit_service_tier() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         task_name: String,
@@ -1322,13 +1326,13 @@ async fn multi_agent_v2_partial_fork_accepts_explicit_service_tier() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "fork_with_tier",
-                "fork_turns": "1",
+                "task_name": "fresh_with_tier",
+                "fork_turns": "none",
                 "service_tier": ServiceTier::Fast.request_value()
             })),
         ))
         .await
-        .expect("multi-agent v2 partial fork should accept explicit service tier");
+        .expect("multi-agent v2 spawn without history should accept explicit service tier");
     let (content, _) = expect_text_output(output);
     let result: SpawnAgentResult =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
@@ -1420,7 +1424,7 @@ async fn multi_agent_v2_full_history_fork_inherits_effective_parent_service_tier
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
+async fn multi_agent_v2_spawn_without_history_allows_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
     let manager = thread_manager();
@@ -1447,17 +1451,17 @@ async fn multi_agent_v2_spawn_partial_fork_turns_allows_agent_type_override() {
             "spawn_agent",
             function_payload(json!({
                 "message": "inspect this repo",
-                "task_name": "partial_fork",
+                "task_name": "fresh_agent",
                 "agent_type": role_name,
-                "fork_turns": "1"
+                "fork_turns": "none"
             })),
         ))
         .await
-        .expect("partial fork should allow agent_type overrides");
+        .expect("fresh agent should allow agent_type overrides");
     let (content, _) = expect_text_output(output);
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
-    assert_eq!(result["task_name"], "/root/partial_fork");
+    assert_eq!(result["task_name"], "/root/fresh_agent");
     let agent_id = manager
         .captured_ops()
         .into_iter()
@@ -1673,8 +1677,9 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
             )
     }));
 
+    let step_context = StepContext::for_test(Arc::clone(&turn));
     let world_state = session
-        .build_world_state_for_step(&StepContext::for_test(Arc::clone(&turn)))
+        .build_world_state_for_step(&step_context, /*new_window*/ true)
         .await
         .expect("world state should build");
     assert_eq!(
@@ -1750,8 +1755,10 @@ async fn multi_agent_v2_spawn_rejects_legacy_fork_context() {
     );
 }
 
+#[test_case::test_case("banana"; "invalid string")]
+#[test_case::test_case("0"; "zero turns")]
 #[tokio::test]
-async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
+async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string(fork_turns: &str) {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -1775,7 +1782,7 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
             function_payload(json!({
                 "message": "inspect this repo",
                 "task_name": "worker",
-                "fork_turns": "banana"
+                "fork_turns": fork_turns
             })),
         ))
         .await
@@ -1784,49 +1791,7 @@ async fn multi_agent_v2_spawn_rejects_invalid_fork_turns_string() {
 
     assert_eq!(
         err,
-        FunctionCallError::RespondToModel(
-            "fork_turns must be `none`, `all`, or a positive integer string".to_string()
-        )
-    );
-}
-
-#[tokio::test]
-async fn multi_agent_v2_spawn_rejects_zero_fork_turns() {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let manager = thread_manager();
-    let root = manager
-        .start_thread(StartThreadOptions::new((*turn.config).clone()))
-        .await
-        .expect("root thread should start");
-    set_agent_control(&mut session, manager.agent_control());
-    session.thread_id = root.thread_id;
-    let mut config = (*turn.config).clone();
-    config
-        .features
-        .enable(Feature::MultiAgentV2)
-        .expect("test config should allow feature update");
-    set_turn_config(&mut turn, config);
-
-    let err = SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "message": "inspect this repo",
-                "task_name": "worker",
-                "fork_turns": "0"
-            })),
-        ))
-        .await
-        .err()
-        .expect("zero turn count should be rejected");
-
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "fork_turns must be `none`, `all`, or a positive integer string".to_string()
-        )
+        FunctionCallError::RespondToModel("fork_turns must be `none` or `all`".to_string())
     );
 }
 
@@ -2039,6 +2004,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status() {
         .send_event(
             child_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: child_turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: Some(final_message.clone()),
@@ -2491,6 +2457,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .send_event(
             first_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: first_turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: Some("first done".to_string()),
@@ -2533,6 +2500,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         .send_event(
             second_turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: second_turn.sub_id.clone(),
                 started_at: None,
                 last_agent_message: Some("second done".to_string()),
@@ -2808,6 +2776,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
         .send_event(
             aborted_turn.as_ref(),
             EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: None,
                 turn_id: Some(aborted_turn.sub_id.clone()),
                 started_at: None,
                 reason: TurnAbortReason::Interrupted,
@@ -5419,6 +5388,7 @@ async fn multi_agent_v2_wait_agent_condition_prioritizes_steer_over_error_final_
         session
             .steer_input(
                 &mut steer,
+                /*sender_messages*/ None,
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
@@ -5427,7 +5397,8 @@ async fn multi_agent_v2_wait_agent_condition_prioritizes_steer_over_error_final_
                 /*incoming_root_turn_id*/ None,
             )
             .await
-            .expect("new user steer should be accepted"),
+            .expect("new user steer should be accepted")
+            .0,
         turn.sub_id
     );
 
@@ -5512,6 +5483,7 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_steer_after_mailbox_act
         session
             .steer_input(
                 &mut steer,
+                /*sender_messages*/ None,
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
@@ -5520,7 +5492,8 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_steer_after_mailbox_act
                 /*incoming_root_turn_id*/ None,
             )
             .await
-            .expect("new user steer should be accepted"),
+            .expect("new user steer should be accepted")
+            .0,
         turn.sub_id
     );
 
@@ -5584,6 +5557,7 @@ async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_lat
         session
             .steer_input(
                 &mut steer,
+                /*sender_messages*/ None,
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
@@ -5592,7 +5566,8 @@ async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_lat
                 /*incoming_root_turn_id*/ None,
             )
             .await
-            .expect("new user steer should be accepted"),
+            .expect("new user steer should be accepted")
+            .0,
         turn.sub_id
     );
     session

@@ -51,13 +51,14 @@ use super::ExecCommandArgs;
 use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
-use super::shell_mode_for_environment;
 
 // A byte limit is a conservative hard token bound even for byte-fallback tokenizers.
 const EXEC_COMMAND_REJECTION_MAX_BYTES: usize = 900;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExecCommandHandlerOptions {
+    pub(crate) include_login_parameter: bool,
+    pub(crate) include_shell_parameter: bool,
     pub(crate) allow_tty: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
     pub(crate) include_environment_id: bool,
@@ -80,6 +81,8 @@ impl Default for ExecCommandHandler {
         Self {
             lifetime: ExecCommandLifetime::Interactive,
             options: ExecCommandHandlerOptions {
+                include_login_parameter: false,
+                include_shell_parameter: true,
                 allow_tty: true,
                 exec_permission_approvals_enabled: false,
                 include_environment_id: false,
@@ -113,9 +116,11 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
     fn spec(&self) -> ToolSpec {
         let spec = create_exec_command_tool_with_environment_id(
             CommandToolOptions {
+                include_login_parameter: self.options.include_login_parameter,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
             },
             self.options.include_environment_id,
+            self.options.include_shell_parameter,
             self.options.include_windows_shell_guidance,
         );
         let mut spec = match self.lifetime {
@@ -179,8 +184,9 @@ impl ExecCommandHandler {
         );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
         let turn_environment = resolve_tool_environment(
-            &step_context.environments,
+            &step_context,
             environment_args.environment_id.as_deref(),
+            "unified exec is unavailable in this session",
         )?;
         let native_environment_cwd = turn_environment.cwd().clone();
         let cwd = environment_args
@@ -250,8 +256,6 @@ impl ExecCommandHandler {
             &turn_environment.selection.environment_id,
         )
         .await;
-        let shell_mode =
-            shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         // Remote environments may use a different OS and must build commands with their native
         // shell; fall back to the session shell when the environment did not report one.
         let shell = turn_environment
@@ -278,13 +282,9 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let resolved_command = get_command(
-            &args,
-            shell,
-            &shell_mode,
-            turn_environment.config().allow_login_shell,
-        )
-        .map_err(FunctionCallError::RespondToModel)?;
+        let resolved_command =
+            get_command(&args, shell, turn_environment.config().allow_login_shell)
+                .map_err(FunctionCallError::RespondToModel)?;
         let command = resolved_command.command;
         let ExecCommandArgs {
             mut tty,
@@ -413,7 +413,6 @@ impl ExecCommandHandler {
             cwd,
             sandbox_cwd: native_environment_cwd,
             turn_environment: turn_environment.clone(),
-            shell_mode,
             network: context.step_context.turn.network.clone(),
             tty,
             sandbox_permissions: effective_additional_permissions.sandbox_permissions,

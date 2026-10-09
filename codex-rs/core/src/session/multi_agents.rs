@@ -210,7 +210,8 @@ pub(crate) fn resolve_usage_hints(
     })
 }
 
-fn resolve_usage_hints_unchecked(
+// Merge-safety anchor: legacy history recognition uses the existing renderer without revalidating activation-time identity; inherited retention is decided separately by its captured birth binding.
+pub(crate) fn resolve_usage_hints_unchecked(
     config: &MultiAgentV2Config,
     multi_agent_messages: ResolvedMultiAgentMessages<'_>,
     omit_update_plan_instructions: bool,

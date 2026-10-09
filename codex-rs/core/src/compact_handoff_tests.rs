@@ -238,6 +238,26 @@ async fn cached_recovery_packet_is_read_only_overlay_at_the_existing_boundary() 
     );
 }
 
+#[test]
+fn history_owned_base_instructions_are_not_duplicated_in_handoff_prompt() {
+    let declaration = ContextualUserFragment::into(crate::context::BaseInstructionsFragment(
+        "history-owned base sentinel".to_string(),
+    ));
+    let snapshot = pre_compact_handoff_input_snapshot_from_parts(
+        vec![declaration.clone()],
+        BaseInstructions {
+            text: "top-level base sentinel".to_string(),
+            provenance: None,
+        },
+        None,
+    )
+    .expect("history-owned declaration should remain model-visible");
+
+    assert_eq!(snapshot.input, vec![declaration]);
+    assert!(snapshot.base_instructions.text.is_empty());
+    assert_eq!(snapshot.base_instructions.provenance, None);
+}
+
 #[tokio::test]
 async fn pending_identity_without_cached_packet_neither_loads_recall_nor_mutates_state() {
     let identity = PostCompactRecoveryIdentity {
@@ -612,8 +632,8 @@ async fn stale_prepared_source_rejects_installation_before_replacement() {
     let error = session
         .replace_compacted_history(
             vec![message(None, "user", "replacement must not install").into()],
-            /*reference_context_item*/ None,
-            /*world_state_baseline*/ None,
+            step_context.to_turn_context_item(),
+            crate::context::world_state::WorldStateSnapshot::default(),
             CompactedHistoryMetadata {
                 input_goal_ids: Default::default(),
                 message: "summary".to_string(),

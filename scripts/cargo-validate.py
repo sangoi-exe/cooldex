@@ -94,8 +94,7 @@ WINDOWS_RUNTIME_RESOURCE_CONTRACT_KEYS = frozenset(
     }
 )
 WINDOWS_RUNTIME_MANIFEST_KEYS = (
-    WINDOWS_RUNTIME_CONFIG_KEYS
-    - frozenset({"minimum_free_disk_gib"})
+    WINDOWS_RUNTIME_CONFIG_KEYS - frozenset({"minimum_free_disk_gib"})
 ) | frozenset({"resource_contract", "source_materialization"})
 WINDOWS_EXECUTOR_POWERSHELL = "/mnt/c/Program Files/PowerShell/7/pwsh.exe"
 WINDOWS_EXECUTOR_HELPER_PATH = Path("scripts/cargo-validate-windows.ps1")

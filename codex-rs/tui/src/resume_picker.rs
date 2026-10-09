@@ -80,6 +80,10 @@ mod page_loading;
 #[path = "resume_picker_color_tests.rs"]
 mod color_tests;
 
+#[cfg(test)]
+#[path = "resume_picker_pagination_error_tests.rs"]
+mod pagination_error_tests;
+
 use page_loading::PageCwdFilter;
 use page_loading::PageLoadMode;
 use page_loading::PaginationState;
@@ -592,6 +596,11 @@ async fn run_session_picker_with_loader(
             Some(ev) = tui_events.next() => {
                 alt.tui.clipboard.poll();
                 let screen_size = alt.tui.screen_size_for_event(&ev)?;
+                if matches!(&ev, TuiEvent::Paste(_) | TuiEvent::FocusLost)
+                    || matches!(&ev, TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+                {
+                    state.chord_matcher.cancel();
+                }
                 let ev = if let TuiEvent::Key(key) = ev {
                     let Some(key) = state.route_key_chord(key) else {
                         continue;
@@ -1152,6 +1161,7 @@ impl PickerState {
         if let Overlay::Transcript(view) = &mut overlay {
             view.set_keymap_bindings(&self.keymap);
         }
+        self.chord_matcher.cancel();
         self.overlay = Some(overlay);
         self.pending_transcript_open = None;
         self.transcript_loading_frame_shown = false;
@@ -1526,7 +1536,19 @@ impl PickerState {
                     }));
                     return Ok(None);
                 }
-                let page = page.map_err(color_eyre::Report::from)?;
+                let page = match page {
+                    Ok(page) => page,
+                    Err(_) if !self.all_rows.is_empty() => {
+                        self.pagination.next_cursor = None;
+                        self.pending_page_down_target = None;
+                        self.frozen_footer_percent = None;
+                        self.search_state = SearchState::Idle;
+                        self.inline_error = Some("Could not load more sessions".to_string());
+                        self.request_frame();
+                        return Ok(None);
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 self.ingest_page(page);
                 self.complete_pending_page_down();
                 let completed_token = pending.search_token.or(search_token);
@@ -1560,6 +1582,7 @@ impl PickerState {
                     self.transcript_cells
                         .insert(thread_id, SessionTranscriptState::Failed);
                     if self.pending_transcript_open == Some(thread_id) {
+                        self.chord_matcher.cancel();
                         self.pending_transcript_cancellation = None;
                         self.pending_transcript_open = None;
                         self.transcript_loading_frame_shown = false;
@@ -1636,6 +1659,7 @@ impl PickerState {
     }
 
     fn apply_filter(&mut self) {
+        self.chord_matcher.cancel();
         let base_iter = self
             .all_rows
             .iter()
@@ -2074,6 +2098,7 @@ fn thread_list_params(
     use_state_db_only: bool,
 ) -> ThreadListParams {
     ThreadListParams {
+        excluded_thread_ids: None,
         originators: None,
         cursor,
         limit: Some(PAGE_SIZE as u32),
@@ -6731,6 +6756,7 @@ session_picker_view = "dense"
             name: None,
             turns: vec![codex_app_server_protocol::Turn {
                 id: String::from("turn-1"),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![
                     ThreadItem::UserMessage {
@@ -6818,6 +6844,7 @@ session_picker_view = "dense"
             name: None,
             turns: vec![codex_app_server_protocol::Turn {
                 id: String::from("turn-1"),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::Reasoning {
                     id: String::from("reasoning-1"),
@@ -6896,6 +6923,7 @@ session_picker_view = "dense"
             name: None,
             turns: vec![codex_app_server_protocol::Turn {
                 id: String::from("turn-1"),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::Reasoning {
                     id: String::from("reasoning-1"),
