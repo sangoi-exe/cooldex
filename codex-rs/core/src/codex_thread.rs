@@ -727,13 +727,13 @@ impl CodexThread {
             }
         };
         match routing_result.unwrap_or(Err(CodexErr::InternalAgentDied)) {
-            Ok(TurnInputSubmission::Started { turn_id }) => {
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => {
                 self.session.pending_user_message_admissions.complete(
                     &submission_id,
                     Ok(UserMessageAdmission::Started { turn_id }),
                 );
             }
-            Ok(TurnInputSubmission::Steered { turn_id }) => {
+            Ok(TurnInputSubmission::Steered { turn_id, .. }) => {
                 self.session.pending_user_message_admissions.complete(
                     &submission_id,
                     Ok(UserMessageAdmission::Steered { turn_id }),

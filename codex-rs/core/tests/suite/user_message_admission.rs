@@ -130,7 +130,7 @@ async fn user_message_admission_reports_steered_after_persistence() -> Result<()
         }]))
         .await?
     {
-        TurnInputSubmission::Started { turn_id } => turn_id,
+        TurnInputSubmission::Started { turn_id, .. } => turn_id,
         other => panic!("expected initial turn start, got {other:?}"),
     };
     timeout(
