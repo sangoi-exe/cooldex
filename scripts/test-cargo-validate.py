@@ -3650,7 +3650,7 @@ class CargoValidateTests(unittest.TestCase):
         self.assertIn("all() - (", filter_expression)
         sandbox_exclusion = (
             "(package(codex-windows-sandbox) & test(/(?:^|::)"
-            "(?:acl::tests|allow::tests|audit::tests|cap::tests|deny_read_acl::tests|"
+            "(?:acl::tests|allow::tests|audit::tests|cap::tests|deny_read_acl::tests|deny_read_state::tests|"
             "desktop::tests|elevated::ipc_framed::tests|elevated::runner_client::tests|"
             "file_write::tests|helper_materialization::tests|identity::tests|logging::tests|"
             "no_reparse_dir::tests|path_normalization::tests|resolved_permissions::tests|"
@@ -3710,6 +3710,7 @@ class CargoValidateTests(unittest.TestCase):
                 "piped_child_has_no_console_with_or_without_job_containment",
             ),
             "codex-windows-sandbox": (
+                "deny_read_state::tests",
                 "windows_equivalent_names_are_scrubbed_decoded_and_deduplicated",
                 "large_payload_survives_windows_process_creation",
                 "environment_child",
@@ -3733,6 +3734,9 @@ class CargoValidateTests(unittest.TestCase):
                 "powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_powershell",
                 "powershell_alias_falls_back_without_primary_runtime_over_rpc::mixed_case_powershell",
             ),
+            "codex-windows-sandbox": (
+                "deny_read_state::tests::sync_rejects_linked_state_before_changing_acls",
+            ),
         }
         neutral_tests = {
             "codex-app-server": (
@@ -3749,6 +3753,7 @@ class CargoValidateTests(unittest.TestCase):
                 "error_kind::tests::classifies_native_backend_errors",
             ),
             "codex-windows-sandbox": (
+                "deny_read_resolver::tests::exact_missing_paths_are_preserved",
                 "launch_environment::tests::only_large_payloads_use_environment_transport",
                 "environment_transport::tests::unicode_payload_roundtrips_and_stale_chunks_are_replaced",
                 "environment_transport::tests::malformed_transport_is_rejected_and_scrubbed",
