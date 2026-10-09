@@ -391,7 +391,6 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
 fn responses_api_request_serializes_max_output_tokens_when_set() -> Result<()> {
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
-        instructions: "Say hi".into(),
         input: Vec::new(),
         tools: Some(empty_tools().into()),
         tool_choice: "auto".into(),
