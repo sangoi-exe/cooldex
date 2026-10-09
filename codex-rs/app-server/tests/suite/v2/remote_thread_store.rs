@@ -246,6 +246,8 @@ async fn thread_list_repeated_cursor_returns_internal_error() -> Result<()> {
             dynamic_tools: Vec::new(),
             selected_capability_roots: Vec::new(),
             multi_agent_version: None,
+            // Merge-safety anchor: ordinary fresh fixture threads retain the explicit Resolve birth binding required by runtime creation.
+            agent_usage_hint_binding: codex_protocol::protocol::AgentUsageHintBinding::Resolve,
             history_mode: Default::default(),
             history_base: None,
             subagent_history_start_ordinal: None,

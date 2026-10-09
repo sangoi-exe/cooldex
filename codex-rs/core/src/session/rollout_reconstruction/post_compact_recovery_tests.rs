@@ -278,6 +278,7 @@ fn generic_turn_complete_without_application_does_not_consume() {
     let state = reconstruct(&[
         marked_compaction(),
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            root_turn_id: None,
             turn_id: TURN_ID.to_string(),
             last_agent_message: None,
             error: None,

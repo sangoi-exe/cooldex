@@ -297,7 +297,6 @@ async fn steered_input_checkpoint_controls_next_request(
         assert_eq!(
             test.codex.steer_turn(input, turn_id.clone()).await?,
             codex_core::SteerSubmission::Steered {
-                root_turn_id: turn_id.clone(),
                 turn_id: turn_id.clone()
             }
         );

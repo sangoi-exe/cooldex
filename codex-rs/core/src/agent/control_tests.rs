@@ -1753,6 +1753,7 @@ enabled = false
             .session
             .persist_rollout_items(&[
                 RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_attribution: None,
                     turn_id: bounded_turn_id.clone(),
                     root_turn_id: None,
                     trace_id: None,
