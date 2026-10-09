@@ -22,5 +22,9 @@ Scenario: Manual /compact with no prior user turn currently still issues a compa
 03:message/user:
     <COMPACTION_SUMMARY>
     MANUAL_EMPTY_SUMMARY
-04:message/user:
+04:message/assistant:
+    <POST_COMPACT_HANDOFF>
+05:message/developer:
+    <POST_COMPACT_RECOVERY>
+06:message/user:
     AFTER_MANUAL_EMPTY_COMPACT

@@ -180,7 +180,7 @@ async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
 }
 
 #[test_case("all", json!([[]]); "full history")]
-#[test_case("1", json!([]); "partial history")]
+#[test_case("1", json!([[]]); "legacy numeric full history")]
 #[test_case("none", json!([]); "no history")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_recall_reads_only_the_rollout_owned_by_its_history_mode(

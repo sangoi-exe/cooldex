@@ -115,7 +115,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .get("agent_type")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Agent type override for the new agent. Full-history forks reject this field; set `fork_turns` to `none` or a positive integer when an explicit override is needed.\nrole help"
+            "Agent type override for the new agent. Full-history forks reject this field; set `fork_turns` to `none` when an explicit override is needed.\nrole help"
         )
     );
     assert_eq!(
@@ -123,7 +123,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .get("fork_turns")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Optional history mode. Omitted or `all` uses a full-history fork with the parent's atomic identity and rejects identity overrides. Use `none` or a positive integer string such as `3` when an identity override is needed."
+            "Parent history to inherit. Omitted or `all` uses a full-history fork with the parent's atomic identity and rejects identity overrides. Use `none` to start without parent history when an identity override is needed. Only `all` and `none` are supported."
         )
     );
     assert_eq!(
@@ -131,7 +131,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .get("model")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Model override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+            "Model override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` when an explicit override is needed."
         )
     );
     assert_eq!(
@@ -139,7 +139,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .get("reasoning_effort")
             .and_then(|schema| schema.description.as_deref()),
         Some(
-            "Reasoning effort override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` or a positive integer when an explicit override is needed."
+            "Reasoning effort override for the new agent. Full-history forks reject this field; use `fork_turns=\"none\"` when an explicit override is needed."
         )
     );
     assert_eq!(

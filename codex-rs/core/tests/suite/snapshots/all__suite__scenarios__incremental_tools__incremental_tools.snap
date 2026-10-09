@@ -16,12 +16,13 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
-        - namespace/functions; hash=cc6e8cf0e5405f3a
+00:additional_tools/developer (2; hash=69d2e434560b532f):
+        - namespace/functions; hash=a933d3a1409bd69f
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -42,12 +43,13 @@ Settings:
 Settings: relative to window 1
   model: "updated-tools-model"
 -- request 3 (turn) --
-00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
-        - namespace/functions; hash=cc6e8cf0e5405f3a
+00:additional_tools/developer (2; hash=69d2e434560b532f):
+        - namespace/functions; hash=a933d3a1409bd69f
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image

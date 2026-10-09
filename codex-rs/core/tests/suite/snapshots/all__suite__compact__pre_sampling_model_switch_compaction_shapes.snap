@@ -44,5 +44,9 @@ Scenario: Pre-sampling compaction on model switch to a smaller context window: c
 04:message/user:
     <COMPACTION_SUMMARY>
     PRE_SAMPLING_SUMMARY
-05:message/user:
+05:message/assistant:
+    <POST_COMPACT_HANDOFF>
+06:message/developer:
+    <POST_COMPACT_RECOVERY>
+07:message/user:
     after switch

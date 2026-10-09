@@ -16,12 +16,13 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=30feffe01b108a65):
-        - namespace/functions; hash=dfb4b8684addc20d
+00:additional_tools/developer (2; hash=e74ea113947b507e):
+        - namespace/functions; hash=1c6c0855ec0f3032
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - function/new_context
           - function/get_context_remaining
@@ -51,12 +52,49 @@ Settings:
 ## Window 2 (after request 2: input diverged at item 03)
 Settings: same as window 1
 -- request 3 (turn) --
-00:additional_tools/developer (2; hash=30feffe01b108a65):
-        - namespace/functions; hash=dfb4b8684addc20d
+00:additional_tools/developer (2; hash=e74ea113947b507e):
+        - namespace/functions; hash=1c6c0855ec0f3032
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
+          - function/request_user_input
+          - function/new_context
+          - function/get_context_remaining
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+03:message/developer:
+    <context_window>
+    Agent name: /root
+    First context window id: <UUID 1>
+    Current context window id: <UUID 2>
+    Previous context window id: <UUID 1>
+    </context_window>
+04:message/user:
+    <ENVIRONMENT_CONTEXT>
+05:message/developer:
+    <POST_COMPACT_RECOVERY>
+06:message/user:
+    <ENVIRONMENT_CONTEXT>
+07:message/user:
+    Continue in the new window with incremental tools.
+
+## Window 3 (after request 3: input diverged at item 05)
+Settings: same as window 1
+-- request 4 (turn) --
+00:additional_tools/developer (2; hash=e74ea113947b507e):
+        - namespace/functions; hash=1c6c0855ec0f3032
+          - custom/exec
+          - function/wait
+          - function/exec_command
+          - function/write_stdin
+          - function/recall
           - function/request_user_input
           - function/new_context
           - function/get_context_remaining
@@ -80,7 +118,6 @@ Settings: same as window 1
     <ENVIRONMENT_CONTEXT>
 06:message/user:
     Continue in the new window with incremental tools.
--- request 4 (turn) --
 07:message/user:
     <ENVIRONMENT_CONTEXT>
 08:message/user:

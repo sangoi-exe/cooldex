@@ -49,7 +49,7 @@ Scenario: A parent spawns a child before the selected environment is configured.
 06:function_call/collaboration.spawn_agent:{"fork_turns":"none","message":"Wait for the shared workspace to become ready.","task_name":"worker"}
 07:function_call_output:{"task_name":"/root/worker"}
 
-## Window 2 (after request 2: input diverged at item 02, settings changed (tools))
+## Window 2 (after request 2: input diverged at item 02)
 -- request 3 (request; child sees the inherited starting environment) --
 00:message/developer:
     You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to c...rate with them until their goal is genuinely handled. [hash=2a3efec66e7f8963]
@@ -141,7 +141,7 @@ Scenario: A parent spawns a child before the selected environment is configured.
       <filesystem><workspace_roots><root><CWD></root></workspace_roots><permission_profile type="managed"><f...ntry></file_system></permission_profile></filesystem> [hash=e8c1de60307d0a3d]
     </environment_context>
 
-## Window 4 (after request 4: input diverged at item 02, settings changed (tools))
+## Window 4 (after request 4: input diverged at item 02)
 -- request 5 (request; parent receives the child result) --
 00:message/developer:
     You are Codex, a coding agent based on GPT-5. You and the user share one workspace, and your job is to c...rate with them until their goal is genuinely handled. [hash=2a3efec66e7f8963]

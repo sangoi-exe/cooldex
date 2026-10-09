@@ -16,15 +16,15 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=1b268a066f0cde19):
+        - namespace/functions; hash=de50a5f82a485106
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -187,15 +187,15 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 02)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
+00:additional_tools/developer (3; hash=1b268a066f0cde19):
+        - namespace/functions; hash=de50a5f82a485106
           - custom/exec
           - function/wait
           - function/request_user_input
           - function/request_user_input_async
         - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
           - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
           - function/followup_task
           - function/interrupt_agent
           - function/list_agents
@@ -304,10 +304,18 @@ Settings: same as window 1
 07:message/user:
     Summarize the kickoff notes with $notes:summarize.
 08:compaction:encrypted=true; chars=26; hash=ec5e2724e6f5f641
-09:message/user[2]:
+09:message/assistant:
+    <post_compact_handoff>
+    resume from the compacted state
+    </post_compact_handoff>
+10:message/developer:
+    <post_compact_recovery>
+    {"compaction_window_id":"<UUID 1>","boundary_item_id":"cmp_<UUID 2>","directive":"A context compaction j...","mid_turn_continuation":"resume_interrupted_turn"}} [hash=389eb8ff6bc1b51a]
+    </post_compact_recovery>
+11:message/user[2]:
     [01] Check the final kickoff brief and attached sketch with $final-check and $calendar:agenda.
     [02] <input_image:image_url>
-10:message/user:
+12:message/user:
     <skill>
     <name>final-check</name>
     <path><SKILLS_ROOT>/final-check/SKILL.md</path>
@@ -319,7 +327,7 @@ Settings: same as window 1
     Check that the brief has an owner for every action.
 
     </skill>
-11:message/user:
+13:message/user:
     <skill>
     <name>calendar:agenda</name>
     <path><PLUGINS_CACHE>/test/calendar/local/skills/agenda/SKILL.md</path>
@@ -331,7 +339,7 @@ Settings: same as window 1
     List meetings with dates and attendees.
 
     </skill>
-12:message/developer:
+14:message/developer:
     Capabilities from the `calendar` plugin:
     - Skills from this plugin are prefixed with `calendar:`.
     Use these plugin-associated capabilities to help solve the task.

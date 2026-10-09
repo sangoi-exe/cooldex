@@ -2824,7 +2824,28 @@ async fn inheriting_fork_preserves_parent_config(history_mode: ThreadHistoryMode
 
         }))
     };
-    assert_eq!(comparable(1), comparable(2));
+    let child_request = comparable(1);
+    let mut expected_child_request = comparable(2);
+    // Merge-safety anchor: the durable parent exposes recall; an ephemeral child inherits every other tool and request setting unchanged.
+    let parent_tools = expected_child_request["tools"]
+        .as_array_mut()
+        .expect("parent tools");
+    assert_eq!(
+        parent_tools
+            .iter()
+            .filter(|tool| tool["name"] == "recall")
+            .count(),
+        1,
+    );
+    parent_tools.retain(|tool| tool["name"] != "recall");
+    assert!(
+        child_request["tools"]
+            .as_array()
+            .expect("child tools")
+            .iter()
+            .all(|tool| tool["name"] != "recall")
+    );
+    assert_eq!(child_request, expected_child_request);
     assert_eq!(
         requests[1].body_json()["prompt_cache_key"],
         requests[2].body_json()["prompt_cache_key"]

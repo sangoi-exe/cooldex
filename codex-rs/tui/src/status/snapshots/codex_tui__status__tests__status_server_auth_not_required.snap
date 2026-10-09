@@ -1,11 +1,10 @@
 ---
 source: tui/src/status/tests.rs
-assertion_line: 798
 expression: rendered
 ---
 /status
 
-  >_ OpenAI Codex (v0.160.0)
+  >_ OpenAI Codex (v0.162.0)
 
   Model:           gpt-5.6-sol (reasoning none, summaries auto)
   Model provider:  server-ollama

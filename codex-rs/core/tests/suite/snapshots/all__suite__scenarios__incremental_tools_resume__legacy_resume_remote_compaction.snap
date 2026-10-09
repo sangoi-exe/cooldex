@@ -16,12 +16,13 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
-        - namespace/functions; hash=cc6e8cf0e5405f3a
+00:additional_tools/developer (2; hash=69d2e434560b532f):
+        - namespace/functions; hash=a933d3a1409bd69f
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -45,12 +46,45 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 02)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (2; hash=49f981f03ae5c5ce):
-        - namespace/functions; hash=cc6e8cf0e5405f3a
+00:additional_tools/developer (2; hash=69d2e434560b532f):
+        - namespace/functions; hash=a933d3a1409bd69f
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
+          - function/request_user_input
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/user:
+    Begin with the legacy tool prefix.
+03:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+04:message/user:
+    <ENVIRONMENT_CONTEXT>
+05:message/user:
+    Resume without moving the tool prefix.
+06:compaction:encrypted=true; chars=17; hash=6c10f5e81c1f8e16
+07:message/assistant:
+    <POST_COMPACT_HANDOFF>
+08:message/developer:
+    <POST_COMPACT_RECOVERY>
+09:message/user:
+    Continue in the new window with incremental tools.
+
+## Window 3 (after request 4: input diverged at item 07)
+Settings: same as window 1
+-- request 5 (turn) --
+00:additional_tools/developer (2; hash=69d2e434560b532f):
+        - namespace/functions; hash=a933d3a1409bd69f
+          - custom/exec
+          - function/wait
+          - function/exec_command
+          - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -68,7 +102,6 @@ Settings: same as window 1
 06:compaction:encrypted=true; chars=17; hash=6c10f5e81c1f8e16
 07:message/user:
     Continue in the new window with incremental tools.
--- request 5 (turn) --
 08:message/user:
     <ENVIRONMENT_CONTEXT>
 09:message/user:

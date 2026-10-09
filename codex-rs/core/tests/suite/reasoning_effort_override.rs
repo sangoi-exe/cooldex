@@ -175,7 +175,28 @@ pub(super) async fn prediction_fork_requests() -> anyhow::Result<Vec<ResponsesRe
             .remove("client_metadata");
         responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(body))
     };
-    assert_eq!(comparable(2), comparable(3));
+    let child = comparable(2);
+    let mut expected_child = comparable(3);
+    // Merge-safety anchor: Lite embeds tools in input; only the durable parent's recall is unavailable to the ephemeral child, leaving the full residual request equality intact.
+    assert_eq!(expected_child["input"][0]["type"], "additional_tools");
+    assert_eq!(child["input"][0]["type"], "additional_tools");
+    let parent_functions = expected_child["input"][0]["tools"]
+        .as_array_mut()
+        .expect("parent tools")
+        .iter_mut()
+        .find(|tool| tool["type"] == "namespace" && tool["name"] == "functions")
+        .expect("parent functions namespace")["tools"]
+        .as_array_mut()
+        .expect("parent function tools");
+    assert_eq!(
+        parent_functions
+            .iter()
+            .filter(|tool| tool["name"] == "recall")
+            .count(),
+        1,
+    );
+    parent_functions.retain(|tool| tool["name"] != "recall");
+    assert_eq!(child, expected_child);
     Ok(requests)
 }
 
@@ -268,15 +289,34 @@ async fn prediction_fork_pins_effort_from_parent_with_overrides_disabled(
             .remove("client_metadata");
         responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(body))
     };
-    let parent = comparable(1);
+    let mut expected_child = comparable(1);
     let mut child = comparable(2);
+    assert_eq!(expected_child["input"][0]["type"], "additional_tools");
+    assert_eq!(child["input"][0]["type"], "additional_tools");
+    // Merge-safety anchor: the parent is durable and the prediction child is ephemeral, independently of effort policy; only recall differs in their remaining tool configuration.
+    let parent_functions = expected_child["input"][0]["tools"]
+        .as_array_mut()
+        .expect("parent tools")
+        .iter_mut()
+        .find(|tool| tool["type"] == "namespace" && tool["name"] == "functions")
+        .expect("parent functions namespace")["tools"]
+        .as_array_mut()
+        .expect("parent function tools");
+    assert_eq!(
+        parent_functions
+            .iter()
+            .filter(|tool| tool["name"] == "recall")
+            .count(),
+        1,
+    );
+    parent_functions.retain(|tool| tool["name"] != "recall");
     let child_input = child["input"].as_array_mut().expect("child input");
     assert_eq!(
         child_input.pop(),
         Some(effort_update(ReasoningEffort::Medium))
     );
     assert_eq!(child_input.pop(), Some(message("user", "child turn")));
-    assert_eq!(child, parent);
+    assert_eq!(child, expected_child);
     Ok(())
 }
 

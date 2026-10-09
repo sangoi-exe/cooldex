@@ -688,9 +688,17 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
         let compact_request = &requests[1];
         let actual = [turn_request, compact_request].map(|request| {
             let body = request.body_json();
+            assert!(body.get("instructions").is_none());
+            let input = body["input"].as_array().expect("Responses request input");
+            assert!(
+                input[0]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("msg_"))
+            );
             serde_json::json!({
                 "lite_header": request.header(RESPONSES_LITE_HEADER),
                 "instructions": body.get("instructions").cloned().unwrap_or(Value::Null),
+                "base_instructions_input": responses::strip_response_item_ids_from_json(input[0].clone()),
                 "has_top_level_tools": body
                     .get("tools")
                     .and_then(Value::as_array)
@@ -717,7 +725,15 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
         let expected = [
             serde_json::json!({
                 "lite_header": null,
-                "instructions": "test instructions",
+                "instructions": null,
+                "base_instructions_input": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "test instructions"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["model.base_instructions"],
+                    },
+                },
                 "has_top_level_tools": true,
                 "has_additional_tools_input": false,
                 "parallel_tool_calls": true,
@@ -725,7 +741,15 @@ async fn gpt_5_6_family_uses_full_responses_for_turn_and_compaction() -> Result<
             }),
             serde_json::json!({
                 "lite_header": null,
-                "instructions": "test instructions",
+                "instructions": null,
+                "base_instructions_input": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "test instructions"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["model.base_instructions"],
+                    },
+                },
                 "has_top_level_tools": true,
                 "has_additional_tools_input": false,
                 "parallel_tool_calls": true,

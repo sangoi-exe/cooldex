@@ -54,6 +54,10 @@ Scenario: Pre-turn auto-compaction uses the prior context without the incoming u
 05:message/user:
     <COMPACTION_SUMMARY>
     PRE_TURN_SUMMARY
-06:message/user[2]:
+06:message/assistant:
+    <POST_COMPACT_HANDOFF>
+07:message/developer:
+    <POST_COMPACT_RECOVERY>
+08:message/user[2]:
     [01] <input_image:detail,image_url>
     [02] USER_THREE

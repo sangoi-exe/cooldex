@@ -2465,7 +2465,7 @@ async fn full_history_spawn_inherits_active_step_identity() -> Result<()> {
 async fn tool_messages_follow_mid_turn_model_changes() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    const FULL_HISTORY_IDENTITY_GUIDANCE: &str = "Full-history forks (`fork_turns` omitted or set to `all`) inherit the parent agent type, provider, model, reasoning effort, reasoning summary, base instructions, developer instructions, and service tier as one identity. They reject `agent_type`, `model`, `reasoning_effort`, and `service_tier` overrides. Use `fork_turns=\"none\"` or a positive integer when an identity override is needed.";
+    const FULL_HISTORY_IDENTITY_GUIDANCE: &str = "Full-history forks (`fork_turns` omitted or set to `all`) inherit the parent agent type, provider, model, reasoning effort, reasoning summary, base instructions, developer instructions, and service tier as one identity. They reject `agent_type`, `model`, `reasoning_effort`, and `service_tier` overrides. Use `fork_turns=\"none\"` when an identity override is needed.";
     const MULTI_AGENT_TOOLS: [&str; 6] = [
         "spawn_agent",
         "send_message",

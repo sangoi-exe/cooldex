@@ -16,6 +16,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -242,9 +243,12 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
         phase: None,
     };
     let (recording, _) = session.record_delivered_assistant_message(message.clone());
+    // Production captures recognized standalone deliveries before steering, even without sender provenance.
+    let sender_messages = capture_sender_user_messages(&session, &mut input).await;
+    assert_eq!(sender_messages.is_some(), standalone_output);
     let mut steering = Box::pin(session.steer_input(
         &mut input,
-        /*sender_messages*/ None,
+        sender_messages.as_ref(),
         additional_context.clone(),
         Some(&turn_context.sub_id),
         /*required_final_output_json_schema*/ None,
@@ -326,11 +330,12 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
     // A second accepted same-map submission must not enqueue the fragments again.
     for retry in 0..2 {
         input = original_input.clone();
+        let sender_messages = capture_sender_user_messages(&session, &mut input).await;
         assert_eq!(
             session
                 .steer_input(
                     &mut input,
-                    /*sender_messages*/ None,
+                    sender_messages.as_ref(),
                     additional_context.clone(),
                     Some(&replacement.sub_id),
                     /*required_final_output_json_schema*/ None,
@@ -397,6 +402,7 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
                             content_item_kinds: Some(vec![ContentItemKind(format!(
                                 "additional_content.{key}"
                             ))]),
+                            content_item_metadata: Some(vec![ContentItemMetadata::harness()]),
                             ..Default::default()
                         },
                     ),

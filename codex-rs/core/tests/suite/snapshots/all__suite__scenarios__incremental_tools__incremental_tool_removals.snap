@@ -16,13 +16,14 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=7748a53142f449b7):
-        - namespace/functions; hash=124fee69a69ed6b2
+00:additional_tools/developer (3; hash=d0da7f7f79571906):
+        - namespace/functions; hash=9c7e4599a41cfa81
           - function/exec_command
           - function/write_stdin
           - function/list_mcp_resources
           - function/list_mcp_resource_templates
           - function/read_mcp_resource
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image

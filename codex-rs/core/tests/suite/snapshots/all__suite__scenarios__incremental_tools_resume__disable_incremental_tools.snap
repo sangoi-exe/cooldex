@@ -16,10 +16,11 @@ Settings:
   text: {"verbosity":"low"}
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=44f4cad2ce4ab17d):
-        - namespace/functions; hash=101d32aa59ea258b
+00:additional_tools/developer (2; hash=9f4e1d7d60dbb752):
+        - namespace/functions; hash=71c1426dd82d0a42
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -47,8 +48,37 @@ Settings:
 ## Window 2 (after request 3: input diverged at item 00)
 Settings: same as window 1
 -- request 4 (turn) --
-00:additional_tools/developer (2; hash=2155c287c22bb8e8):
-        - namespace/functions; hash=cc7ea9ff03477840
+00:additional_tools/developer (2; hash=83237cbe1d634ab1):
+        - namespace/functions; hash=257933ffe7ce9d2b
+          - function/recall
+          - function/request_user_input
+          - custom/apply_patch
+          - function/view_image
+        - tool_search: # Tool discovery  Searches over deferred tool metadata with BM25 and exposes matching tools for t...; args=[limit, query]; hash=400cd6ac61d524a9
+01:message/developer:
+    <MODEL_INSTRUCTIONS>
+02:message/user:
+    Begin with all tools.
+03:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+04:message/user:
+    <ENVIRONMENT_CONTEXT>
+05:message/user:
+    Disable incremental tools and remove shell tools in the existing window.
+06:compaction:encrypted=true; chars=17; hash=6c10f5e81c1f8e16
+07:message/assistant:
+    <POST_COMPACT_HANDOFF>
+08:message/developer:
+    <POST_COMPACT_RECOVERY>
+09:message/user:
+    Continue in the new window.
+
+## Window 3 (after request 4: input diverged at item 07)
+Settings: same as window 1
+-- request 5 (turn) --
+00:additional_tools/developer (2; hash=83237cbe1d634ab1):
+        - namespace/functions; hash=257933ffe7ce9d2b
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -66,7 +96,6 @@ Settings: same as window 1
 06:compaction:encrypted=true; chars=17; hash=6c10f5e81c1f8e16
 07:message/user:
     Continue in the new window.
--- request 5 (turn) --
 08:message/user:
     <ENVIRONMENT_CONTEXT>
 09:message/user:
