@@ -3692,15 +3692,8 @@ class CargoValidateTests(unittest.TestCase):
             ),
             "codex-app-server": ("setup_validates_permissions_before_provisioning",),
             "codex-cli": ("restrictive_launcher_uses_embedded_if_daemon_cannot_start",),
-            "codex-core": (
-                "windows_elevated_approved_git_pull_preserves_deny_read",
-                "windows_elevated_powershell_preserves_relative_paths",
-                "windows_sandbox_cli_preserves_managed_deny_reads_across_launches",
-                "windows_elevated_unified_exec_enforces_large_recursive_deny_reads",
-            ),
             "codex-exec-server": (
                 "file_system_elevated_relative_read_denial_uses_policy_cwd",
-                "powershell_alias_falls_back_without_primary_runtime_over_rpc",
             ),
             "codex-rmcp-client": (
                 "local_stdio_initializes_without_a_console_directly_and_through_cmd",
@@ -3729,10 +3722,6 @@ class CargoValidateTests(unittest.TestCase):
             "codex-exec-server": (
                 "file_system_elevated_relative_read_denial_uses_policy_cwd::local",
                 "file_system_elevated_relative_read_denial_uses_policy_cwd::remote",
-                "powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_pwsh",
-                "powershell_alias_falls_back_without_primary_runtime_over_rpc::uppercase_pwsh",
-                "powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_powershell",
-                "powershell_alias_falls_back_without_primary_runtime_over_rpc::mixed_case_powershell",
             ),
             "codex-windows-sandbox": (
                 "deny_read_state::tests::sync_rejects_linked_state_before_changing_acls",
@@ -3744,6 +3733,10 @@ class CargoValidateTests(unittest.TestCase):
             ),
             "codex-core": (
                 "session::tests::turn_start_mcp_tests::turn_start_refreshes_dirty_mcp_reuses_clean_runtime_and_cancels_discovery",
+            ),
+            "codex-exec-server": (
+                "exec_process_starts_and_exits::local",
+                "exec_process_starts_and_exits::remote",
             ),
             "codex-hooks": (
                 "events::session_end::tests::session_end_matches_other_reason",
@@ -3777,6 +3770,35 @@ class CargoValidateTests(unittest.TestCase):
                 ("affected", selected_filter),
             ):
                 with self.subTest(package=package, selection=selection):
+                    if package == "codex-core":
+                        self.assertIn(
+                            "(package(codex-core) & binary(=windows_sandbox))",
+                            expression,
+                        )
+                        self.assertNotIn(
+                            "windows_elevated_temp_only_core_and_direct_spawn_enforce_carveouts",
+                            expression,
+                        )
+                    if package == "codex-exec-server":
+                        self.assertIn(
+                            "(package(codex-exec-server) & binary(=exec_process) & test(/^windows_sandbox::/))",
+                            expression,
+                        )
+                        self.assertNotIn(
+                            "(package(codex-exec-server) & binary(=exec_process))",
+                            expression,
+                        )
+                        for test_name in (
+                            "windows_sandbox::powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_pwsh",
+                            "windows_sandbox::powershell_alias_falls_back_without_primary_runtime_over_rpc::uppercase_pwsh",
+                            "windows_sandbox::powershell_alias_falls_back_without_primary_runtime_over_rpc::lowercase_powershell",
+                            "windows_sandbox::powershell_alias_falls_back_without_primary_runtime_over_rpc::mixed_case_powershell",
+                            "windows_sandbox::tmpdir_uses_command_environment_over_rpc::mxc",
+                            "windows_sandbox::tmpdir_uses_command_environment_over_rpc::elevated",
+                        ):
+                            self.assertRegex(test_name, "^windows_sandbox::")
+                        for test_name in neutral_tests[package]:
+                            self.assertNotRegex(test_name, "^windows_sandbox::")
                     prefix = f"(package({package}) & test(/(?:^|::)(?:"
                     if prefix not in expression:
                         self.assertNotIn(package, expected_tests)
