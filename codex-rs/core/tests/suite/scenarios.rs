@@ -1993,7 +1993,7 @@ async fn prediction_fork_inherits_parent_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let requests = super::reasoning_effort_override::prediction_fork_requests().await?;
     insta::assert_snapshot!(context_snapshot::format_request_history_snapshot(
-        "A parent pins high request effort, then selects low. Its ephemeral prediction fork inherits the context and baseline, then selects medium on its first turn. Continuing the parent at medium produces the same request.",
+        "A parent pins high request effort, then selects low. Its ephemeral prediction fork inherits the context and baseline, then selects medium on its first turn. Continuing the parent at medium matches the child's context, settings, and effort behavior, except that the durable parent exposes recall and its ephemeral child does not.",
         &requests,
         &ContextSnapshotOptions::default().include_request_settings(),
     ));
