@@ -193,6 +193,7 @@ fn safety_buffering_notification(
     }
 }
 
+// Merge-safety anchor: remembered safety choices, retry confirmation, and optional automatic actions remain client-owned.
 fn open_safety_buffering_retry_confirmation(
     chat: &mut ChatWidget,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,

@@ -134,6 +134,7 @@ pub fn directory_symlink_creation_supported() -> bool {
     std::fs::create_dir(&source).expect("create directory symlink probe target");
     let link = directory.path().join("link");
     let linked = std::os::windows::fs::symlink_dir(&source, &link);
+    // Merge-safety anchor: directory-symlink capability probing skips only Windows OS error 1314; unrelated errors fail loud.
     if linked
         .as_ref()
         .is_err_and(|error| error.raw_os_error() == Some(1314))

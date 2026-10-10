@@ -2630,6 +2630,7 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         1,
         "follow-up reminder should be persisted for guardian forks"
     );
+    // Merge-safety anchor: reserve the native compaction window identity before installing and publishing replacement history.
     let (window_number, window_ids) = session.prepare_auto_compact_window().await;
     session
         .replace_compacted_history(
@@ -3146,6 +3147,7 @@ async fn guardian_review_retries_transient_session_failure_then_approves() -> an
         &server,
         vec![
             // Exhaust the reviewer's one inner stream retry before testing the outer retry.
+            // Merge-safety anchor: this fixture exhausts the inner stream retry budget before asserting the distinct outer Guardian retry.
             sse_failed(
                 "resp-session-failure",
                 "server_is_overloaded",

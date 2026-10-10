@@ -1,6 +1,7 @@
 use super::*;
 use codex_app_server_protocol::TurnItemsView;
 
+// Merge-safety anchor: selected-user-file persistence updates live remembered preferences only after a successful save.
 #[tokio::test]
 async fn safety_buffering_choice_saves_selected_file_and_live_settings() -> anyhow::Result<()> {
     use codex_config::types::SafetyBufferingChoice;

@@ -266,6 +266,7 @@ fn run_cli_command(command: &mut Command) -> io::Result<Output> {
                 ));
             }
             Ok(CliCommandEvent::Exited(Ok(status))) => {
+                // Merge-safety anchor: containment teardown releases descendant-held output handles before accepting process/output quiescence.
                 cleanup.terminate()?;
                 exit_status = Some(status);
             }

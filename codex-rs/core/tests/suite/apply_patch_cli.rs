@@ -521,6 +521,7 @@ async fn apply_patch_cli_rejects_duplicate_resolved_paths() -> Result<()> {
         out.contains("apply_patch verification failed"),
         "expected verification failure: {out}"
     );
+    // Merge-safety anchor: CLI duplicate-path diagnostics retain actionable one-operation-per-path or separate-call guidance.
     assert!(
         out.contains("multiple operations target")
             && out.contains("use one operation per path or separate apply_patch calls"),

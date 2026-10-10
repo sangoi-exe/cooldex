@@ -198,6 +198,7 @@ async fn try_verify_apply_patch_args(
     for hunk in hunks {
         let path = hunk.resolve_path(&effective_cwd)?;
         if changes.contains_key(&path) {
+            // Merge-safety anchor: duplicate resolved paths retain actionable guidance to use one operation per path or separate calls.
             return Err(ParseError::InvalidPatchError(format!(
                 "multiple operations target {}; use one operation per path or separate apply_patch calls",
                 path.inferred_native_path_string()

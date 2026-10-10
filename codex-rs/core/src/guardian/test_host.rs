@@ -35,6 +35,7 @@ pub(crate) fn install(session: &Session, config: &Config) {
         codex_extension_api::empty_extension_registry(),
         Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
+            // Merge-safety anchor: the test host's instruction provider respects the configured include_global_agents_md opt-out.
             codex_home::GlobalInstructionsMode::from_include_global_agents_md(
                 config.include_global_agents_md,
             ),

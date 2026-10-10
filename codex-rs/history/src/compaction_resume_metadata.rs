@@ -47,6 +47,7 @@ pub fn resume_multi_agent_version(item: &RolloutItem) -> Option<MultiAgentVersio
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        // Merge-safety anchor: recovery-applied markers carry no runtime version; turn context and compaction metadata remain its sources.
         | RolloutItem::PostCompactRecoveryApplied(_)
         | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_)

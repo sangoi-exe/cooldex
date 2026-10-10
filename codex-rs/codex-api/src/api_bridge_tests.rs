@@ -126,6 +126,7 @@ async fn http_retry_deadline_survives_mapping_and_respects_terminal_errors() {
 
 #[test]
 fn map_api_error_distinguishes_capacity_from_slow_down() {
+    // Merge-safety anchor: headerless overload remains retryable under fork backoff policy and distinct from slow_down.
     for (code, expected, retryable) in [
         (
             "server_is_overloaded",
