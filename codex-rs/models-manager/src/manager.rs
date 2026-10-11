@@ -917,10 +917,10 @@ fn construct_model_info(
     config: &ModelsManagerConfig,
 ) -> ModelInfo {
     let model_info = if let Some(mut remote) = remote {
-        // Merge-safety anchor: catalog-resolved GPT-5.6 Sol/Terra/Luna disable Responses Lite; unrelated models retain catalog-driven behavior.
+        // Merge-safety anchor: catalog-resolved GPT-6.1 Sol and GPT-5.6 Sol/Terra/Luna disable Responses Lite; unrelated models retain catalog-driven behavior.
         if matches!(
             remote.slug.as_str(),
-            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            "gpt-6.1-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) {
             remote.use_responses_lite = false;
         }

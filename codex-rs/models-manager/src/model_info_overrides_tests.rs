@@ -13,7 +13,9 @@ use super::openai_manager_for_tests;
 use super::remote_model;
 
 #[tokio::test]
-async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
+async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_models() {
+    let mut sol_6_1 = remote_model("gpt-6.1-sol", "GPT-6.1 Sol", /*priority*/ 11);
+    sol_6_1.use_responses_lite = true;
     let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
     sol.use_responses_lite = true;
     let mut terra = remote_model("gpt-5.6-terra", "GPT-5.6 Terra", /*priority*/ 9);
@@ -22,7 +24,13 @@ async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     luna.use_responses_lite = true;
     let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 7);
     unrelated.use_responses_lite = true;
-    let candidates = [sol.clone(), terra.clone(), luna.clone(), unrelated.clone()];
+    let candidates = [
+        sol_6_1.clone(),
+        sol.clone(),
+        terra.clone(),
+        luna.clone(),
+        unrelated.clone(),
+    ];
     let config = ModelsManagerConfig::default();
     let manager = OpenAiModelsManager::new_without_cache(
         TestModelsEndpoint::with_command_auth(vec![Ok(candidates.to_vec())]),
@@ -38,6 +46,9 @@ async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     );
 
     let actual = [
+        construct_model_info_from_candidates("gpt-6.1-sol", &candidates, &config),
+        construct_model_info_from_candidates("gpt-6.1-sol-2026-10-11", &candidates, &config),
+        construct_model_info_from_candidates("openai/gpt-6.1-sol-2026-10-11", &candidates, &config),
         construct_model_info_from_candidates("gpt-5.6-sol", &candidates, &config),
         construct_model_info_from_candidates("gpt-5.6-sol-2026-07-20", &candidates, &config),
         construct_model_info_from_candidates("openai/gpt-5.6-sol-2026-07-20", &candidates, &config),
@@ -57,6 +68,13 @@ async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
         ),
         construct_model_info_from_candidates("gpt-5.6-codex-2026-07-20", &candidates, &config),
     ];
+
+    let mut expected_sol_6_1 = sol_6_1;
+    expected_sol_6_1.use_responses_lite = false;
+    let mut expected_sol_6_1_versioned = expected_sol_6_1.clone();
+    expected_sol_6_1_versioned.slug = "gpt-6.1-sol-2026-10-11".to_string();
+    let mut expected_sol_6_1_namespaced = expected_sol_6_1.clone();
+    expected_sol_6_1_namespaced.slug = "openai/gpt-6.1-sol-2026-10-11".to_string();
 
     let mut expected_sol = sol;
     expected_sol.use_responses_lite = false;
@@ -81,12 +99,14 @@ async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
 
     assert_eq!(
         [
+            manager.get_model_info("gpt-6.1-sol", &config).await,
             manager.get_model_info("gpt-5.6-sol", &config).await,
             manager.get_model_info("gpt-5.6-terra", &config).await,
             manager.get_model_info("gpt-5.6-luna", &config).await,
             manager.get_model_info("gpt-5.6-codex", &config).await,
         ],
         [
+            expected_sol_6_1.clone(),
             expected_sol.clone(),
             expected_terra.clone(),
             expected_luna.clone(),
@@ -100,6 +120,9 @@ async fn gpt_5_6_family_forces_full_responses_after_catalog_resolution() {
     assert_eq!(
         actual,
         [
+            expected_sol_6_1,
+            expected_sol_6_1_versioned,
+            expected_sol_6_1_namespaced,
             expected_sol,
             expected_sol_versioned,
             expected_sol_namespaced,
