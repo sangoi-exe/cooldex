@@ -14,6 +14,8 @@ use super::remote_model;
 
 #[tokio::test]
 async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_models() {
+    let mut astra = remote_model("gpt-6-astra", "GPT-6 Astra", /*priority*/ 12);
+    astra.use_responses_lite = true;
     let mut sol_6_1 = remote_model("gpt-6.1-sol", "GPT-6.1 Sol", /*priority*/ 11);
     sol_6_1.use_responses_lite = true;
     let mut sol = remote_model("gpt-5.6-sol", "GPT-5.6 Sol", /*priority*/ 10);
@@ -25,6 +27,7 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
     let mut unrelated = remote_model("gpt-5.6-codex", "GPT-5.6 Codex", /*priority*/ 7);
     unrelated.use_responses_lite = true;
     let candidates = [
+        astra.clone(),
         sol_6_1.clone(),
         sol.clone(),
         terra.clone(),
@@ -46,6 +49,9 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
     );
 
     let actual = [
+        construct_model_info_from_candidates("gpt-6-astra", &candidates, &config),
+        construct_model_info_from_candidates("gpt-6-astra-2026-10-11", &candidates, &config),
+        construct_model_info_from_candidates("openai/gpt-6-astra-2026-10-11", &candidates, &config),
         construct_model_info_from_candidates("gpt-6.1-sol", &candidates, &config),
         construct_model_info_from_candidates("gpt-6.1-sol-2026-10-11", &candidates, &config),
         construct_model_info_from_candidates("openai/gpt-6.1-sol-2026-10-11", &candidates, &config),
@@ -68,6 +74,13 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
         ),
         construct_model_info_from_candidates("gpt-5.6-codex-2026-07-20", &candidates, &config),
     ];
+
+    let mut expected_astra = astra;
+    expected_astra.use_responses_lite = false;
+    let mut expected_astra_versioned = expected_astra.clone();
+    expected_astra_versioned.slug = "gpt-6-astra-2026-10-11".to_string();
+    let mut expected_astra_namespaced = expected_astra.clone();
+    expected_astra_namespaced.slug = "openai/gpt-6-astra-2026-10-11".to_string();
 
     let mut expected_sol_6_1 = sol_6_1;
     expected_sol_6_1.use_responses_lite = false;
@@ -99,6 +112,7 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
 
     assert_eq!(
         [
+            manager.get_model_info("gpt-6-astra", &config).await,
             manager.get_model_info("gpt-6.1-sol", &config).await,
             manager.get_model_info("gpt-5.6-sol", &config).await,
             manager.get_model_info("gpt-5.6-terra", &config).await,
@@ -106,6 +120,7 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
             manager.get_model_info("gpt-5.6-codex", &config).await,
         ],
         [
+            expected_astra.clone(),
             expected_sol_6_1.clone(),
             expected_sol.clone(),
             expected_terra.clone(),
@@ -120,6 +135,9 @@ async fn catalog_resolved_full_responses_exceptions_preserve_raw_and_unrelated_m
     assert_eq!(
         actual,
         [
+            expected_astra,
+            expected_astra_versioned,
+            expected_astra_namespaced,
             expected_sol_6_1,
             expected_sol_6_1_versioned,
             expected_sol_6_1_namespaced,
