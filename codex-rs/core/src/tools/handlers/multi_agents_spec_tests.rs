@@ -149,8 +149,8 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
     );
     assert_eq!(
-        parameters.required.as_ref(),
-        Some(&vec!["task_name".to_string(), "message".to_string()])
+        parameters.required.as_deref(),
+        Some(["task_name".to_string(), "message".to_string()].as_slice())
     );
     assert_eq!(
         output_schema.expect("spawn_agent output schema").to_value()["required"],
@@ -368,8 +368,8 @@ fn send_message_tool_requires_message_and_has_no_output_schema() {
         Some("Relative or canonical task name to message (from spawn_agent).")
     );
     assert_eq!(
-        parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        parameters.required.as_deref(),
+        Some(["target".to_string(), "message".to_string()].as_slice())
     );
     assert_eq!(output_schema, None);
 }
@@ -409,8 +409,8 @@ fn followup_task_tool_requires_message_and_has_no_output_schema() {
     );
     assert!(!properties.contains_key("items"));
     assert_eq!(
-        parameters.required.as_ref(),
-        Some(&vec!["target".to_string(), "message".to_string()])
+        parameters.required.as_deref(),
+        Some(["target".to_string(), "message".to_string()].as_slice())
     );
     assert_eq!(output_schema, None);
 }

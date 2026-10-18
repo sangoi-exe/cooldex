@@ -118,6 +118,8 @@ impl PreCompactHandoffSource {
     fn synthesis_prompt(&self) -> Prompt {
         let mut input = self.input.clone();
         input.push(ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -396,7 +398,7 @@ impl HandoffOutputCollector {
                     unreachable!("assistant text items are messages")
                 };
                 for content_item in content {
-                    let ContentItem::OutputText { text } = content_item else {
+                    let ContentItem::OutputText { text, .. } = content_item else {
                         return Err(PreCompactHandoffFailure::UnexpectedOutput);
                     };
                     self.text.push_str(&text);

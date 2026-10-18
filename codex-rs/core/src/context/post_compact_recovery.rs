@@ -1,7 +1,9 @@
+use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::message_from_parts;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
-use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
 use codex_utils_output_truncation::approx_token_count;
 use serde::Serialize;
 
@@ -77,9 +79,17 @@ impl PostCompactRecoveryContext {
             body,
             handoff: handoff.map(PostCompactHandoffContext::new),
         };
-        let mut rendered = context.render();
+        let mut rendered = context
+            .render()
+            .into_text()
+            .expect("recovery fragments render text");
         if let Some(handoff) = context.handoff.as_ref() {
-            rendered.push_str(&handoff.render());
+            rendered.push_str(
+                &handoff
+                    .render()
+                    .into_text()
+                    .expect("handoff fragments render text"),
+            );
         }
         if rendered.len() > MAX_PACKET_BYTES || approx_token_count(&rendered) > MAX_PACKET_TOKENS {
             return Err(PostCompactRecoveryContextError::PacketCap);
@@ -103,30 +113,24 @@ impl PostCompactHandoffContext {
         }
     }
 
-    fn output_content(&self) -> Vec<ContentItem> {
-        vec![ContentItem::OutputText {
-            text: self.render(),
-        }]
-    }
-
-    // Merge-safety anchor: the transient handoff remains assistant `OutputText` with its
-    // content-kind metadata; generic contextual conversion emits input text.
+    // Merge-safety anchor: the transient handoff remains assistant `OutputText` with its producer-owned classification and attribution; generic contextual conversion emits input text.
     pub(crate) fn into_response_item(self) -> ResponseItem {
-        let role = self.role().to_string();
-        let content = self.output_content();
-        let content_kind = self.content_kind();
-        ResponseItem::Message {
-            id: None,
-            role,
-            content,
-            phase: None,
-            internal_chat_message_metadata_passthrough: Some(
-                InternalChatMessageMetadataPassthrough {
-                    content_item_kinds: Some(vec![content_kind]),
-                    ..Default::default()
-                },
-            ),
-        }
+        let content = ContentItem::OutputText {
+            text: self
+                .render()
+                .into_text()
+                .expect("handoff fragments render text"),
+            annotations: None,
+            logprobs: None,
+        };
+        message_from_parts(
+            self.role(),
+            vec![AnnotatedContent::from_parts(
+                content,
+                self.content_kind(),
+                self.content_metadata(),
+            )],
+        )
     }
 }
 
@@ -147,8 +151,8 @@ impl ContextualUserFragment for PostCompactRecoveryContext {
         (OPEN_MARKER, CLOSE_MARKER)
     }
 
-    fn body(&self) -> String {
-        self.body.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.body.clone())
     }
 }
 
@@ -169,8 +173,8 @@ impl ContextualUserFragment for PostCompactHandoffContext {
         (HANDOFF_OPEN_MARKER, HANDOFF_CLOSE_MARKER)
     }
 
-    fn body(&self) -> String {
-        self.body.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.body.clone())
     }
 }
 

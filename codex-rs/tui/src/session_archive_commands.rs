@@ -265,6 +265,7 @@ pub(super) async fn start_app_server_for_session_command(
             .await
             .wrap_err("failed to load config.toml")?;
         return Ok(AppServerSession::new(
+            crate::backend_id::BackendId::new(),
             super::connect_remote_app_server(endpoint).await?,
             ThreadParamsMode::Remote,
         )
@@ -420,6 +421,7 @@ pub(super) async fn start_app_server_for_session_command(
         .await
         .wrap_err("failed to initialize state database")?;
     let app_server = super::start_app_server(
+        crate::backend_id::BackendId::new(),
         &mut app_server_target,
         arg0_paths,
         config,

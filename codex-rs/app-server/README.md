@@ -19,6 +19,55 @@ These errors are not evidence that history is exhausted; callers can retry.
 A successful response with `nextCursor: null` still indicates exhaustion.
 Default scan-and-repair requests retain their filesystem fallback.
 
+# Shutdown admission errors
+
+When graceful shutdown rejects new work, app-server returns JSON-RPC error
+`-32600` with `data: {"reason":"serverShuttingDown"}`. Clients can use the
+reason to distinguish shutdown from other invalid requests.
+
+# Thread read state (experimental)
+
+Local durable ordinary user threads expose a `readState` on the
+`thread/read` response. `thread/list` returns `readStates`, a map from eligible
+thread IDs on the returned page to their receipts. Null (or absent on older servers)
+means durable read state is unavailable; a missing map entry means that row is
+ineligible. Ephemeral, not-yet-persisted, service and product-owned threads are
+ineligible. Shared `Thread` objects, including search and lifecycle responses,
+carry no receipts. After start, resume or fork, use `thread/read` to obtain the
+current receipt.
+Each local thread has one receipt, with the same storage ownership as the thread.
+
+A read state is `{firstUnread, revision}`. `firstUnread` is null when read,
+`{type:"threadStart"}` for an explicit unread mark (even for an empty thread),
+or `{type:"turn", turnId}` for the earliest eligible completed result.
+`revision` is an opaque string, scoped to this thread.
+
+Only newly delivered, durable, visible terminal results advance read state,
+before `turn/completed`. Every new result changes the revision, even when an
+older turn remains the first unread position. Reverting a paginated thread
+clears a removed position; explicit thread-start marks survive. Loading snapshots
+never acknowledges activity; empty threads start read and forked history does
+not publish inherited turns as new results.
+
+Enabling `initialize.capabilities.experimentalApi` permits updating read state and
+receiving its notifications.
+
+`thread/readState/update` takes `{threadId, expectedRevision, operation}`,
+where operation is `{type:"read"}` or `{type:"unread"}`.
+Use the revision of the row or transcript actually seen. An unread edit
+starts at `threadStart`; a read edit clears the position. Both require an
+exact revision match, and both conflicts return `-32600` with
+`{reason:"readStateConflict", readState:<current>}` as error data.
+Do not blindly retry: the original action may precede an unseen result or
+another window's mark. Unavailable threads fail; writes never change recency.
+
+Started, resumed or forked threads send `thread/readState/changed` alongside
+ordinary thread events; thread/unsubscribe or disconnect stops delivery.
+Clients can filter this method with the existing notification opt-out setting.
+Revisions are equality tokens, not clocks: never compare or merge them across
+threads or hosts. When concurrent responses disagree, refresh with `thread/read`.
+Offscreen threads converge on page refresh.
+
 # Guardian circuit-breaker errors
 
 Set `auto_review.circuit_break_action = "strict"` to include `TooManyDenials` in

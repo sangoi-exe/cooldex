@@ -30,10 +30,10 @@ use codex_protocol::protocol::TokenUsage;
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
+    /// Merge-safety anchor: token presence closes admission through terminal delivery while the task remains retained; cancellation only signals final-batch recording.
+    /// Reservations that have not started still accept inputs.
+    pub(crate) finishing: Option<CancellationToken>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
-    /// Merge-safety anchor: terminal finalization retains the task slot through event delivery;
-    /// exact replacement retirement stays distinct from direct interruption and cancellation.
-    pub(crate) finishing: bool,
     /// A start admitted before asynchronous preparation finishes. The ActiveTurn owner verifies
     /// this ID before task installation so cancellation cannot admit a stale task.
     pub(crate) reserved_turn_id: Option<String>,
@@ -68,8 +68,8 @@ impl Default for ActiveTurn {
     fn default() -> Self {
         Self {
             task: None,
+            finishing: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
-            finishing: false,
             reserved_turn_id: None,
             input_persisted: None,
         }

@@ -586,9 +586,13 @@ impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
 
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -597,9 +601,13 @@ fn user_msg(text: &str) -> ResponseItem {
 }
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -700,6 +708,8 @@ fn truncates_before_requested_user_message() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             call_id: "c1".to_string(),
             name: "tool".to_string(),
@@ -1029,6 +1039,10 @@ async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
 
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
+    // Resolve the model locally before waiting for the MCP lifecycle hook.
+    config.model_catalog = Some(
+        codex_models_manager::bundled_models_response().expect("bundled model catalog should load"),
+    );
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
@@ -1773,6 +1787,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
+            /*executor_capability_discovery_v2*/ None,
         )
         .await;
     let second_session = &second_thread.thread.session;
@@ -1795,6 +1810,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
+            /*executor_capability_discovery_v2*/ None,
         )
         .await;
 
@@ -1911,6 +1927,7 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 },
                 /*ready_selected_capability_roots*/ &[],
                 /*executor_capability_discovery*/ None,
+                /*executor_capability_discovery_v2*/ None,
             )
             .await;
         assert_eq!(
@@ -3064,6 +3081,8 @@ fn multi_agent_v2_interrupted_marker_uses_developer_input_message() {
     assert_eq!(
         developer_interrupted_marker(),
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {

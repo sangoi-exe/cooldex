@@ -12,6 +12,7 @@ use codex_prompts::ResolvedMultiAgentMessages;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::ContentItem;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
@@ -87,7 +88,7 @@ fn usage_hint_text_for_source(
             .clone()
             .map(MultiAgentRoleInstructions::from_agent_usage_hint_instructions)
             .map(|instructions| {
-                validate_usage_hint_rendered("agent_usage_hint_binding", &instructions.render())?;
+                validate_usage_hint_instructions("agent_usage_hint_binding", &instructions)?;
                 Ok(instructions)
             })
             .transpose();
@@ -172,7 +173,7 @@ pub(crate) fn resolve_usage_hints(
                 .then(|| MultiAgentRoleInstructions::Configured(configured.to_owned()));
             return instructions
                 .map(|instructions| {
-                    validate_usage_hint_rendered(configured_source, &instructions.render())?;
+                    validate_usage_hint_instructions(configured_source, &instructions)?;
                     Ok(instructions)
                 })
                 .transpose();
@@ -190,7 +191,7 @@ pub(crate) fn resolve_usage_hints(
             wait_agent_enabled: config.wait_agent_enabled,
             expose_model_overrides: config.expose_spawn_agent_model_overrides,
         };
-        validate_usage_hint_rendered(message_source, &instructions.render())?;
+        validate_usage_hint_instructions(message_source, &instructions)?;
         Ok(Some(instructions))
     };
 
@@ -257,7 +258,17 @@ pub(crate) fn validate_usage_hint_binding(
     };
     let instructions =
         MultiAgentRoleInstructions::from_agent_usage_hint_instructions(instructions.clone());
-    validate_usage_hint_rendered(source, &instructions.render())
+    validate_usage_hint_instructions(source, &instructions)
+}
+
+fn validate_usage_hint_instructions(
+    source: &str,
+    instructions: &MultiAgentRoleInstructions,
+) -> CodexResult<()> {
+    let ContentItem::InputText { text } = instructions.render() else {
+        unreachable!("multi-agent role instructions render input text");
+    };
+    validate_usage_hint_rendered(source, &text)
 }
 
 pub(crate) fn validate_usage_hint_rendered(source: &str, rendered: &str) -> CodexResult<()> {

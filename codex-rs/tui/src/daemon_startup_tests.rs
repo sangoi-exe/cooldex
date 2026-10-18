@@ -12,6 +12,8 @@ fn audited_overrides_allow_daemon_without_allowing_arbitrary_config() {
     for (raw, eligible) in [
         ("features.transcript_v2=true", true),
         ("features.transcript_v2=false", true),
+        ("features.app_server_websocket_compression=true", true),
+        ("features.app_server_websocket_compression=false", true),
         ("features={transcript_v2=true}", true),
         ("features.transcript_v2='true'", false),
         ("features.worktrees=true", true),
@@ -62,6 +64,7 @@ fn monorepo_wrapper_overrides_are_eligible_and_select_only_server_features() {
     let overrides = codex_utils_cli::CliConfigOverrides {
         raw_overrides: [
             "features.realtime_conversation=true",
+            "features.app_server_websocket_compression=true",
             "features.worktrees=true",
             "features.remote_models=true",
             "features.api_key_model_discovery=true",
@@ -127,6 +130,7 @@ fn daemon_launch_telemetry_records_once_on_connection_or_early_return() {
         let observations = std::cell::RefCell::new(Vec::new());
         let launch = daemon_telemetry::Launch(Some(|target: &AppServerTarget, actual: bool| {
             observations.borrow_mut().push((target.clone(), actual));
+            Vec::new()
         }));
         if connected {
             launch.record(&AppServerTarget::Embedded, connected);
@@ -154,6 +158,10 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
             "matching",
             "stale overrides",
             "conflicting client",
+            "explicit enable",
+            "managed",
+            "legacy managed",
+            "old requirements server",
             "unsupported RPC",
         ] {
             let home = TempDir::new()?;
@@ -163,19 +171,21 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
                 .build()
                 .await?;
             config.features.enable(Feature::ApiKeyModelDiscovery)?;
-            if scenario == "conflicting client" {
-                config.features.disable(Feature::ApiKeyModelDiscovery)?;
-            }
+            let cli_overrides = match scenario {
+                "matching" | "stale overrides" => Vec::new(),
+                _ => vec![(
+                    "features.api_key_model_discovery".to_string(),
+                    toml::Value::Boolean(scenario == "explicit enable"),
+                )],
+            };
             let features = [
                 Feature::ApiKeyModelDiscovery,
                 Feature::CodeModeHost,
                 Feature::AuthElicitation,
                 Feature::McpOAuthRefreshCoordination,
             ].map(|feature| {
-                let enabled = if feature == Feature::ApiKeyModelDiscovery && scenario == "stale overrides" {
+                let enabled = if feature == Feature::ApiKeyModelDiscovery && matches!(scenario, "stale overrides" | "explicit enable") {
                     false
-                } else if feature == Feature::ApiKeyModelDiscovery && scenario == "conflicting client" {
-                    true
                 } else {
                     config.features.enabled(feature)
                 };
@@ -197,16 +207,34 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
                     else {
                         continue;
                     };
-                    let response = if request.method == "initialize" {
-                        json!({"id": request.id, "result": {"userAgent": "daemon-test"}})
-                    } else {
-                        assert_eq!(request.method, "experimentalFeature/list");
-                        assert_eq!(request.params.unwrap()["threadId"], json!(null));
-                        if scenario == "unsupported RPC" {
+                    let response = match request.method.as_str() {
+                        "initialize" => {
+                            json!({"id": request.id, "result": {"userAgent": "daemon-test"}})
+                        }
+                        "config/read" => {
+                            json!({"id": request.id, "result": {"config": {}, "layers": [{
+                                "name": {"type": "legacyManagedConfigTomlFromFile"}, "config":
+                                if scenario == "legacy managed" {
+                                    json!({"features": {"api_key_model_discovery": true}})
+                                } else { json!({}) }
+                            }]}})
+                        }
+                        "configRequirements/read" if scenario == "old requirements server" => {
+                            json!({"id": request.id, "error": {"code": -32600, "message": "Invalid request: unknown variant `configRequirements/read`"}})
+                        }
+                        "configRequirements/read" => json!({"id": request.id, "result": {
+                            "requirements": if scenario == "managed" {
+                                json!({"featureRequirements": {"api_key_model_discovery": true}})
+                            } else { json!(null) }
+                        }}),
+                        "experimentalFeature/list" if scenario == "unsupported RPC" => {
                             json!({"id": request.id, "error": {"code": -32601, "message": "method not found"}})
-                        } else {
+                        }
+                        "experimentalFeature/list" => {
+                            assert_eq!(request.params.unwrap()["threadId"], json!(null));
                             json!({"id": request.id, "result": {"data": features, "nextCursor": null}})
                         }
+                        _ => panic!("unexpected request: {}", request.method),
                     };
                     socket
                         .send(Message::Text(response.to_string().into()))
@@ -214,15 +242,19 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
                         .unwrap();
                 }
             });
-            let result = daemon_startup::compatibility_warning(&target, &config).await;
+            let result =
+                daemon_startup::compatibility_warning(&target, &config, &cli_overrides).await;
             server.await?;
-            if scenario == "matching" {
+            if matches!(
+                scenario,
+                "matching" | "stale overrides" | "managed" | "legacy managed"
+            ) {
                 assert_eq!(result?, None);
                 continue;
             }
             let reason = match scenario {
-                "stale overrides" => "This session requires api_key_model_discovery to be enabled",
-                "conflicting client" => {
+                "explicit enable" => "This session requires api_key_model_discovery to be enabled",
+                "conflicting client" | "old requirements server" => {
                     "This session requires api_key_model_discovery to be disabled"
                 }
                 "unsupported RPC" => "Experimental feature request failed",
@@ -244,7 +276,7 @@ async fn daemon_feature_compatibility_respects_required_and_optional_attachment(
                         daemon_startup::FAILURE_HINT
                     )
                 );
-                if scenario == "stale overrides" {
+                if scenario == "explicit enable" {
                     insta::assert_snapshot!("daemon_feature_mismatch_error", error);
                 }
             }
@@ -312,6 +344,7 @@ async fn daemon_startup_falls_back_only_for_implicit_endpoints() -> color_eyre::
         let original_target = target.clone();
         let mut state_db = None;
         let result = start_app_server(
+            crate::backend_id::BackendId::new(),
             &mut target,
             Arg0DispatchPaths::default(),
             config,

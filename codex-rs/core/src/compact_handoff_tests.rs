@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 fn message(id: Option<ResponseItemId>, role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id,
         role: role.to_string(),
         content: vec![ContentItem::InputText {
@@ -38,10 +40,14 @@ fn message(id: Option<ResponseItemId>, role: &str, text: &str) -> ResponseItem {
 
 fn output_message(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
         id: None,
         role: role.to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
+            annotations: None,
+            logprobs: None,
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -443,6 +449,8 @@ async fn collector_ignores_reasoning_before_assistant_text() {
 #[tokio::test]
 async fn collector_discards_all_partial_text_for_invalid_or_incomplete_output() {
     let tool = ResponseItem::FunctionCall {
+        encrypted_content: None,
+        status: None,
         id: None,
         name: "shell".to_string(),
         namespace: None,
@@ -454,7 +462,7 @@ async fn collector_discards_all_partial_text_for_invalid_or_incomplete_output() 
     let unexpected = ResponseItem::AdditionalTools {
         id: None,
         role: "developer".to_string(),
-        tools: Vec::new(),
+        tools: Arc::default(),
     };
     let cases = vec![
         (

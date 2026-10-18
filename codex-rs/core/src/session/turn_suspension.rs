@@ -23,7 +23,7 @@ pub(super) async fn suspend_turn_and_shutdown(
         let Some(active_turn) = active.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
         };
-        if active_turn.finishing {
+        if active_turn.finishing.is_some() {
             return Ok(SuspendTurnOutcome::NotActive);
         }
         let Some(task) = active_turn.task.as_ref() else {
@@ -32,19 +32,6 @@ pub(super) async fn suspend_turn_and_shutdown(
         if task.kind != TaskKind::Regular {
             return Ok(SuspendTurnOutcome::UnsupportedTask);
         }
-    }
-
-    // This is a snapshot of currently loaded descendants, not a spawn-admission seal.
-    // Previously closed descendants and concurrent future spawns remain best effort.
-    if session
-        .services
-        .local_agent_runtime
-        .list_live_agent_subtree_thread_ids(session.thread_id)
-        .await?
-        .len()
-        > 1
-    {
-        return Ok(SuspendTurnOutcome::HasLiveDescendants);
     }
 
     let live_thread = session
@@ -64,7 +51,7 @@ pub(super) async fn suspend_turn_and_shutdown(
         let Some(active_turn) = active.as_ref() else {
             return Ok(SuspendTurnOutcome::NotActive);
         };
-        if active_turn.finishing {
+        if active_turn.finishing.is_some() {
             return Ok(SuspendTurnOutcome::NotActive);
         }
         let Some(task) = active_turn.task.as_ref() else {
@@ -126,6 +113,11 @@ pub(super) async fn suspend_turn_and_shutdown(
         .input_queue
         .clear_pending_for_turn_state(turn_state.as_ref())
         .await;
+
+    // The root task has stopped without a terminal event. Fence new starts and stop every
+    // other local session, even if the suspension caller disconnects during cleanup.
+    // The host owns the separate tree-cleanup wait and any persistence-writer fencing.
+    session.services.local_agent_runtime.request_shutdown();
 
     // Stop all producers before flushing their final history and closing its writer.
     // If either persistence step fails, do not report success: the current worker

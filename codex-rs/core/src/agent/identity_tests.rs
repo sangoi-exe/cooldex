@@ -259,11 +259,37 @@ fn full_history_capture_preserves_typed_hint_or_inherited_absence() {
 
 #[test]
 fn usage_hint_instruction_conversion_preserves_raw_text_and_markers() {
-    for instructions in [
-        MultiAgentRoleInstructions::unmarked("unmarked hint"),
-        MultiAgentRoleInstructions::catalog("marked hint"),
+    const LITERAL_MARKERS: &str = "<multi_agent_role>literal marker text</multi_agent_role>";
+    for (instructions, text, marked) in [
+        (
+            MultiAgentRoleInstructions::unmarked("unmarked hint"),
+            "unmarked hint",
+            false,
+        ),
+        (
+            MultiAgentRoleInstructions::catalog("marked hint"),
+            "marked hint",
+            true,
+        ),
+        (
+            MultiAgentRoleInstructions::unmarked(LITERAL_MARKERS),
+            LITERAL_MARKERS,
+            false,
+        ),
+        (
+            MultiAgentRoleInstructions::catalog(LITERAL_MARKERS),
+            LITERAL_MARKERS,
+            true,
+        ),
     ] {
         let persisted = instructions.clone().into_agent_usage_hint_instructions();
+        assert_eq!(
+            persisted,
+            AgentUsageHintInstructions {
+                text: text.to_string(),
+                marked,
+            }
+        );
         let restored =
             MultiAgentRoleInstructions::from_agent_usage_hint_instructions(persisted.clone());
 

@@ -79,6 +79,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-feedback": "feedback",
             "codex-file-search": "file-search",
             "codex-file-system": "file-system",
+            "codex-file-watcher": "file-watcher",
             "codex-git-attribution": "ext/git-attribution",
             "codex-git-utils": "git-utils",
             "codex-guardian-context": "guardian-context",
@@ -97,6 +98,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-mermaid": "mermaid",
             "codex-model-provider": "model-provider",
             "codex-models-manager": "models-manager",
+            "codex-multi-env-copy-file": "ext/multi-env-copy-file",
             "codex-mxc-sandbox": "mxc-sandbox",
             "codex-otel-trace-websocket": "otel-trace-websocket",
             "codex-protocol": "protocol",
@@ -157,6 +159,7 @@ class CargoValidateTests(unittest.TestCase):
                                 "codex-ansi-escape",
                                 "codex-cloud-client",
                                 "codex-file-search",
+                                "codex-file-watcher",
                                 "codex-git-attribution",
                                 "codex-utils-sleep-inhibitor",
                                 "codex-utils-stream-parser",
@@ -170,6 +173,11 @@ class CargoValidateTests(unittest.TestCase):
                 packages[-1]["targets"].append(
                     {"kind": ["bin"], "test": True, "doctest": False}
                 )
+            elif package_name == "codex-multi-env-copy-file":
+                packages[-1]["targets"] = [
+                    {"kind": ["lib"], "test": False, "doctest": False},
+                    {"kind": ["test"], "test": True, "doctest": False},
+                ]
 
         (self.repo_root / "codex-rs" / "core" / "src" / "config").mkdir(parents=True)
         (self.repo_root / "codex-rs" / "core" / "src" / "config" / "mod.rs").write_text(
@@ -1053,59 +1061,60 @@ class CargoValidateTests(unittest.TestCase):
             [["just", "fmt"], ["just", "write-config-schema"]], prep_commands
         )
 
-    def test_app_server_runtime_selection_uses_native_nextest_packages(self) -> None:
-        plan = self.plan_json(
-            "--file",
-            "codex-rs/app-server/tests/common/test_app_server.rs",
-            "--mode",
-            "standard",
-        )
-        commands = self.command_lines(plan)
-        self.assertIn("codex-app-server", plan["selected_packages"])
-        windows_commands = [
-            command
-            for command in plan["commands"]  # type: ignore[index]
-            if command["kind"] == "windows-nextest-packages"
-        ]
-        self.assertEqual(1, len(windows_commands))
-        windows_command = windows_commands[0]
+    def test_runtime_selection_uses_native_nextest_packages_and_binary_prerequisites(
+        self,
+    ) -> None:
         planner = load_planner_module()
         config = planner.load_config(PRODUCTION_CONFIG)
         workspace_argv = config["commands"]["windows-nextest-workspace"]["argv"]
         filter_expression = workspace_argv[workspace_argv.index("-E") + 1]
-        self.assertEqual(
-            f"(package(codex-app-server)) & ({filter_expression})",
-            windows_command["argv"][windows_command["argv"].index("-E") + 1],
-        )
-        self.assertEqual(
-            [
+        cases = (
+            (
+                "codex-rs/app-server/tests/common/test_app_server.rs",
                 "codex-app-server",
-                "codex-code-mode-host",
-                "codex-rmcp-client",
-                "codex-cli",
-            ],
-            [
-                package
-                for flag, package in zip(
-                    windows_command["argv"], windows_command["argv"][1:]
+                ["codex-code-mode-host", "codex-rmcp-client", "codex-cli"],
+            ),
+            (
+                "codex-rs/ext/multi-env-copy-file/tests/copy_file.rs",
+                "codex-multi-env-copy-file",
+                ["codex-cli"],
+            ),
+        )
+        for file_path, package_name, prerequisites in cases:
+            with self.subTest(file_path=file_path):
+                plan = self.plan_json("--file", file_path, "--mode", "standard")
+                commands = self.command_lines(plan)
+                self.assertEqual([package_name], plan["selected_packages"])
+                windows_commands = [
+                    command
+                    for command in plan["commands"]  # type: ignore[index]
+                    if command["kind"] == "windows-nextest-packages"
+                ]
+                self.assertEqual(1, len(windows_commands))
+                windows_argv = windows_commands[0]["argv"]
+                self.assertEqual(
+                    f"(package({package_name})) & ({filter_expression})",
+                    windows_argv[windows_argv.index("-E") + 1],
                 )
-                if flag == "-p"
-            ],
-        )
-        self.assertNotIn("--workspace", windows_command["argv"])
-        self.assertNotIn("--exclude", windows_command["argv"])
-        self.assertNotIn(
-            [
-                "./scripts/cargo-guard.sh",
-                "cargo",
-                "test",
-                "-p",
-                "codex-app-server",
-                "--no-fail-fast",
-            ],
-            commands,
-        )
-        self.assertIn("windows_runtime", plan)
+                self.assertEqual(
+                    [package_name, *prerequisites],
+                    [
+                        package
+                        for flag, package in zip(windows_argv, windows_argv[1:])
+                        if flag == "-p"
+                    ],
+                )
+                self.assertNotIn("--workspace", windows_argv)
+                self.assertNotIn("--exclude", windows_argv)
+                for cargo_args in (
+                    ["check", "-p", package_name, "--tests"],
+                    ["test", "-p", package_name, "--no-run"],
+                    ["test", "-p", package_name, "--no-fail-fast"],
+                ):
+                    self.assertNotIn(
+                        ["./scripts/cargo-guard.sh", "cargo", *cargo_args], commands
+                    )
+                self.assertIn("windows_runtime", plan)
 
     def test_windows_nextest_package_features_follow_selected_packages(self) -> None:
         planner = load_planner_module()
@@ -3326,6 +3335,35 @@ class CargoValidateTests(unittest.TestCase):
             projected["resource_contract"],
         )
 
+    def test_production_windows_v8_pins_match_locked_source_artifact_identities(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        runtime = tomllib.loads(PRODUCTION_CONFIG.read_text(encoding="utf-8"))[
+            "windows_runtime"
+        ]
+        # Unlike the synthetic lock in setUp, these are independently maintained source inputs.
+        planner.validate_windows_runtime_values(
+            runtime, REPO_ROOT, "production runtime"
+        )
+        checksum_path = (
+            REPO_ROOT
+            / "third_party"
+            / "v8"
+            / f"rusty_v8_{runtime['v8_version'].replace('.', '_')}.sha256"
+        )
+        checksums = {
+            filename: digest
+            for digest, filename in (
+                line.split()
+                for line in checksum_path.read_text(encoding="utf-8").splitlines()
+            )
+        }
+        for artifact in ("archive", "binding"):
+            with self.subTest(artifact=artifact):
+                filename = runtime[f"v8_{artifact}_url"].rsplit("/", 1)[1]
+                self.assertEqual(checksums[filename], runtime[f"v8_{artifact}_sha256"])
+
     def test_windows_runtime_v8_version_must_match_cargo_lock(self) -> None:
         planner = load_planner_module()
         config = self.manifest_config(
@@ -5025,10 +5063,24 @@ class CargoValidateTests(unittest.TestCase):
                 "codex-rs/core-plugin-common/src/plugin_id.rs",
                 "codex-rs/core-plugin-common/src/plugin_id_tests.rs",
             ),
+            "codex-file-watcher": (
+                "codex-rs/file-watcher/src/file_watcher_tests.rs",
+                "codex-rs/file-watcher/src/lib.rs",
+            ),
             "codex-keyring-store": (
                 "codex-rs/keyring-store/src/error_kind.rs",
                 "codex-rs/keyring-store/src/error_kind_tests.rs",
                 "codex-rs/keyring-store/src/lib.rs",
+            ),
+            "codex-multi-env-copy-file": (
+                "codex-rs/ext/multi-env-copy-file/Cargo.toml",
+                "codex-rs/ext/multi-env-copy-file/src/extension.rs",
+                "codex-rs/ext/multi-env-copy-file/src/lib.rs",
+                "codex-rs/ext/multi-env-copy-file/src/tool.rs",
+                "codex-rs/ext/multi-env-copy-file/tests/copy_file.rs",
+                "codex-rs/ext/multi-env-copy-file/tests/suite/connectivity.rs",
+                "codex-rs/ext/multi-env-copy-file/tests/suite/mod.rs",
+                "codex-rs/ext/multi-env-copy-file/tests/suite/transfers.rs",
             ),
             "codex-utils-cargo-bin": (
                 "codex-rs/utils/cargo-bin/src/executable.rs",
@@ -5416,8 +5468,13 @@ class CargoValidateTests(unittest.TestCase):
         for file_path in (
             ".bazelrc",
             ".bazelversion",
+            "bazel/extensions/codex_release_archive.bzl",
             "bazel/rules/BUILD.bazel",
             "bazel/rules/runtime_package.bzl",
+            "bazel/rules/schema_bundle.bzl",
+            "bazel/schema/BUILD.bazel",
+            "bazel/schema/tools/BUILD.bazel",
+            "bazel/schema/tools/python_codegen.py",
             "codex-rs/BUILD.bazel",
             "defs.bzl",
             "patches/BUILD.bazel",
@@ -5427,10 +5484,16 @@ class CargoValidateTests(unittest.TestCase):
             "patches/rules_rust_compiler_thp.patch",
             "patches/rules_rust_process_wrapper_param_file.patch",
             "patches/rules_rust_release_build_script_profile.patch",
+            "patches/v8_array_sort_elements_kind.patch",
             "patches/v8_bazel_rules.patch",
+            "patches/v8_module_deps.patch",
+            "sdk/python/BUILD.bazel",
             "third_party/v8/BUILD.bazel",
             "third_party/v8/gnu_libcxx_shared_exception_symbols.txt",
-            "third_party/v8/rusty_v8_150_4_0.sha256",
+            "third_party/v8/icu.BUILD.bazel",
+            "third_party/v8/libcxx.BUILD.bazel",
+            "third_party/v8/rusty_v8_152_2_0.sha256",
+            "third_party/v8/rusty_v8_152_2_0_release_manifests.sha256",
         ):
             with self.subTest(file_path=file_path):
                 plan = self.plan_json("--file", file_path, "--mode", "standard")
@@ -5503,26 +5566,33 @@ class CargoValidateTests(unittest.TestCase):
 
     def test_upstream_sync_external_inputs_remain_classification_only(self) -> None:
         for file_path in (
+            ".gitattributes",
             ".github/actions/build-bazel-package-binaries/action.yml",
             ".github/actions/build-bazel-release/action.yml",
             ".github/actions/build-cargo-package-binaries/action.yml",
             ".github/actions/build-codex-packages/action.yml",
+            ".github/actions/run-argument-comment-lint/action.yml",
             ".github/actions/setup-bazel-ci/action.yml",
             ".github/actions/setup-ci/action.yml",
             ".github/actions/setup-rusty-v8/action.yml",
             ".github/actions/windows-code-sign/action.yml",
             ".github/scripts/build-codex-package-archive.sh",
             ".github/scripts/check_github_canary.py",
+            ".github/scripts/contract_releases.py",
             ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
             ".github/scripts/macos-signing/sign_macos_code.sh",
             ".github/scripts/macos-signing/test_sign_macos_cli_package.py",
             ".github/scripts/npm_alpha_tag.py",
             ".github/scripts/publish_r2_release.py",
             ".github/scripts/releases.py",
+            ".github/scripts/resolve_exec_server_releases.py",
             ".github/scripts/run-bazel-ci.sh",
             ".github/scripts/select_windows_bazel_targets.py",
+            ".github/scripts/test_contract_releases.py",
             ".github/scripts/test_releases.py",
             ".github/scripts/test_select_windows_bazel_targets.py",
+            ".github/scripts/test_v8_canary_changes.py",
+            ".github/scripts/v8_canary_changes.py",
             ".github/scripts/windows_bazel_test_durations.tsv",
             ".github/scripts/voice_windows_tools.py",
             ".github/workflows/bazel.yml",
@@ -5533,7 +5603,10 @@ class CargoValidateTests(unittest.TestCase):
             ".github/workflows/rust-ci.yml",
             ".github/workflows/rust-release.yml",
             ".github/workflows/rust-release-argument-comment-lint.yml",
+            ".github/workflows/rust-release-provisioned-macos.yml",
             ".github/workflows/rust-release-windows.yml",
+            ".github/workflows/rusty-v8-release.yml",
+            ".github/workflows/v8-canary.yml",
             "codex-rs/.cargo/audit.toml",
             "codex-rs/deny.toml",
             "codex-rs/docs/bazel.md",
@@ -5548,8 +5621,11 @@ class CargoValidateTests(unittest.TestCase):
             "scripts/codex_package/targets.py",
             "scripts/codex_package/test_layout.py",
             "scripts/install/install.ps1",
+            "scripts/install/install.sh",
+            "scripts/install/test_install_sh.py",
             "sdk/python/docs/api-reference.md",
             "sdk/python/tests/test_app_server_turn_controls.py",
+            "sdk/python/tests/test_contract_generation.py",
             "sdk/typescript/src/exec.ts",
             "sdk/typescript/src/index.ts",
             "sdk/typescript/src/thread.ts",

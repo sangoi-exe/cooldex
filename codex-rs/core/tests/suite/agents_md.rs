@@ -21,7 +21,6 @@ use codex_home::GlobalInstructionsMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::error::CodexErrorDetails;
-use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -1897,14 +1896,11 @@ async fn root_global_instruction_provider_is_bound_per_creation_boundary() -> Re
     parent.thread.shutdown_and_wait().await?;
     let resumed = test
         .thread_manager
-        .resume_thread_with_history_and_user_instructions_provider(
-            test.config.clone(),
-            history,
-            test.thread_manager.auth_manager(),
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-            Some(excluded.clone()),
-        )
+        .start_thread(StartThreadOptions {
+            initial_history: history,
+            user_instructions_provider: Some(excluded.clone()),
+            ..StartThreadOptions::new(test.config.clone())
+        })
         .await?;
     assert_eq!(resumed.thread_id, parent_id);
     assert!(!Arc::ptr_eq(&resumed.thread, &parent.thread));

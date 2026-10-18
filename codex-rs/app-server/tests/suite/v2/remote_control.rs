@@ -48,6 +48,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::LoaderOverrides;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_install_context::LocalPackageLane;
 use codex_protocol::protocol::SessionSource;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
@@ -59,6 +60,7 @@ use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -878,6 +880,157 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
         Some(false)
     );
 
+    assert!(
+        !codex_home
+            .path()
+            .join("app-server-daemon/settings.json")
+            .exists()
+    );
+
+    Ok(())
+}
+
+// Merge-safety anchor: managed preference writes preserve settings and lifecycle locks only in the selected generic or package-lane daemon's state directory.
+#[test_case(None; "generic")]
+#[test_case(Some(LocalPackageLane::Codex); "codex_lane")]
+#[test_case(Some(LocalPackageLane::CdxDev); "cdx_dev_lane")]
+#[tokio::test]
+async fn managed_rpc_persists_unless_daemon_lock_is_busy(
+    local_package_lane: Option<LocalPackageLane>,
+) -> Result<()> {
+    use super::daemon_update_recovery::connect_daemon_client;
+    use super::daemon_update_recovery::request;
+    use super::daemon_update_recovery::spawn_server;
+    use serde_json::json;
+    use std::process::Stdio;
+
+    let home = TempDir::new()?;
+    let mut backend = BlockingRemoteControlBackend::start(home.path()).await?;
+    let socket = home.path().join("control/server.sock");
+    let mut settings_file = None;
+    let mut excluded_settings = Vec::new();
+    let initial_settings = br#"{"autoUpdateEnabled":false}"#;
+    for lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        let mut state = home.path().join("app-server-daemon");
+        if let Some(lane) = lane {
+            state = state.join(lane.package_root_component());
+        }
+        std::fs::create_dir_all(&state)?;
+        let path = state.join("settings.json");
+        std::fs::write(&path, initial_settings)?;
+        if lane == local_package_lane {
+            settings_file = Some(path);
+        } else {
+            excluded_settings.push(path);
+        }
+    }
+    let settings_file = settings_file.context("selected daemon settings")?;
+    let _server = if let Some(lane) = local_package_lane {
+        // Exercise real executable-ancestry recognition and app-server startup,
+        // rather than injecting the expected settings path into the processor.
+        let package = home
+            .path()
+            .join("packages/app-server-daemon")
+            .join(lane.package_root_component())
+            .join("releases/test");
+        std::fs::create_dir_all(package.join("bin"))?;
+        let entrypoint = if cfg!(windows) {
+            "bin/codex.exe"
+        } else {
+            "bin/codex"
+        };
+        std::fs::write(
+            package.join("codex-package.json"),
+            serde_json::to_vec(&json!({
+                "version": env!("CARGO_PKG_VERSION"), "entrypoint": entrypoint
+            }))?,
+        )?;
+        let binary = package.join(entrypoint);
+        codex_utils_cargo_bin::copy_executable(
+            &codex_utils_cargo_bin::cargo_bin("codex-app-server")?,
+            &binary,
+        )?;
+        tokio::process::Command::new(binary)
+            .args(["--listen", &format!("unix://{}", socket.display())])
+            .arg(app_test_support::DISABLE_PLUGIN_STARTUP_TASKS_ARG)
+            .arg("--managed-daemon")
+            .env("CODEX_HOME", home.path())
+            .env(
+                "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+                home.path().join("managed_config.toml"),
+            )
+            .current_dir(home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?
+    } else {
+        spawn_server(home.path(), &socket)?
+    };
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let enable = request(
+        &mut client,
+        /*id*/ 2,
+        "remoteControl/enable",
+        json!(null),
+    );
+    let enroll = async {
+        timeout(DEFAULT_TIMEOUT, backend.wait_for_enroll_request()).await??;
+        backend.complete_enrollment()
+    };
+    tokio::try_join!(enable, enroll)?;
+    let mut settings = tokio::fs::read(&settings_file).await?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&settings)?,
+        json!({"autoUpdateEnabled": false, "remoteControlEnabled": true})
+    );
+    for (id, method, ephemeral) in [
+        (3, "remoteControl/disable", true),
+        (4, "remoteControl/disable", false),
+        (5, "remoteControl/enable", true),
+    ] {
+        request(&mut client, id, method, json!({"ephemeral": ephemeral})).await?;
+        let updated = tokio::fs::read(&settings_file).await?;
+        if ephemeral {
+            assert_eq!(updated, settings);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&updated)?,
+                json!({"autoUpdateEnabled": false, "remoteControlEnabled": false})
+            );
+        }
+        settings = updated;
+    }
+    // A lifecycle operation holding daemon.lock must not block the RPC or
+    // allow it to overwrite other settings being changed by the daemon.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(settings_file.with_file_name("daemon.lock"))?;
+    lock.lock()?;
+    request(
+        &mut client,
+        /*id*/ 6,
+        "remoteControl/enable",
+        json!(null),
+    )
+    .await?;
+    assert_eq!(tokio::fs::read(&settings_file).await?, settings);
+    for path in excluded_settings {
+        assert_eq!(tokio::fs::read(path).await?, initial_settings);
+    }
     Ok(())
 }
 

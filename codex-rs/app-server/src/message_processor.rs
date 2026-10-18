@@ -163,7 +163,7 @@ pub(crate) struct MessageProcessor {
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
     project_processor: ProjectRequestProcessor,
-    remote_control_processor: RemoteControlRequestProcessor,
+    pub(super) remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
@@ -252,6 +252,8 @@ pub(crate) struct MessageProcessorArgs {
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) config: Arc<Config>,
+    /// Original project context, retained even when startup falls back to defaults.
+    pub(crate) startup_cwd: Option<std::path::PathBuf>,
     pub(crate) config_manager: ConfigManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) feedback: CodexFeedback,
@@ -278,6 +280,7 @@ impl MessageProcessor {
             analytics_events_client,
             arg0_paths,
             config,
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback,
@@ -341,20 +344,23 @@ impl MessageProcessor {
                 codex_core::CodexAppsToolsCache::default(),
                 session_source,
                 environment_manager,
-                thread_extensions(ThreadExtensionDependencies {
-                    event_sink: Arc::clone(&extension_event_sink),
-                    auth_manager: auth_manager.clone(),
-                    state_db: state_db.clone(),
-                    analytics_events_client: analytics_events_client.clone(),
-                    thread_manager: thread_manager.clone(),
-                    goal_service: Arc::clone(&goal_service),
-                    environment_manager: Arc::clone(&environment_manager_for_extensions),
-                    executor_skill_provider: Arc::clone(&executor_skill_provider),
-                    git_attribution_base_url: config.chatgpt_base_url.clone(),
-                    http_client_factory: config.http_client_factory(),
-                    queue_service: queue_service.clone(),
-                    turn_start_admission: Some(Arc::clone(&turn_start_admission)),
-                }),
+                thread_extensions(
+                    config.as_ref(),
+                    ThreadExtensionDependencies {
+                        event_sink: Arc::clone(&extension_event_sink),
+                        auth_manager: auth_manager.clone(),
+                        state_db: state_db.clone(),
+                        analytics_events_client: analytics_events_client.clone(),
+                        thread_manager: thread_manager.clone(),
+                        goal_service: Arc::clone(&goal_service),
+                        environment_manager: Arc::clone(&environment_manager_for_extensions),
+                        executor_skill_provider: Arc::clone(&executor_skill_provider),
+                        git_attribution_base_url: config.chatgpt_base_url.clone(),
+                        http_client_factory: config.http_client_factory(),
+                        queue_service: queue_service.clone(),
+                        turn_start_admission: Some(Arc::clone(&turn_start_admission)),
+                    },
+                ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
                     // Merge-safety anchor: app-server request roots bind global AGENTS.md inclusion from their effective Config; this startup provider is only the direct-manager fallback.
@@ -383,8 +389,10 @@ impl MessageProcessor {
         });
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
+            startup_cwd,
             Arc::clone(&config),
             thread_manager.get_models_manager(),
+            Arc::clone(&auth_manager),
         ));
         let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
         let turn_cost_worker =
@@ -408,6 +416,7 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
+            Arc::clone(&model_catalog),
             analytics_events_client.clone(),
         );
         let on_effective_plugins_changed =
@@ -424,6 +433,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            Arc::clone(&model_catalog),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -1521,11 +1531,17 @@ impl MessageProcessor {
             ClientRequest::ThreadRead { params, .. } => {
                 self.thread_processor.thread_read(&request_id, params).await
             }
+            ClientRequest::ThreadReadStateUpdate { params, .. } => {
+                self.thread_processor.thread_read_state_update(params).await
+            }
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
             }
             ClientRequest::ThreadItemsList { params, .. } => {
                 self.thread_processor.thread_items_list(params).await
+            }
+            ClientRequest::ThreadItemsRead { params, .. } => {
+                self.thread_processor.thread_items_read(params).await
             }
             ClientRequest::ThreadShellCommand { params, .. } => {
                 self.thread_processor
@@ -1917,3 +1933,7 @@ mod gateway_oauth_tests;
 #[cfg(test)]
 #[path = "message_processor_thread_lifecycle_tests.rs"]
 mod thread_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "message_processor_workspace_routing_tests.rs"]
+mod workspace_routing_tests;

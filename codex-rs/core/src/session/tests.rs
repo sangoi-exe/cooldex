@@ -315,6 +315,7 @@ impl StepContext {
             selected_capability_roots: Vec::new(),
             executor_capability_discovery: None,
             extension_data: codex_extension_api::ExtensionData::new(turn.sub_id.clone()),
+            executor_capability_discovery_v2: None,
             mcp: Arc::new(codex_mcp::McpBinding::empty(mcp_config_for_test(
                 &turn.config,
             ))),
@@ -345,6 +346,8 @@ mod guardian_tests;
 
 fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -384,7 +387,7 @@ fn assign_missing_response_item_ids_assigns_additional_tools_ids() {
     let items = Cow::Owned(vec![ResponseItem::AdditionalTools {
         id: None,
         role: "developer".to_string(),
-        tools: Vec::new(),
+        tools: Arc::from([]),
     }]);
 
     let items = Session::assign_missing_response_item_ids(items);
@@ -414,9 +417,13 @@ async fn default_turn_context_assigns_missing_response_item_ids() {
 
 fn assistant_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: text.to_string(),
         }],
         phase: None,
@@ -612,6 +619,8 @@ async fn world_state_extension_metrics_follow_turn_model_switch() {
 
 fn skill_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -876,6 +885,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
+        /*output_token_replay_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         codex_model_provider::WorkspaceRoutingContext::new(
@@ -2449,6 +2459,8 @@ async fn reconstruct_history_matches_live_compactions() {
 async fn reconstruct_history_uses_replacement_history_verbatim() {
     let (session, turn_context) = make_session_and_context().await;
     let summary_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -2466,6 +2478,8 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
             metadata: Some(CodexHarnessMetadata::default()),
         },
         ResponseItemEnvelope::new(ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -3124,6 +3138,8 @@ async fn prepares_image_failures_before_history_insertion() {
 async fn prepares_resumed_history_before_installing_it() {
     let (session, _turn_context) = make_session_and_context().await;
     let resumed_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -3163,6 +3179,8 @@ async fn prepares_resumed_history_before_installing_it() {
     assert_eq!(
         raw_history_items(&history),
         vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -3543,8 +3561,12 @@ async fn recompute_token_usage_updates_model_context_window() {
     assert_eq!(actual.model_context_window, Some(128_000));
 }
 
+#[test_case(crate::session::TokenUsageContext::Sampling; "sampling")]
+#[test_case(crate::session::TokenUsageContext::SpendingOnly; "spending_only")]
 #[tokio::test]
-async fn record_token_usage_info_notifies_extension_contributors() {
+async fn record_token_usage_info_notifies_extension_contributors(
+    context: crate::session::TokenUsageContext,
+) {
     struct SessionTokenUsageMarker;
     struct ThreadTokenUsageMarker;
 
@@ -3626,6 +3648,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
             &turn_context,
             &turn_context.initial_settings,
             Some(&first_usage),
+            crate::session::TokenUsageContext::Sampling,
         )
         .await
         .expect("first usage should be recorded");
@@ -3634,12 +3657,21 @@ async fn record_token_usage_info_notifies_extension_contributors() {
             &turn_context,
             &turn_context.initial_settings,
             Some(&second_usage),
+            context,
         )
         .await
         .expect("second usage should be recorded");
 
     let mut expected_total_usage = first_usage.clone();
     expected_total_usage.add_assign(&second_usage);
+    let expected_session_info = TokenUsageInfo {
+        total_token_usage: expected_total_usage.clone(),
+        last_token_usage: match context {
+            crate::session::TokenUsageContext::Sampling => second_usage.clone(),
+            crate::session::TokenUsageContext::SpendingOnly => first_usage.clone(),
+        },
+        model_context_window: turn_context.model_context_window(),
+    };
     let expected = vec![
         RecordedTokenUsage {
             session_level_id: session.session_id().to_string(),
@@ -3672,6 +3704,10 @@ async fn record_token_usage_info_notifies_extension_contributors() {
         .drain(..)
         .collect::<Vec<_>>();
     assert_eq!(expected, actual);
+    assert_eq!(
+        session.token_usage_info().await,
+        Some(expected_session_info)
+    );
 }
 
 #[tokio::test]
@@ -4232,6 +4268,8 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
     let response_item =
         ContextualUserFragment::into(DeveloperInstructions::new("Subagent guidance."));
     let mut expected_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -6206,12 +6244,21 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
     assert_eq!(restored.mcp_attribution_snapshot(), expected);
 }
 
+#[test_case(None; "idle")]
+#[test_case(Some(ActiveTurn::default()); "reserved turn")]
+#[test_case(Some(ActiveTurn {
+    finishing: Some(tokio_util::sync::CancellationToken::new()),
+    ..Default::default()
+}); "finishing turn")]
 #[tokio::test]
-async fn standalone_settings_invalidate_continuation_before_delivering_acceptance() {
+async fn standalone_settings_invalidate_continuation_before_delivering_acceptance(
+    active_turn: Option<ActiveTurn>,
+) {
     let (mut session, turn_context) = make_session_and_context().await;
     let (tx, rx) = async_channel::bounded(1);
     session.tx_event = tx;
     session.state.lock().await.last_started_turn_id = Some("superseded-turn".into());
+    *session.active_turn.lock().await = active_turn;
     session
         .tx_event
         .send(Event {
@@ -6267,8 +6314,10 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
     submissions.await;
 }
 
+#[test_case::test_case(false; "complete replacement")]
+#[test_case::test_case(true; "prefix with live suffix")]
 #[tokio::test]
-async fn compaction_persists_resume_metadata_and_companion_records() {
+async fn compaction_persists_resume_metadata_and_companion_records(prefix_installation: bool) {
     // Merge-safety anchor: complete native companion records retain the prepared late-goal recovery boundary and current upstream turn attribution in one durable checkpoint.
     let (mut session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
@@ -6341,6 +6390,17 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         .await;
     let input_goal_ids =
         crate::context::UserGoalUpdate::message_ids(session.clone_history().await.raw_items());
+    let prefix = {
+        let mut state = session.state.lock().await;
+        state
+            .history
+            .set_world_state_baseline(world_state.render_full().0);
+        CompactionPrefix {
+            generation: state.history.history_version(),
+            len: state.history.annotated_items().len(),
+            auth_owner_generation: session.services.model_client.auth_owner_generation(),
+        }
+    };
     // The goal edit is accepted after the compaction input was captured.
     let mut accepted_goal = {
         session
@@ -6360,18 +6420,38 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         .replace_compacted_history(
             vec![ResponseItemEnvelope::new(user_message("compacted context"))],
             turn_context_baseline.clone(),
-            world_state.render_full().0,
+            if prefix_installation {
+                WorldStateSnapshot::default()
+            } else {
+                world_state.render_full().0
+            },
             {
-                let metadata = CompactedHistoryMetadata {
-                    input_goal_ids,
-                    message: String::new(),
-                    window_number,
-                    window_ids,
-                    compaction_response_id: None,
-                    compaction_model_hash: None,
-                    reviewer_compaction_hash: None,
-                };
-                metadata.with_prepared_handoff(prepared_handoff.clone())
+                if prefix_installation {
+                    CompactedHistoryInstallation::Prefix {
+                        prefix,
+                        window_number,
+                        window_ids,
+                        prepared_handoff: prepared_handoff.clone(),
+                        prefix_context: Vec::new(),
+                        initial_context: Vec::new(),
+                        model_info: turn_context.model_info(),
+                        compaction_response_id: "prefix-compaction".to_string(),
+                        reviewer_compaction_hash: None,
+                        turn_context: &turn_context,
+                        started_item: None,
+                    }
+                } else {
+                    CompactedHistoryMetadata {
+                        input_goal_ids,
+                        message: String::new(),
+                        window_number,
+                        window_ids,
+                        compaction_response_id: None,
+                        compaction_model_hash: None,
+                        reviewer_compaction_hash: None,
+                    }
+                    .with_prepared_handoff(prepared_handoff.clone())
+                }
             },
         )
         .await
@@ -7109,6 +7189,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
+            /*output_token_replay_enabled*/ false,
             /*attestation_provider*/ None,
             config.http_client_factory(),
             config.workspace_routing_context(),
@@ -7157,15 +7238,13 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
+        history_initialization: HistoryInitialization::New,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     };
     let per_turn_config = session.build_per_turn_config(
         &session_configuration,
-        session_configuration.cwd().clone(),
-        crate::environment_selection::ThreadEnvironments::primary_workspace_roots_for(
-            &session_configuration.environments,
-        ),
+        resolved_turn_environments.local_selection(),
     );
     let plugins_input = per_turn_config.plugins_config_input();
     let plugin_outcome = session
@@ -7331,6 +7410,7 @@ async fn make_session_with_config_and_rx(
         tx_event,
         agent_status_tx,
         InitialHistory::New,
+        HistoryInitialization::New,
         ForkPersistence::Copied,
         SessionSource::Exec,
         skills_service,
@@ -7350,6 +7430,7 @@ async fn make_session_with_config_and_rx(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
         )),
+        /*resume_preparation*/ None,
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
@@ -7449,6 +7530,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
 
+    let history_initialization = HistoryInitialization::from_history(&initial_history);
     let session = Session::new(
         /*startup*/ None,
         session_configuration,
@@ -7464,6 +7546,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         tx_event,
         agent_status_tx,
         initial_history,
+        history_initialization,
         ForkPersistence::Copied,
         session_source,
         skills_service,
@@ -7490,6 +7573,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
                 .expect("state db should initialize"),
             ),
         )),
+        /*resume_preparation*/ None,
         codex_rollout_trace::ThreadTraceContext::disabled(),
         /*attestation_provider*/ None,
         /*external_time_provider*/ None,
@@ -9375,6 +9459,7 @@ where
             config
                 .features
                 .enabled(Feature::ConcurrentReasoningSummaries),
+            /*output_token_replay_enabled*/ false,
             /*attestation_provider*/ None,
             config.http_client_factory(),
             config.workspace_routing_context(),
@@ -9423,15 +9508,13 @@ where
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
+        history_initialization: HistoryInitialization::New,
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     });
     let per_turn_config = session.build_per_turn_config(
         &session_configuration,
-        session_configuration.cwd().clone(),
-        crate::environment_selection::ThreadEnvironments::primary_workspace_roots_for(
-            &session_configuration.environments,
-        ),
+        resolved_turn_environments.local_selection(),
     );
     let plugins_input = per_turn_config.plugins_config_input();
     let plugin_outcome = session
@@ -11094,10 +11177,9 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
 
     let developer_messages = developer_message_texts(&initial_context);
     assert!(
-        developer_messages
-            .iter()
-            .flatten()
-            .any(|text| text.contains("<context_window>\nAgent name: /root/worker\n")),
+        developer_messages.iter().any(|message| message
+            .concat()
+            .contains("<context_window>\nAgent name: /root/worker\n")),
         "expected subagent context window to include its canonical name, got {developer_messages:?}"
     );
     assert!(
@@ -11336,6 +11418,8 @@ async fn record_context_updates_and_set_reference_context_item_reinjects_full_co
     let turn_context = Arc::new(turn_context);
     let step_context = StepContext::for_test(Arc::clone(&turn_context));
     let compacted_summary = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -11533,6 +11617,10 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
         let messages = model_info.model_messages.as_mut().unwrap();
         messages.instructions_template = Some("A instructions".to_string());
     });
+    session.state.lock().await.base_instructions_provenance =
+        Some(codex_protocol::models::BaseInstructionsProvenance::Model {
+            model: "base-model".to_string(),
+        });
     session
         .set_previous_turn_settings(Some(PreviousTurnSettings {
             model: "base-model".to_string(),
@@ -11807,6 +11895,7 @@ async fn realtime_conversation_list_voices_emits_builtin_list() {
                 RealtimeVoice::Marin,
                 RealtimeVoice::Cedar,
             ],
+            v3: RealtimeVoicesList::builtin().v3,
             default_v1: RealtimeVoice::Cove,
             default_v2: RealtimeVoice::Marin,
         },
@@ -12177,7 +12266,7 @@ async fn start_gated_compaction_publication(
     store: &GatedInMemoryThreadStore,
 ) -> (
     PostFlushGate,
-    tokio::task::JoinHandle<codex_protocol::error::Result<()>>,
+    tokio::task::JoinHandle<codex_protocol::error::Result<bool>>,
 ) {
     let (window_number, window_ids) = session.prepare_auto_compact_window().await;
     let gate = store.gate_next_flush();
@@ -12212,7 +12301,7 @@ async fn start_gated_compaction_publication(
 
 async fn finish_gated_compaction_publication(
     gate: &PostFlushGate,
-    compaction: tokio::task::JoinHandle<codex_protocol::error::Result<()>>,
+    compaction: tokio::task::JoinHandle<codex_protocol::error::Result<bool>>,
 ) {
     gate.release().await;
     timeout(Duration::from_secs(2), compaction)
@@ -12343,6 +12432,8 @@ async fn install_test_post_compact_recovery(session: &Session) -> PostCompactRec
         .replace_compacted_history(
             vec![
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {
@@ -13025,6 +13116,8 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
         ),
         CompactionReason::ModelDownshift,
         CompactionPhase::PreTurn,
+        /*candidate*/ None,
+        crate::compact_remote_v2::CompactionFallback::Foreground,
         &cancellation_token,
     )
     .await
@@ -13411,7 +13504,7 @@ async fn user_input_answer_order_wait_preserves_the_original_waiter_after_retire
 async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
     start_regular_never_ending_task(&session, &turn_context).await;
-    let (turn_state, cancellation_token, done) = {
+    let (turn_state, cancellation_token, mut done) = {
         let active = session.active_turn.lock().await;
         let active_turn = active.as_ref().expect("running turn");
         let task = active_turn.task.as_ref().expect("installed task");
@@ -13461,7 +13554,7 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
                 .lock()
                 .await
                 .as_ref()
-                .is_some_and(|turn| turn.finishing);
+                .is_some_and(|turn| turn.finishing.is_some());
             let drained = turn_state.lock().await.pending_input.is_empty();
             if finishing && drained {
                 break;
@@ -13471,6 +13564,36 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
     })
     .await
     .expect("task reaches finalization and drains its original input");
+    let finishing = {
+        let active = session.active_turn.lock().await;
+        let turn = active.as_ref().expect("terminal delivery retains the slot");
+        assert!(turn.task.is_some());
+        turn.finishing.clone().expect("recording milestone exists")
+    };
+    timeout(StdDuration::from_secs(/*secs*/ 5), finishing.cancelled())
+        .await
+        .expect("final recording completes before terminal delivery");
+    // Merge-safety anchor: recording completion never substitutes for terminal retirement; both late client injection and replacement still wait on the retained task's done notification.
+    let mut late_client = Box::pin(session.inject_client_response_items(
+        vec![ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "late-client".to_owned(),
+            name: Some("exec".to_owned()),
+            output: FunctionCallOutputPayload::from_text("late client response".to_owned()),
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        &turn_context,
+    ));
+    let mut replacement = Box::pin(session.abort_all_tasks(TurnAbortReason::Replaced));
+    assert!(futures::poll!(late_client.as_mut()).is_pending());
+    assert!(futures::poll!(replacement.as_mut()).is_pending());
+    assert!(
+        session
+            .reserve_turn_start("cannot-overtake-terminal")
+            .await
+            .is_none()
+    );
+    assert!(futures::poll!(done.as_mut()).is_pending());
     assert!(
         turn_state
             .lock()
@@ -13499,9 +13622,11 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
     assert!(turn_state.lock().await.pending_input.is_empty());
     assert!(!session.input_queue.has_pending_mailbox_items().await);
     drop(terminal_error);
-    timeout(StdDuration::from_secs(/*secs*/ 5), done)
-        .await
-        .expect("finishing task retires");
+    timeout(StdDuration::from_secs(/*secs*/ 5), async {
+        tokio::join!(done, late_client, replacement);
+    })
+    .await
+    .expect("finishing task retires");
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     assert!(session.active_turn.lock().await.is_none());
     assert!(!session.input_queue.has_pending_mailbox_items().await);
@@ -13516,7 +13641,7 @@ async fn terminal_finalization_rejects_direct_interruption_and_suspension() {
         active
             .as_mut()
             .expect("started task should retain an active turn")
-            .finishing = true;
+            .finishing = Some(CancellationToken::new());
     }
 
     let (reply, response) = tokio::sync::oneshot::channel();
@@ -13547,7 +13672,7 @@ async fn terminal_finalization_rejects_direct_interruption_and_suspension() {
         active
             .as_mut()
             .expect("finishing turn should retain its task through terminal delivery")
-            .finishing = false;
+            .finishing = None;
     }
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     recv_terminal_event(&events, TerminalEventKind::TurnAborted).await;
@@ -13776,6 +13901,8 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -13960,6 +14087,8 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
 async fn abort_empty_active_turn_preserves_pending_input() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let pending_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -14300,6 +14429,8 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         .await;
 
     let item = ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "test_tool".to_string(),
         namespace: None,
@@ -14419,6 +14550,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         &Default::default(),
     );
     let item = ResponseItem::CustomToolCall {
+        encrypted_content: None,
         id: None,
         status: None,
         call_id: "call-1".to_string(),

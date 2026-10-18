@@ -1,7 +1,11 @@
+//! Keep content and its positional annotations together during history edits.
+
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::input_text;
+use codex_utils_string::plan_token_truncation;
 
 /// Content, classification and attribution travel together through edits and truncation.
 #[derive(Clone, Debug, PartialEq)]
@@ -11,13 +15,77 @@ pub struct AnnotatedContent {
     metadata: ContentItemMetadata,
 }
 
+/// Applies the string truncator's head/tail selection to the combined text.
+/// Retained slices keep their kind and source; the generated notice has harness
+/// provenance. Non-text parts are retained unchanged, without cloning media.
+pub fn truncate_annotated_text(
+    parts: Vec<AnnotatedContent>,
+    max_tokens: usize,
+) -> Vec<AnnotatedContent> {
+    let text: String = parts
+        .iter()
+        .filter_map(|part| match part.content() {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
+                Some(text.as_str())
+            }
+            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
+        })
+        .collect();
+    let Some(truncation) = plan_token_truncation(&text, max_tokens) else {
+        return parts;
+    };
+    let mut notice = Some(AnnotatedContent::text(
+        truncation.marker,
+        ContentItemKind("unknown".to_string()),
+        ContentItemMetadata::harness(),
+    ));
+    let mut result = Vec::with_capacity(parts.len() + 2);
+    let mut offset = 0;
+    for part in parts {
+        let length = match part.content() {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => text.len(),
+            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => {
+                result.push(part);
+                continue;
+            }
+        };
+        let start = offset;
+        offset += length;
+        if offset <= truncation.removed.start || start >= truncation.removed.end {
+            result.push(part);
+            continue;
+        }
+        let prefix_end = truncation.removed.start.saturating_sub(start);
+        let suffix_start = truncation.removed.end.saturating_sub(start).min(length);
+        if prefix_end > 0 {
+            result.push(part.text_slice(0..prefix_end));
+        }
+        if let Some(notice) = notice.take() {
+            result.push(notice);
+        }
+        if suffix_start < length {
+            result.push(part.text_slice(suffix_start..length));
+        }
+    }
+    result
+}
+
 impl AnnotatedContent {
     /// Creates content and its classification together.
     pub fn new(content: ContentItem, kind: ContentItemKind) -> Self {
+        Self::from_parts(content, kind, ContentItemMetadata::default())
+    }
+
+    /// Creates content with its producer-owned classification and attribution.
+    pub fn from_parts(
+        content: ContentItem,
+        kind: ContentItemKind,
+        metadata: ContentItemMetadata,
+    ) -> Self {
         Self {
             content,
             kind,
-            metadata: ContentItemMetadata::default(),
+            metadata,
         }
     }
 
@@ -27,11 +95,7 @@ impl AnnotatedContent {
         kind: ContentItemKind,
         metadata: ContentItemMetadata,
     ) -> Self {
-        Self {
-            content: ContentItem::InputText { text: text.into() },
-            kind,
-            metadata,
-        }
+        Self::from_parts(input_text(text), kind, metadata)
     }
 
     /// Returns the model-visible content.
@@ -53,11 +117,36 @@ impl AnnotatedContent {
     pub fn into_parts(self) -> (ContentItem, ContentItemKind, ContentItemMetadata) {
         (self.content, self.kind, self.metadata)
     }
+
+    // Called only for the UTF-8-aligned text ranges selected by the truncator.
+    fn text_slice(&self, range: std::ops::Range<usize>) -> Self {
+        let content = match &self.content {
+            ContentItem::InputText { text } => ContentItem::InputText {
+                text: text[range].to_owned(),
+            },
+            ContentItem::OutputText { text, .. } => ContentItem::OutputText {
+                text: text[range].to_owned(),
+                // Original offsets and token probabilities do not describe a shortened slice.
+                annotations: None,
+                logprobs: None,
+            },
+            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => {
+                unreachable!("only text parts have byte ranges")
+            }
+        };
+        Self {
+            content,
+            kind: self.kind.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 /// Assembles a message without separating its content from its attribution.
 pub fn message_from_parts(role: impl Into<String>, parts: Vec<AnnotatedContent>) -> ResponseItem {
     let mut item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.into(),
         content: Vec::new(),

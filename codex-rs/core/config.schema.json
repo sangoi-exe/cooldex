@@ -216,25 +216,6 @@
       "description": "Account settings for a single app.",
       "type": "object"
     },
-    "AppServerMode": {
-      "description": "Selects how an interactive TUI obtains its local app-server.",
-      "oneOf": [
-        {
-          "description": "Preserve the upstream implicit-daemon-or-embedded selection.",
-          "enum": [
-            "upstream"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Spawn one private app-server child owned by this TUI instance.",
-          "enum": [
-            "instance_child"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "AppToolApproval": {
       "enum": [
         "auto",
@@ -371,6 +352,23 @@
         "conversation"
       ],
       "type": "string"
+    },
+    "AsyncCompactionConfigToml": {
+      "additionalProperties": false,
+      "description": "Background compaction settings. A threshold alone does not enable the feature.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "model_async_compact_threshold_percent": {
+          "description": "Percentage of the model's full context window that starts background compaction. Defaults to 65; valid values are 1–100, including when disabled.",
+          "format": "uint8",
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "AuthCredentialsStoreMode": {
       "description": "Determine where Codex should store CLI auth credentials.",
@@ -663,47 +661,6 @@
       },
       "type": "object"
     },
-    "ComputerUseConfigToml2": {
-      "additionalProperties": false,
-      "properties": {
-        "display_ready_timeout": {
-          "description": "Maximum time to wait for Xvfb/Openbox startup, in milliseconds.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "mcp_bin": {
-          "description": "Absolute path to the source/development Computer Use MCP binary.",
-          "type": "string"
-        },
-        "openbox": {
-          "description": "Command or path used to start Openbox for the local desktop session.",
-          "type": "string"
-        },
-        "shutdown_grace_period": {
-          "description": "Grace period before force-terminating owned session processes, in milliseconds.",
-          "format": "uint64",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sky_bin": {
-          "description": "Absolute path to the source/development Sky binary.",
-          "type": "string"
-        },
-        "temp_root": {
-          "description": "Session temp root for Computer Use working files.",
-          "type": "string"
-        },
-        "xvfb": {
-          "description": "Command or path used to start Xvfb for the local desktop session.",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
     "ComputerUseMacosConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -796,6 +753,9 @@
             "api_key_model_discovery": {
               "type": "boolean"
             },
+            "app_server_websocket_compression": {
+              "type": "boolean"
+            },
             "apply_patch_freeform": {
               "type": "boolean"
             },
@@ -826,6 +786,9 @@
                   "type": "object"
                 }
               ]
+            },
+            "async_compaction": {
+              "$ref": "#/definitions/FeatureToml_for_AsyncCompactionConfigToml"
             },
             "auth_elicitation": {
               "type": "boolean"
@@ -862,6 +825,9 @@
             },
             "code_mode_host": {
               "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
+            },
+            "code_mode_host_grpc": {
+              "type": "boolean"
             },
             "code_mode_interrupt": {
               "type": "boolean"
@@ -900,7 +866,7 @@
               "type": "boolean"
             },
             "computer_use": {
-              "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
+              "type": "boolean"
             },
             "concurrent_reasoning_summaries": {
               "type": "boolean"
@@ -913,6 +879,9 @@
             },
             "context_management": {
               "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+            },
+            "credential_masking": {
+              "type": "boolean"
             },
             "current_time_reminder": {
               "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
@@ -957,6 +926,9 @@
               "type": "boolean"
             },
             "executor_capability_discovery": {
+              "type": "boolean"
+            },
+            "executor_capability_discovery_v2": {
               "type": "boolean"
             },
             "experimental_use_unified_exec_tool": {
@@ -1070,6 +1042,9 @@
             "mcp_oauth_refresh_coordination": {
               "type": "boolean"
             },
+            "mcp_tool_list_changed": {
+              "type": "boolean"
+            },
             "memories": {
               "type": "boolean"
             },
@@ -1094,6 +1069,9 @@
             "multi_agent_v2_dynamic_tools": {
               "type": "boolean"
             },
+            "multi_env_copy_file": {
+              "type": "boolean"
+            },
             "network_proxy": {
               "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
             },
@@ -1104,6 +1082,9 @@
               "type": "boolean"
             },
             "omit_app_server_notification_media": {
+              "type": "boolean"
+            },
+            "output_token_replay": {
               "type": "boolean"
             },
             "personality": {
@@ -1175,6 +1156,9 @@
             "retain_client_developer_messages": {
               "type": "boolean"
             },
+            "retain_client_tool_outputs": {
+              "type": "boolean"
+            },
             "rollout_budget": {
               "$ref": "#/definitions/FeatureToml_for_RolloutBudgetConfigToml"
             },
@@ -1233,6 +1217,9 @@
               "type": "boolean"
             },
             "step_model_switching": {
+              "type": "boolean"
+            },
+            "subagent_default_context_limits": {
               "type": "boolean"
             },
             "system_proxy_fallback": {
@@ -1308,6 +1295,9 @@
               "type": "boolean"
             },
             "view_image": {
+              "type": "boolean"
+            },
+            "wake_on_agent_messages": {
               "type": "boolean"
             },
             "web_search": {
@@ -1452,7 +1442,7 @@
           "type": "string"
         },
         {
-          "description": "Copy every nonempty transcript or footer mouse selection on release.",
+          "description": "Copy every nonempty transcript, footer, or composer mouse selection on release.",
           "enum": [
             "always"
           ],
@@ -1626,6 +1616,16 @@
       },
       "type": "object"
     },
+    "FeatureToml_for_AsyncCompactionConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/AsyncCompactionConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_CodeModeConfigToml": {
       "anyOf": [
         {
@@ -1643,16 +1643,6 @@
         },
         {
           "$ref": "#/definitions/CodeModeHostConfigToml"
-        }
-      ]
-    },
-    "FeatureToml_for_ComputerUseConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/ComputerUseConfigToml2"
         }
       ]
     },
@@ -1985,7 +1975,7 @@
               "$ref": "#/definitions/AsyncClassifierMode"
             }
           ],
-          "description": "Classifier experiment override. Otherwise use the model default, then snapshots."
+          "description": "Classifier mode override. Otherwise use the model default, then conversation."
         },
         "classifier_instructions": {
           "type": "string"
@@ -2283,6 +2273,10 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "trusted_content_hash": {
+          "description": "Approved plugin contents; kept separate for declaration-only clients.",
+          "type": "string"
         },
         "trusted_hash": {
           "type": "string"
@@ -2972,6 +2966,10 @@
           "description": "Disable the model's direct-message tools; spawning and automatic child results remain available.",
           "type": "boolean"
         },
+        "disable_native_tools": {
+          "description": "Hide native multi-agent tools while retaining the V2 runtime for host-provided tools.",
+          "type": "boolean"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -3017,18 +3015,15 @@
         "non_code_mode_only": {
           "type": "boolean"
         },
-        "policy": {
-          "$ref": "#/definitions/MultiAgentV2Policy"
+        "preserve_fork_prefix": {
+          "description": "Preserve the parent's model-visible history on full forks and append child instructions. Defaults to false. Legacy compaction without a reusable context baseline still rebuilds.",
+          "type": "boolean"
         },
         "root_agent_usage_hint_text": {
           "type": "string"
         },
         "subagent_developer_instructions": {
           "description": "Overrides inherited developer instructions for subagents without role-specific instructions.",
-          "type": "string"
-        },
-        "subagent_instructions_file": {
-          "description": "Base instructions loaded once for partial- and no-history V2 child sessions.",
           "type": "string"
         },
         "subagent_usage_hint_text": {
@@ -3053,14 +3048,6 @@
         }
       },
       "type": "object"
-    },
-    "MultiAgentV2Policy": {
-      "description": "Selects the built-in MultiAgentV2 delegation policy.",
-      "enum": [
-        "explicit_request_only",
-        "proactive"
-      ],
-      "type": "string"
     },
     "NetworkDomainPermissionToml": {
       "enum": [
@@ -3713,6 +3700,10 @@
     "PluginConfig": {
       "additionalProperties": false,
       "properties": {
+        "auto_provision": {
+          "description": "Provisioning metadata. Omission does not request provisioning. Only applies with `remote_plugin_id` and Plugin Service availability to the requesting user at provisioning time. Effective enablement, trusted provisioning policy, and authentication and authorization restrictions still apply. This value is not trusted authorization and does not trigger provisioning.",
+          "type": "boolean"
+        },
         "enabled": {
           "description": "Explicit activation override. Omission inherits the installed-plugin default.",
           "type": "boolean"
@@ -3723,6 +3714,14 @@
           },
           "description": "Per-MCP-server policy overlays for MCP servers contributed by this plugin.",
           "type": "object"
+        },
+        "release_id": {
+          "description": "Release identifier used to pin the remote plugin to a specific release. Omission leaves release selection unchanged. Core stores this metadata without selecting or fetching a release.",
+          "type": "string"
+        },
+        "remote_plugin_id": {
+          "description": "Stable, unique identifier of a ChatGPT-hosted remote plugin. Availability to the requesting user is determined by Plugin Service at provisioning time.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -3794,6 +3793,24 @@
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "Preset": {
+      "additionalProperties": false,
+      "description": "One reusable prompt or slash command submitted through the TUI composer.",
+      "properties": {
+        "input": {
+          "description": "Plain-text input, limited to 8,000 UTF-8 bytes.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Optional short name for the picker and shortcut hints.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "input"
+      ],
       "type": "object"
     },
     "ProfileTui": {
@@ -4056,22 +4073,38 @@
         "alloy",
         "arbor",
         "ash",
+        "aube",
         "ballad",
         "breeze",
+        "bubbie",
         "cedar",
         "coral",
         "cove",
         "echo",
         "ember",
+        "haetsal",
+        "hanul",
+        "himari",
         "juniper",
+        "leher",
         "maple",
         "marin",
+        "miko",
+        "neer",
+        "porto",
+        "rindo",
+        "rio",
+        "rivage",
         "sage",
+        "selva",
         "shimmer",
         "sol",
+        "sonna",
         "spruce",
+        "tinta",
         "vale",
-        "verse"
+        "verse",
+        "viola"
       ],
       "type": "string"
     },
@@ -4223,14 +4256,6 @@
         }
       },
       "type": "object"
-    },
-    "SafetyBufferingChoice": {
-      "description": "Deliberately selected action for a safety-buffered request.",
-      "enum": [
-        "dismiss-and-keep-waiting",
-        "retry-with-faster-model"
-      ],
-      "type": "string"
     },
     "SandboxMode": {
       "enum": [
@@ -4692,15 +4717,6 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
-        "app_server_mode": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AppServerMode"
-            }
-          ],
-          "default": "upstream",
-          "description": "Controls how an ordinary interactive TUI obtains its local app-server. Defaults to `upstream`."
-        },
         "auto_recap": {
           "default": true,
           "description": "Generate automatic conversation recaps when the terminal is unfocused. Defaults to `true`. Disabling this leaves `/recap` available on demand.",
@@ -4713,7 +4729,12 @@
             }
           ],
           "default": "auto",
-          "description": "Copy selected transcript or footer text when the mouse button is released. Defaults to `auto`: enabled except in direct terminals known to forward their native copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows). Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying."
+          "description": "Copy selected transcript, footer, or composer text when the mouse button is released. Defaults to `auto`: enabled except in direct terminals known to forward their native copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows). Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying."
+        },
+        "copy_on_select_clear_selection": {
+          "default": false,
+          "description": "Deselect read-only transcript or footer text after Copy on select confirms delivery. Editable composer selections remain visible. Defaults to `false` and has no effect when Copy on select is off.",
+          "type": "boolean"
         },
         "disable_paste_burst": {
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
@@ -4777,6 +4798,7 @@
               "increase_reasoning_effort": null,
               "interrupt_turn": null,
               "next_permission_mode": null,
+              "open_presets": null,
               "previous_permission_mode": null,
               "prompt_stack_back": null,
               "skip_question": null,
@@ -4988,6 +5010,14 @@
           "default": "composer",
           "description": "Where the terminal pet should anchor vertically.\n\nDefaults to `composer`, which follows the current TUI composer viewport."
         },
+        "presets": {
+          "additionalProperties": {
+            "$ref": "#/definitions/Preset"
+          },
+          "default": {},
+          "description": "Saved inputs keyed by a single digit (`0` through `9`).",
+          "type": "object"
+        },
         "question_esc_back": {
           "default": true,
           "description": "Escape returns from async questions to the composer, preserving the answer draft.",
@@ -5029,20 +5059,6 @@
           ],
           "default": "auto",
           "description": "Right-click text paste fallback. Defaults to `auto` (Windows/WSL/Linux). `on` also enables macOS; neither mode reads over SSH or in recognized VS Code terminals. This controls the fullscreen fallback, not the terminal's own paste binding."
-        },
-        "safety_buffering_auto_apply": {
-          "default": false,
-          "description": "Apply an offered remembered safety-buffering action without asking again. Defaults to false, which only preselects the remembered action.",
-          "type": "boolean"
-        },
-        "safety_buffering_last_choice": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/SafetyBufferingChoice"
-            }
-          ],
-          "default": null,
-          "description": "Last deliberately selected wait action or confirmed retry; unset means no preference."
         },
         "screen_reader_detection_done": {
           "description": "Records the one-time screen-reader detection attempt. Either value skips detection.",
@@ -5325,6 +5341,14 @@
             }
           ],
           "description": "Switch to the next available permission mode."
+        },
+        "open_presets": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open saved prompts and slash commands."
         },
         "previous_permission_mode": {
           "allOf": [
@@ -5777,6 +5801,7 @@
             "increase_reasoning_effort": null,
             "interrupt_turn": null,
             "next_permission_mode": null,
+            "open_presets": null,
             "previous_permission_mode": null,
             "prompt_stack_back": null,
             "skip_question": null,
@@ -7064,14 +7089,6 @@
       "description": "Developer instructions inserted as a `developer` role message.",
       "type": "string"
     },
-    "developer_instructions_file": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/AbsolutePathBuf"
-        }
-      ],
-      "description": "Optional path to a file containing developer instructions."
-    },
     "disable_paste_burst": {
       "description": "Legacy fallback for `tui.disable_paste_burst`. Prefer the setting under `[tui]`.",
       "type": "boolean"
@@ -7131,6 +7148,9 @@
         "api_key_model_discovery": {
           "type": "boolean"
         },
+        "app_server_websocket_compression": {
+          "type": "boolean"
+        },
         "apply_patch_freeform": {
           "type": "boolean"
         },
@@ -7161,6 +7181,9 @@
               "type": "object"
             }
           ]
+        },
+        "async_compaction": {
+          "$ref": "#/definitions/FeatureToml_for_AsyncCompactionConfigToml"
         },
         "auth_elicitation": {
           "type": "boolean"
@@ -7197,6 +7220,9 @@
         },
         "code_mode_host": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
+        },
+        "code_mode_host_grpc": {
+          "type": "boolean"
         },
         "code_mode_interrupt": {
           "type": "boolean"
@@ -7235,7 +7261,7 @@
           "type": "boolean"
         },
         "computer_use": {
-          "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
+          "type": "boolean"
         },
         "concurrent_reasoning_summaries": {
           "type": "boolean"
@@ -7248,6 +7274,9 @@
         },
         "context_management": {
           "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
+        },
+        "credential_masking": {
+          "type": "boolean"
         },
         "current_time_reminder": {
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
@@ -7292,6 +7321,9 @@
           "type": "boolean"
         },
         "executor_capability_discovery": {
+          "type": "boolean"
+        },
+        "executor_capability_discovery_v2": {
           "type": "boolean"
         },
         "experimental_use_unified_exec_tool": {
@@ -7405,6 +7437,9 @@
         "mcp_oauth_refresh_coordination": {
           "type": "boolean"
         },
+        "mcp_tool_list_changed": {
+          "type": "boolean"
+        },
         "memories": {
           "type": "boolean"
         },
@@ -7429,6 +7464,9 @@
         "multi_agent_v2_dynamic_tools": {
           "type": "boolean"
         },
+        "multi_env_copy_file": {
+          "type": "boolean"
+        },
         "network_proxy": {
           "$ref": "#/definitions/FeatureToml_for_NetworkProxyConfigToml"
         },
@@ -7439,6 +7477,9 @@
           "type": "boolean"
         },
         "omit_app_server_notification_media": {
+          "type": "boolean"
+        },
+        "output_token_replay": {
           "type": "boolean"
         },
         "personality": {
@@ -7510,6 +7551,9 @@
         "retain_client_developer_messages": {
           "type": "boolean"
         },
+        "retain_client_tool_outputs": {
+          "type": "boolean"
+        },
         "rollout_budget": {
           "$ref": "#/definitions/FeatureToml_for_RolloutBudgetConfigToml"
         },
@@ -7568,6 +7612,9 @@
           "type": "boolean"
         },
         "step_model_switching": {
+          "type": "boolean"
+        },
+        "subagent_default_context_limits": {
           "type": "boolean"
         },
         "system_proxy_fallback": {
@@ -7643,6 +7690,9 @@
           "type": "boolean"
         },
         "view_image": {
+          "type": "boolean"
+        },
+        "wake_on_agent_messages": {
           "type": "boolean"
         },
         "web_search": {
@@ -7762,10 +7812,6 @@
     },
     "include_environment_context_time": {
       "description": "Whether environment context includes the current date and timezone.",
-      "type": "boolean"
-    },
-    "include_global_agents_md": {
-      "description": "Whether to load global AGENTS instructions from the Codex home directory.",
       "type": "boolean"
     },
     "include_permissions_instructions": {
@@ -7981,10 +8027,6 @@
       ],
       "default": {},
       "description": "Default and per-plugin settings keyed by exact `<plugin>@<marketplace>` IDs."
-    },
-    "post_compact_recovery_instructions": {
-      "description": "Model-visible developer instructions included in post-compact recovery context.",
-      "type": "string"
     },
     "profile": {
       "description": "Profile to use from the `profiles` map.",

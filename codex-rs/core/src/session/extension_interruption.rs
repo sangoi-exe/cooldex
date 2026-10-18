@@ -27,7 +27,7 @@ impl CodexThread {
             let active = self.session.active_turn.lock().await;
             let Some(task) = active
                 .as_ref()
-                .filter(|turn| !turn.finishing)
+                .filter(|turn| turn.finishing.is_none())
                 .and_then(|turn| turn.task.as_ref())
             else {
                 return Ok(false);
@@ -73,7 +73,7 @@ impl Session {
             // Merge-safety anchor: terminal finalization retains event-delivery ownership of a
             // finishing turn, so conditional interruption can only retire a running task.
             let Some(turn) = active.as_ref().filter(|turn| {
-                !turn.finishing
+                turn.finishing.is_none()
                     && turn
                         .task
                         .as_ref()

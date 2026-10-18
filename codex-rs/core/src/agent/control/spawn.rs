@@ -17,14 +17,21 @@ use crate::context::BaseInstructionsFragment;
 use crate::context::ContextualUserFragment;
 use crate::context::CurrentTimeReminder;
 use crate::context::CurrentTimeUnavailable;
+use crate::context::GuardianApprovedAction;
 use crate::context::ManagedDeveloperInstructions;
+use crate::context::ModelInstructions;
 use crate::context::MultiAgentModeInstructions;
 use crate::context::MultiAgentRoleInstructions;
+use crate::context::MultiAgentUsageHint;
+use crate::context::world_state::IncrementalToolsHint;
 use crate::context::world_state::PersistentModeState;
 use crate::session::multi_agents::full_history_usage_hint_binding;
 use crate::session::multi_agents::resolve_usage_hints_unchecked;
 use crate::session::multi_agents::validate_usage_hint_binding;
+use crate::tasks::InterruptedTurnHistoryMarker;
+use crate::thread_manager::ForkSnapshot;
 use crate::thread_manager::StartThreadOptions;
+use crate::thread_manager::fork_history_from_snapshot;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
@@ -201,7 +208,11 @@ fn retain_forked_developer_message(
         return false;
     };
     content.retain(|content_item| {
-        if content_item.kind().as_str() == "guardian.approved_action" {
+        // Leave base instructions for the later context-baseline retention check.
+        if content_item.kind().as_str() == BaseInstructionsFragment::KIND {
+            return true;
+        }
+        if content_item.kind().as_str() == GuardianApprovedAction::KIND {
             return false;
         }
         let ContentItem::InputText { text } = content_item.content() else {
@@ -213,7 +224,7 @@ fn retain_forked_developer_message(
         // Persisted role hints can predate the current bundled wording and lack markers.
         let is_usage_hint = matches!(
             content_item.kind().as_str(),
-            "multi_agent.role_instructions" | "multi_agent.usage_hint"
+            MultiAgentRoleInstructions::KIND | MultiAgentUsageHint::KIND
         ) || MultiAgentRoleInstructions::matches_text(text)
             || usage_hint_texts
                 .iter()
@@ -1237,7 +1248,15 @@ impl LocalAgentControl {
             }
         }
         let input_admission = input_admission_started_at.elapsed();
-        // Merge-safety anchor: V2 spawn commits its captured birth identity with metadata; native telemetry must not replace this with a metadata-only commit.
+        // Keep provisional ownership through the final awaits. Commit and return to the
+        // backend caller in one poll; later tool-result publication is outside this boundary.
+        let status = self.get_status(new_thread.thread_id).await;
+        let config = match spawn_config {
+            Some(config) => config,
+            None => new_thread.thread.config_snapshot().await,
+        };
+        // Merge-safety anchor: final-await cancellation owns the provisional child until its
+        // captured birth identity and metadata can be committed atomically with acceptance.
         reservation.commit_with_identity_snapshot(agent_metadata.clone(), identity_snapshot);
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
@@ -1265,11 +1284,7 @@ impl LocalAgentControl {
         let agent = LiveAgent {
             thread_id: new_thread.thread_id,
             metadata: agent_metadata,
-            status: self.get_status(new_thread.thread_id).await,
-        };
-        let config = match spawn_config {
-            Some(config) => config,
-            None => new_thread.thread.config_snapshot().await,
+            status,
         };
         let session_telemetry = new_thread
             .thread
@@ -1353,12 +1368,17 @@ impl LocalAgentControl {
         let captured_usage_hint_text = match &config.agent_usage_hint_binding {
             AgentUsageHintBinding::Inherited {
                 instructions: Some(instructions),
-            } if multi_agent_version == MultiAgentVersion::V2 => Some(
-                MultiAgentRoleInstructions::from_agent_usage_hint_instructions(
-                    instructions.clone(),
-                )
-                .render(),
-            ),
+            } if multi_agent_version == MultiAgentVersion::V2 => {
+                let ContentItem::InputText { text } =
+                    MultiAgentRoleInstructions::from_agent_usage_hint_instructions(
+                        instructions.clone(),
+                    )
+                    .render()
+                else {
+                    unreachable!("multi-agent role instructions render input text");
+                };
+                Some(text)
+            }
             AgentUsageHintBinding::Resolve | AgentUsageHintBinding::Inherited { .. } => None,
         };
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
@@ -1372,7 +1392,12 @@ impl LocalAgentControl {
                 [parent_usage_hints.root, parent_usage_hints.subagent]
                     .into_iter()
                     .flatten()
-                    .map(|instructions| instructions.render())
+                    .map(|instructions| {
+                        let ContentItem::InputText { text } = instructions.render() else {
+                            unreachable!("multi-agent role instructions render input text");
+                        };
+                        text
+                    })
                     .chain(captured_usage_hint_text.iter().cloned())
                     .collect()
             } else {
@@ -1390,24 +1415,34 @@ impl LocalAgentControl {
             }
             break;
         }
-        // Merge-safety anchor: Full-history V2 retains its parent identity context only when the
-        // final reference baseline is preserved. In that branch, only the exact effective inherited
-        // usage-hint fragment rendered from the captured binding survives sanitization. A reference
-        // reset leaves hint emission to the existing reconstruction owner without resolving mutable
-        // role/catalog state or appending a child layer.
+        // Merge-safety anchor: full-history V2 retains only its exact captured usage hint when
+        // the reference baseline survives, including preserved-prefix forks. A reset leaves hint
+        // reconstruction to the bound owner; it never resolves or appends a new child layer.
         let retained_usage_hint_text = if preserve_context_baselines {
             captured_usage_hint_text.as_deref()
         } else {
             None
         };
-        // Compaction stores response items separately, so sanitize both top-level messages and
-        // compacted replacement histories with the same owner.
+        let preserve_fork_prefix = multi_agent_version == MultiAgentVersion::V2
+            && config.multi_agent_v2.preserve_fork_prefix
+            && preserve_context_baselines;
+        if preserve_fork_prefix {
+            let InitialHistory::Forked(items) = fork_history_from_snapshot(
+                ForkSnapshot::Interrupted,
+                InitialHistory::Forked(forked_rollout_items),
+                InterruptedTurnHistoryMarker::Disabled,
+            ) else {
+                unreachable!("a forked snapshot remains forked");
+            };
+            forked_rollout_items = items;
+        }
+        // Sanitize standalone messages and compaction replacement histories at the same owner.
         let retain_forked_item = |envelope: &mut ResponseItemEnvelope| {
             if multi_agent_version == MultiAgentVersion::V2
-                && matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user" || role == "assistant")
+                && (preserve_fork_prefix
+                    || matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user" || role == "assistant"))
             {
-                // Persist the scope of every inherited conversational message, including the suffix
-                // after a checkpoint. Resume must not recapture it as local authorization.
+                // Resume must not recapture copied parent messages as local authorization.
                 envelope
                     .metadata
                     .get_or_insert_default()
@@ -1421,6 +1456,16 @@ impl LocalAgentControl {
                 metadata.user_input_order = None;
             }
             let response_item = &mut envelope.item;
+            if !retain_forked_developer_message(
+                response_item,
+                &multi_agent_v2_usage_hint_texts_to_filter,
+                retained_usage_hint_text,
+            ) {
+                return false;
+            }
+            if preserve_fork_prefix {
+                return true;
+            }
             // Tool declarations and their comparison baseline must survive or be rebuilt together.
             // Apply this to both standalone items and compaction replacement histories.
             if matches!(response_item, ResponseItem::AdditionalTools { .. }) {
@@ -1429,26 +1474,23 @@ impl LocalAgentControl {
             if matches!(response_item, ResponseItem::AgentMessage { .. }) {
                 return false;
             }
-            if !retain_forked_developer_message(
-                response_item,
-                &multi_agent_v2_usage_hint_texts_to_filter,
-                retained_usage_hint_text,
-            ) {
-                return false;
-            }
 
             if matches!(response_item, ResponseItem::Message { role, .. } if role == "developer") {
                 let Some(mut content) = to_annotated_content(response_item) else {
                     return false;
                 };
                 content.retain_mut(|content_item| {
-                    if content_item.kind().as_str() == BaseInstructionsFragment::KIND {
+                    if matches!(
+                        content_item.kind().as_str(),
+                        BaseInstructionsFragment::KIND | IncrementalToolsHint::KIND
+                    ) {
                         return preserve_context_baselines;
                     }
                     let ContentItem::InputText { text } = content_item.content_mut() else {
                         return true;
                     };
                     if ManagedDeveloperInstructions::matches_text(text)
+                        || ModelInstructions::matches_text(text)
                         || PersistentModeState::matches_text(text)
                     {
                         // If the child will rebuild its initial context, drop the inherited
@@ -1479,7 +1521,11 @@ impl LocalAgentControl {
             true
         };
         forked_rollout_items.retain_mut(|item| {
-            if !keep_forked_rollout_item(item, preserve_context_baselines)
+            let keep = (preserve_fork_prefix && matches!(item, RolloutItem::ResponseItem(_)))
+                || keep_forked_rollout_item(item, preserve_context_baselines);
+            // Merge-safety anchor: a V2 child persists its own birth binding, never the copied
+            // parent's SessionMeta, even when native history retains the full response prefix.
+            if !keep
                 || multi_agent_version == MultiAgentVersion::V2
                     && matches!(&*item, RolloutItem::SessionMeta(_))
                 || destination_history_mode == Some(ThreadHistoryMode::Paginated)

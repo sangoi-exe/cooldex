@@ -41,6 +41,7 @@ pub use runtime::MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
 pub use sqlite::SqliteConfig;
+pub use sqlite::SqlitePoolWriteExt;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;
@@ -90,10 +91,13 @@ pub use runtime::GoalAccountingOutcome;
 pub use runtime::GoalStore;
 pub use runtime::GoalUpdate;
 pub use runtime::MemoryStore;
+pub use runtime::ReadStateOperation;
+pub use runtime::ReadStateUpdate;
 pub use runtime::RemoteControlEnrollmentRecord;
 pub use runtime::SqliteIntegrityCheck;
 pub use runtime::SqliteQueueStore;
 pub use runtime::ThreadFilterOptions;
+pub use runtime::ThreadReadState;
 pub use runtime::backup_runtime_db_for_fresh_start;
 pub use runtime::collect_runtime_db_backups;
 pub use runtime::is_sqlite_corruption_error;

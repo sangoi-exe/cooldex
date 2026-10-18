@@ -13,7 +13,6 @@ use codex_exec_server::EnvironmentConnectionState;
 use codex_exec_server::EnvironmentInfo;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
-use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::EnvironmentCapabilityRoots;
@@ -84,17 +83,13 @@ impl EnvironmentConfigOrigin {
 
 /// Combines persisted thread roots with attachment roots in selection order.
 ///
-/// Thread-owned attachments still rely on roots reported by legacy executors. A matching live root
-/// refreshes the persisted location while explicit owner configuration retains the existing
-/// thread-first collision behavior.
+/// A matching root from the current attachment refreshes its persisted location. Root IDs from
+/// other environments and persisted roots absent from the attachment keep their existing location.
 pub(crate) fn combine_selected_capability_roots(
     thread_roots: &[SelectedCapabilityRoot],
-    sources: impl IntoIterator<Item = (EnvironmentConfigOrigin, Vec<SelectedCapabilityRoot>)>,
+    sources: impl IntoIterator<Item = Vec<SelectedCapabilityRoot>>,
 ) -> Vec<SelectedCapabilityRoot> {
-    let attachment_roots = sources
-        .into_iter()
-        .flat_map(|(config_origin, roots)| roots.into_iter().map(move |root| (config_origin, root)))
-        .collect::<Vec<_>>();
+    let attachment_roots = sources.into_iter().flatten().collect::<Vec<_>>();
     let mut combined_roots = thread_roots
         .iter()
         .map(|thread_root| {
@@ -104,23 +99,21 @@ pub(crate) fn combine_selected_capability_roots(
             } = &thread_root.location;
             attachment_roots
                 .iter()
-                .find_map(|(origin, attachment_root)| {
-                    if *origin != EnvironmentConfigOrigin::Thread
-                        || attachment_root.id != thread_root.id
-                    {
-                        return None;
+                .find(|attachment_root| {
+                    if attachment_root.id != thread_root.id {
+                        return false;
                     }
                     let CapabilityRootLocation::Environment {
                         environment_id: attachment_environment_id,
                         ..
                     } = &attachment_root.location;
-                    (attachment_environment_id == thread_environment_id).then_some(attachment_root)
+                    attachment_environment_id == thread_environment_id
                 })
                 .unwrap_or(thread_root)
                 .clone()
         })
         .collect::<Vec<_>>();
-    combined_roots.extend(attachment_roots.into_iter().map(|(_, root)| root));
+    combined_roots.extend(attachment_roots);
     combined_roots
 }
 
@@ -715,12 +708,11 @@ impl ThreadEnvironments {
                 let EnvironmentConfigState::Ready(config) = &environment.selection.config else {
                     return None;
                 };
-                Some((
-                    environment.config_origin,
+                Some(
                     environment
                         .config_origin
                         .selected_capability_roots(&environment.environment, config),
-                ))
+                )
             }),
         );
         let mut seen_root_ids = HashSet::with_capacity(selected_capability_roots.len());
@@ -1159,14 +1151,6 @@ impl TurnEnvironmentSnapshot {
         self.turn_environments().next()
     }
 
-    /// Returns the first selected environment's host folders, even if setup is not ready yet.
-    pub(crate) fn primary_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
-        self.primary_workspace_root_uris()
-            .iter()
-            .filter_map(|root| root.to_abs_path().ok())
-            .collect()
-    }
-
     /// Returns the first selection's executor paths, even when setup is not ready yet.
     pub(crate) fn primary_workspace_root_uris(&self) -> &[PathUri] {
         let selection = match self.environments.first() {
@@ -1194,20 +1178,26 @@ impl TurnEnvironmentSnapshot {
     }
 
     pub(crate) fn local_environment_cwd(&self) -> Option<AbsolutePathBuf> {
+        self.local_selection()
+            .and_then(|selection| selection.cwd.to_abs_path().ok())
+    }
+
+    /// The local workspace remains host-owned while its executor is still starting.
+    pub(crate) fn local_selection(&self) -> Option<&TurnEnvironmentSelection> {
         self.environments
             .iter()
             .find_map(|environment| match environment {
                 TurnEnvironmentState::Ready(environment)
                     if !environment.environment.is_remote() =>
                 {
-                    environment.cwd().to_abs_path().ok()
+                    Some(&environment.selection)
                 }
                 TurnEnvironmentState::Ready(_) => None,
                 TurnEnvironmentState::Starting(environment)
                     if environment.selection.environment_id
                         == codex_exec_server::LOCAL_ENVIRONMENT_ID =>
                 {
-                    environment.selection.cwd.to_abs_path().ok()
+                    Some(&environment.selection)
                 }
                 TurnEnvironmentState::Starting(_) | TurnEnvironmentState::Failed { .. } => None,
             })
@@ -1282,11 +1272,6 @@ impl TurnEnvironmentSnapshot {
                 TurnEnvironmentState::Failed { selection, .. } => selection.clone(),
             })
             .collect()
-    }
-
-    pub(crate) fn primary_filesystem(&self) -> Option<Arc<dyn ExecutorFileSystem>> {
-        self.primary()
-            .map(|environment| environment.environment.get_filesystem())
     }
 
     pub(crate) fn single_local_environment(&self) -> Option<&TurnEnvironment> {

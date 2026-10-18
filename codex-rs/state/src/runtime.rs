@@ -19,6 +19,7 @@ use crate::model::datetime_to_epoch_millis;
 use crate::model::datetime_to_epoch_seconds;
 use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
+use crate::sqlite::SqliteWriteQueryExt;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
 use chrono::DateTime;
@@ -57,6 +58,7 @@ mod rollout_migration;
 pub(crate) mod test_support;
 mod thread_attachments;
 mod thread_metadata;
+mod thread_read_state;
 mod thread_section_order;
 mod thread_sections;
 mod threads;
@@ -81,6 +83,9 @@ pub use recovery::is_sqlite_corruption_error;
 pub use recovery::runtime_db_path_for_corruption_error;
 pub use recovery::sqlite_error_detail_is_lock;
 pub use remote_control::RemoteControlEnrollmentRecord;
+pub use thread_read_state::ReadStateOperation;
+pub use thread_read_state::ReadStateUpdate;
+pub use thread_read_state::ThreadReadState;
 pub use threads::ThreadFilterOptions;
 
 // "Partition" is the retained-log-content bucket we cap at 10 MiB:
@@ -387,7 +392,7 @@ ON CONFLICT(id) DO NOTHING
     .bind(1_i64)
     .bind(crate::BackfillStatus::Pending.as_str())
     .bind(Utc::now().timestamp())
-    .execute(pool)
+    .execute_with_busy_retry(pool)
     .await?;
     Ok(())
 }

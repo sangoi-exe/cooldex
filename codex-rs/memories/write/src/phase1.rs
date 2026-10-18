@@ -10,7 +10,6 @@ use crate::runtime::MemoryStartupContext;
 use crate::runtime::StageOneRequestContext;
 use codex_config::types::MemoriesConfig;
 use codex_core::Prompt;
-use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_protocol::MemoryVersion;
 use codex_protocol::ResponseItemId;
@@ -264,7 +263,7 @@ mod job {
         rollout_git_branch: Option<&str>,
         stage_one_context: &StageOneRequestContext,
     ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
+        let rollout_items = crate::rollout_input::read_recent_rollout_items(rollout_path).await?;
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,
             MemoryVersion::V2 => crate::rollout_input::serialize_tiered_input(
@@ -291,6 +290,8 @@ mod job {
         let mut prompt = Prompt::default();
         prompt.input = match config.memories.version {
             MemoryVersion::V1 => vec![ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: Some(ResponseItemId::new("msg")),
                 role: "user".to_string(),
                 content: vec![ContentItem::InputText { text: input_text }],
@@ -584,6 +585,8 @@ mod tests {
     #[test]
     fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
         let mixed_contextual_message = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -605,6 +608,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
         let skill_message = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -616,6 +621,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
         let subagent_message = ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -644,6 +651,8 @@ mod tests {
             parsed,
             vec![
                 ResponseItem::Message {
+                    encrypted_content: None,
+                    status: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText {

@@ -1,7 +1,9 @@
 use super::ContextualUserFragment;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::MULTI_AGENT_MODE_CLOSE_TAG;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -98,10 +100,9 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
         (MULTI_AGENT_MODE_OPEN_TAG, MULTI_AGENT_MODE_CLOSE_TAG)
     }
 
-    fn body(&self) -> String {
-        // `effective_multi_agent_mode` selects the policy-owned bundled text.
-        // Configured and catalog text is carried separately as a bounded explanation.
-        match &self.multi_agent_mode {
+    fn body(&self) -> ContentItem {
+        // Policy owns the built-in text; configured and catalog text is a bounded explanation.
+        input_text(match &self.multi_agent_mode {
             MultiAgentMode::Custom(hint_text) => hint_text.clone(),
             mode @ (MultiAgentMode::ExplicitRequestOnly | MultiAgentMode::Proactive) => {
                 let base_text = built_in_mode_text(mode);
@@ -110,6 +111,6 @@ impl ContextualUserFragment for MultiAgentModeInstructions {
                     None => base_text,
                 }
             }
-        }
+        })
     }
 }

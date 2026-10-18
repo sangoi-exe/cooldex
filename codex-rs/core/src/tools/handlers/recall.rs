@@ -88,7 +88,7 @@ impl ToolOutput for RecallToolOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.context.render(), Some(true))
+        FunctionToolOutput::from_content(vec![self.context.render().into()], Some(true))
             .to_response_item(call_id, payload)
     }
 

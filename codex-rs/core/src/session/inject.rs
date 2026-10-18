@@ -23,7 +23,10 @@ impl Session {
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
         let active_turn = self.active_turn.lock().await;
-        let Some(active_turn) = active_turn.as_ref().filter(|turn| turn.task.is_some()) else {
+        let Some(active_turn) = active_turn
+            .as_ref()
+            .filter(|turn| turn.task.is_some() && turn.finishing.is_none())
+        else {
             return Err(input);
         };
         let turn_state = Arc::clone(&active_turn.turn_state);
@@ -51,7 +54,10 @@ impl Session {
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         let active_turn = self.active_turn.lock().await;
-        let Some(active_turn) = active_turn.as_ref().filter(|turn| turn.task.is_some()) else {
+        let Some(active_turn) = active_turn
+            .as_ref()
+            .filter(|turn| turn.task.is_some() && turn.finishing.is_none())
+        else {
             return Err(input);
         };
         let turn_state = Arc::clone(&active_turn.turn_state);
@@ -104,7 +110,7 @@ impl Session {
                 .await;
                 return;
             };
-            if turn.finishing {
+            if turn.finishing.is_some() {
                 let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
                 let _ = done.as_mut().enable();
                 drop(active_turn);
@@ -312,6 +318,15 @@ impl Session {
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        let finishing = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.finishing.clone());
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

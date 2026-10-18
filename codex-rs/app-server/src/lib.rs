@@ -55,6 +55,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::WebSocketCompression;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_app_server_transport::daemon_recovery_file_path_for_local_package_lane;
 use codex_config::ConfigLayerSource;
@@ -166,6 +167,7 @@ pub use crate::transport::app_server_control_socket_path;
 // Merge-safety anchor: package-lane control-socket resolution remains available only through the existing app-server facade, matching the CLI's app-server dependency boundary.
 pub use crate::transport::app_server_control_socket_path_for_local_package_lane;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use crate::transport::verified_local_daemon_socket;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
@@ -605,7 +607,8 @@ pub async fn run_main_with_transport_options(
     );
     let bootstrap_config = config_manager
         .load_startup_config(startup_cwd.clone())
-        .await?;
+        .await?
+        .config;
     let bootstrap_auth =
         AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
             .await
@@ -617,7 +620,7 @@ pub async fn run_main_with_transport_options(
     );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager.load_latest_config(startup_cwd).await {
+    let config = match config_manager.load_latest_config(startup_cwd.clone()).await {
         Ok(config) => config,
         Err(err) if is_nonrecoverable_config_error(&err) => {
             return Err(err);
@@ -859,6 +862,14 @@ pub async fn run_main_with_transport_options(
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
+    let websocket_compression = if config
+        .features
+        .enabled(Feature::AppServerWebSocketCompression)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     // Merge-safety anchor: instance-child mode terminates after its final connection, while direct
     // Unix-socket service remains multi-client.
@@ -893,6 +904,7 @@ pub async fn run_main_with_transport_options(
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -903,6 +915,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -1046,15 +1059,19 @@ pub async fn run_main_with_transport_options(
     });
 
     let recovery_file = daemon_recovery_file_path_for_runtime(&config.codex_home, &runtime_options);
+    // Merge-safety anchor: managed RPC preferences and their sibling daemon.lock stay in the already-selected daemon's recovery/state directory, including local package lanes.
+    let daemon_settings_file =
+        managed_daemon.then(|| recovery_file.with_file_name("settings.json"));
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
-        let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+        let mut processor = MessageProcessor::new(MessageProcessorArgs {
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
             config: Arc::new(config),
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback: feedback.clone(),
@@ -1075,7 +1092,9 @@ pub async fn run_main_with_transport_options(
                 PluginStartupTasks::Start
             )
             .then_some(plugin_startup_config),
-        }));
+        });
+        processor.remote_control_processor.daemon_settings_file = daemon_settings_file;
+        let processor = Arc::new(processor);
         let mut thread_created_rx = processor.thread_created_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
@@ -1661,6 +1680,7 @@ mod tests {
     use super::AppServerLaunchMode;
     use super::AppServerRuntimeOptions;
     use super::AppServerTransport;
+    use super::ConfigManager;
     use super::LogFormat;
     use super::ShutdownAction;
     use super::ShutdownSignal;
@@ -1671,7 +1691,6 @@ mod tests {
     use super::loader_overrides_with_test_user_config_file;
     use super::turn_admission::TurnAdmission;
     use super::validate_app_server_launch_mode;
-    #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
     use codex_config::types::AppServerMode;
     use codex_install_context::LocalPackageLane;
@@ -1726,6 +1745,47 @@ mod tests {
         assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
         assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
+    }
+
+    #[tokio::test]
+    async fn startup_config_reports_defaults_without_recovering_a_missing_selected_profile() {
+        let home = tempfile::tempdir().expect("home");
+        let config_file = home.path().join("config.toml");
+        std::fs::write(&config_file, "").expect("empty config");
+        let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+        let startup = manager
+            .load_startup_config(/*fallback_cwd*/ None)
+            .await
+            .expect("valid config");
+        assert!(!startup.used_defaults);
+
+        std::fs::write(&config_file, "[tui").expect("malformed config");
+        let startup = manager
+            .load_startup_config(/*fallback_cwd*/ None)
+            .await
+            .expect("ordinary config errors may use defaults");
+        assert!(startup.used_defaults);
+
+        std::fs::write(&config_file, "").expect("restore base config");
+        let mut overrides = LoaderOverrides::without_managed_config_for_tests();
+        overrides.user_config_path = Some(
+            AbsolutePathBuf::from_absolute_path(home.path().join("missing.config.toml"))
+                .expect("selected config path"),
+        );
+        overrides.user_config_profile = Some("missing".parse().expect("profile name"));
+        let manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            Vec::new(),
+            overrides,
+            Default::default(),
+        );
+        let error = manager
+            .load_startup_config(/*fallback_cwd*/ None)
+            .await
+            .err()
+            .expect("a missing selected profile must not use defaults");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(super::is_nonrecoverable_config_error(&error));
     }
 
     #[test]

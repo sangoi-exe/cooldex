@@ -4,6 +4,7 @@ use crate::context::MultiAgentRoleInstructions;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::test_support::FragmentSectionTestExt as _;
 use codex_protocol::models::ResponseItem;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_output_truncation::approx_token_count;
 use pretty_assertions::assert_eq;
 
@@ -110,10 +111,11 @@ fn unchanged_mode_is_reemitted_after_usage_hint_migration() {
         .expect("unchanged mode should follow migrated usage instructions");
 
     assert_eq!(
-        instructions.render(),
+        instructions.render().expect_text(),
         MultiAgentModeInstructions::new(MultiAgentMode::Proactive, /*explanation*/ None)
             .expect("proactive mode should render")
             .render()
+            .expect_text()
     );
 }
 
@@ -188,7 +190,8 @@ fn custom_mode_is_bounded_before_snapshot_and_rendering() {
         .render_fragment_diff(PreviousSectionState::Absent)
         .1
         .expect("custom mode should render")
-        .render();
+        .render()
+        .expect_text();
     assert!(approx_token_count(&rendered) <= 400);
 
     let explained = state_with_explanation(
@@ -203,6 +206,9 @@ fn custom_mode_is_bounded_before_snapshot_and_rendering() {
             .as_deref()
             .is_some_and(|explanation| approx_token_count(explanation) <= 400)
     );
-    let rendered = fragment.expect("explained mode should render").render();
+    let rendered = fragment
+        .expect("explained mode should render")
+        .render()
+        .expect_text();
     assert!(approx_token_count(&rendered) <= 400);
 }

@@ -23,6 +23,8 @@ pub enum SpawnAgentForkMode {
     FullHistory,
 }
 
+// Merge-safety anchor: full-history V2 hint identity travels in the captured Config binding,
+// never in a second mutable spawn-option hint snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnAgentOptions {
     pub fork_parent_spawn_call_id: Option<String>,
@@ -37,7 +39,6 @@ pub struct SpawnAgentOptions {
     /// Plugin choices from the turn requesting the child. Omission inherits the parent's
     /// current choices; an explicit list, including an empty one, overrides them and history.
     pub disabled_plugin_ids: Option<Vec<String>>,
-    pub multi_agent_v2_usage_hints: Option<ResolvedMultiAgentV2UsageHints>,
     pub cyber_access_program: Option<CyberAccessProgram>,
 }
 

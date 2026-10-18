@@ -183,7 +183,7 @@ impl InputQueue {
         let active = active_turn.lock().await;
         // Merge-safety anchor: finishing slots reject notices atomically with upstream expected-turn admission, preserving its conditional cancellation check.
         let Some(active_turn) = active.as_ref().filter(|turn| {
-            !turn.finishing
+            turn.finishing.is_none()
                 && turn.task.as_ref().is_some_and(|task| {
                     expected_turn_id.is_none_or(|id| {
                         task.turn_context.sub_id == id && !task.cancellation_token.is_cancelled()

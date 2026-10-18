@@ -3,7 +3,9 @@
 
 use crate::without_update_plan_instructions;
 use codex_context_fragments::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_protocol::protocol::AgentUsageHintInstructions;
 
 const DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT: &str = "Full-history forks (`fork_turns` omitted or `\"all\"`) inherit the parent model and reasoning effort and do not accept overrides. Only set `model` or `reasoning_effort` when explicitly requested by the user, applicable `AGENTS.md` instructions, or skill instructions; when doing so, set `fork_turns` to `\"none\"`.";
@@ -36,6 +38,9 @@ pub enum MultiAgentRoleInstructions {
 }
 
 impl MultiAgentRoleInstructions {
+    /// Content classification shared by role producers and inherited-history filtering.
+    pub const KIND: &str = "multi_agent.role_instructions";
+
     pub fn unmarked(text: impl Into<String>) -> Self {
         Self::Captured {
             text: text.into(),
@@ -66,38 +71,13 @@ impl MultiAgentRoleInstructions {
             },
             Self::Captured { text, marked } => AgentUsageHintInstructions { text, marked },
             instructions @ Self::Composed { marked, .. } => AgentUsageHintInstructions {
-                text: instructions.body(),
+                text: instructions.body_text(),
                 marked,
             },
         }
     }
-}
 
-impl ContextualUserFragment for MultiAgentRoleInstructions {
-    fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("multi_agent.role_instructions".to_string())
-    }
-
-    fn role(&self) -> &'static str {
-        "developer"
-    }
-
-    fn markers(&self) -> (&'static str, &'static str) {
-        match self {
-            Self::Composed { marked: true, .. } | Self::Captured { marked: true, .. } => {
-                Self::type_markers()
-            }
-            Self::Configured(_)
-            | Self::Composed { marked: false, .. }
-            | Self::Captured { marked: false, .. } => ("", ""),
-        }
-    }
-
-    fn type_markers() -> (&'static str, &'static str) {
-        ("<multi_agent_role>", "</multi_agent_role>")
-    }
-
-    fn body(&self) -> String {
+    fn body_text(&self) -> String {
         match self {
             Self::Configured(text) | Self::Captured { text, .. } => text.clone(),
             Self::Composed {
@@ -129,6 +109,35 @@ impl ContextualUserFragment for MultiAgentRoleInstructions {
                 text
             }
         }
+    }
+}
+
+impl ContextualUserFragment for MultiAgentRoleInstructions {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind(Self::KIND.to_string())
+    }
+
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Composed { marked: true, .. } | Self::Captured { marked: true, .. } => {
+                Self::type_markers()
+            }
+            Self::Configured(_)
+            | Self::Composed { marked: false, .. }
+            | Self::Captured { marked: false, .. } => ("", ""),
+        }
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        ("<multi_agent_role>", "</multi_agent_role>")
+    }
+
+    fn body(&self) -> ContentItem {
+        input_text(self.body_text())
     }
 }
 

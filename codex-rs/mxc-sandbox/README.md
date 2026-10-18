@@ -10,11 +10,11 @@ Windows executors record `codex.windows_mxc.available` once per process with an
 `available=true|false` tag. This measures runtime availability independently of
 selection. Unsupported Windows executors reject MXC requests before execution.
 
-`is_available()` uses MXC's cached PSEC API-set check. The SDK validates native
-creation and capabilities for each request at launch. Its broad
-`platform_support()` result also includes older AppContainer backends and is not
-used here. A requested deny path requires native `PSE_SUPPORT_FS_DENY` support;
-host-loopback ingress requires PSEC 1.1 and native ingress support.
+`is_available()` uses MXC's cached create/close probe, rather than an OS build
+number or the SDK's broad `platform_support()` result. The latter also reports
+older AppContainer backends as supported. A requested deny path additionally
+requires the native `PSE_SUPPORT_FS_DENY` capability; otherwise the command
+fails before launch.
 
 The wrapper inherits the command's pipes or ConPTY console. MXC creates its
 child suspended, assigns a kill-on-close job before resuming it, and retains
@@ -45,6 +45,13 @@ request: the canonical `PermissionProfile`, policy cwd, proxy context, and exact
 argv. The helper inherits command cwd, environment, and stdio from the shared
 process path; policy cwd can differ from command cwd.
 
+Windows MXC reserves `SystemDrive` and `LOCALAPPDATA` for the host's validated,
+nonempty values in both wrapper and explicit child environments. Caller
+overrides are replaced case-insensitively; unavailable host values fail before
+launch with a diagnostic naming the variable.
+Windows may virtualize the child's `LOCALAPPDATA` into a sandbox directory
+beneath the host profile.
+
 The request uses launcher-only environment chunks to leave Windows' command-line
 budget to the workload. Payloads are limited to 1,000,000 UTF-8 bytes and chunks
 to 4096 bytes; the helper removes them before native process creation. Use
@@ -70,9 +77,10 @@ to 4096 bytes; the helper removes them before native process creation. Use
   command are not implicitly granted.
 - The native API represents paths and environment values as Unicode strings.
   Non-Unicode values fail instead of undergoing lossy conversion.
-- An empty child environment uses the Windows user-profile defaults, preserving
-  the previous SDK behavior. Nonempty environments remain explicit; the SDK now
-  requires `SystemRoot` and `LOCALAPPDATA` before launch.
+- An empty child environment still uses the Windows user-profile defaults.
+  Supplying only two keys would turn it into an incomplete explicit environment,
+  so the wrapper's bootstrap values are removed before the SDK selects defaults.
+  Nonempty environments remain explicit except for these two host-owned values.
 - The upstream runner terminates remaining descendants when the foreground
   process exits, as well as on cancellation. Both existing Windows backends
   preserve descendants after normal exit, so detached servers currently lose
@@ -87,10 +95,6 @@ to 4096 bytes; the helper removes them before native process creation. Use
   suite on supported Windows and the corresponding platform hosts.
   Test the normal `powershell.exe` and `pwsh.exe` command paths, not only `cmd.exe`.
 
-The MXC 1.0.0 Git revision is pinned with the workspace dependencies.
-Native launch errors are returned without dumping the SDK's diagnostic buffer,
-which may contain command or environment data.
-
-Cargo builds on Windows GNU targets require `RC_PATH` to point to `rc.exe` or
-`llvm-rc.exe`; the SDK's automatic resource compiler lookup supports MSVC only.
-Bazel supplies its hermetic LLVM resource compiler.
+The MXC git revision is pinned with the workspace dependencies. Native launch
+errors are returned without dumping the SDK's diagnostic buffer, which may
+contain command or environment data.

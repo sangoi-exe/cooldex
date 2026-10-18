@@ -1,6 +1,7 @@
 //! Extension prompt placement with content and producer attribution kept together.
 
 use codex_context_fragments::AnnotatedContent;
+use codex_context_fragments::ContextualUserFragment;
 use codex_context_fragments::RenderedFragment;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
@@ -10,7 +11,7 @@ use codex_protocol::models::ContentItemMetadata;
 pub enum PromptSlot {
     DeveloperPolicy,
     DeveloperCapabilities,
-    /// Text inside the context-window message, supplied by `contribute_thread_context`.
+    /// Content inside the context-window message, supplied by `contribute_thread_context`.
     ContextWindow,
 }
 
@@ -21,6 +22,15 @@ pub struct PromptFragment {
 }
 
 impl PromptFragment {
+    /// Places a contextual fragment in the prompt, preserving its content, kind, and source.
+    /// The slot determines placement within the developer message, regardless of its original role.
+    pub fn from_fragment(slot: PromptSlot, fragment: &impl ContextualUserFragment) -> Self {
+        Self {
+            slot,
+            content: fragment.render_fragment().into_parts().1,
+        }
+    }
+
     /// Creates harness-provided context for the given slot.
     pub fn new(slot: PromptSlot, text: impl Into<String>, content_kind: ContentItemKind) -> Self {
         Self {
@@ -61,15 +71,12 @@ impl PromptFragment {
         self.slot
     }
 
-    /// Returns the model-visible text.
-    pub fn text(&self) -> &str {
-        let ContentItem::InputText { text } = self.content.content() else {
-            unreachable!("prompt fragments contain text");
-        };
-        text
+    /// Returns the model-visible content.
+    pub fn content(&self) -> &ContentItem {
+        self.content.content()
     }
 
-    /// Returns the producer-owned classification of the model-visible text.
+    /// Returns the producer-owned classification of the model-visible content.
     pub fn content_kind(&self) -> &ContentItemKind {
         self.content.kind()
     }

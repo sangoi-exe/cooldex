@@ -37,6 +37,8 @@ mod config_rpc;
 #[path = "connection_handling_stdio_tests.rs"]
 mod connection_handling_stdio;
 mod connection_handling_websocket;
+#[path = "connection_handling_websocket_compression_tests.rs"]
+mod connection_handling_websocket_compression;
 #[cfg(unix)]
 mod connection_handling_websocket_unix;
 #[cfg(unix)]
@@ -149,6 +151,7 @@ mod thread_name_persistence;
 mod thread_name_websocket;
 mod thread_queue;
 mod thread_read;
+mod thread_read_state;
 mod thread_resume;
 mod thread_revert;
 mod thread_sections;

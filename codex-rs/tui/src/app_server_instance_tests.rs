@@ -534,10 +534,12 @@ async fn two_instance_children_use_distinct_endpoints_and_reap_cleanly() -> Resu
         .expect("second child identity");
 
     let first_session = crate::app_server_session::AppServerSession::new_instance_child(
+        crate::backend_id::BackendId::new(),
         first.client,
         first.supervisor,
     );
     let second_session = crate::app_server_session::AppServerSession::new_instance_child(
+        crate::backend_id::BackendId::new(),
         second.client,
         second.supervisor,
     );
@@ -585,6 +587,7 @@ async fn instance_child_propagates_psp_feature_override_to_child_argv() -> Resul
     assert!(!args.iter().any(|arg| arg == "--psp"));
 
     crate::app_server_session::AppServerSession::new_instance_child(
+        crate::backend_id::BackendId::new(),
         started.client,
         started.supervisor,
     )
@@ -637,6 +640,7 @@ async fn instance_child_replays_parent_cwd_profile_and_resolved_oss_provider_bef
     );
 
     crate::app_server_session::AppServerSession::new_instance_child(
+        crate::backend_id::BackendId::new(),
         started.client,
         started.supervisor,
     )

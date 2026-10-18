@@ -56,6 +56,12 @@ pub(crate) struct ConfigManager {
     network_policy_snapshot: Arc<RwLock<Option<Arc<ApplicationPolicySnapshot>>>>,
 }
 
+/// Startup configuration, including whether loading had to fall back to defaults.
+pub(crate) struct StartupConfig {
+    pub(crate) config: Config,
+    pub(crate) used_defaults: bool,
+}
+
 /// Configuration and policy must finish loading against the same account and cloud snapshot.
 pub(crate) struct ApplicationPolicyLoad {
     cloud_config: CloudConfigBundleLoader,
@@ -336,16 +342,22 @@ impl ConfigManager {
     pub(crate) async fn load_startup_config(
         &self,
         fallback_cwd: Option<PathBuf>,
-    ) -> std::io::Result<Config> {
+    ) -> std::io::Result<StartupConfig> {
         match self.load_latest_config(fallback_cwd).await {
-            Ok(config) => Ok(config),
+            Ok(config) => Ok(StartupConfig {
+                config,
+                used_defaults: false,
+            }),
             // Merge-safety anchor: a missing explicitly selected profile is terminal even when non-strict startup may otherwise use defaults.
             Err(error) if self.strict_config || crate::is_nonrecoverable_config_error(&error) => {
                 Err(error)
             }
             Err(error) => {
                 warn!(%error, "configuration is unavailable; using default settings");
-                self.load_default_config().await
+                Ok(StartupConfig {
+                    config: self.load_default_config().await?,
+                    used_defaults: true,
+                })
             }
         }
     }

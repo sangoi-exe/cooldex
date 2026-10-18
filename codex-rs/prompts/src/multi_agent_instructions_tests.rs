@@ -29,6 +29,13 @@ fn role_segment_filters_base_and_appends_bundled_guidance() {
         } else {
             expected_body.clone()
         };
+        let captured = instructions.clone().into_agent_usage_hint_instructions();
+        assert_eq!(captured.text, expected_body);
+        assert_eq!(captured.marked, marked);
+        assert_eq!(
+            MultiAgentRoleInstructions::from_agent_usage_hint_instructions(captured).render(),
+            instructions.render(),
+        );
         assert_eq!(
             instructions.render_fragment(),
             RenderedFragment::new(

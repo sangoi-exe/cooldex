@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_diagnostics::Gauge;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
@@ -322,7 +323,7 @@ impl Session {
 
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with its active reservation"
+        reason = "record the started turn atomically with task registration"
     )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
@@ -352,6 +353,18 @@ impl Session {
                 }
             }
         };
+        // Replace the cache; in-flight acquisitions retain their previous Arc.
+        self.services
+            .thread_extension_data
+            .insert(ExecutorCapabilityDiscoveryV2Cache::default());
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::ExecutorCapabilityDiscoveryV2)
+        {
+            // MCP contributors must project the new inventory even if their other inputs match.
+            self.request_mcp_runtime_reprojection();
+        }
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -412,6 +425,7 @@ impl Session {
         }) else {
             return false;
         };
+        // Record lineage only when the task starts: settings changes can invalidate a reservation.
         self.record_started_turn(
             &turn_context.sub_id,
             (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
@@ -513,8 +527,8 @@ impl Session {
 
     /// Starts a regular turn when the session is idle and pending work is waiting.
     ///
-    /// Pending work includes mailbox mail marked with `trigger_turn`, or any mailbox mail while
-    /// an outstanding durable sleep is attached to the thread.
+    /// Mail can request a new task with `trigger_turn`, wake durable sleep, or wake a root with
+    /// `wake_on_agent_messages` enabled.
     ///
     /// This helper generates a fresh sub-id for the synthetic turn before delegating to the
     /// explicit-sub-id variant.
@@ -530,8 +544,7 @@ impl Session {
     /// Starts a regular turn with the provided sub-id when pending work should wake an idle
     /// session.
     ///
-    /// The turn is created only when the session is idle and mailbox mail either requests a turn
-    /// or can wake an outstanding durable sleep.
+    /// Starts an idle turn for explicit follow-ups, durable sleep, or enabled message wakes.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
@@ -565,7 +578,7 @@ impl Session {
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {
-            // Queue-only mail wakes durable sleep without selecting a new task's settings.
+            // Queue-only wakes retain the previous turn context without selecting a new task.
             start_options = previous_options;
             start_options.cyber_access_program = self
                 .reference_context_item()
@@ -647,7 +660,7 @@ impl Session {
             let _settings_guard = self.acquire_thread_settings_persistence().await;
             let mut active = self.active_turn.lock().await;
             if active.as_ref().is_some_and(|active_turn| {
-                !active_turn.finishing
+                active_turn.finishing.is_none()
                     && active_turn
                         .task
                         .as_ref()
@@ -718,6 +731,8 @@ impl Session {
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
+        let finishing = CancellationToken::new();
+        let finish_recording = finishing.clone().drop_guard();
         let active_turn = {
             let mut active = self.active_turn.lock().await;
             active.as_mut().and_then(|active_turn| {
@@ -725,13 +740,13 @@ impl Session {
                     .task
                     .as_ref()
                     .filter(|task| Arc::ptr_eq(&task.turn_context, &turn_context))?;
-                if active_turn.finishing {
+                if active_turn.finishing.is_some() {
                     return None;
                 }
                 // Merge-safety anchor: terminal work retains the active slot through terminal
                 // event delivery, except the established private-guardian handoff below;
                 // cancellation stays reserved for genuine abort paths.
-                active_turn.finishing = true;
+                active_turn.finishing = Some(finishing);
                 Some((
                     Arc::clone(&active_turn.turn_state),
                     active_turn.input_persisted.take(),
@@ -799,6 +814,8 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
+        // Recording completion does not retire the retained task or reopen admission.
+        drop(finish_recording);
         if let Some(sender) = input_persisted {
             let _ = sender.send(Err(
                 crate::codex_thread::TryStartTurnIfIdleRejectionReason::TaskEndedBeforePersistence,
@@ -974,7 +991,7 @@ impl Session {
         let cleared_active_turn = {
             let mut active = self.active_turn.lock().await;
             if let Some(active_turn) = active.as_ref()
-                && active_turn.finishing
+                && active_turn.finishing.is_some()
                 && active_turn.task.as_ref().is_some_and(|task| {
                     Arc::ptr_eq(&task.turn_context, &turn_context)
                         && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
@@ -1026,7 +1043,7 @@ impl Session {
                 let mut active = self.active_turn.lock().await;
                 if active
                     .as_ref()
-                    .is_some_and(|active_turn| active_turn.finishing)
+                    .is_some_and(|active_turn| active_turn.finishing.is_some())
                 {
                     if !matches!(reason, TurnAbortReason::Replaced) {
                         return None;

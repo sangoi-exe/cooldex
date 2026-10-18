@@ -6,13 +6,13 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use codex_protocol::protocol::FileSystemAccessMode;
 use codex_protocol::protocol::FileSystemPath;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::FileSystemSpecialPath;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_windows_sandbox::resolve_windows_deny_read_paths;
-use mxc_sdk::mxc_common as wxc_common;
 use thiserror::Error;
 use wxc_common::cmdline::CommandLineContext;
 use wxc_common::cmdline::CommandLineError;
@@ -139,7 +139,11 @@ pub(super) fn build_request(
         .iter()
         .map(PathUri::from_host_native_path)
         .collect::<std::io::Result<Vec<_>>>()?;
-    let fs = materialize_volume_roots(policy.clone(), &volumes)?;
+    #[cfg(windows)]
+    let read_volumes = crate::windows::implicit_read_roots(volume_roots, cwd, command_cwd)?;
+    #[cfg(not(windows))]
+    let read_volumes = volumes.clone();
+    let fs = materialize_volume_roots(policy.clone(), &volumes, &read_volumes)?;
     let roots = if full_disk_write {
         Vec::new()
     } else {
@@ -275,7 +279,7 @@ pub(super) fn build_request(
             .to_str()
             .ok_or(PolicyError::NonUnicodeCommandCwd)?
             .to_owned(),
-        env: (!env.is_empty()).then_some(env),
+        env,
         policy: ContainerPolicy {
             capabilities: vec!["registryRead".to_owned()],
             readwrite_paths: unicode_paths(write)?,
@@ -343,22 +347,30 @@ fn prune_unavailable_volume_roots(paths: &mut NativePaths, volume_roots: &HashSe
     });
 }
 
-// Bind :root to every executor volume before canonical precedence and carveout
-// resolution. This is purely lexical; native volume enumeration happens later.
+// Bind :root before canonical precedence and carveout resolution. Only implicit
+// reads use the filtered volumes; writes and denies retain every executor volume.
 pub(super) fn materialize_volume_roots(
     mut fs: FileSystemSandboxPolicy,
     volume_roots: &[PathUri],
+    implicit_read_roots: &[PathUri],
 ) -> Result<FileSystemSandboxPolicy, PolicyError> {
     let mut entries = Vec::new();
     for entry in fs.entries {
         match &entry.path {
             FileSystemPath::Special {
                 value: FileSystemSpecialPath::Root,
-            } => entries.extend(volume_roots.iter().map(|path| {
-                let mut entry = entry.clone();
-                entry.path = path.clone().into();
-                entry
-            })),
+            } => {
+                let roots = if entry.access == FileSystemAccessMode::Read {
+                    implicit_read_roots
+                } else {
+                    volume_roots
+                };
+                entries.extend(roots.iter().map(|path| {
+                    let mut entry = entry.clone();
+                    entry.path = path.clone().into();
+                    entry
+                }));
+            }
             FileSystemPath::Special {
                 value:
                     FileSystemSpecialPath::ProjectRoots { .. }

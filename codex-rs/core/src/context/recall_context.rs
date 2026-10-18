@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 /// Chronological persisted assistant and reasoning intervals returned by the explicit `recall` tool.
 // Merge-safety anchor: Recall renders its interval list directly, without an availability envelope or local truncation.
@@ -34,7 +36,7 @@ impl ContextualUserFragment for RecallContext {
         ("", "")
     }
 
-    fn body(&self) -> String {
-        self.json.clone()
+    fn body(&self) -> ContentItem {
+        input_text(self.json.clone())
     }
 }

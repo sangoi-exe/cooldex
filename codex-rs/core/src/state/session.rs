@@ -95,6 +95,7 @@ pub(crate) struct SessionState {
     // Merge-safety anchor: post_compact_recovery and prepared auto-compaction
     // windows remain session-scoped so recovery installs only a matching window.
     pub(crate) post_compact_recovery: PostCompactRecoveryRuntimeState,
+    pub(crate) async_compaction: crate::session::async_compaction::AsyncCompactionState,
     /// Original request effort for the current model while configuration updates remain active.
     pub(crate) reasoning_effort_pin: ReasoningEffortPin,
     /// Set under the state lock before shutdown takes the last warmup handle.
@@ -141,6 +142,7 @@ impl SessionState {
             turn_attribution: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             post_compact_recovery: PostCompactRecoveryRuntimeState::Absent,
+            async_compaction: crate::session::async_compaction::AsyncCompactionState::default(),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
             shutting_down: false,
             startup_prewarm: None,
