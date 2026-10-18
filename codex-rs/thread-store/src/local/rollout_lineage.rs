@@ -260,11 +260,14 @@ impl RolloutLineage {
                 ),
             })?;
         let thread_id = session_meta.meta.id;
-        tokio::task::spawn_blocking(move || {
+        let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+        let items = tokio::task::spawn_blocking(move || {
             let mut items = vec![RolloutItem::SessionMeta(session_meta)];
             for segment in self.segments() {
-                let file =
-                    codex_rollout::open_rollout_seekable_reader(segment.rollout_path.as_path())?;
+                let file = codex_rollout::open_rollout_seekable_reader(
+                    segment.rollout_path.as_path(),
+                    || stop.is_closed(),
+                )?;
                 let end_byte_offset = segment.end.map_or(u64::MAX, |end| end.end_byte_offset);
                 let reader = BufReader::new(file.take(end_byte_offset));
                 for line in reader.lines() {
@@ -296,8 +299,9 @@ impl RolloutLineage {
         .await
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to join paginated history replay: {err}"),
-        })?
-        .map_err(|err| ThreadStoreError::Internal {
+        })?;
+        drop(keep_running);
+        items.map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to load paginated history for thread {thread_id}: {err}"),
         })
     }
