@@ -47,18 +47,20 @@ async fn task_finish_preserves_notification_budget_and_queued_user_input() {
         codex_protocol::openai_models::TruncationPolicyConfig::tokens(/*limit*/ 400);
     turn.next_step_settings.store(Arc::new(current));
 
-    // Stall recording the first batch, then inject while finalization is in progress.
-    let state = session.state.lock().await;
-    let (cancellation_token, mut done) = {
+    // Merge-safety anchor: let the native runner finish its guardian lookup before blocking history recording, while retaining task-owned retirement for late client injection.
+    let (turn_state, cancellation_token, mut done) = {
         let active = session.active_turn.lock().await;
-        let task = active
-            .as_ref()
-            .and_then(|turn| turn.task.as_ref())
-            .expect("running task");
+        let active_turn = active.as_ref().expect("active turn");
+        let task = active_turn.task.as_ref().expect("running task");
         let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
         let _ = done.as_mut().enable();
-        (task.cancellation_token.clone(), done)
+        (
+            Arc::clone(&active_turn.turn_state),
+            task.cancellation_token.clone(),
+            done,
+        )
     };
+    let pending_input = turn_state.lock().await;
     cancellation_token.cancel();
     let late = vec![notification("late notification".to_string())];
     tokio::join!(done.as_mut(), async {
@@ -73,6 +75,9 @@ async fn task_finish_preserves_notification_budget_and_queued_user_input() {
         {
             tokio::task::yield_now().await;
         }
+        // Transfer the barrier from the final input drain to its history recording.
+        let state = session.state.lock().await;
+        drop(pending_input);
         // Admission is closed even if recording has not yet reached the history lock.
         let notice = vec![notification("producer still running".to_string())];
         assert_eq!(session.inject_if_running(notice.clone()).await, Err(notice));

@@ -992,20 +992,19 @@ impl Session {
                     )
                 }
                 SubmittedTurnInput::ResponseItem(item)
-                    if matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) =>
-                {
-                    (
-                        pending_turn_input(
-                            self,
-                            SubmittedTurnInput::ResponseItem(item.clone()),
-                            sender_messages,
-                            &active_turn_id,
-                            origin,
-                        )
-                        .await,
-                        None,
+                | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem {
+                    item, ..
+                }) if matches!(item, ResponseItem::FunctionCallOutput { call_id: None, .. }) => (
+                    pending_turn_input(
+                        self,
+                        input.clone(),
+                        sender_messages,
+                        &active_turn_id,
+                        origin,
                     )
-                }
+                    .await,
+                    None,
+                ),
                 _ => return Err(SteerInputError::EmptyInput),
             };
             let active = self.active_turn.lock().await;

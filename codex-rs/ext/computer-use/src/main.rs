@@ -55,7 +55,6 @@ async fn main() -> anyhow::Result<()> {
     let runtime = LocalComputerUseRuntime::new(LocalComputerUseRuntimeConfig {
         session,
         sky_binary_path: args.sky_bin,
-        ..Default::default()
     });
     let service = ComputerUseServer::new(runtime);
     let running = service.serve(stdio()).await?;
