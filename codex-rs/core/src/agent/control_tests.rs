@@ -4783,9 +4783,17 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         ),
         "a subagent must not inherit its parent review checkpoint",
     );
+    assert_eq!(
+        history_contains_text(history.raw_items(), "parent-private-release"),
+        preserve_fork_prefix,
+        "only native prefix retention preserves parent approval as inherited model context",
+    );
     assert!(
-        !history_contains_text(history.raw_items(), "parent-private-release"),
-        "a subagent must not inherit parent-local approval messages",
+        !history_contains_text(
+            history.conversation_history_snapshot().review_items(),
+            "parent-private-release",
+        ),
+        "inherited parent approval must not enter the child's review history",
     );
     let mut inherited_context = codex_history::RetainedContext::default();
     inherited_context.reserve_order();
@@ -4824,12 +4832,13 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
         !history_contains_text(history.raw_items(), "Previous parent root guidance."),
         "forked child history should strip stale parent hints from compacted replacement history"
     );
-    assert!(
-        !history_contains_text(
+    assert_eq!(
+        history_contains_text(
             history.raw_items(),
             "Proactive multi-agent delegation is active."
         ),
-        "forked child history should strip stale policy fragments from compound compacted messages"
+        preserve_fork_prefix,
+        "only native prefix retention preserves inherited policy fragments in compacted messages"
     );
     assert!(
         history_contains_text(history.raw_items(), "Parent developer instructions."),

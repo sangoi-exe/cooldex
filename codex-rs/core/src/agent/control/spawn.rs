@@ -194,11 +194,12 @@ pub(super) fn drop_unowned_recovery_applications(items: &mut Vec<RolloutItem>) {
     });
 }
 
-// Merge-safety anchor: inherited V2 history keeps only its captured effective hint, even when durable kind metadata identifies that fragment as a role hint.
+// Merge-safety anchor: preserved V2 prefixes filter only usage hints against the captured birth binding; native non-identity context survives as inherited context, not child-local authorization.
 fn retain_forked_developer_message(
     item: &mut ResponseItem,
     usage_hint_texts: &[String],
     retained_usage_hint_text: Option<&str>,
+    preserve_fork_prefix: bool,
 ) -> bool {
     if !matches!(item, ResponseItem::Message { role, .. } if role == "developer") {
         return true;
@@ -212,7 +213,7 @@ fn retain_forked_developer_message(
         if content_item.kind().as_str() == BaseInstructionsFragment::KIND {
             return true;
         }
-        if content_item.kind().as_str() == GuardianApprovedAction::KIND {
+        if !preserve_fork_prefix && content_item.kind().as_str() == GuardianApprovedAction::KIND {
             return false;
         }
         let ContentItem::InputText { text } = content_item.content() else {
@@ -229,12 +230,15 @@ fn retain_forked_developer_message(
             || usage_hint_texts
                 .iter()
                 .any(|usage_hint_text| usage_hint_text == text);
-        !((is_usage_hint && !is_retained_usage_hint)
-            || text
+        if is_usage_hint && !is_retained_usage_hint {
+            return false;
+        }
+        preserve_fork_prefix
+            || !(text
                 .starts_with(crate::guardian::AUTO_REVIEW_DENIED_ACTION_APPROVAL_DEVELOPER_PREFIX)
-            || MultiAgentModeInstructions::matches_text(text)
-            || CurrentTimeReminder::matches_text(text)
-            || CurrentTimeUnavailable::matches_text(text))
+                || MultiAgentModeInstructions::matches_text(text)
+                || CurrentTimeReminder::matches_text(text)
+                || CurrentTimeUnavailable::matches_text(text))
     });
     !content.is_empty() && set_annotated_content(item, content).is_some()
 }
@@ -1436,7 +1440,7 @@ impl LocalAgentControl {
             };
             forked_rollout_items = items;
         }
-        // Sanitize standalone messages and compaction replacement histories at the same owner.
+        // Apply the narrow captured-hint exception to standalone and compacted prefix content; ordinary forks still sanitize non-identity context before rebuilding the child's view.
         let retain_forked_item = |envelope: &mut ResponseItemEnvelope| {
             if multi_agent_version == MultiAgentVersion::V2
                 && (preserve_fork_prefix
@@ -1460,6 +1464,7 @@ impl LocalAgentControl {
                 response_item,
                 &multi_agent_v2_usage_hint_texts_to_filter,
                 retained_usage_hint_text,
+                preserve_fork_prefix,
             ) {
                 return false;
             }
