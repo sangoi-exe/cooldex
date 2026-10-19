@@ -1030,7 +1030,11 @@ impl ContextManager {
 }
 
 /// Configuration updates require harness provenance; raw system messages are never retained.
+// Merge-safety anchor: shared top-level recording/replay admission keeps compaction observations archival; canonical replacement arrays remain model-visible through the native replacement owners.
 fn is_api_message(message: &ResponseItem, metadata: Option<&CodexHarnessMetadata>) -> bool {
+    if metadata.is_some_and(|metadata| metadata.compaction_output) {
+        return false;
+    }
     match message {
         ResponseItem::Message { role, .. } => role.as_str() != "system",
         ResponseItem::ConfigurationUpdate { .. } => {

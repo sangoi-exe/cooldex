@@ -29,6 +29,7 @@ fn role_segment_filters_base_and_appends_bundled_guidance() {
         } else {
             expected_body.clone()
         };
+        // Merge-safety anchor: typed usage-hint capture preserves text, marked state, and equivalent rendering after restoration.
         let captured = instructions.clone().into_agent_usage_hint_instructions();
         assert_eq!(captured.text, expected_body);
         assert_eq!(captured.marked, marked);

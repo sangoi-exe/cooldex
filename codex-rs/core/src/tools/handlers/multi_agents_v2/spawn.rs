@@ -127,6 +127,7 @@ async fn handle_spawn_agent(
             agent_type: args.agent_type,
             model: args.model,
             reasoning_effort: args.reasoning_effort,
+            // Merge-safety anchor: forward service_tier through shared thread_spawn preparation to retain final-child-model validation.
             service_tier: args.service_tier,
         },
     )

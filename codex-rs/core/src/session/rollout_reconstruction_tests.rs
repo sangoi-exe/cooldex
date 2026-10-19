@@ -453,6 +453,59 @@ async fn record_initial_history_restores_world_state_baseline(input: BaselineTur
     );
 }
 
+// Merge-safety anchor: completed original compaction observations remain archival across reconstruction even when no replacement checkpoint was installed.
+#[tokio::test]
+async fn record_initial_history_excludes_completed_compaction_observations_without_replacement() {
+    let (session, turn_context) = make_session_and_context().await;
+    let user = user_message("admitted source before compaction");
+    let observations = [
+        serde_json::from_value(json!({
+            "type": "reasoning", "id": "compaction-reasoning",
+            "summary": [{"type": "summary_text", "text": "Summarizing the admitted source"}]
+        }))
+        .expect("native compaction reasoning"),
+        assistant_message("completed original compaction summary"),
+    ];
+    let mut rollout_items = vec![RolloutItem::ResponseItem(user.clone().into())];
+    rollout_items.extend(observations.into_iter().map(|item| {
+        RolloutItem::ResponseItem(ResponseItemEnvelope {
+            item,
+            metadata: Some(codex_history::CodexHarnessMetadata {
+                compaction_output: true,
+                ..Default::default()
+            }),
+        })
+    }));
+    rollout_items.push(RolloutItem::EventMsg(EventMsg::RawResponseCompleted(
+        codex_protocol::protocol::RawResponseCompletedEvent {
+            response_id: "completed-compaction-without-checkpoint".to_string(),
+            token_usage: None,
+            usage_metadata: None,
+        },
+    )));
+    let rollout_items =
+        serde_json::from_value(serde_json::to_value(rollout_items).unwrap()).unwrap();
+
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
+            conversation_id: session.thread_id,
+            history: Arc::new(rollout_items),
+            rollout_path: None,
+        }))
+        .await;
+
+    let history = session.clone_history().await;
+    assert_eq!(
+        strip_metadata_from_items(&raw_history_items(&history)),
+        vec![user.clone()]
+    );
+    assert_eq!(
+        strip_metadata_from_items(&history.for_prompt(&turn_context.model_info().input_modalities)),
+        vec![user]
+    );
+}
+
 #[tokio::test]
 async fn record_initial_history_restores_pending_post_compact_recovery() {
     let (session, turn_context) = make_session_and_context().await;

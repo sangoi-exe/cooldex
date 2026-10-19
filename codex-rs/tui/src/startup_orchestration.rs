@@ -7,6 +7,39 @@ use super::*;
 use codex_terminal_detection::Multiplexer;
 use codex_terminal_detection::TerminalName;
 
+// Merge-safety anchor: explicit local attachment recognizes only the invoking package's owner and retains the verified protected endpoint, never the replaceable advertised alias.
+pub(super) fn resolve_explicit_local_daemon_socket(
+    codex_home: &Path,
+    local_package_lane: Option<LocalPackageLane>,
+    explicit_remote_endpoint: &mut Option<RemoteAppServerEndpoint>,
+) -> std::io::Result<Option<AbsolutePathBuf>> {
+    let explicit_local_daemon_socket = match explicit_remote_endpoint.as_ref() {
+        Some(RemoteAppServerEndpoint::UnixSocket { socket_path })
+            if daemon_socket_path(codex_home, local_package_lane)
+                .is_ok_and(|default_socket| default_socket == *socket_path) =>
+        {
+            // An explicit attachment requires the server to be present. Do not classify a missing daemon as remote during its restart window.
+            if !socket_path.as_path().try_exists()? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the requested app-server socket is not available",
+                ));
+            }
+            // A bound socket at the advertised path may be an SSH forward. Keep a verified endpoint so replacing the advertised alias cannot redirect local config.
+            codex_app_server_client::verified_local_daemon_socket(socket_path.as_path())
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    if let Some(socket_path) = &explicit_local_daemon_socket {
+        *explicit_remote_endpoint = Some(RemoteAppServerEndpoint::UnixSocket {
+            socket_path: socket_path.clone(),
+        });
+    }
+    Ok(explicit_local_daemon_socket)
+}
+
 pub(super) async fn run_main_inner(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
@@ -106,32 +139,11 @@ pub(super) async fn run_main_inner(
         }
     };
 
-    // A bound socket at the default path may be an SSH forward. Keep a verified
-    // endpoint so replacing the advertised alias cannot redirect local config.
-    let explicit_local_daemon_socket = match &explicit_remote_endpoint {
-        Some(RemoteAppServerEndpoint::UnixSocket { socket_path })
-            if codex_app_server_client::app_server_control_socket_path(&codex_home)
-                .is_ok_and(|default_socket| default_socket == *socket_path) =>
-        {
-            // An explicit attachment requires the server to be present. Do not
-            // classify a missing daemon as remote during its restart window.
-            if !socket_path.as_path().try_exists()? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "the requested app-server socket is not available",
-                ));
-            }
-            codex_app_server_client::verified_local_daemon_socket(socket_path.as_path())
-                .ok()
-                .flatten()
-        }
-        _ => None,
-    };
-    if let Some(socket_path) = &explicit_local_daemon_socket {
-        explicit_remote_endpoint = Some(RemoteAppServerEndpoint::UnixSocket {
-            socket_path: socket_path.clone(),
-        });
-    }
+    let explicit_local_daemon_socket = resolve_explicit_local_daemon_socket(
+        &codex_home,
+        InstallContext::current().local_package_lane(),
+        &mut explicit_remote_endpoint,
+    )?;
 
     let mut launch_loader_overrides = loader_overrides.clone();
     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {

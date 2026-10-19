@@ -3958,17 +3958,7 @@ impl Session {
                         });
                 }
             }
-            // Merge-safety anchor: original compaction outputs share native preparation, persistence and raw publication but stay outside live history so recording cannot invalidate the prepared handoff source.
-            for envelope in items.iter_mut().filter(|envelope| {
-                !envelope
-                    .metadata
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.compaction_output)
-            }) {
-                state
-                    .history
-                    .record_annotated_items(std::slice::from_mut(envelope), policy);
-            }
+            state.history.record_annotated_items(&mut items, policy);
         }
         for image in image_preparations {
             self.services

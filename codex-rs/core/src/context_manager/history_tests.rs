@@ -1079,6 +1079,57 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
     );
 }
 
+// Merge-safety anchor: top-level compaction observations stay outside live/replayed model history while marked replacement summaries remain visible through native replacement APIs.
+#[test]
+fn compaction_observations_are_archival_but_replacement_summaries_are_visible() {
+    let policy = TruncationPolicy::Tokens(10_000);
+    let mut recorded = create_history_with_items(vec![user_msg("admitted source")]);
+    let expected_source = recorded.annotated_items().to_vec();
+    let mut replayed = recorded.clone();
+    let mut observations = vec![
+        reasoning_msg("original compaction reasoning"),
+        assistant_msg("original compaction summary"),
+    ]
+    .into_iter()
+    .map(|item| ResponseItemEnvelope {
+        item,
+        metadata: Some(CodexHarnessMetadata {
+            compaction_output: true,
+            ..Default::default()
+        }),
+    })
+    .collect::<Vec<_>>();
+    let expected_observations = observations.clone();
+
+    recorded.record_annotated_items(&mut observations, policy);
+    for observation in &observations {
+        replayed.replay_annotated_item(observation, policy);
+    }
+
+    assert_eq!(observations, expected_observations);
+    assert_eq!(recorded.annotated_items(), expected_source);
+    assert_eq!(replayed.annotated_items(), expected_source);
+
+    let replacement = vec![ResponseItemEnvelope {
+        item: ContextualUserFragment::into(crate::context::CompactionSummary::new(
+            "installed replacement summary",
+        )),
+        metadata: Some(CodexHarnessMetadata {
+            compaction_output: true,
+            ..Default::default()
+        }),
+    }];
+    recorded.replace_compacted(replacement.clone(), /*reviewer_compaction_hash*/ None);
+    replayed.replace_annotated(replacement.clone());
+    for history in [recorded, replayed] {
+        assert_eq!(history.annotated_items(), replacement);
+        assert_eq!(
+            history.for_prompt(&[InputModality::Text]),
+            vec![replacement[0].item.clone()]
+        );
+    }
+}
+
 #[test]
 fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
     let envelope = ResponseItemEnvelope {

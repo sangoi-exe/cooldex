@@ -7,6 +7,165 @@ use crate::legacy_core::config::ConfigBuilder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_local_daemon_recognition_verifies_only_selected_owner() -> color_eyre::Result<()>
+{
+    let home = TempDir::new()?;
+    let mut daemons = Vec::new();
+    for daemon_lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        let advertised_socket = match daemon_lane {
+            Some(lane) => {
+                codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
+                    home.path(),
+                    lane,
+                )?
+            }
+            None => codex_app_server_client::app_server_control_socket_path(home.path())?,
+        };
+        let (listener, guard) =
+            codex_app_server_transport::bind_private_daemon_socket(advertised_socket.as_path())
+                .await?;
+        let verified_socket =
+            AbsolutePathBuf::from_absolute_path(std::fs::read_link(advertised_socket.as_path())?)?;
+        assert_ne!(advertised_socket, verified_socket);
+        daemons.push((
+            daemon_lane,
+            advertised_socket,
+            verified_socket,
+            listener,
+            guard,
+        ));
+    }
+
+    for caller_lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        for (daemon_lane, advertised_socket, verified_socket, _, _) in &daemons {
+            let mut endpoint = Some(RemoteAppServerEndpoint::UnixSocket {
+                socket_path: advertised_socket.clone(),
+            });
+            let local_socket = startup_orchestration::resolve_explicit_local_daemon_socket(
+                home.path(),
+                caller_lane,
+                &mut endpoint,
+            )?;
+            let same_owner = caller_lane == *daemon_lane;
+            assert_eq!(local_socket.as_ref(), same_owner.then_some(verified_socket));
+            let expected_endpoint = RemoteAppServerEndpoint::UnixSocket {
+                socket_path: if same_owner {
+                    verified_socket.clone()
+                } else {
+                    advertised_socket.clone()
+                },
+            };
+            assert_eq!(endpoint.as_ref(), Some(&expected_endpoint));
+            let target = app_server_target_for_launch(
+                endpoint,
+                local_socket,
+                /*can_reuse_implicit_local_daemon*/ false,
+                AppServerMode::Upstream,
+                /*workload_identity_selected*/ false,
+                /*exec_server_url*/ None,
+            )?;
+            if same_owner {
+                assert_eq!(
+                    target,
+                    AppServerTarget::LocalDaemon {
+                        endpoint: expected_endpoint,
+                        allow_embedded_fallback: false,
+                    }
+                );
+                assert!(!target.uses_remote_workspace());
+                assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
+            } else {
+                assert_eq!(
+                    target,
+                    AppServerTarget::Remote {
+                        endpoint: expected_endpoint
+                    }
+                );
+                assert!(target.uses_remote_workspace());
+                assert_eq!(target.thread_params_mode(), ThreadParamsMode::Remote);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_local_daemon_recognition_rejects_unverified_advertised_socket()
+-> color_eyre::Result<()> {
+    let home = TempDir::new()?;
+    for caller_lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        let socket_path = daemon_socket_path(home.path(), caller_lane)?;
+        codex_uds::prepare_private_socket_directory(
+            socket_path.as_path().parent().expect("socket parent"),
+        )
+        .await?;
+        // A real listener at the advertised path may be an SSH forward, not our daemon.
+        let _listener = codex_uds::UnixListener::bind(socket_path.as_path()).await?;
+        let expected_endpoint = RemoteAppServerEndpoint::UnixSocket { socket_path };
+        let mut endpoint = Some(expected_endpoint.clone());
+        let local_socket = startup_orchestration::resolve_explicit_local_daemon_socket(
+            home.path(),
+            caller_lane,
+            &mut endpoint,
+        )?;
+        assert_eq!(local_socket, None);
+        assert_eq!(endpoint.as_ref(), Some(&expected_endpoint));
+        assert_eq!(
+            app_server_target_for_launch(
+                endpoint,
+                local_socket,
+                /*can_reuse_implicit_local_daemon*/ false,
+                AppServerMode::Upstream,
+                /*workload_identity_selected*/ false,
+                /*exec_server_url*/ None,
+            )?,
+            AppServerTarget::Remote {
+                endpoint: expected_endpoint
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_local_daemon_recognition_requires_selected_socket_to_exist() -> color_eyre::Result<()> {
+    let home = TempDir::new()?;
+    for caller_lane in [
+        None,
+        Some(LocalPackageLane::Codex),
+        Some(LocalPackageLane::CdxDev),
+    ] {
+        let expected_endpoint = RemoteAppServerEndpoint::UnixSocket {
+            socket_path: daemon_socket_path(home.path(), caller_lane)?,
+        };
+        let mut endpoint = Some(expected_endpoint.clone());
+        let error = startup_orchestration::resolve_explicit_local_daemon_socket(
+            home.path(),
+            caller_lane,
+            &mut endpoint,
+        )
+        .expect_err("an explicit local attachment must not become remote during a restart");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(endpoint, Some(expected_endpoint));
+    }
+    Ok(())
+}
+
 #[test]
 fn audited_overrides_allow_daemon_without_allowing_arbitrary_config() {
     for (raw, eligible) in [

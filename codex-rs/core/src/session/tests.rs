@@ -6246,10 +6246,6 @@ async fn mcp_attribution_checkpoints_cover_batch_prefixes_compaction_and_restore
 
 #[test_case(None; "idle")]
 #[test_case(Some(ActiveTurn::default()); "reserved turn")]
-#[test_case(Some(ActiveTurn {
-    finishing: Some(tokio_util::sync::CancellationToken::new()),
-    ..Default::default()
-}); "finishing turn")]
 #[tokio::test]
 async fn standalone_settings_invalidate_continuation_before_delivering_acceptance(
     active_turn: Option<ActiveTurn>,
@@ -6309,6 +6305,133 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
     assert!(matches!(
         rx.recv().await.expect("receive settings event").msg,
         EventMsg::ThreadSettingsApplied(_)
+    ));
+    drop(tx_sub);
+    submissions.await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "hold terminal publication while settings acceptance distinguishes real running and finishing tasks"
+)]
+async fn standalone_settings_preserve_running_but_invalidate_retained_finishing_continuation() {
+    let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    start_regular_never_ending_task(&session, &turn_context).await;
+    let (cancellation_token, mut done) = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .expect("running task is registered");
+        let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+        let _ = done.as_mut().enable();
+        (task.cancellation_token.clone(), done)
+    };
+    let terminal_error = turn_context.terminal_error.lock().await;
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let mut submissions = Box::pin(tokio::task::unconstrained(submission_loop(
+        Arc::clone(&session),
+        Arc::clone(&turn_context.config),
+        rx_sub,
+    )));
+
+    for finishing in [false, true] {
+        if finishing {
+            cancellation_token.cancel();
+            let recording_complete = timeout(StdDuration::from_secs(5), async {
+                loop {
+                    if let Some(finishing) = session
+                        .active_turn
+                        .lock()
+                        .await
+                        .as_ref()
+                        .and_then(|turn| turn.finishing.clone())
+                    {
+                        break finishing;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real task reaches finalization");
+            timeout(StdDuration::from_secs(5), recording_complete.cancelled())
+                .await
+                .expect("input recording finishes before terminal delivery");
+        }
+        {
+            let active = session.active_turn.lock().await;
+            let turn = active.as_ref().expect("task retains its active slot");
+            assert!(turn.task.is_some());
+            assert_eq!(turn.finishing.is_some(), finishing);
+        }
+        assert_eq!(
+            session.state.lock().await.last_started_turn_id,
+            Some(turn_context.sub_id.clone()),
+            "recording completion alone does not invalidate continuation lineage"
+        );
+
+        let (reply, mut accepted) = tokio::sync::oneshot::channel();
+        tx_sub
+            .send(Submission {
+                id: format!("settings-finishing-{finishing}"),
+                turn_extension_init: None,
+                op: Op::ThreadSettings {
+                    thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
+                    reply: Some(reply),
+                },
+                trace: None,
+                parent_turn_id: None,
+                root_turn_id: None,
+                residency_guard: None,
+            })
+            .await
+            .expect("submit standalone settings");
+        assert!(futures::poll!(submissions.as_mut()).is_pending());
+        assert_eq!(
+            session.state.lock().await.last_started_turn_id,
+            if finishing {
+                None
+            } else {
+                Some(turn_context.sub_id.clone())
+            }
+        );
+        accepted
+            .try_recv()
+            .expect("lineage is settled before receiving settings acceptance")
+            .expect("standalone settings accepted");
+        assert!(futures::poll!(done.as_mut()).is_pending());
+    }
+
+    drop(terminal_error);
+    timeout(StdDuration::from_secs(5), done)
+        .await
+        .expect("finishing task retires after terminal publication");
+    recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+    assert!(session.active_turn.lock().await.is_none());
+    let continuation = super::turn_input::handle(
+        &session,
+        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "late-continuation".to_owned(),
+                name: Some("exec".to_owned()),
+                output: FunctionCallOutputPayload::from_text("late response".to_owned()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        )),
+        TurnInputMode::ContinueIfIdle {
+            expected_previous_turn_id: turn_context.sub_id.clone(),
+        },
+        "stale-continuation".to_owned(),
+    )
+    .await
+    .expect("valid internal continuation request");
+    assert!(matches!(
+        continuation,
+        TurnInputSubmission::NotSubmitted {
+            reason: codex_protocol::turn_input::NotSubmittedReason::Superseded,
+        }
     ));
     drop(tx_sub);
     submissions.await;

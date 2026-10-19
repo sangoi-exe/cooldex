@@ -49,11 +49,10 @@ pub(super) async fn update(
     let updates = prepare_update(overrides, &session.services.selected_capability_roots);
     let commit = session.update_settings(updates).await?;
     let active_turn = session.active_turn.lock().await;
-    // A registered running task retains its lineage so it can be recovered after a daemon
-    // restart. Reservations and finishing turns have no interrupted work to continue.
+    // Merge-safety anchor: retained finishing tasks have no interrupted work to continue; only genuinely running tasks preserve recovery lineage through standalone settings updates.
     if active_turn
         .as_ref()
-        .is_none_or(|active_turn| active_turn.task.is_none())
+        .is_none_or(|active_turn| active_turn.task.is_none() || active_turn.finishing.is_some())
     {
         session.state.lock().await.last_started_turn_id = None;
     }

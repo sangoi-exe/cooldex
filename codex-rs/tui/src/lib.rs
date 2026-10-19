@@ -546,16 +546,12 @@ async fn connect_remote_app_server(
     Ok(AppServerClient::Remote(app_server))
 }
 
-// Merge-safety anchor: passive implicit daemon discovery follows only the current package's canonical lane control socket; unbound execution retains generic selection and never probes another lane.
-async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
-    maybe_probe_daemon_socket(codex_home, InstallContext::current().local_package_lane()).await
-}
-
-async fn maybe_probe_daemon_socket(
+// Merge-safety anchor: implicit discovery and explicit-local recognition share the current package's canonical lane control socket; unbound execution retains generic selection and another owner's socket is never local.
+fn daemon_socket_path(
     codex_home: &Path,
     local_package_lane: Option<LocalPackageLane>,
-) -> Option<AbsolutePathBuf> {
-    let socket_path = match local_package_lane {
+) -> std::io::Result<AbsolutePathBuf> {
+    match local_package_lane {
         Some(local_package_lane) => {
             codex_app_server_transport::app_server_control_socket_path_for_local_package_lane(
                 codex_home,
@@ -564,7 +560,17 @@ async fn maybe_probe_daemon_socket(
         }
         None => codex_app_server_client::app_server_control_socket_path(codex_home),
     }
-    .ok()?;
+}
+
+async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
+    maybe_probe_daemon_socket(codex_home, InstallContext::current().local_package_lane()).await
+}
+
+async fn maybe_probe_daemon_socket(
+    codex_home: &Path,
+    local_package_lane: Option<LocalPackageLane>,
+) -> Option<AbsolutePathBuf> {
+    let socket_path = daemon_socket_path(codex_home, local_package_lane).ok()?;
     #[cfg(windows)]
     let (validated_path, _directory) =
         codex_uds::validate_private_socket_path(socket_path.as_path()).ok()?;
