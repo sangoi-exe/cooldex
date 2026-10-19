@@ -461,7 +461,6 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
 
 #[derive(Clone)]
 pub(crate) struct ThreadRequestProcessor {
-    pub(super) auth_manager: Arc<AuthManager>,
     pub(crate) thread_manager: Arc<ThreadManager>,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
     pub(super) arg0_paths: Arg0DispatchPaths,
@@ -501,7 +500,6 @@ enum RunningThreadResumeResult {
 impl ThreadRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
         outgoing: Arc<OutgoingMessageSender>,
         arg0_paths: Arg0DispatchPaths,
@@ -520,7 +518,6 @@ impl ThreadRequestProcessor {
         initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
         Self {
-            auth_manager,
             thread_manager,
             outgoing,
             arg0_paths,

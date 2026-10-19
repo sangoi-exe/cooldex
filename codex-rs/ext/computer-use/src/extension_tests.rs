@@ -306,6 +306,7 @@ async fn incomplete_environment_pair_emits_one_warning_per_thread() -> TestResul
             "test-originator",
             &[],
             None,
+            None,
         ))
         .await;
     let second = contributor
@@ -315,6 +316,7 @@ async fn incomplete_environment_pair_emits_one_warning_per_thread() -> TestResul
             &thread_store,
             "test-originator",
             &[],
+            None,
             None,
         ))
         .await;
@@ -539,6 +541,7 @@ sky_bin = "{sky_bin}"
             "test-originator",
             &[],
             None,
+            None,
         ))
         .await;
 
@@ -623,6 +626,7 @@ async fn contribute_for_thread(
             &thread_store,
             "test-originator",
             &[],
+            None,
             None,
         ))
         .await

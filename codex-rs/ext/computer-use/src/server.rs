@@ -11,7 +11,7 @@ use rmcp::model::JsonObject;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParams;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::Tool;
 use rmcp::model::ToolAnnotations;
 use rmcp::service::RequestContext;
@@ -207,8 +207,8 @@ impl<Runtime> ServerHandler for ComputerUseServer<Runtime>
 where
     Runtime: ComputerUseRuntime,
 {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(COMPUTER_USE_SERVER_INSTRUCTIONS)
     }
 

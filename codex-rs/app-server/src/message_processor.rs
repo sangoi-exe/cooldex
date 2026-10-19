@@ -521,7 +521,6 @@ impl MessageProcessor {
             Arc::clone(&thread_list_state_permit),
         );
         let thread_processor = ThreadRequestProcessor::new(
-            auth_manager.clone(),
             Arc::clone(&thread_manager),
             outgoing.clone(),
             arg0_paths.clone(),
