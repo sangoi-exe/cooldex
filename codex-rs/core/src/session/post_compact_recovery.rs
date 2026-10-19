@@ -40,7 +40,7 @@ impl PreparedPostCompactRecovery {
                             && content.iter().any(|content| {
                                 matches!(
                                     content,
-                                    codex_protocol::models::ContentItem::OutputText { text }
+                                    codex_protocol::models::ContentItem::OutputText { text, .. }
                                         if PostCompactHandoffContext::matches_text(text)
                                 )
                             })

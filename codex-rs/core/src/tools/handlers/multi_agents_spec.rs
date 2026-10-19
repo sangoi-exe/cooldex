@@ -963,7 +963,7 @@ fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema
         "Required as true with return_when and targets to wait for a target condition without a timeout. Cannot accompany timeout_ms."
             .to_string(),
     ));
-    disable_timeout.enum_values = Some(vec![json!(true)]);
+    disable_timeout.enum_values = Some(vec![json!(true)].into_boxed_slice());
     let conditional_properties = BTreeMap::from([
         ("targets".to_string(), targets),
         (

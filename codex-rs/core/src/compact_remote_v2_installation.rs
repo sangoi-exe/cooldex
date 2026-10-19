@@ -94,9 +94,9 @@ async fn build_and_install_compaction(
         return Ok(false);
     }
     if let Some(candidate) = &candidate {
-        let state = sess.state.lock().await;
-        if state.history.history_version() != candidate.prefix.generation
-            || state.history.annotated_items().len() < candidate.prefix.len
+        let history = sess.clone_history().await;
+        if history.history_version() != candidate.prefix.generation
+            || history.annotated_items().len() < candidate.prefix.len
             || sess.services.model_client.auth_owner_generation()
                 != candidate.prefix.auth_owner_generation
         {

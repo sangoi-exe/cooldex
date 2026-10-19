@@ -1318,7 +1318,10 @@ pub(crate) fn pre_compact_handoff_input_snapshot_from_parts(
         post_compact_recovery::insert_post_compact_recovery_packet(&mut input, &identity, packet)?;
     }
     // Merge-safety anchor: hidden handoff synthesis preserves the history-owned base declaration without sending a second top-level copy.
-    let base_instructions = if input.iter().any(BaseInstructionsFragment::matches_item) {
+    let base_instructions = if input
+        .iter()
+        .any(|item| BaseInstructionsFragment::text_from_item(item).is_some())
+    {
         BaseInstructions {
             text: String::new(),
             provenance: None,

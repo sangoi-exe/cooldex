@@ -464,12 +464,15 @@ fn wait_agent_tool_v2_supports_generic_and_conditional_waits() {
     assert!(conditional_properties.contains_key("return_when"));
     assert!(conditional_properties.contains_key("disable_timeout"));
     assert_eq!(
-        conditional.required.as_ref(),
-        Some(&vec![
-            "targets".to_string(),
-            "return_when".to_string(),
-            "disable_timeout".to_string(),
-        ])
+        conditional.required.as_deref(),
+        Some(
+            [
+                "targets".to_string(),
+                "return_when".to_string(),
+                "disable_timeout".to_string(),
+            ]
+            .as_slice()
+        )
     );
     assert_eq!(
         serde_json::to_value(conditional).expect("conditional schema should serialize")["additionalProperties"],
@@ -506,14 +509,14 @@ fn wait_agent_tool_v2_supports_generic_and_conditional_waits() {
     assert_eq!(
         conditional_properties
             .get("return_when")
-            .and_then(|schema| schema.enum_values.as_ref()),
-        Some(&vec![json!("any_final"), json!("all_final")])
+            .and_then(|schema| schema.enum_values.as_deref()),
+        Some([json!("any_final"), json!("all_final")].as_slice())
     );
     assert_eq!(
         conditional_properties
             .get("disable_timeout")
-            .and_then(|schema| schema.enum_values.as_ref()),
-        Some(&vec![json!(true)])
+            .and_then(|schema| schema.enum_values.as_deref()),
+        Some([json!(true)].as_slice())
     );
     let output_schema = output_schema.expect("wait output schema").to_value();
     assert_eq!(
