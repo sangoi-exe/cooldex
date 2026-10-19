@@ -1211,6 +1211,8 @@ fn resumed_usage_hint_binding_uses_only_the_first_canonical_session_meta() -> Re
         conversation_id: child_thread_id,
         history: Arc::new(vec![
             RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 role: "user".to_string(),
                 content: Vec::new(),

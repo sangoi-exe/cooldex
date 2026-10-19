@@ -79,17 +79,9 @@ impl PostCompactRecoveryContext {
             body,
             handoff: handoff.map(PostCompactHandoffContext::new),
         };
-        let mut rendered = context
-            .render()
-            .into_text()
-            .expect("recovery fragments render text");
+        let mut rendered = format!("{OPEN_MARKER}{}{CLOSE_MARKER}", context.body);
         if let Some(handoff) = context.handoff.as_ref() {
-            rendered.push_str(
-                &handoff
-                    .render()
-                    .into_text()
-                    .expect("handoff fragments render text"),
-            );
+            rendered.push_str(&handoff.render_text());
         }
         if rendered.len() > MAX_PACKET_BYTES || approx_token_count(&rendered) > MAX_PACKET_TOKENS {
             return Err(PostCompactRecoveryContextError::PacketCap);
@@ -113,13 +105,14 @@ impl PostCompactHandoffContext {
         }
     }
 
+    fn render_text(&self) -> String {
+        format!("{HANDOFF_OPEN_MARKER}{}{HANDOFF_CLOSE_MARKER}", self.body)
+    }
+
     // Merge-safety anchor: the transient handoff remains assistant `OutputText` with its producer-owned classification and attribution; generic contextual conversion emits input text.
     pub(crate) fn into_response_item(self) -> ResponseItem {
         let content = ContentItem::OutputText {
-            text: self
-                .render()
-                .into_text()
-                .expect("handoff fragments render text"),
+            text: self.render_text(),
             annotations: None,
             logprobs: None,
         };

@@ -5340,7 +5340,7 @@ class CargoValidateTests(unittest.TestCase):
         for file_path in (
             ".github/workflows/unmapped.yml",
             "scripts/test-remote-env.sh",
-            "scripts/install/install.sh",
+            "scripts/install/unmapped.sh",
             "sdk/python/unmapped.py",
             "sdk/typescript/src/unmapped.ts",
             "codex-rs/.cargo/unmapped.toml",
