@@ -160,6 +160,32 @@ async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.codex.flush_rollout().await?;
+    let persisted_compaction_output = test
+        .thread_store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: false,
+        })
+        .await?
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if envelope
+                    .item
+                    .id()
+                    .is_some_and(|id| id.as_str() == "summary")
+                    && envelope
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.compaction_output) =>
+            {
+                Some(envelope.item)
+            }
+            _ => None,
+        })
+        .context("persisted original compaction assistant output")?;
     test.codex
         .start_or_steer_turn(user_turn("use recall"))
         .await?;
@@ -174,7 +200,10 @@ async fn recall_returns_closed_intervals_as_an_inert_current_thread_tool_result(
         .function_call_output_text("recall-call")
         .expect("recall function output");
     let value: Value = serde_json::from_str(&output)?;
-    assert_eq!(value, json!([[persisted_answer]]));
+    assert_eq!(
+        value,
+        json!([[persisted_answer, persisted_compaction_output]])
+    );
 
     Ok(())
 }

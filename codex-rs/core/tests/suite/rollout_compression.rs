@@ -94,6 +94,32 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    test.codex.flush_rollout().await?;
+    let persisted_compaction_output = test
+        .thread_store
+        .load_history(LoadThreadHistoryParams {
+            thread_id: test.session_configured.thread_id,
+            include_archived: false,
+        })
+        .await?
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if envelope
+                    .item
+                    .id()
+                    .is_some_and(|id| id.as_str() == "summary")
+                    && envelope
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.compaction_output) =>
+            {
+                Some(envelope.item)
+            }
+            _ => None,
+        })
+        .context("persisted original compaction assistant output")?;
     turn(
         &server,
         &test.codex,
@@ -237,7 +263,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     );
     assert!(parent_path.with_extension("jsonl.zst").exists());
 
-    // Merge-safety anchor: Recall traverses complete compressed inherited history and returns the persisted pre-checkpoint interval, not its synthetic replacement.
+    // Merge-safety anchor: Recall traverses complete compressed inherited history and returns persisted assistant observations, including original compaction output, not the synthetic replacement-user summary.
     let recall_requests = mount_sse_sequence(
         &server,
         vec![
@@ -272,7 +298,10 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .function_call_output_text("compressed-recall-call")
         .expect("recall function output");
     let recall: Value = serde_json::from_str(&output)?;
-    assert_eq!(recall, json!([[persisted_answer]]));
+    assert_eq!(
+        recall,
+        json!([[persisted_answer, persisted_compaction_output]])
+    );
     assert!(parent_path.with_extension("jsonl.zst").exists());
 
     resumed.thread.shutdown_and_wait().await?;
