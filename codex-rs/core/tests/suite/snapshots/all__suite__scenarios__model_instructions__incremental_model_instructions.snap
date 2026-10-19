@@ -15,10 +15,11 @@ Settings:
   stream: true
   tool_choice: "auto"
 -- request 1 (turn) --
-00:additional_tools/developer (2; hash=946019c94afdd69a):
-        - namespace/functions; hash=ce01915b77cef9ee
+00:additional_tools/developer (2; hash=223f2773ae09be5d):
+        - namespace/functions; hash=1062e87aed7a2847
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - function/view_image
         - namespace/multi_agent_v1: Tools for spawning and managing sub-agents.; hash=d492855cc7064c73
@@ -62,10 +63,11 @@ Settings:
 ## Window 2 (after request 4: input diverged at item 01)
 Settings: same as window 1
 -- request 5 (turn) --
-00:additional_tools/developer (2; hash=946019c94afdd69a):
-        - namespace/functions; hash=ce01915b77cef9ee
+00:additional_tools/developer (2; hash=223f2773ae09be5d):
+        - namespace/functions; hash=1062e87aed7a2847
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - function/view_image
         - namespace/multi_agent_v1: Tools for spawning and managing sub-agents.; hash=d492855cc7064c73
@@ -96,5 +98,13 @@ Settings: same as window 1
 06:message/user:
     Continue without further changes.
 07:compaction:encrypted=true; chars=29; hash=a44318b8dfee766d
-08:message/user:
+08:message/assistant:
+    <post_compact_handoff>
+    resume from the compacted state
+    </post_compact_handoff>
+09:message/developer:
+    <post_compact_recovery>
+    {"compaction_window_id":"<UUID 1>","boundary_item_id":"cmp_<UUID 2>","directive":"A context compaction j...","mid_turn_continuation":"resume_interrupted_turn"}} [hash=389eb8ff6bc1b51a]
+    </post_compact_recovery>
+10:message/user:
     Continue after compaction.

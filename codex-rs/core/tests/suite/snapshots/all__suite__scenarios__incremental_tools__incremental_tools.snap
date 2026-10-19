@@ -87,12 +87,13 @@ Settings: relative to window 1
 ## Window 3 (after request 5: input diverged at item 00)
 Settings: same as window 2
 -- request 6 (turn) --
-00:additional_tools/developer (2; hash=1322c3a339378659):
-        - namespace/functions; hash=9d5d7a0adab05fef
+00:additional_tools/developer (2; hash=cc6db1c3c7b0f070):
+        - namespace/functions; hash=ea2f8a601896a458
           - custom/exec
           - function/wait
           - function/exec_command
           - function/write_stdin
+          - function/recall
           - function/request_user_input
           - custom/apply_patch
           - function/view_image
@@ -112,5 +113,9 @@ Settings: same as window 2
 07:message/user:
     Continue with the same updated tools.
 08:compaction:encrypted=true; chars=28; hash=e4a73156e0a498bc
-09:message/user:
+09:message/assistant:
+    <POST_COMPACT_HANDOFF>
+10:message/developer:
+    <POST_COMPACT_RECOVERY>
+11:message/user:
     Continue after compaction.

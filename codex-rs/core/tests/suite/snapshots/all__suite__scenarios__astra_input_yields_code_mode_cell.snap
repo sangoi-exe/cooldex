@@ -6,22 +6,7 @@ Scenario: Astra continues after new user input yields a running code cell, then 
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=9ab88498bc1279c2):
-        - namespace/functions; hash=18cfedc98a4d8c41
-          - custom/exec
-          - function/wait
-          - function/request_user_input
-          - function/request_user_input_async
-        - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
-          - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
-          - function/followup_task
-          - function/interrupt_agent
-          - function/list_agents
-          - function/send_message
-          - function/spawn_agent
-          - function/wait_agent
-01:message/developer:
+00:message/developer:
     You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collabo...them until their intended goal is completely handled. [hash=efa50f074efa5803]
 
     # When to ask the user for permission
@@ -39,7 +24,7 @@ Scenario: Astra continues after new user input yields a running code cell, then 
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-02:message/developer[2]:
+01:message/developer[2]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `read-only`: The san... permits reading files. Network access is restricted. [hash=be7da4425f89053c]
         # Escalation Requests
@@ -73,7 +58,7 @@ Scenario: Astra continues after new user input yields a running code cell, then 
 
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
         </collaboration_mode>
-03:message/developer:
+02:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -91,9 +76,9 @@ Scenario: Astra continues after new user input yields a running code cell, then 
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
-04:message/developer:
+03:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-05:message/user:
+04:message/user:
     <environment_context>
       <cwd><CWD></cwd>
       <shell><HOST_SHELL></shell>
@@ -101,20 +86,20 @@ Scenario: Astra continues after new user input yields a running code cell, then 
       <timezone><HOST_TIMEZONE></timezone>
       <filesystem><workspace_roots><root><CWD></root></workspace_roots><permission_profile type="managed"><f...ntry></file_system></permission_profile></filesystem> [hash=e8c1de60307d0a3d]
     </environment_context>
-06:message/user:
+05:message/user:
     Check the release status.
 -- request 2 (turn) --
-07:custom_tool_call/exec:// @exec: {"yield_time_ms": 60000}
+06:custom_tool_call/exec:// @exec: {"yield_time_ms": 60000}
     text(await tools.check_release({}));
-08:custom_tool_call_output:Script running with cell ID <CELL_ID>
+07:custom_tool_call_output:Script running with cell ID <CELL_ID>
     Wall time <DURATION> seconds
     Output:
 
-09:message/user:
+08:message/user:
     Please also highlight the customer impact.
 -- request 3 (turn) --
-10:function_call/functions.wait:{"cell_id":"<CELL_ID>","yield_time_ms":60000}
-11:function_call_output:Script completed
+09:function_call/functions.wait:{"cell_id":"<CELL_ID>","yield_time_ms":60000}
+10:function_call_output:Script completed
     Wall time <DURATION> seconds
     Output:
      | Release ready
