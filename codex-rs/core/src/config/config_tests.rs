@@ -12663,6 +12663,7 @@ max_concurrent_threads_per_session = 17
     assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
 
+// Merge-safety anchor: usage-hint budgets measure complete configured/composed rendered text through native text projection, including composed marker overhead and multibyte bytes, not bodies or ContentItem envelopes.
 #[test]
 fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_rendering() {
     let mut config = resolve_multi_agent_v2_config(&ConfigToml::default());
