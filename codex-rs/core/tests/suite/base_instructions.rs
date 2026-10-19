@@ -335,8 +335,32 @@ async fn model_switches_refresh_the_window_base_across_compaction_and_restart() 
     assert_request_base(&resumed_request, SWITCHED);
     assert!(model_updates(&resumed_request).is_empty());
     assert!(!resumed_request.body_contains_text(ORIGINAL));
+    // Merge-safety anchor: resume preserves the exact durable prefix, excluding only consumed producer-classified handoff/recovery carriers rather than arbitrary message text.
+    let transient_kinds = [
+        "compaction.post_compact_handoff",
+        "compaction.post_compact_recovery",
+    ];
+    for kind in transient_kinds {
+        assert!(compacted_request.has_content_kinds(&[kind]));
+        assert!(!resumed_request.has_content_kinds(&[kind]));
+    }
     let resumed_input = resumed_request.input();
-    let compacted_input = compacted_request.input();
+    let mut compacted_input = compacted_request.input();
+    let sampled_input_len = compacted_input.len();
+    compacted_input.retain(|item| {
+        !item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+            .as_array()
+            .is_some_and(|kinds| {
+                kinds.len() == 1
+                    && kinds[0]
+                        .as_str()
+                        .is_some_and(|kind| transient_kinds.contains(&kind))
+            })
+    });
+    assert_eq!(
+        sampled_input_len - compacted_input.len(),
+        transient_kinds.len()
+    );
     if test.executor_environment().exec_server_url().is_some() {
         assert!(resumed_input[1..].starts_with(&compacted_input[1..]));
     } else {
