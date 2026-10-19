@@ -5394,7 +5394,7 @@ async fn multi_agent_v2_wait_agent_condition_prioritizes_steer_over_error_final_
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
-                /*responsesapi_client_metadata*/ None,
+                /*responsesapi_client_metadata*/ Default::default(),
                 UserInputOrigin::User,
                 /*incoming_root_turn_id*/ None,
             )
@@ -5489,7 +5489,7 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_steer_after_mailbox_act
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
-                /*responsesapi_client_metadata*/ None,
+                /*responsesapi_client_metadata*/ Default::default(),
                 UserInputOrigin::User,
                 /*incoming_root_turn_id*/ None,
             )
@@ -5563,7 +5563,7 @@ async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_lat
                 /*additional_context*/ Default::default(),
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
-                /*responsesapi_client_metadata*/ None,
+                /*responsesapi_client_metadata*/ Default::default(),
                 UserInputOrigin::User,
                 /*incoming_root_turn_id*/ None,
             )

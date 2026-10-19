@@ -459,6 +459,8 @@ async fn record_initial_history_restores_pending_post_compact_recovery() {
     let compaction_window_id = Uuid::now_v7().to_string();
     let boundary_item_id = "msg_resume_recovery_boundary";
     let replacement_history = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -527,6 +529,8 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
     let boundary_item_id = "msg_compaction_boundary";
     let consuming_turn_id = "turn-consuming-recovery";
     let replacement_history = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::from_server(boundary_item_id.to_string())),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {

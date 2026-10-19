@@ -12679,7 +12679,8 @@ fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_renderi
     .expect("configured usage hint at the rendered limit should resolve")
     .root
     .expect("configured root usage hint should be present")
-    .render();
+    .render()
+    .expect_text();
     assert_eq!(
         codex_utils_string::approx_token_count(&configured),
         MAX_MULTI_AGENT_USAGE_HINT_TOKENS
@@ -12714,7 +12715,8 @@ fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_renderi
     .expect("short catalog hint should resolve")
     .root
     .expect("catalog root usage hint should be present")
-    .render();
+    .render()
+    .expect_text();
     let fixed_rendered_bytes = probe.len() - 1;
     let composed_base_bytes =
         codex_utils_string::approx_bytes_for_tokens(MAX_MULTI_AGENT_USAGE_HINT_TOKENS)
@@ -12734,7 +12736,8 @@ fn multi_agent_v2_usage_hint_limit_applies_after_configured_and_composed_renderi
     .expect("composed usage hint at the rendered limit should resolve")
     .root
     .expect("composed root usage hint should be present")
-    .render();
+    .render()
+    .expect_text();
     assert!(composed.starts_with("<multi_agent_role>"));
     assert!(composed.ends_with("</multi_agent_role>"));
     assert_eq!(

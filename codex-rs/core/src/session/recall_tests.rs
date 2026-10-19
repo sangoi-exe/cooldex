@@ -18,10 +18,14 @@ use super::*;
 
 fn message(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
+            annotations: None,
+            logprobs: None,
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,

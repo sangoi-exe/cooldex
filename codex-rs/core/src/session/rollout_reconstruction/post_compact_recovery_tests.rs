@@ -23,6 +23,8 @@ const TURN_ID: &str = "turn_consuming";
 
 fn boundary_item(id: &str) -> ResponseItemEnvelope {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: Some(ResponseItemId::from_server(id.to_string())),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -122,6 +124,8 @@ fn recovery_placement_precedes_an_interleaved_native_tool_batch() {
     };
     let mut input = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "shell".to_string(),
             namespace: None,
@@ -131,10 +135,14 @@ fn recovery_placement_precedes_an_interleaved_native_tool_batch() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
                 text: "interleaved response item".to_string(),
+                annotations: None,
+                logprobs: None,
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
