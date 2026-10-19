@@ -1039,7 +1039,6 @@ async fn continue_turn_if_idle_starts_new_turn_with_internal_input() {
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
     let test = test_codex()
-        .with_extensions(Arc::new(extensions.build()))
         .with_model("gpt-5.6-sol")
         .with_extensions(Arc::new(extensions.build()))
         .with_config(|config| {
