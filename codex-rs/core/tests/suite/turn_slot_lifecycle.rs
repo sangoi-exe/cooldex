@@ -86,7 +86,7 @@ impl ThreadStore for GatedAppendStore {
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            if is_deferred_mailbox_append(&params) && self.armed.swap(false, Ordering::SeqCst) {
+            if is_terminal_append(&params) && self.armed.swap(false, Ordering::SeqCst) {
                 let (complete, completed) = oneshot::channel();
                 self.pending_appends
                     .send(PendingAppend {
@@ -138,15 +138,11 @@ fn is_late_mailbox_response_item(item: &RolloutItem) -> bool {
     )
 }
 
-fn is_deferred_mailbox_append(params: &AppendThreadItemsParams) -> bool {
-    params.items.iter().any(|item| {
-        matches!(
-            item,
-            RolloutItem::InterAgentCommunicationMetadata {
-                trigger_turn: false
-            }
-        )
-    }) && params.items.iter().any(is_late_mailbox_response_item)
+fn is_terminal_append(params: &AppendThreadItemsParams) -> bool {
+    params
+        .items
+        .iter()
+        .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
 }
 
 fn is_client_injected_developer_message(item: &RolloutItem, text: &str) -> bool {
@@ -260,15 +256,14 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
     first_complete
         .send(())
         .expect("first response completion should remain gated");
-    // Completion persists deferred mailbox mail after the active slot enters terminal
-    // finalization, before terminal lifecycle delivery can emit TurnComplete.
+    // Terminal event persistence precedes delivery, while the finishing task still owns the slot.
     let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
         .await
-        .expect("terminal transition should persist queued mail")
+        .expect("terminal transition should persist its completion event")
         .expect("append observer should remain open");
     assert!(
-        is_deferred_mailbox_append(&pending_append.params),
-        "gate must pause the deferred queue-only mailbox append"
+        is_terminal_append(&pending_append.params),
+        "gate must pause terminal event persistence before delivery"
     );
 
     let second_submit = tokio::spawn({
@@ -433,30 +428,17 @@ async fn compact_waits_for_prior_turn_terminal_finalization() {
         )
     })
     .await;
-    codex
-        .submit(Op::InterAgentCommunication {
-            communication: codex_protocol::protocol::InterAgentCommunication::new(
-                AgentPath::try_from("/root/worker").expect("worker path should parse"),
-                AgentPath::root(),
-                Vec::new(),
-                "late mailbox input".to_string(),
-                /*trigger_turn*/ false,
-            ),
-            start_options: Default::default(),
-        })
-        .await
-        .expect("submit queue-only mailbox input");
     store.armed.store(true, Ordering::SeqCst);
     first_complete
         .send(())
         .expect("first response completion should remain gated");
     let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
         .await
-        .expect("terminal transition should persist queued mail")
+        .expect("terminal transition should persist its completion event")
         .expect("append observer should remain open");
     assert!(
-        is_deferred_mailbox_append(&pending_append.params),
-        "gate must pause the deferred queue-only mailbox append"
+        is_terminal_append(&pending_append.params),
+        "gate must pause terminal event persistence before delivery"
     );
 
     codex.submit(Op::Compact).await.expect("submit compact");
@@ -525,30 +507,17 @@ async fn client_injection_waits_for_terminal_finalization_and_persists_once() {
         )
     })
     .await;
-    codex
-        .submit(Op::InterAgentCommunication {
-            communication: codex_protocol::protocol::InterAgentCommunication::new(
-                AgentPath::try_from("/root/worker").expect("worker path should parse"),
-                AgentPath::root(),
-                Vec::new(),
-                "late mailbox input".to_string(),
-                /*trigger_turn*/ false,
-            ),
-            start_options: Default::default(),
-        })
-        .await
-        .expect("submit queue-only mailbox input");
     store.armed.store(true, Ordering::SeqCst);
     first_complete
         .send(())
         .expect("first response completion should remain gated");
     let pending_append = tokio::time::timeout(Duration::from_secs(2), append_requests.recv())
         .await
-        .expect("terminal transition should persist queued mail")
+        .expect("terminal transition should persist its completion event")
         .expect("append observer should remain open");
     assert!(
-        is_deferred_mailbox_append(&pending_append.params),
-        "gate must pause the deferred queue-only mailbox append"
+        is_terminal_append(&pending_append.params),
+        "gate must pause terminal event persistence before delivery"
     );
 
     let injected_text = "client response item during terminal finalization";

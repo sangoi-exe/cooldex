@@ -781,17 +781,10 @@ impl Session {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
-        let mut pending_input = self
+        let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
-        // Merge-safety anchor: terminal recording drains only the queue-only FIFO prefix before
-        // event delivery, leaving a trigger-turn boundary intact for next-turn settings.
-        pending_input.extend(
-            self.input_queue
-                .drain_queue_only_mailbox_input_prefix()
-                .await,
-        );
         let (
             turn_had_memory_citation,
             turn_tool_calls,

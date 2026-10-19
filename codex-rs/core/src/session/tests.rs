@@ -13495,7 +13495,7 @@ async fn user_input_answer_order_wait_preserves_the_original_waiter_after_retire
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
-// Merge-safety anchor: real task finalization rejects notices after its sole drain even when the mailbox phase remains CurrentTurn, without notifying subscribers or leaving backlog.
+// Merge-safety anchor: terminal recording drains turn-local notices, not the session mailbox; finishing slots reject late notices without notifying subscribers, while queued mail waits for a later consuming turn.
 #[tokio::test]
 #[expect(
     clippy::await_holding_invalid_type,
@@ -13503,6 +13503,7 @@ async fn user_input_answer_order_wait_preserves_the_original_waiter_after_retire
 )]
 async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
+    assert!(!session.features.enabled(Feature::WakeOnAgentMessages));
     start_regular_never_ending_task(&session, &turn_context).await;
     let (turn_state, cancellation_token, mut done) = {
         let active = session.active_turn.lock().await;
@@ -13542,6 +13543,16 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
             .has_changed()
             .expect("activity channel remains open")
     );
+    activity.borrow_and_update();
+
+    let queued_mail = InterAgentCommunication {
+        content: "session mailbox input for a later turn".to_owned(),
+        ..notice.clone()
+    };
+    session
+        .input_queue
+        .enqueue_mailbox_communication(queued_mail.clone(), Default::default())
+        .await;
     activity.borrow_and_update();
 
     // The real task runner completes, drains this notice, and then waits before publishing the terminal event.
@@ -13620,7 +13631,7 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
             .expect("activity channel remains open")
     );
     assert!(turn_state.lock().await.pending_input.is_empty());
-    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    assert!(session.input_queue.has_pending_mailbox_items().await);
     drop(terminal_error);
     timeout(StdDuration::from_secs(/*secs*/ 5), async {
         tokio::join!(done, late_client, replacement);
@@ -13629,6 +13640,23 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
     .expect("finishing task retires");
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0,
+        vec![TurnInput::InterAgentCommunication(queued_mail)]
+    );
+    assert!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await
+            .0
+            .is_empty()
+    );
     assert!(!session.input_queue.has_pending_mailbox_items().await);
 }
 
