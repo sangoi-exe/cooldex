@@ -306,7 +306,18 @@ async fn partial_answers_survive_forked_child_requests(
             body["instructions"],
             requests[1].body_json()["instructions"]
         );
-        assert!(child_requests[0].body_contains_text("Check both results independently."));
+        // Merge-safety anchor: full-history forks retain the captured parent developer identity, not the generic child default.
+        let developer_texts = child_requests[0].message_input_texts("developer");
+        assert!(
+            developer_texts
+                .iter()
+                .any(|text| text == "Coordinate the investigation.")
+        );
+        assert!(
+            !developer_texts
+                .iter()
+                .any(|text| text.contains("Check both results independently."))
+        );
         if code_mode {
             assert_eq!(
                 child_requests[0].custom_tool_call_output_content_and_success("spawn-worker"),
@@ -322,7 +333,7 @@ async fn partial_answers_survive_forked_child_requests(
             insta::assert_snapshot!(
                 "preserved_answer_fork",
                 context_snapshot::format_request_history_snapshot(
-                    "A worker inherits the parent prefix unchanged and receives its own instructions. Requests are grouped by parent, then child.",
+                    "A worker inherits the parent prefix and captured developer identity unchanged, with a separate child task. Requests are grouped by parent, then child.",
                     &requests,
                     &ContextSnapshotOptions::default().rewrite_known_segments()
                 )

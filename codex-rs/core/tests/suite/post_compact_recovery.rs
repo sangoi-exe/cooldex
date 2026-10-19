@@ -267,8 +267,14 @@ async fn wait_for_blocked_recovery_terminal_error(codex: &codex_core::CodexThrea
         error.message,
         "Fatal error: post-compact recovery is blocked: boundary_mismatch"
     );
-    let EventMsg::TurnComplete(completed) =
-        wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await
+    let EventMsg::TurnComplete(completed) = wait_for_event(codex, |event| {
+        assert!(
+            !matches!(event, EventMsg::Error(_)),
+            "blocked recovery must emit exactly one Error before TurnComplete"
+        );
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await
     else {
         unreachable!("predicate guarantees a turn complete event");
     };

@@ -63,7 +63,7 @@ async fn strict_3p_mcp_refresh_preserves_cache_while_exec_tracks_available_tools
         })
         .with_model_info_override("gpt-6-astra", |model| {
             model.tool_mode = Some(ToolMode::CodeModeOnly);
-            model.use_responses_lite = true;
+            model.use_responses_lite = false;
             model.supports_search_tool = false;
         })
         .build_with_auto_env(&server)
@@ -130,16 +130,20 @@ text(JSON.stringify(results));"#;
     let requests = mock.requests();
     // Each of four turns needs two requests: one calls exec, the next includes its output.
     assert_eq!(requests.len(), 8);
-    let prefix = requests[0].inputs_of_type("additional_tools");
+    // Merge-safety anchor: named Astra keeps a full-Responses eager catalog stable while exec observes the live MCP registry.
+    let catalog = requests[0].body_json()["tools"].clone();
     assert!(
-        !prefix.is_empty(),
-        "Responses Lite must supply a real tool prefix"
+        !catalog
+            .as_array()
+            .expect("full Responses should expose a top-level tool catalog")
+            .is_empty(),
+        "full Responses must supply a nonempty eager tool catalog"
     );
     for (index, request) in requests.iter().enumerate() {
         assert_eq!(
-            request.inputs_of_type("additional_tools"),
-            prefix,
-            "request {}: MCP registration or refresh changed the eager tool prefix",
+            request.body_json()["tools"],
+            catalog,
+            "request {}: MCP registration or refresh changed the model-visible eager catalog",
             index + 1,
         );
     }
@@ -179,14 +183,13 @@ text(JSON.stringify(results));"#;
     ];
     let sections = labels.into_iter().zip(&requests).collect::<Vec<_>>();
     let snapshot = context_snapshot::format_labeled_requests_snapshot(
-        "Strict Code Mode Only: MCP config changes between turns, with omit-all and namespace skips. Exec calls the live catalog. One window means the captured prefix stayed stable. The execution environment remains running.",
+        "Strict Code Mode Only: MCP config changes between turns, with omit-all and namespace skips. Exec calls the live catalog. The model-visible eager catalog remains stable. The execution environment remains running.",
         &sections,
         &ContextSnapshotOptions::default()
             .rewrite_known_segments()
             .include_request_settings(),
     );
-    // The starting exec schema varies across Cargo and Bazel builds. The assertions above
-    // still compare every real prefix byte; the formatter has already grouped the windows.
+    // Existing build-specific schema-hash normalization stays at the golden boundary; the assertions above compare the complete model-visible catalog.
     let snapshot = regex_lite::Regex::new(
         r"(?m)(^00:additional_tools/developer \(\d+; hash=|^ +- namespace/functions; hash=)[0-9a-f]{16}",
     )?

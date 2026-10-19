@@ -1148,25 +1148,34 @@ class CargoValidateTests(unittest.TestCase):
             list(command.argv[-2:]),
         )
 
-    def test_windows_nextest_package_filter_inherits_pty_windows_only_exclusion(
+    def test_windows_nextest_package_filters_inherit_windows_only_exclusions(
         self,
     ) -> None:
         planner = load_planner_module()
         config = planner.load_config(PRODUCTION_CONFIG)
         workspace_argv = config["commands"]["windows-nextest-workspace"]["argv"]
         workspace_filter = workspace_argv[workspace_argv.index("-E") + 1]
-        excluded_test = "contained_std_spawn_releases_inherited_pipes_after_root_exit"
-        self.assertIn(excluded_test, workspace_filter)
-
-        command = planner.windows_nextest_packages_command(
-            config, ["codex-utils-pty"], "fixture", []
-        )
-        self.assertIsNotNone(command)
-        selected_filter = command.argv[command.argv.index("-E") + 1]
-        self.assertEqual(
-            f"(package(codex-utils-pty)) & ({workspace_filter})", selected_filter
-        )
-        self.assertIn(excluded_test, selected_filter)
+        for package, exclusion in (
+            (
+                "codex-utils-pty",
+                "contained_std_spawn_releases_inherited_pipes_after_root_exit",
+            ),
+            (
+                "codex-cli",
+                "(package(codex-cli) & binary(=app_server_daemon_windows))",
+            ),
+        ):
+            with self.subTest(package=package):
+                self.assertIn(exclusion, workspace_filter)
+                command = planner.windows_nextest_packages_command(
+                    config, [package], "fixture", []
+                )
+                self.assertIsNotNone(command)
+                selected_filter = command.argv[command.argv.index("-E") + 1]
+                self.assertEqual(
+                    f"(package({package})) & ({workspace_filter})", selected_filter
+                )
+                self.assertIn(exclusion, selected_filter)
 
     def test_rmcp_client_native_selection_builds_cli_without_expanding_test_scope(
         self,
@@ -3769,6 +3778,10 @@ class CargoValidateTests(unittest.TestCase):
             "codex-app-server": (
                 "suite::v2::windows_sandbox_setup::startup_mxc_preference_is_resolved_before_readiness",
             ),
+            "codex-cli": (
+                "login_with_api_key_reads_stdin_and_writes_auth_json",
+                "execpolicy_check_matches_expected_json",
+            ),
             "codex-core": (
                 "session::tests::turn_start_mcp_tests::turn_start_refreshes_dirty_mcp_reuses_clean_runtime_and_cancels_discovery",
             ),
@@ -3808,6 +3821,13 @@ class CargoValidateTests(unittest.TestCase):
                 ("affected", selected_filter),
             ):
                 with self.subTest(package=package, selection=selection):
+                    if package == "codex-cli":
+                        self.assertIn(
+                            "(package(codex-cli) & binary(=app_server_daemon_windows))",
+                            expression,
+                        )
+                        self.assertNotIn("binary(=login)", expression)
+                        self.assertNotIn("binary(=execpolicy)", expression)
                     if package == "codex-core":
                         self.assertIn(
                             "(package(codex-core) & binary(=windows_sandbox))",

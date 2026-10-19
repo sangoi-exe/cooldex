@@ -427,7 +427,23 @@ async fn run_compact_task_inner_impl(
         }
     };
 
-    // Merge-safety anchor: local compaction holds output, completion and usage operation-local until successful collection; summaries enter history only through the durable installer with compaction-output provenance.
+    // Merge-safety anchor: local compaction keeps failed attempts private, publishes successful non-post-turn originals through the native recorder before response completion, and installs replacement history only through the durable handoff/recovery boundary.
+    if !matches!(compaction_metadata.phase(), CompactionPhase::PostTurn) {
+        for item in &compaction_response.items {
+            sess.record_annotated_conversation_items(
+                turn_context.as_ref(),
+                &step_context.settings.model_info,
+                vec![ResponseItemEnvelope {
+                    item: item.clone(),
+                    metadata: Some(CodexHarnessMetadata {
+                        compaction_output: true,
+                        ..Default::default()
+                    }),
+                }],
+            )
+            .await;
+        }
+    }
     sess.record_observed_response_completed(
         turn_context.as_ref(),
         &compaction_response.response_id,

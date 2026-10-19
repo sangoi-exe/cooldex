@@ -177,7 +177,26 @@ async fn prediction_forks_do_not_auto_compact(
             "tools": body["tools"],
         })))
     };
-    assert_eq!(comparable(1), comparable(4));
+    let child_request = comparable(1);
+    let mut expected_child_request = comparable(4);
+    // Merge-safety anchor: only the durable parent's recall tool differs; ephemeral predictions retain identical input, instructions, and every other tool.
+    let parent_tools = expected_child_request["tools"]
+        .as_array_mut()
+        .expect("parent tools");
+    let recall_index = parent_tools
+        .iter()
+        .position(|tool| tool["name"] == "recall")
+        .expect("durable parent exposes recall");
+    assert_eq!(parent_tools.remove(recall_index)["type"], "function");
+    assert!(
+        child_request["tools"]
+            .as_array()
+            .expect("child tools")
+            .iter()
+            .all(|tool| tool["name"] != "recall"),
+        "ephemeral prediction child must not expose recall"
+    );
+    assert_eq!(child_request, expected_child_request);
     assert!(requests[1].body_contains_text("Retain this skill metadata"));
     assert!(requests[2].body_contains_text("Remember the original context."));
     assert!(requests[3].body_contains_text("Remember the original context."));

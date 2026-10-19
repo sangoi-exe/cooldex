@@ -77,6 +77,7 @@ use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::namespace_child_tool;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
@@ -533,13 +534,9 @@ async fn astra_asks_an_async_question_and_receives_the_answer_while_working() ->
         .iter()
         .map(|body| serde_json::from_slice(body))
         .collect::<serde_json::Result<Vec<serde_json::Value>>>()?;
+    // Merge-safety anchor: named Astra retains the fork's full-Responses top-level catalog rather than Lite positional declarations.
     for request in &requests {
-        let tool = request["input"][0]["tools"]
-            .as_array()
-            .expect("Responses Lite tools")
-            .iter()
-            .flat_map(|namespace| namespace["tools"].as_array().into_iter().flatten())
-            .find(|tool| tool["name"] == "request_user_input_async")
+        let tool = namespace_child_tool(request, "functions", "request_user_input_async")
             .expect("the async question tool should be directly visible to the model");
         assert_eq!(tool["parameters"], parameters);
     }

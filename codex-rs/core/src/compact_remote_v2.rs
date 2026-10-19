@@ -264,6 +264,13 @@ async fn run_remote_compact_task_inner(
         .await;
     match result {
         Ok(installed) => Ok(installed),
+        // Merge-safety anchor: standalone compaction Fatal errors belong to canonical task completion, which reports one Error and retains that same terminal payload.
+        Err(err)
+            if matches!(phase, CompactionPhase::StandaloneTurn)
+                && matches!(err.details(), CodexErrorDetails::Fatal(_)) =>
+        {
+            Err(err)
+        }
         Err(err)
             if matches!(err.details(), CodexErrorDetails::TurnAborted)
                 || matches!(phase, CompactionPhase::PostTurn) =>

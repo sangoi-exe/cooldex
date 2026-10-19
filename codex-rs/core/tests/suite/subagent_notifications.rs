@@ -1812,43 +1812,43 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     } else {
         Some(parent_request.instructions_text())
     };
-    let parent_lite_base_instruction_group = if catalog_marked_usage_hint {
+    // Merge-safety anchor: catalog-marked Astra hints retain full-Responses catalog placement and the captured parent's standalone developer base-instruction group.
+    let parent_base_instruction_group = if catalog_marked_usage_hint {
         assert!(
             parent_body.get("instructions").is_none(),
-            "Responses Lite should omit top-level instructions"
+            "full Responses should keep base instructions in developer input"
+        );
+        assert!(
+            parent_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty()),
+            "full Responses should expose a nonempty top-level tool catalog"
         );
         let parent_input = parent_request.input();
         assert_eq!(
-            parent_input
-                .first()
-                .and_then(|item| item.get("type"))
-                .and_then(Value::as_str),
-            Some("additional_tools"),
-            "Responses Lite should prefix prompt input with additional tools"
-        );
-        assert_eq!(
             (
                 parent_input
-                    .get(1)
+                    .first()
                     .and_then(|item| item.get("type"))
                     .and_then(Value::as_str),
                 parent_input
-                    .get(1)
+                    .first()
                     .and_then(|item| item.get("role"))
                     .and_then(Value::as_str),
             ),
             (Some("message"), Some("developer")),
-            "Responses Lite should place base instructions in the first developer message after additional tools"
+            "full Responses should place base instructions in the first input developer message"
         );
         let base_instruction_group = parent_request
             .message_input_text_groups("developer")
             .into_iter()
             .next()
-            .expect("Responses Lite parent request should contain a base-instructions developer message");
+            .expect("full Responses parent request should contain a base-instructions developer message");
         assert_eq!(
             base_instruction_group.len(),
             1,
-            "Responses Lite should encode base instructions as one developer text group"
+            "full Responses should encode base instructions as one developer text group"
         );
         Some(base_instruction_group)
     } else {
@@ -1985,51 +1985,50 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     }
     let child_body = child_request.body_json();
     if !world_state_identity {
-        if let Some(parent_lite_base_instruction_group) = parent_lite_base_instruction_group {
+        if let Some(parent_base_instruction_group) = parent_base_instruction_group {
             assert!(
                 child_body.get("instructions").is_none(),
-                "Responses Lite child should omit top-level instructions"
+                "full Responses child should keep base instructions in developer input"
+            );
+            assert!(
+                child_body
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty()),
+                "full Responses child should expose a nonempty top-level tool catalog"
             );
             let child_input = child_request.input();
             assert_eq!(
-                child_input
-                    .first()
-                    .and_then(|item| item.get("type"))
-                    .and_then(Value::as_str),
-                Some("additional_tools"),
-                "Responses Lite child should prefix prompt input with additional tools"
-            );
-            assert_eq!(
                 (
                     child_input
-                        .get(1)
+                        .first()
                         .and_then(|item| item.get("type"))
                         .and_then(Value::as_str),
                     child_input
-                        .get(1)
+                        .first()
                         .and_then(|item| item.get("role"))
                         .and_then(Value::as_str),
                 ),
                 (Some("message"), Some("developer")),
-                "Responses Lite child should retain base instructions as the first developer message after additional tools"
+                "full Responses child should retain base instructions as the first input developer message"
             );
-            let child_lite_base_instruction_group = child_request
+            let child_base_instruction_group = child_request
                 .message_input_text_groups("developer")
                 .into_iter()
                 .next()
-                .expect("Responses Lite child request should contain a base-instructions developer message");
+                .expect("full Responses child request should contain a base-instructions developer message");
             assert_eq!(
-                child_lite_base_instruction_group, parent_lite_base_instruction_group,
+                child_base_instruction_group, parent_base_instruction_group,
                 "full-history child should inherit the parent's base-instructions developer group"
             );
             assert_ne!(
-                child_lite_base_instruction_group,
+                child_base_instruction_group,
                 vec![CONFIGURED_CHILD_INSTRUCTIONS.to_string()],
                 "full-history child should not use configured child base instructions"
             );
         } else {
             let parent_instructions = parent_instructions
-                .expect("non-Lite parent request should carry base instructions in input");
+                .expect("parent request should carry base instructions in input");
             assert_eq!(child_request.instructions_text(), parent_instructions);
             assert_ne!(
                 child_request.instructions_text(),
