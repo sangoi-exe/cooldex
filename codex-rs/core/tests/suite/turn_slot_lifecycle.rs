@@ -215,6 +215,7 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
             },
         ],
         response_chunks("resp-second", "msg-second", "second answer"),
+        response_chunks("resp-third", "msg-third", "third answer"),
     ])
     .await;
     let (pending_appends, mut append_requests) = mpsc::unbounded_channel();
@@ -334,23 +335,6 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
             .count(),
         1
     );
-    assert_eq!(
-        second_request["input"]
-            .as_array()
-            .expect("second request input")
-            .iter()
-            .filter(|item| {
-                item["type"] == "agent_message"
-                    && item["content"].as_array().is_some_and(|content| {
-                        content.iter().any(|content| {
-                            content["type"] == "input_text"
-                                && content["text"] == "late mailbox input"
-                        })
-                    })
-            })
-            .count(),
-        1
-    );
     let history = codex
         .load_history(/*include_archived*/ false)
         .await
@@ -374,6 +358,38 @@ async fn fresh_submit_waits_for_prior_turn_terminal_transition() {
                         trigger_turn: false
                     }
                 )
+            })
+            .count(),
+        1
+    );
+
+    // Fresh user input is sampled first; the second turn records its pending mail before a later request sees it.
+    submit_user_input(&codex, "third prompt").await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    server.wait_for_request_count(/*count*/ 3).await;
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 3);
+    let third_request: Value = from_slice(&requests[2]).expect("parse third request");
+    assert_eq!(
+        message_input_texts(&third_request, "user")
+            .iter()
+            .filter(|text| text.as_str() == "third prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        third_request["input"]
+            .as_array()
+            .expect("third request input")
+            .iter()
+            .filter(|item| {
+                item["type"] == "agent_message"
+                    && item["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|content| {
+                            content["type"] == "input_text"
+                                && content["text"] == "late mailbox input"
+                        })
+                    })
             })
             .count(),
         1
