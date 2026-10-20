@@ -1547,22 +1547,30 @@ class CargoValidateWindowsTests(unittest.TestCase):
             "-E",
             "package(codex-cli)",
         ]
-        process, summary, result = self.invoke(
-            self.manifest([self.command(argv=planner_argv, env=self.fixture_env())]),
-            fixture_opt_in=True,
+        focused_argv = list(planner_argv)
+        focused_argv.insert(focused_argv.index("-E"), "--lib")
+        focused_argv[focused_argv.index("-E") + 1] = (
+            "(package(planner-owned-package-one) | package(planner-owned-package-two))"
+            " & (all() - test(=excluded)) & (test(=unit::case) | test(/unit::other/))"
         )
+        for argv in (planner_argv, focused_argv):
+            with self.subTest(argv=argv):
+                process, summary, result = self.invoke(
+                    self.manifest([self.command(argv=argv, env=self.fixture_env())]),
+                    fixture_opt_in=True,
+                )
 
-        self.assertEqual(process.returncode, 0, msg=process.stderr)
-        self.assertEqual(summary["status"], "success")
-        command_result = result["command_results"][0]
-        self.assertEqual(command_result["argv"], planner_argv)
-        self.assertEqual(command_result["launch_arguments"], planner_argv[1:])
-        self.assertEqual(
-            self.unix_path(command_result["fake_argv_path"])
-            .read_text(encoding="utf-8")
-            .splitlines(),
-            planner_argv[1:],
-        )
+                self.assertEqual(process.returncode, 0, msg=process.stderr)
+                self.assertEqual(summary["status"], "success")
+                command_result = result["command_results"][0]
+                self.assertEqual(command_result["argv"], argv)
+                self.assertEqual(command_result["launch_arguments"], argv[1:])
+                self.assertEqual(
+                    self.unix_path(command_result["fake_argv_path"])
+                    .read_text(encoding="utf-8")
+                    .splitlines(),
+                    argv[1:],
+                )
 
     @unittest.skipUnless(
         Path(PWSH).is_file(),

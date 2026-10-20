@@ -47,6 +47,7 @@ Usage:
   ./scripts/cargo-guard.sh plan --changed --mode standard
   ./scripts/cargo-guard.sh plan --range BASE..HEAD --mode strict
   ./scripts/cargo-guard.sh plan --commit HEAD --mode standard
+  ./scripts/cargo-guard.sh plan --file <changed-path> --mode standard --test-filter '<nextest-expression>'
   ./scripts/cargo-guard.sh prep-plan --changed --mode standard
   ./scripts/cargo-guard.sh prep --changed --mode standard
   ./scripts/cargo-guard.sh verify --changed --mode standard
@@ -69,6 +70,13 @@ Planner selectors:
   - --range <rev-range>: files changed by a Git revision range, including deleted paths
   - --file <path>: explicit changed file
   - --surface <name>: explicit validation surface
+  - --test-filter <expr>: intersect one Nextest expression with affected native
+    runtime packages and global exclusions; standard/strict validation only
+  - --lib: native library test targets only, for inspected helper-free cases;
+    omits automatic binary fixture prerequisites, not required fixture preparation
+  - runtime focus is rejected for prep, quick, full, or plans without native runtime
+  - default procedure: inspect changed owners/direct followers and select related
+    cases explicitly; broader testing requires established impact/scope
   - --json: print machine-readable JSON plan output
   - --yolo: for native Windows validation plans only, bypass disk preflight floors;
     this risks disk-full or incomplete outputs and never triggers cleanup

@@ -2360,7 +2360,11 @@ def selected_native_test_filter(packages: list[str], test_filter: str) -> str:
 
 
 def windows_nextest_packages_argv(
-    command_config: dict[str, Any], test_packages: list[str]
+    command_config: dict[str, Any],
+    test_packages: list[str],
+    *,
+    test_filter: str | None = None,
+    lib: bool = False,
 ) -> list[str]:
     workspace_argv = windows_nextest_workspace_argv(command_config)
     if tuple(workspace_argv[:4]) != ("cargo", "nextest", "run", "--workspace"):
@@ -2370,7 +2374,7 @@ def windows_nextest_packages_argv(
     argv = list(workspace_argv[:3])
     workspace_features: list[str] = []
     package_exclusions: set[str] = set()
-    test_filter: str | None = None
+    workspace_test_filter: str | None = None
     index = 4
     while index < len(workspace_argv):
         argument = workspace_argv[index]
@@ -2393,12 +2397,12 @@ def windows_nextest_packages_argv(
                 raise PlannerError(
                     f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must end with its Nextest filter"
                 )
-            test_filter = workspace_argv[index + 1]
+            workspace_test_filter = workspace_argv[index + 1]
             break
         else:
             argv.append(argument)
             index += 1
-    if test_filter is None:
+    if workspace_test_filter is None:
         raise PlannerError(
             f"validation command {WINDOWS_NEXTEST_WORKSPACE_COMMAND!r} must define a Nextest filter"
         )
@@ -2407,15 +2411,22 @@ def windows_nextest_packages_argv(
         package for package in test_packages if package not in package_exclusions
     ]
     build_packages = list(selected_test_packages)
-    for package in selected_test_packages:
-        for prerequisite in command_config["native_binary_prerequisites"].get(
-            package, []
-        ):
-            if prerequisite not in build_packages:
-                build_packages.append(prerequisite)
-    argv.extend(
-        ("-E", selected_native_test_filter(selected_test_packages, test_filter))
+    # Merge-safety anchor: explicit library focus is for inspected helper-free cases; normal package selection retains its binary fixture prerequisites.
+    if lib:
+        argv.append("--lib")
+    else:
+        for package in selected_test_packages:
+            for prerequisite in command_config["native_binary_prerequisites"].get(
+                package, []
+            ):
+                if prerequisite not in build_packages:
+                    build_packages.append(prerequisite)
+    selected_filter = selected_native_test_filter(
+        selected_test_packages, workspace_test_filter
     )
+    if test_filter is not None:
+        selected_filter += f" & ({test_filter})"
+    argv.extend(("-E", selected_filter))
     argv.extend(argument for package in build_packages for argument in ("-p", package))
     feature_args = [
         feature
@@ -2485,11 +2496,20 @@ def windows_nextest_packages_command(
     packages: list[str],
     reason: str,
     history_entries: list[dict[str, Any]],
+    *,
+    test_filter: str | None = None,
+    lib: bool = False,
 ) -> CommandEntry | None:
     command_config = config["commands"][WINDOWS_NEXTEST_WORKSPACE_COMMAND]
-    argv = windows_nextest_packages_argv(command_config, packages)
+    argv = windows_nextest_packages_argv(
+        command_config, packages, test_filter=test_filter, lib=lib
+    )
     if "-p" not in argv:
         return None
+    if test_filter is not None:
+        reason += "; caller-supplied Nextest filter intersects affected packages and global exclusions"
+    if lib:
+        reason += "; library test targets only, without automatic native binary fixture prerequisites"
     return command_from_config(
         config,
         WINDOWS_NEXTEST_WORKSPACE_COMMAND,
@@ -2651,7 +2671,17 @@ def build_plan(
     telemetry_level: str,
     path_evidence: dict[str, PathSelectionEvidence] | None = None,
     yolo: bool = False,
+    test_filter: str | None = None,
+    lib: bool = False,
 ) -> Plan:
+    # Merge-safety anchor: runtime focus must be applied, never silently ignored or presented as full-workspace validation.
+    runtime_focus = test_filter is not None or lib
+    if runtime_focus and (stage != "validation" or mode not in {"standard", "strict"}):
+        raise PlannerError(
+            "--test-filter and --lib require standard or strict validation with a native runtime command; prep, quick, and full do not support runtime focus"
+        )
+    if test_filter is not None and not test_filter.strip():
+        raise PlannerError("--test-filter requires a non-empty Nextest expression")
     history_entries = read_history_entries(
         receipt_dir / "history.jsonl" if receipt_dir else None
     )
@@ -2807,6 +2837,8 @@ def build_plan(
             validation_packages,
             "selected runtime packages request native Windows platform-neutral tests",
             history_entries,
+            test_filter=test_filter,
+            lib=lib,
         )
         if windows_nextest_command is not None:
             add_command(commands, windows_nextest_command)
@@ -2952,6 +2984,22 @@ def build_plan(
         )
 
     has_windows_command = any(command.platform == "windows" for command in commands)
+    if runtime_focus:
+        if not any(
+            command.kind == WINDOWS_NEXTEST_PACKAGES_KIND
+            and command.platform == "windows"
+            for command in commands
+        ):
+            raise PlannerError(
+                "--test-filter and --lib require a native runtime command in the selected validation plan"
+            )
+        selection.warnings.append(
+            "Native runtime focus is caller-selected coverage, not automatic discovery of related tests; WSL validation is unchanged"
+        )
+        if lib:
+            selection.warnings.append(
+                "--lib requires inspected helper-free library cases; cases needing executable fixtures require their established preparation and route, not cached binaries"
+            )
     if yolo and not has_windows_command:
         raise PlannerError(
             "--yolo requires a native Windows command in the selected validation plan"
@@ -4528,6 +4576,15 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=VALID_MODES, default=default_mode)
     parser.add_argument(
+        "--test-filter",
+        help="intersect one Nextest expression with affected native runtime packages and global exclusions (standard/strict only)",
+    )
+    parser.add_argument(
+        "--lib",
+        action="store_true",
+        help="focus native runtime on inspected helper-free library test targets, omitting automatic binary fixture prerequisites (standard/strict only)",
+    )
+    parser.add_argument(
         "--yolo",
         action="store_true",
         help="bypass only native Windows disk preflight floors for a validation plan with native Windows commands",
@@ -4683,6 +4740,8 @@ def main(argv: list[str]) -> int:
             telemetry_level=args.telemetry_level,
             path_evidence=path_evidence,
             yolo=args.yolo,
+            test_filter=args.test_filter,
+            lib=args.lib,
         )
         write_plan_receipt(plan, repo_root)
         print_plan(plan, args.json)

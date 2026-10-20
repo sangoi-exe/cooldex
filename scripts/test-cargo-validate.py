@@ -1116,6 +1116,312 @@ class CargoValidateTests(unittest.TestCase):
                     )
                 self.assertIn("windows_runtime", plan)
 
+    def test_guard_help_and_plan_forward_native_runtime_focus(self) -> None:
+        env = {**os.environ, "WSL_DISTRO_NAME": "cargo-validate-test-distro"}
+        for action in ([], ["plan"]):
+            with self.subTest(action=action):
+                help_result = subprocess.run(
+                    [str(REPO_ROOT / "scripts" / "cargo-guard.sh"), *action, "--help"],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(0, help_result.returncode, help_result.stderr)
+                self.assertIn("--test-filter", help_result.stdout)
+                self.assertIn("--lib", help_result.stdout)
+        process = subprocess.run(
+            [
+                str(REPO_ROOT / "scripts" / "cargo-guard.sh"),
+                "plan",
+                "--json",
+                "--no-receipt",
+                "--repo-root",
+                str(self.repo_root),
+                "--metadata-json",
+                str(self.metadata_path),
+                "--config",
+                str(PRODUCTION_CONFIG),
+                "--file",
+                "codex-rs/core/src/config/mod.rs",
+                "--mode",
+                "standard",
+                "--test-filter",
+                "test(=unit::case)",
+                "--lib",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, process.returncode, process.stderr)
+        plan = json.loads(process.stdout)
+        native = next(
+            command for command in plan["commands"] if command["platform"] == "windows"
+        )
+        self.assertIn("--lib", native["argv"])
+        self.assertTrue(
+            native["argv"][native["argv"].index("-E") + 1].endswith(
+                " & (test(=unit::case))"
+            )
+        )
+
+    def test_native_runtime_focus_reaches_frozen_argv_and_preserves_wsl_validation(
+        self,
+    ) -> None:
+        file_args = (
+            "--file",
+            "codex-rs/core/src/config/mod.rs",
+            "--file",
+            "codex-rs/tui/src/app.rs",
+        )
+        test_filter = "test(=unit::case) | package(unrelated)"
+        for mode in ("standard", "strict"):
+            normal = self.plan_json(*file_args, "--mode", mode)
+            normal_native = next(
+                command
+                for command in normal["commands"]
+                if command["kind"] == "windows-nextest-packages"
+            )
+            normal_argv = normal_native["argv"]
+            for focus_args in (
+                ("--test-filter", test_filter),
+                ("--lib",),
+                ("--test-filter", test_filter, "--lib"),
+            ):
+                with self.subTest(mode=mode, focus_args=focus_args):
+                    focused = self.plan_json(*file_args, "--mode", mode, *focus_args)
+                    native = next(
+                        command
+                        for command in focused["commands"]
+                        if command["kind"] == "windows-nextest-packages"
+                    )
+                    expected_argv = list(normal_argv)
+                    if "--lib" in focus_args:
+                        expected_argv.insert(expected_argv.index("-E"), "--lib")
+                        for prerequisite in (
+                            "codex-cli",
+                            "codex-exec",
+                            "codex-code-mode-host",
+                            "codex-rmcp-client",
+                        ):
+                            index = expected_argv.index(prerequisite)
+                            self.assertEqual("-p", expected_argv[index - 1])
+                            del expected_argv[index - 1 : index + 1]
+                        self.assertIn("library test targets only", native["reason"])
+                        self.assertTrue(
+                            any(
+                                "inspected helper-free" in warning
+                                for warning in focused["warnings"]
+                            )
+                        )
+                    if "--test-filter" in focus_args:
+                        expected_argv[expected_argv.index("-E") + 1] += (
+                            f" & ({test_filter})"
+                        )
+                        self.assertIn(
+                            "intersects affected packages and global exclusions",
+                            native["reason"],
+                        )
+                    self.assertEqual(expected_argv, native["argv"])
+                    self.assertIn("--no-fail-fast", native["argv"])
+                    self.assertEqual(
+                        "fail", native["argv"][native["argv"].index("--no-tests") + 1]
+                    )
+                    self.assertEqual(
+                        normal["selected_packages"], focused["selected_packages"]
+                    )
+                    self.assertEqual(
+                        normal["windows_runtime"], focused["windows_runtime"]
+                    )
+                    self.assertEqual(
+                        [
+                            command
+                            for command in normal["commands"]
+                            if command is not normal_native
+                        ],
+                        [
+                            command
+                            for command in focused["commands"]
+                            if command is not native
+                        ],
+                    )
+                    self.assertTrue(
+                        any(
+                            "caller-selected coverage" in warning
+                            for warning in focused["warnings"]
+                        )
+                    )
+
+    def test_library_focus_keeps_selected_package_features_and_exclusions(self) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        command = planner.windows_nextest_packages_command(
+            config,
+            ["codex-app-server", "codex-v8-poc", "codex-bwrap", "codex-voice-host"],
+            "fixture",
+            [],
+            test_filter="all()",
+            lib=True,
+        )
+        self.assertIsNotNone(command)
+        self.assertEqual(
+            ["codex-app-server", "codex-v8-poc"],
+            [
+                package
+                for flag, package in zip(command.argv, command.argv[1:])
+                if flag == "-p"
+            ],
+        )
+        self.assertIn("--lib", command.argv)
+        self.assertEqual(("--features", "codex-v8-poc/sandbox"), command.argv[-2:])
+        workspace_argv = self.windows_workspace_aggregate_argv()
+        workspace_filter = workspace_argv[workspace_argv.index("-E") + 1]
+        self.assertEqual(
+            f"(package(codex-app-server) | package(codex-v8-poc)) & ({workspace_filter}) & (all())",
+            command.argv[command.argv.index("-E") + 1],
+        )
+
+    def test_native_runtime_focus_binds_existing_command_and_plan_identity(
+        self,
+    ) -> None:
+        planner = load_planner_module()
+        config = planner.load_config(PRODUCTION_CONFIG)
+        plans = [
+            planner.build_plan(
+                action="plan",
+                stage="validation",
+                mode="standard",
+                files=["codex-rs/core/src/config/mod.rs"],
+                explicit_surfaces=[],
+                repo_root=self.repo_root,
+                config=config,
+                packages=planner.load_metadata(self.repo_root, self.metadata_path),
+                receipt_dir=None,
+                telemetry_level="full",
+                **focus,
+            )
+            for focus in (
+                {},
+                {"test_filter": "test(=unit::first)"},
+                {"test_filter": "test(=unit::second)"},
+                {"lib": True},
+                {"test_filter": "test(=unit::first)", "lib": True},
+            )
+        ]
+        native_commands = [
+            next(
+                command
+                for command in plan.commands
+                if command.kind == "windows-nextest-packages"
+            )
+            for plan in plans
+        ]
+        self.assertEqual(
+            len(plans), len({command.fingerprint for command in native_commands})
+        )
+        self.assertEqual(
+            len(plans),
+            len({planner.command_resume_id(command) for command in native_commands}),
+        )
+        self.assertEqual(
+            len(plans), len({planner.plan_resume_id(plan, "tooling") for plan in plans})
+        )
+        self.assertEqual(
+            1, len({command.job_contract_digest for command in native_commands})
+        )
+
+    def test_native_runtime_focus_rejects_ignored_or_full_selection(self) -> None:
+        cases = (
+            (
+                "prep-plan",
+                "standard",
+                "codex-rs/core/src/config/mod.rs",
+                "standard or strict validation",
+            ),
+            (
+                "prep",
+                "strict",
+                "codex-rs/core/src/config/mod.rs",
+                "standard or strict validation",
+            ),
+            (
+                "plan",
+                "quick",
+                "codex-rs/core/src/config/mod.rs",
+                "standard or strict validation",
+            ),
+            (
+                "verify",
+                "full",
+                "codex-rs/core/src/config/mod.rs",
+                "standard or strict validation",
+            ),
+            (
+                "plan",
+                "standard",
+                "scripts/cargo-validate.py",
+                "native runtime command in the selected",
+            ),
+            (
+                "plan",
+                "standard",
+                "codex-rs/linux-sandbox/Cargo.toml",
+                "native runtime command in the selected",
+            ),
+            (
+                "plan",
+                "strict",
+                "codex-rs/voice-host/Cargo.toml",
+                "native runtime command in the selected",
+            ),
+        )
+        for action, mode, file_path, error in cases:
+            for focus_args in (("--test-filter", "all()"), ("--lib",)):
+                with self.subTest(
+                    action=action, mode=mode, file_path=file_path, focus_args=focus_args
+                ):
+                    process = self.run_planner(
+                        action,
+                        "--no-receipt",
+                        "--repo-root",
+                        str(self.repo_root),
+                        "--metadata-json",
+                        str(self.metadata_path),
+                        "--config",
+                        str(PRODUCTION_CONFIG),
+                        "--file",
+                        file_path,
+                        "--mode",
+                        mode,
+                        *focus_args,
+                        check=False,
+                    )
+                    self.assertEqual(2, process.returncode)
+                    self.assertIn(error, process.stderr)
+        for test_filter in ("", " \t "):
+            with self.subTest(test_filter=test_filter):
+                process = self.run_planner(
+                    "plan",
+                    "--no-receipt",
+                    "--repo-root",
+                    str(self.repo_root),
+                    "--metadata-json",
+                    str(self.metadata_path),
+                    "--config",
+                    str(PRODUCTION_CONFIG),
+                    "--file",
+                    "codex-rs/core/src/config/mod.rs",
+                    "--test-filter",
+                    test_filter,
+                    check=False,
+                )
+                self.assertEqual(2, process.returncode)
+                self.assertIn("requires a non-empty Nextest expression", process.stderr)
+
     def test_windows_nextest_package_features_follow_selected_packages(self) -> None:
         planner = load_planner_module()
         config = planner.load_config(PRODUCTION_CONFIG)
