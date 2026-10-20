@@ -109,12 +109,12 @@ impl ToolExecutor<ToolInvocation> for RecallHandler {
             name: TOOL_NAME.to_string(),
             description: "Return closed compaction intervals from the current thread as a chronological JSON list of intervals containing assistant messages and visible reasoning. The current open interval is excluded."
                 .to_string(),
-            strict: true,
+            strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(
                 BTreeMap::from([(
                     "intervals".to_string(),
-                    JsonSchema::one_of(
+                    JsonSchema::any_of(
                         vec![
                             JsonSchema::integer(/*description*/ None),
                             JsonSchema::string_enum(
