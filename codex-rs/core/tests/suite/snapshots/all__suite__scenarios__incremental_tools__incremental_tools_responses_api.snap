@@ -15,12 +15,12 @@ Settings:
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
-  tools (10; hash=1fda60e0f7be0b47):
+  tools (10; hash=4bd85a4fe1d42e1c):
     - custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=1354e7ae8c305e60
     - function/wait: Waits on a yielded `exec` cell and returns new output or completion. - Use `wait` only after `exe...; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=6692d8f6c55be489
     - function/exec_command: Runs a command in a PTY, returning output or a session ID for ongoing interaction.  exec tool dec...; args=[cmd, justification, login, max_output_tokens, prefix_rule, sandbox_permissions, shell, tty, workdir, yield_time_ms]; hash=759843fc2a7d41a0
     - function/write_stdin: Writes characters to an existing unified exec session and returns recent output.  exec tool decla...; args=[chars, max_output_tokens, session_id, yield_time_ms]; hash=e6405481b30a43c1
-    - function/recall: Return closed compaction intervals from the current thread as a chronological JSON list of interv...; args=[intervals]; hash=48f2b8d80e2d2fee
+    - function/recall: Return closed compaction intervals from the current thread as a chronological JSON list of interv...; args=[intervals]; hash=6fe61ad0c5bae56b
     - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
     - custom/apply_patch: The `apply_patch` tool can be used to edit files. Each file path may appear in only one patch ope...; hash=2f4a2e2143b09f94
     - function/view_image: View a local image file from the filesystem when visual inspection is needed. Use this for images...; args=[detail, path]; hash=1b87dd8874f6fa10
@@ -42,7 +42,7 @@ Settings:
 ## Window 2 (after request 2)
 Settings: relative to window 1
   model: "updated-tools-model"
-  tools (10; hash=e72fe372bbb8fa88):
+  tools (10; hash=c07249c55dc4c025):
     ~ custom/exec: Updated execution instructions.  Some deferred nested tools may be omitted from this description....; hash=7af6961848c10849
 -- request 3 (turn) --
 00:message/developer:
