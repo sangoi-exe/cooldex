@@ -116,8 +116,10 @@ impl LocalAgentControl {
             message,
             /*trigger_turn*/ false,
         );
-        let context =
+        let mut context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, outcome.thread_id);
+        // Merge-safety anchor: only canonical V2 terminal errors gain queue-only wake eligibility; Guardian errors do not retry their blocked action.
+        context.terminal_error_wake = matches!(status, AgentStatus::Errored(_));
         let delivery = self
             .send_inter_agent_communication(
                 parent_thread_id,

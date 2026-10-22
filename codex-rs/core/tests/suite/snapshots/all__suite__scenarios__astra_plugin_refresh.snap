@@ -8,30 +8,30 @@ Scenario: Astra checks for Notes, refreshes its installed plugin without restart
 Settings:
   include: ["reasoning.encrypted_content"]
   model: "gpt-6-astra"
-  parallel_tool_calls: true
+  parallel_tool_calls: false
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
-  reasoning: {"effort":"low"}
+  reasoning: {"context":"all_turns","effort":"low"}
   store: false
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
-  tools (7; hash=4ef702f8ca216367):
-    - custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=2fcf837a4b756f6a
-    - function/wait: Waits on a yielded `exec` cell and returns new output or completion. - Use `wait` only after `exe...; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=6692d8f6c55be489
-    - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
-    - function/request_user_input_async: Ask the user one or more questions during ongoing work. Use this tool only to request missing inf...; args=[questions]; hash=d6d74f33db330162
-    - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
-      - function/sleep
-    - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
-      - function/followup_task
-      - function/interrupt_agent
-      - function/list_agents
-      - function/send_message
-      - function/spawn_agent
-      - function/wait_agent
-    - web_search; hash=e214d4db1bc49e89
 -- request 1 (turn) --
-00:message/developer:
+00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
+        - namespace/functions; hash=fada4a476a3754dd
+          - custom/exec
+          - function/wait
+          - function/request_user_input
+          - function/request_user_input_async
+        - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
+          - function/sleep
+        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
+          - function/followup_task
+          - function/interrupt_agent
+          - function/list_agents
+          - function/send_message
+          - function/spawn_agent
+          - function/wait_agent
+01:message/developer:
     You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collabo...them until their intended goal is completely handled. [hash=efa50f074efa5803]
 
     # When to ask the user for permission
@@ -49,7 +49,7 @@ Settings:
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-01:message/developer[2]:
+02:message/developer[2]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
         Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
@@ -70,7 +70,7 @@ Settings:
 
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
         </collaboration_mode>
-02:message/developer:
+03:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -88,9 +88,9 @@ Settings:
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
-03:message/developer:
+04:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-04:message/user:
+05:message/user:
     <environment_context>
       <cwd><CWD></cwd>
       <shell><HOST_SHELL></shell>
@@ -98,18 +98,19 @@ Settings:
       <timezone><HOST_TIMEZONE></timezone>
       <filesystem><workspace_roots><root><WORKSPACE_ROOT 1></root></workspace_roots><permission_profile type...e="unrestricted" /></permission_profile></filesystem> [hash=0592734c170299c1]
     </environment_context>
-05:message/user:
+06:message/user:
     Check whether the Notes plugin echo tool is available.
+07:configuration_update:reasoning={"effort":"low"}
 -- request 2 (turn) --
-06:custom_tool_call/exec:text(ALL_TOOLS.filter(({ name }) => name === "mcp__notes__echo").map(({ name }) => name));
-07:custom_tool_call_output:Script completed
+08:custom_tool_call/exec:text(ALL_TOOLS.filter(({ name }) => name === "mcp__notes__echo").map(({ name }) => name));
+09:custom_tool_call_output:Script completed
     Wall time <DURATION> seconds
     Output:
      | []
 -- request 3 (turn) --
-08:message/assistant:
+10:message/assistant:
     The Notes tool is not installed yet.
-09:message/developer:
+11:message/developer:
     <skills_instructions>
     ## Skills
     A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list ...ed into an absolute path using the skill roots table. [hash=ca27c3957f42502b]
@@ -118,9 +119,9 @@ Settings:
     ### Available skills
     - notes:summarize: Summarize team notes (file: r0/notes/local/skills/summarize/SKILL.md)
     </skills_instructions>
-10:message/user:
+12:message/user:
     I installed Notes. Use $notes:summarize and the Notes tool to check that Mira owns the kickoff.
-11:message/user:
+13:message/user:
     <skill>
     <name>notes:summarize</name>
     <path><PLUGINS_CACHE>/test/notes/local/skills/summarize/SKILL.md</path>
@@ -132,31 +133,31 @@ Settings:
     State the owner and date from the notes.
 
     </skill>
-12:message/developer:
+14:message/developer:
     Capabilities from the `notes` plugin:
     - Skills from this plugin are prefixed with `notes:`.
     - MCP servers from this plugin available in this session: `notes`.
     Use these plugin-associated capabilities to help solve the task.
 -- request 4 (turn) --
-13:custom_tool_call/exec:text(ALL_TOOLS.filter(({ name }) => name === "mcp__notes__echo").map(({ name }) => name));
-14:custom_tool_call_output:Script completed
+15:custom_tool_call/exec:text(ALL_TOOLS.filter(({ name }) => name === "mcp__notes__echo").map(({ name }) => name));
+16:custom_tool_call_output:Script completed
     Wall time <DURATION> seconds
     Output:
      | ["mcp__notes__echo"]
 -- request 5 (turn) --
-15:custom_tool_call/exec:const result = await tools.mcp__notes__echo({ message: "Mira owns the kickoff" }); text(result.structuredContent?.echo);
-16:custom_tool_call_output:Script completed
+17:custom_tool_call/exec:const result = await tools.mcp__notes__echo({ message: "Mira owns the kickoff" }); text(result.structuredContent?.echo);
+18:custom_tool_call_output:Script completed
     Wall time <DURATION> seconds
     Output:
      | ECHOING: Mira owns the kickoff
 -- request 6 (turn) --
-17:message/assistant:
+19:message/assistant:
     The Notes plugin confirms Mira owns the kickoff.
-18:message/user:
+20:message/user:
     Use the Notes tool again to check that the kickoff is Friday.
 -- request 7 (turn) --
-19:custom_tool_call/exec:const result = await tools.mcp__notes__echo({ message: "The kickoff is Friday" }); text(result.structuredContent?.echo);
-20:custom_tool_call_output:Script completed
+21:custom_tool_call/exec:const result = await tools.mcp__notes__echo({ message: "The kickoff is Friday" }); text(result.structuredContent?.echo);
+22:custom_tool_call_output:Script completed
     Wall time <DURATION> seconds
     Output:
      | ECHOING: The kickoff is Friday

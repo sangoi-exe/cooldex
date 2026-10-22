@@ -371,6 +371,7 @@ async fn restore_v2_identity_snapshot(
         base_instructions,
         developer_instructions,
         latest_thread_settings.service_tier,
+        latest_thread_settings.agent_role_daybreak,
         Some(shell_tool_enabled),
         agent_role_feature_opt_outs,
         agent_role_skill_restrictions,
@@ -648,7 +649,11 @@ impl LocalAgentControl {
                 )));
             }
         };
-        let mut environment_selections = self.runtime.registry.evicted_environments(thread_id);
+        let evicted_environments = self.runtime.registry.evicted_environments(thread_id);
+        let mut environment_selections = evicted_environments
+            .as_ref()
+            .map(|environments| environments.selections.clone());
+        let evicted_environments = evicted_environments.map(|environments| environments.bindings);
 
         let stored_thread = state
             .read_stored_thread(ReadThreadParams {
@@ -695,16 +700,15 @@ impl LocalAgentControl {
             }
         }
         let parent = if let Some(parent) = parent {
-            let turn = parent
-                .session
-                .new_turn_with_default_settings(Uuid::now_v7().to_string(), Default::default())
-                .await;
+            // Parent preparation is context-only; the reloaded recipient validates its own policy when work starts.
+            let turn = parent.session.new_default_turn().await;
             config = build_agent_resume_config(&turn).map_err(|_| {
                 CodexErr::InvalidRequest(format!(
                     "cannot resume multi-agent v2 child {thread_id} with the current parent settings"
                 ))
             })?;
-            Some((parent, turn.initial_environments.clone()))
+            let environments = parent.session.inherited_environment_snapshot().await;
+            Some((parent, environments))
         } else {
             None
         };
@@ -743,6 +747,11 @@ impl LocalAgentControl {
                 )));
             }
             if let Some(selections) = environment_selections.as_mut() {
+                let parent_selections = parent_environments.all_selections();
+                let ready_parent = parent_environments.refresh_readiness();
+                let ready_evicted = evicted_environments
+                    .as_ref()
+                    .map(TurnEnvironmentSnapshot::refresh_readiness);
                 for selection in selections {
                     let environment_id = &selection.environment_id;
                     let invalid_environment = |reason: &str| {
@@ -750,17 +759,22 @@ impl LocalAgentControl {
                             "cannot resume multi-agent v2 child {thread_id}: cached environment {environment_id} {reason}"
                         ))
                     };
-                    // Matching the attachment also keeps startup on the captured owner executor.
-                    let owner_environment = parent_environments
+                    // A changed parent selection does not revoke the child's retained binding.
+                    // If the parent still configures this workspace, keep enforcing its current
+                    // roots and permissions rather than restoring superseded authority.
+                    let owner_environments = if parent_selections.iter().any(|parent_selection| {
+                        parent_selection.environment_id == selection.environment_id
+                            && parent_selection.cwd == selection.cwd
+                    }) {
+                        &ready_parent
+                    } else {
+                        ready_evicted.as_ref().unwrap_or(&ready_parent)
+                    };
+                    let owner_environment = owner_environments
                         .turn_environments()
-                        .find(|environment| {
-                            let parent_selection = &environment.selection;
-                            parent_selection.environment_id == selection.environment_id
-                                && parent_selection.cwd == selection.cwd
-                                && parent_selection.workspace_roots == selection.workspace_roots
-                        })
+                        .find(|environment| environment.selection.has_same_workspace(selection))
                         .ok_or_else(|| {
-                            invalid_environment("no longer matches a ready parent environment")
+                            invalid_environment("has no matching ready environment binding")
                         })?;
                     let owner_config = owner_environment.config();
                     let child_config = match &selection.config {
@@ -822,24 +836,44 @@ impl LocalAgentControl {
                 }
             }
             (
-                Some(parent_environments.clone()),
+                Some(
+                    evicted_environments
+                        .as_ref()
+                        .unwrap_or(parent_environments)
+                        .clone(),
+                ),
                 Some(Arc::clone(&parent.session.services.exec_policy)),
                 Some(parent.client_mcp_extensions()),
             )
         } else {
             (
-                self.inherited_environments_for_source(&state, Some(&session_source))
-                    .await,
+                match &evicted_environments {
+                    Some(environments) => Some(environments.clone()),
+                    None => {
+                        self.inherited_environments_for_source(&state, Some(&session_source))
+                            .await
+                    }
+                },
                 self.inherited_exec_policy_for_source(&state, Some(&session_source), &config)
                     .await,
                 None,
             )
         };
-        let inherited_instructions = if let Some((parent, _)) = parent.as_ref() {
-            Some(parent.session.inherited_instructions().await)
-        } else if let Some(parent_thread_id) = parent_thread_id
-            && let Ok(parent) = state.get_thread(parent_thread_id).await
-        {
+        let inherited_parent = if let Some((parent, _)) = parent.as_ref() {
+            Some(Arc::clone(parent))
+        } else if let Some(parent_thread_id) = parent_thread_id {
+            state.get_thread(parent_thread_id).await.ok()
+        } else {
+            None
+        };
+        let prompt_cache_key = inherited_parent.as_ref().map(|parent| {
+            parent
+                .session
+                .services
+                .model_client
+                .prompt_cache_key_policy()
+        });
+        let inherited_instructions = if let Some(parent) = inherited_parent {
             Some(parent.session.inherited_instructions().await)
         } else {
             self.runtime
@@ -872,6 +906,7 @@ impl LocalAgentControl {
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
                 config,
+                prompt_cache_key,
                 initial_history,
                 agent_control: self.clone(),
                 session_source,
@@ -1673,7 +1708,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1712,6 +1747,14 @@ impl LocalAgentControl {
                 &config,
             )
             .await;
+        // Merge-safety anchor: V1 cold reload restores recipient policy from persisted settings, never the sender or a mutable role file.
+        config.agent_role_daybreak = state
+            .load_latest_thread_settings_snapshot(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: true,
+            })
+            .await?
+            .and_then(|settings| settings.agent_role_daybreak);
         let agent_max_threads = config.effective_agent_max_threads(multi_agent_version);
         let mut reservation = self
             .runtime
@@ -1746,6 +1789,7 @@ impl LocalAgentControl {
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
                 config: config.clone(),
+                prompt_cache_key: None,
                 initial_history,
                 agent_control: self.clone(),
                 session_source,

@@ -268,6 +268,7 @@ mod update_versions;
 mod updates;
 #[cfg(any(not(debug_assertions), test))]
 mod updates_cache;
+mod user_prompt;
 mod version;
 mod vim_search;
 mod width;
@@ -777,7 +778,9 @@ pub(crate) async fn start_embedded_app_server_for_picker(
 ) -> color_eyre::Result<AppServerSession> {
     let mut target = AppServerTarget::Embedded;
     let mut state_db = init_state_db_for_app_server_target(config, &target).await?;
-    start_app_server(
+    // Keep the shared test fixture's frame independent of embedded startup size.
+    // Merge-safety anchor: boxed startup returns the owned backend session rather than reconstructing one from a bare client.
+    Box::pin(start_app_server(
         crate::backend_id::BackendId::new(),
         &mut target,
         Arg0DispatchPaths::default(),
@@ -792,7 +795,7 @@ pub(crate) async fn start_embedded_app_server_for_picker(
         &mut state_db,
         Arc::new(EnvironmentManager::default_for_tests()),
         Default::default(),
-    )
+    ))
     .await
     .map(|app_server| app_server.with_local_codex_home(&config.codex_home))
 }
@@ -2329,7 +2332,7 @@ async fn run_ratatui_app(
     // transitions have enough stack headroom to rebuild configuration and the chat widget.
     let app_result = Box::pin(App::run(
         &mut tui,
-        app_server,
+        crate::app::backend_sessions::InitialBackendSessions::singleton(app_server),
         config,
         current_cwd.to_path_buf(),
         cli_kv_overrides.clone(),
@@ -2711,8 +2714,15 @@ requires_openai_auth = {requires_openai_auth}
 
         for (label, config_toml, login_status, target, expected) in [
             (
-                "disabled by default",
+                "enabled by default",
                 "",
+                LoginStatus::NotAuthenticated,
+                AppServerTarget::Embedded,
+                true,
+            ),
+            (
+                "explicitly disabled",
+                "[features]\nbedrock_setup_wizard = false\n",
                 LoginStatus::NotAuthenticated,
                 AppServerTarget::Embedded,
                 false,

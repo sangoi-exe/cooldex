@@ -34,7 +34,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentStatus;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoicesList;
@@ -85,15 +84,18 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
-    communication: InterAgentCommunication,
+    communication: crate::PendingAgentMessage,
     start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
     let trigger_turn = communication.trigger_turn;
+    let terminal_error_wake = communication.terminal_error_wake;
     sess.input_queue
         .enqueue_mailbox_communication(communication, start_options)
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
+    // Merge-safety anchor: terminal errors reach the shared scheduler even when ordinary mail wakes are disabled; all admission guards remain there.
     if trigger_turn
+        || terminal_error_wake
         || sess.features.enabled(Feature::WakeOnAgentMessages)
         || sess.has_outstanding_durable_sleep()
     {
@@ -126,9 +128,20 @@ pub async fn run_user_shell_command(
         return;
     }
 
-    let turn_context = sess
+    let turn_context = match sess
         .new_turn_with_default_settings(sub_id, Default::default())
-        .await;
+        .await
+    {
+        Ok(turn_context) => turn_context,
+        Err(error) => {
+            sess.send_event(
+                &error.turn_context,
+                EventMsg::Error(error.error.to_error_event(None)),
+            )
+            .await;
+            return;
+        }
+    };
     sess.spawn_task(
         turn_context,
         Vec::new(),
@@ -253,9 +266,20 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
     // Stop the old turn before the compact task picks up the next turn's environments.
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
-    let turn_context = sess
+    let turn_context = match sess
         .new_turn_with_default_settings(sub_id, Default::default())
-        .await;
+        .await
+    {
+        Ok(turn_context) => turn_context,
+        Err(error) => {
+            sess.send_event(
+                &error.turn_context,
+                EventMsg::Error(error.error.to_error_event(None)),
+            )
+            .await;
+            return;
+        }
+    };
 
     sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
 }
@@ -423,9 +447,20 @@ pub async fn review(
     sub_id: String,
     review_request: ReviewRequest,
 ) {
-    let turn_context = sess
+    let turn_context = match sess
         .new_turn_with_default_settings(sub_id.clone(), Default::default())
-        .await;
+        .await
+    {
+        Ok(turn_context) => turn_context,
+        Err(error) => {
+            sess.send_event(
+                &error.turn_context,
+                EventMsg::Error(error.error.to_error_event(None)),
+            )
+            .await;
+            return;
+        }
+    };
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
     #[allow(deprecated)]
@@ -486,6 +521,7 @@ pub(super) async fn submission_loop(
                     Ok(true) => {
                         sess.input_queue.notify_mailbox();
                         if sess.features.enabled(Feature::WakeOnAgentMessages)
+                            || sess.input_queue.has_terminal_error_mailbox_items().await
                             || sess.has_outstanding_durable_sleep()
                         {
                             sess.maybe_start_turn_for_pending_work().await;
@@ -670,6 +706,11 @@ pub(super) async fn submission_loop(
                     communication,
                     start_options,
                 } => {
+                    let communication = crate::PendingAgentMessage::new(
+                        communication,
+                        sub.message_delivery,
+                        sub.terminal_error_wake,
+                    );
                     inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
                         .await;
                     false

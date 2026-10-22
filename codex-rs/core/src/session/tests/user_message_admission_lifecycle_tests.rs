@@ -72,7 +72,8 @@ async fn aborting_turn_rejects_pending_persisted_user_message_admission() {
     let successor_turn_id = "successor-after-aborted-admission".to_string();
     let successor_context = session
         .new_turn_with_default_settings(successor_turn_id.clone(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     session
         .spawn_task(successor_context, Vec::new(), CompletingTask)
         .await;

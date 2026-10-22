@@ -36,6 +36,7 @@ fn snapshot() -> AgentIdentitySnapshot {
         Some(DEVELOPER_SECRET.to_string()),
         Some("priority".to_string()),
         Some(false),
+        Some(false),
         vec![AgentRoleFeatureOptOut::Apps],
         AgentRoleSkillRestrictions {
             bundled_skills_disabled: true,
@@ -96,6 +97,10 @@ fn identity_equality_covers_every_field() {
     different_developer.developer_instructions = Some(Arc::from("different developer"));
     let mut different_tier = expected.clone();
     different_tier.service_tier = None;
+    let mut different_daybreak = expected.clone();
+    different_daybreak.agent_role_daybreak = Some(true);
+    let mut absent_daybreak = expected.clone();
+    absent_daybreak.agent_role_daybreak = None;
     let mut different_shell_tool = expected.clone();
     different_shell_tool.shell_tool_enabled = Some(true);
     let mut different_feature_opt_outs = expected.clone();
@@ -127,6 +132,8 @@ fn identity_equality_covers_every_field() {
         different_base_provenance,
         different_developer,
         different_tier,
+        different_daybreak,
+        absent_daybreak,
         different_shell_tool,
         different_feature_opt_outs,
         different_skill_restrictions,
@@ -153,6 +160,7 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
         .expect("identity should apply");
 
     assert!(!config.features.enabled(Feature::ShellTool));
+    assert_eq!(config.agent_role_daybreak, Some(false));
     assert!(!config.features.enabled(Feature::Apps));
     assert_eq!(config.model_context_window, Some(196_000));
     assert_eq!(config.model_auto_compact_token_limit, Some(160_000));
@@ -294,5 +302,20 @@ fn usage_hint_instruction_conversion_preserves_raw_text_and_markers() {
             MultiAgentRoleInstructions::from_agent_usage_hint_instructions(persisted.clone());
 
         assert_eq!(restored.into_agent_usage_hint_instructions(), persisted);
+    }
+}
+
+#[tokio::test]
+async fn identity_apply_and_full_history_preserve_optional_daybreak_policy() {
+    for policy in [None, Some(false), Some(true)] {
+        let mut identity = snapshot();
+        identity.agent_role_daybreak = policy;
+        let full_history = identity.for_full_history(None);
+        let mut config = crate::config::test_config().await;
+        config.agent_role_daybreak = policy.map(|enabled| !enabled).or(Some(true));
+        full_history
+            .apply(&mut config, &mut thread_spawn_source())
+            .expect("identity should apply");
+        assert_eq!(config.agent_role_daybreak, policy);
     }
 }

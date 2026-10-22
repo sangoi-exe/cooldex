@@ -96,6 +96,8 @@ pub(crate) async fn prepare_agent_spawn_config_with_service_tier(
         )
         .await?;
         if !options.full_history_fork {
+            // Merge-safety anchor: a fresh recipient inherits the incoming program, not the sender role policy.
+            config.agent_role_daybreak = None;
             apply_spawn_agent_role(session, &mut config, options.role_name).await?;
         }
         apply_requested_spawn_agent_service_tier(session, &mut config, requested_service_tier)

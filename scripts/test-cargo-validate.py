@@ -68,6 +68,8 @@ class CargoValidateTests(unittest.TestCase):
             "codex-core": "core",
             "codex-core-api": "core-api",
             "codex-core-plugin-common": "core-plugin-common",
+            "codex-diagnostics": "diagnostics",
+            "codex-direct-tool-timing": "direct-tool-timing",
             "codex-code-mode-host": "code-mode-host",
             "codex-code-mode-protocol": "code-mode-protocol",
             "codex-code-mode-runtime": "code-mode-runtime",
@@ -95,6 +97,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-login": "login",
             "codex-mcp": "codex-mcp",
             "codex-memories-read": "memories/read",
+            "codex-message-board": "message-board",
             "codex-mermaid": "mermaid",
             "codex-model-provider": "model-provider",
             "codex-models-manager": "models-manager",
@@ -104,7 +107,9 @@ class CargoValidateTests(unittest.TestCase):
             "codex-protocol": "protocol",
             "codex-queue-extension": "ext/queue",
             "codex-realtime-webrtc": "realtime-webrtc",
+            "codex-responses-api-proxy": "responses-api-proxy",
             "codex-rmcp-client": "rmcp-client",
+            "codex-runtime-agent-instance": "runtime-agent-instance",
             "codex-sandboxing": "sandboxing",
             "codex-secrets": "secrets",
             "codex-skills": "skills",
@@ -121,6 +126,7 @@ class CargoValidateTests(unittest.TestCase):
             "codex-utils-audio": "utils/audio",
             "codex-utils-cache": "utils/cache",
             "codex-utils-cargo-bin": "utils/cargo-bin",
+            "codex-utils-critical-path": "utils/critical-path",
             "codex-utils-fuzzy-match": "utils/fuzzy-match",
             "codex-utils-git-discovery": "utils/git-discovery",
             "codex-utils-image": "utils/image",
@@ -158,9 +164,15 @@ class CargoValidateTests(unittest.TestCase):
                             not in {
                                 "codex-ansi-escape",
                                 "codex-cloud-client",
+                                "codex-diagnostics",
+                                "codex-direct-tool-timing",
                                 "codex-file-search",
                                 "codex-file-watcher",
                                 "codex-git-attribution",
+                                "codex-message-board",
+                                "codex-responses-api-proxy",
+                                "codex-runtime-agent-instance",
+                                "codex-utils-critical-path",
                                 "codex-utils-sleep-inhibitor",
                                 "codex-utils-stream-parser",
                             },
@@ -168,7 +180,7 @@ class CargoValidateTests(unittest.TestCase):
                     ],
                 }
             )
-            if package_name == "codex-file-search":
+            if package_name in {"codex-file-search", "codex-responses-api-proxy"}:
                 packages[-1]["targets"][0]["kind"] = ["lib"]
                 packages[-1]["targets"].append(
                     {"kind": ["bin"], "test": True, "doctest": False}
@@ -2256,7 +2268,9 @@ class CargoValidateTests(unittest.TestCase):
         native_exclusion = '  "--exclude",\n  "codex-voice-host",\n'
         runtime_packages = (
             "wsl_runtime_packages = [\n"
+            '  "codex-diagnostics",\n'
             '  "codex-file-search",\n'
+            '  "codex-responses-api-proxy",\n'
             '  "codex-uds",\n'
             '  "codex-utils-path",\n'
             '  "codex-utils-pty",\n'
@@ -2265,7 +2279,9 @@ class CargoValidateTests(unittest.TestCase):
         )
         runtime_packages_before_exclusion = (
             "wsl_runtime_packages = [\n"
+            '  "codex-diagnostics",\n'
             '  "codex-file-search",\n'
+            '  "codex-responses-api-proxy",\n'
             '  "codex-uds",\n'
             '  "codex-utils-path",\n'
             '  "codex-utils-pty",\n'
@@ -4295,7 +4311,9 @@ class CargoValidateTests(unittest.TestCase):
     ) -> None:
         files = (
             "codex-rs/core/Cargo.toml",
+            "codex-rs/diagnostics/Cargo.toml",
             "codex-rs/file-search/Cargo.toml",
+            "codex-rs/responses-api-proxy/Cargo.toml",
             "codex-rs/uds/Cargo.toml",
             "codex-rs/linux-sandbox/Cargo.toml",
         )
@@ -4311,12 +4329,16 @@ class CargoValidateTests(unittest.TestCase):
         }
         packages = (
             "codex-core",
+            "codex-diagnostics",
             "codex-file-search",
+            "codex-responses-api-proxy",
             "codex-uds",
             "codex-linux-sandbox",
         )
         wsl_runtime_packages = {
+            "codex-diagnostics",
             "codex-file-search",
+            "codex-responses-api-proxy",
             "codex-uds",
             "codex-linux-sandbox",
         }
@@ -5389,6 +5411,15 @@ class CargoValidateTests(unittest.TestCase):
                 "codex-rs/core-plugin-common/src/plugin_id.rs",
                 "codex-rs/core-plugin-common/src/plugin_id_tests.rs",
             ),
+            "codex-diagnostics": (
+                "codex-rs/diagnostics/Cargo.toml",
+                "codex-rs/diagnostics/src/lib.rs",
+            ),
+            "codex-direct-tool-timing": (
+                "codex-rs/direct-tool-timing/Cargo.toml",
+                "codex-rs/direct-tool-timing/src/lib.rs",
+                "codex-rs/direct-tool-timing/src/direct_tool_timing_tests.rs",
+            ),
             "codex-file-watcher": (
                 "codex-rs/file-watcher/src/file_watcher_tests.rs",
                 "codex-rs/file-watcher/src/lib.rs",
@@ -5397,6 +5428,11 @@ class CargoValidateTests(unittest.TestCase):
                 "codex-rs/keyring-store/src/error_kind.rs",
                 "codex-rs/keyring-store/src/error_kind_tests.rs",
                 "codex-rs/keyring-store/src/lib.rs",
+            ),
+            "codex-message-board": (
+                "codex-rs/message-board/Cargo.toml",
+                "codex-rs/message-board/src/local/connection.rs",
+                "codex-rs/message-board/tests/local_board.rs",
             ),
             "codex-multi-env-copy-file": (
                 "codex-rs/ext/multi-env-copy-file/Cargo.toml",
@@ -5408,9 +5444,24 @@ class CargoValidateTests(unittest.TestCase):
                 "codex-rs/ext/multi-env-copy-file/tests/suite/mod.rs",
                 "codex-rs/ext/multi-env-copy-file/tests/suite/transfers.rs",
             ),
+            "codex-responses-api-proxy": (
+                "codex-rs/responses-api-proxy/Cargo.toml",
+                "codex-rs/responses-api-proxy/src/lib.rs",
+                "codex-rs/responses-api-proxy/src/auth_tests.rs",
+            ),
+            "codex-runtime-agent-instance": (
+                "codex-rs/runtime-agent-instance/Cargo.toml",
+                "codex-rs/runtime-agent-instance/src/lib.rs",
+                "codex-rs/runtime-agent-instance/src/bootstrap_tests.rs",
+            ),
             "codex-utils-cargo-bin": (
                 "codex-rs/utils/cargo-bin/src/executable.rs",
                 "codex-rs/utils/cargo-bin/src/lib.rs",
+            ),
+            "codex-utils-critical-path": (
+                "codex-rs/utils/critical-path/Cargo.toml",
+                "codex-rs/utils/critical-path/src/lib.rs",
+                "codex-rs/utils/critical-path/src/critical_path_tests.rs",
             ),
         }
         for package_name, paths in cases.items():
@@ -5768,6 +5819,7 @@ class CargoValidateTests(unittest.TestCase):
     def test_upstream_sync_cli_inputs_select_existing_cli_surface(self) -> None:
         for file_path in (
             ".cargo/config.toml",
+            "codex-rs/.cargo/config.toml",
             "codex-rs/agent-message-board-client/README.md",
         ):
             with self.subTest(file_path=file_path):
@@ -5801,6 +5853,8 @@ class CargoValidateTests(unittest.TestCase):
             "bazel/schema/BUILD.bazel",
             "bazel/schema/tools/BUILD.bazel",
             "bazel/schema/tools/python_codegen.py",
+            "bazel/tools/BUILD.bazel",
+            "bazel/tools/dsymutil",
             "codex-rs/BUILD.bazel",
             "defs.bzl",
             "patches/BUILD.bazel",
@@ -5825,6 +5879,9 @@ class CargoValidateTests(unittest.TestCase):
                 plan = self.plan_json("--file", file_path, "--mode", "standard")
                 self.assertEqual([file_path], plan["changed_files"])
                 self.assertEqual([], plan["warnings"])
+                self.assertEqual([], plan["selected_packages"])
+                self.assertEqual([], plan["selected_surfaces"])
+                self.assertEqual(["bazel"], plan["flags"])
                 self.assertEqual(
                     [["just", "bazel-lock-check"]], self.command_lines(plan)
                 )
@@ -5897,6 +5954,7 @@ class CargoValidateTests(unittest.TestCase):
             ".github/actions/build-bazel-release/action.yml",
             ".github/actions/build-cargo-package-binaries/action.yml",
             ".github/actions/build-codex-packages/action.yml",
+            ".github/actions/prepare-bazel-ci/action.yml",
             ".github/actions/run-argument-comment-lint/action.yml",
             ".github/actions/setup-bazel-ci/action.yml",
             ".github/actions/setup-ci/action.yml",
@@ -5904,6 +5962,7 @@ class CargoValidateTests(unittest.TestCase):
             ".github/actions/windows-code-sign/action.yml",
             ".github/scripts/build-codex-package-archive.sh",
             ".github/scripts/check_github_canary.py",
+            ".github/scripts/compute-bazel-windows-path.ps1",
             ".github/scripts/contract_releases.py",
             ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
             ".github/scripts/macos-signing/sign_macos_code.sh",
@@ -5922,10 +5981,12 @@ class CargoValidateTests(unittest.TestCase):
             ".github/scripts/windows_bazel_test_durations.tsv",
             ".github/scripts/voice_windows_tools.py",
             ".github/workflows/bazel.yml",
+            ".github/workflows/cargo-deny.yml",
             ".github/workflows/issue-labeler.yml",
             ".github/workflows/r2-release.yml",
             ".github/workflows/repo-checks.yml",
             ".github/workflows/rust-ci-full.yml",
+            ".github/workflows/rust-ci-full-nextest-platform.yml",
             ".github/workflows/rust-ci.yml",
             ".github/workflows/rust-release.yml",
             ".github/workflows/rust-release-argument-comment-lint.yml",
@@ -5937,6 +5998,10 @@ class CargoValidateTests(unittest.TestCase):
             "codex-rs/deny.toml",
             "codex-rs/docs/bazel.md",
             "codex-rs/docs/protocol_v1.md",
+            "codex-rs/responses-api-proxy/README.md",
+            "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js",
+            "codex-rs/rust-toolchain.toml",
+            "codex-rs/scripts/setup-windows.ps1",
             "scripts/codex_package/README.md",
             "scripts/codex_package/cli.py",
             "scripts/codex_package/dotslash.py",

@@ -86,6 +86,9 @@ mod spawn_settings_tests;
 #[path = "guardian_subagent_notification_tests.rs"]
 mod guardian_subagent_notification_tests;
 
+#[path = "code_mode_agent_message_tests.rs"]
+mod code_mode_agent_message_tests;
+
 const SPAWN_CALL_ID: &str = "spawn-call-1";
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
@@ -1314,7 +1317,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
             &server,
             |req: &wiremock::Request| {
                 body_contains(req, CHILD_TASK)
-                    && !body_contains(req, ROOT_CALL)
+                    && body_contains(req, r#"\"agent_name\":\"/root/child\""#)
                     && !body_contains(req, PRELUDE_CALL)
                     && !body_contains(req, COMPACT_SUMMARY)
             },
@@ -1351,7 +1354,7 @@ async fn grandchild_full_fork_preserves_context_baseline(
                     CHILD_TASK
                 },
             ) && !body_contains(req, GRANDCHILD_TASK)
-                && !body_contains(req, ROOT_CALL)
+                && body_contains(req, r#"\"agent_name\":\"/root/child\""#)
                 && !body_contains(req, CHILD_CALL)
                 && !body_contains(req, COMPACT_PROMPT)
         },
@@ -1370,7 +1373,8 @@ async fn grandchild_full_fork_preserves_context_baseline(
     let grandchild_log = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, GRANDCHILD_TASK) && !body_contains(req, CHILD_CALL)
+            body_contains(req, GRANDCHILD_TASK)
+                && body_contains(req, r#"\"agent_name\":\"/root/child/grandchild\""#)
         },
         sse(vec![
             ev_response_created("baseline-grandchild"),
@@ -1586,7 +1590,22 @@ async fn grandchild_full_fork_preserves_context_baseline(
         context_counts, expected_context_counts,
         "context ownership should match {parent_context:?} in {history_mode:?} mode"
     );
-    assert!(!descendant_requests[1].body_contains_text(CHILD_TASK));
+    if matches!(parent_context, GrandchildParentContext::FullHistory) {
+        let parent_input = root_request.input();
+        assert_eq!(
+            strip_response_item_ids_from_json(json!(
+                &descendant_requests[0].input()[..parent_input.len()]
+            )),
+            strip_response_item_ids_from_json(json!(parent_input))
+        );
+    }
+    let child_input = descendant_requests[0].input();
+    assert_eq!(
+        strip_response_item_ids_from_json(json!(
+            &descendant_requests[1].input()[..child_input.len()]
+        )),
+        strip_response_item_ids_from_json(json!(child_input))
+    );
     Ok(())
 }
 
@@ -1605,8 +1624,8 @@ enum FullHistoryV2ModelSelection {
 
 #[test_case(FullHistoryV2ModelSelection::InheritedIdentity; "full-history child inherits parent identity")]
 #[test_case(FullHistoryV2ModelSelection::WorldStateIdentity; "world state appends context window when agent identity changes")]
-#[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork drops inherited current-time reminders")]
-#[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork drops inherited multi-agent mode instructions")]
+#[test_case(FullHistoryV2ModelSelection::CurrentTimeReminders; "full fork appends current-time reminders after inherited notices")]
+#[test_case(FullHistoryV2ModelSelection::MultiAgentModeInstructions; "full fork retains inherited multi-agent mode instructions")]
 #[test_case(FullHistoryV2ModelSelection::MultiAgentModePolicyInheritance; "full fork inherits explicit policy state")]
 #[test_case(FullHistoryV2ModelSelection::CatalogMarkedUsageHint; "full fork preserves catalog-marked parent usage hint")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1654,7 +1673,8 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     let child_request_log = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
-            body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+            body_contains(req, CHILD_PROMPT)
+                && body_contains(req, r#"\"agent_name\":\"/root/worker\""#)
         },
         sse(vec![
             ev_response_created("resp-child-1"),
@@ -1665,7 +1685,9 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
     .await;
     let _turn1_followup = mount_sse_once_match(
         &server,
-        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        |req: &wiremock::Request| {
+            body_contains(req, SPAWN_CALL_ID) && body_contains(req, r#"\"agent_name\":\"/root\""#)
+        },
         sse(vec![
             ev_response_created("resp-turn1-2"),
             ev_assistant_message("msg-turn1-2", "parent done"),
@@ -1859,6 +1881,15 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
 
     let child_request = wait_for_child_request(&child_request_log).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
+    // Models encode tool declarations and provenance differently; compare inherited messages.
+    let parent_input = parent_request.inputs_of_type("message");
+    let child_input = child_request.inputs_of_type("message");
+    assert_eq!(
+        strip_metadata_from_json(strip_response_item_ids_from_json(json!(
+            &child_input[..parent_input.len()]
+        ))),
+        strip_metadata_from_json(strip_response_item_ids_from_json(json!(parent_input)))
+    );
     let misaligned_child_messages = child_request
         .inputs_of_type("message")
         .into_iter()
@@ -1874,6 +1905,14 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
         .collect::<Vec<_>>();
     assert_eq!(misaligned_child_messages, Vec::<Value>::new());
     let child_developer_messages = child_request.message_input_texts("developer");
+    // Merge-safety anchor: inherited developer context and newly appended child context have separate counts; full-history birth binding must not append a freshly resolved usage hint or policy.
+    let child_suffix_developer_messages = child_input[parent_input.len()..]
+        .iter()
+        .filter(|item| item["role"] == "developer")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "input_text")
+        .filter_map(|part| part["text"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
     if catalog_marked_usage_hint {
         let marked_usage_hint_groups = |request: &ResponsesRequest| {
             request
@@ -1904,25 +1943,33 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
         selection,
         FullHistoryV2ModelSelection::MultiAgentModeInstructions
     ) {
-        let mode_instruction_count = |request: &ResponsesRequest| {
-            request
-                .message_input_texts("developer")
-                .into_iter()
+        let mode_instruction_count = |messages: &[String]| {
+            messages
+                .iter()
                 .filter(|text| text.starts_with(MULTI_AGENT_MODE_OPEN_TAG))
                 .count()
         };
         assert_eq!(
             (
-                mode_instruction_count(&parent_request),
-                mode_instruction_count(&child_request),
+                mode_instruction_count(&parent_request.message_input_texts("developer")),
+                mode_instruction_count(&child_developer_messages),
+                mode_instruction_count(&child_suffix_developer_messages),
             ),
-            (1, 1)
+            (1, 1, 0)
         );
     }
     if matches!(
         selection,
         FullHistoryV2ModelSelection::MultiAgentModePolicyInheritance
     ) {
+        let latest_child_policy = child_request
+            .message_input_texts("developer")
+            .into_iter()
+            .rfind(|message| message.starts_with(MULTI_AGENT_MODE_OPEN_TAG))
+            .expect("inherited delegation policy");
+        assert!(latest_child_policy.contains(FULL_HISTORY_EXPLICIT_POLICY));
+        assert!(!latest_child_policy.contains(FULL_HISTORY_PROACTIVE_POLICY));
+        // The current policy and captured parent usage hint are already inherited.
         assert_eq!(
             (
                 parent_request
@@ -1938,50 +1985,71 @@ async fn spawned_full_history_v2_child_inherits_parent_model_identity_and_contex
             ),
             (1, 0)
         );
-        assert_eq!(
+        let policy_counts = |messages: &[String]| {
             (
-                child_developer_messages
+                messages
                     .iter()
                     .filter(|message| message.starts_with(MULTI_AGENT_MODE_OPEN_TAG))
                     .count(),
-                child_developer_messages
+                messages
                     .iter()
                     .filter(|message| message.contains(FULL_HISTORY_EXPLICIT_POLICY))
                     .count(),
-                child_developer_messages
+                messages
                     .iter()
                     .filter(|message| message.contains(FULL_HISTORY_PROACTIVE_POLICY))
                     .count(),
-                child_developer_messages
+                messages
                     .iter()
                     .filter(|message| message.contains(FULL_HISTORY_ROOT_USAGE_HINT))
                     .count(),
-                child_developer_messages
+                messages
                     .iter()
                     .filter(|message| message.contains(FULL_HISTORY_SUBAGENT_USAGE_HINT))
                     .count(),
-            ),
-            (1, 1, 0, 1, 0)
+            )
+        };
+        assert_eq!(policy_counts(&child_developer_messages), (1, 1, 0, 1, 0));
+        assert_eq!(
+            policy_counts(&child_suffix_developer_messages),
+            (0, 0, 0, 0, 0)
         );
     }
     if matches!(selection, FullHistoryV2ModelSelection::CurrentTimeReminders) {
-        let notice_count = |request: &ResponsesRequest, marker: &str| {
-            request
-                .message_input_texts("developer")
-                .into_iter()
+        let notice_count = |messages: &[String], marker: &str| {
+            messages
+                .iter()
                 .filter(|text| text.starts_with(marker))
                 .count()
         };
+        let parent_developer_messages = parent_request.message_input_texts("developer");
         assert_eq!(
-            notice_count(&parent_request, "<current_time_unavailable>"),
+            notice_count(&parent_developer_messages, "<current_time_unavailable>"),
             1
         );
-        assert_eq!(notice_count(&parent_request, "<current_time_reminder>"), 1);
         assert_eq!(
-            notice_count(&child_request, "<current_time_unavailable>"),
+            notice_count(&parent_developer_messages, "<current_time_reminder>"),
+            1
+        );
+        assert_eq!(
+            notice_count(&child_developer_messages, "<current_time_unavailable>"),
+            1
+        );
+        assert_eq!(
+            notice_count(&child_developer_messages, "<current_time_reminder>"),
+            2
+        );
+        assert_eq!(
+            notice_count(
+                &child_suffix_developer_messages,
+                "<current_time_unavailable>"
+            ),
             0
         );
-        assert_eq!(notice_count(&child_request, "<current_time_reminder>"), 1);
+        assert_eq!(
+            notice_count(&child_suffix_developer_messages, "<current_time_reminder>"),
+            1
+        );
     }
     let child_body = child_request.body_json();
     if !world_state_identity {
@@ -2707,11 +2775,45 @@ async fn multi_agent_v2_spawn_sends_agent_message_to_child(
     if let Some(model) = model {
         assert_eq!(child_request.body_json()["model"], json!(model));
     }
+    let declares_collaboration = |tools: &Value| {
+        tools.as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["name"] == MULTI_AGENT_V2_NAMESPACE)
+        })
+    };
+    if !expects_collaboration_tools {
+        assert!(
+            !declares_collaboration(&child_body["tools"]),
+            "leaf workers must not receive top-level collaboration tools",
+        );
+        let input = child_request.input();
+        if let Some(last_declaration) = input.iter().rposition(|item| {
+            item["type"] == "additional_tools" && declares_collaboration(&item["tools"])
+        }) {
+            let removed_namespace = format!("- {MULTI_AGENT_V2_NAMESPACE}");
+            let collaboration_removed = input[last_declaration + 1..]
+                .iter()
+                .filter(|item| item["role"] == "developer")
+                .filter_map(|item| {
+                    let kinds =
+                        item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                            .as_array()?;
+                    let index = kinds
+                        .iter()
+                        .position(|kind| kind == "tools.removed_definition")?;
+                    item["content"][index]["text"].as_str()
+                })
+                .any(|text| text.lines().any(|line| line == removed_namespace));
+            assert!(
+                collaboration_removed,
+                "leaf workers must mark inherited collaboration tools unavailable",
+            );
+        }
+    }
+    // Merge-safety anchor: leaf status follows the selected model's effective V2 policy, not the presence of an explicit model override; inherited declarations remain historical even after removal.
     assert_eq!(
-        child_request
-            .body_json()
-            .to_string()
-            .contains("\"name\":\"collaboration\""),
+        declares_collaboration(&child_body["tools"]),
         expects_collaboration_tools,
     );
     if plaintext {
@@ -2882,8 +2984,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     let notification = format!(
         "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\n{payload}"
     );
-    // If the child is still running when the parent turn starts, wait_agent blocks
-    // until mailbox delivery. The follow-up request must then contain that delivery.
+    // Successful completion can publish status just before its mail arrives; the explicit follow-up waits for delivery if needed. Terminal errors must wake without this follow-up.
     mount_sse_once_match(
         &server,
         |req: &wiremock::Request| {
@@ -2904,8 +3005,9 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     .await;
     let agent_request = mount_sse_once_match(
         &server,
-        |req: &wiremock::Request| {
-            body_contains(req, TURN_2_NO_WAIT_PROMPT)
+        move |req: &wiremock::Request| {
+            let has_followup = body_contains(req, TURN_2_NO_WAIT_PROMPT);
+            has_followup == matches!(scenario, CompletionScenario::Completed)
                 && body_contains(req, "Message Type: FINAL_ANSWER")
                 && body_contains(req, expected_text)
         },
@@ -2927,6 +3029,10 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
                 .features
                 .enable(Feature::MultiAgentV2)
                 .expect("test config should allow feature update");
+            config
+                .features
+                .disable(Feature::WakeOnAgentMessages)
+                .expect("ordinary message wakes must be disabled");
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(0);
             config.model_provider.supports_websockets = false;
@@ -2976,12 +3082,35 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
     } else {
         None
     };
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: TURN_2_NO_WAIT_PROMPT.to_string(),
-            text_elements: Vec::new(),
-        }]))
+    let child_thread_id = ThreadId::from_string(
+        child_request.body_json()["client_metadata"]["thread_id"]
+            .as_str()
+            .expect("child thread ID"),
+    )?;
+    let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
+    assert!(
+        matches!(child_thread.agent_status().await, AgentStatus::Running),
+        "the parent must be idle before the delayed child terminal response"
+    );
+    if matches!(scenario, CompletionScenario::Completed) {
+        timeout(Duration::from_secs(5), async {
+            while !matches!(child_thread.agent_status().await, AgentStatus::Completed(_)) {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await?;
+        // Successful completion still waits for explicit parent input. The error case sends no follow-up at all.
+        assert!(!agent_request.requests().iter().any(|request| {
+            request.body_contains_text("Message Type: FINAL_ANSWER")
+                && request.body_contains_text(expected_text)
+        }));
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: TURN_2_NO_WAIT_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+    }
     let (completed_activity_started, completed_activity_completed) =
         timeout(Duration::from_secs(5), async {
             let mut active_turn_id = None;
@@ -3032,10 +3161,19 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
         .await
         .expect("timed out waiting for parent turn completion");
 
-    let request = wait_for_requests(&agent_request)
-        .await?
-        .pop()
-        .expect("agent message request");
+    let request = agent_request
+        .requests()
+        .into_iter()
+        .find(|request| {
+            request.body_contains_text("Message Type: FINAL_ANSWER")
+                && request.body_contains_text(expected_text)
+        })
+        .expect("parent sampled with the terminal child message");
+    assert_eq!(
+        request.body_contains_text(TURN_2_NO_WAIT_PROMPT),
+        matches!(scenario, CompletionScenario::Completed),
+        "only successful completion requires an explicit follow-up"
+    );
     assert_eq!(
         strip_response_item_ids_from_json(strip_metadata_from_json(Value::Array(
             request.inputs_of_type("agent_message"),

@@ -176,7 +176,9 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
 impl From<RolloutItemWire<'_>> for RolloutItem {
     fn from(item: RolloutItemWire<'_>) -> Self {
         match item {
-            RolloutItemWire::SessionMeta { payload } => Self::SessionMeta(payload.into_owned()),
+            RolloutItemWire::SessionMeta { payload } => {
+                Self::SessionMeta(Box::new(payload.into_owned()))
+            }
             RolloutItemWire::ResponseItem { payload, metadata } => {
                 if let (
                     ResponseItem::Message {
@@ -228,7 +230,9 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                     trigger_turn: payload.trigger_turn,
                 }
             }
-            RolloutItemWire::Compacted { payload } => Self::Compacted(payload.into_owned()),
+            RolloutItemWire::Compacted { payload } => {
+                Self::Compacted(Box::new(payload.into_owned()))
+            }
             RolloutItemWire::PostCompactRecoveryApplied { payload } => {
                 Self::PostCompactRecoveryApplied(payload.into_owned())
             }

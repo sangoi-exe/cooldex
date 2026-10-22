@@ -1686,8 +1686,11 @@ async fn thread_list_reports_loaded_subagent_direct_input_capability() -> Result
     let parent_rollout_path = rollout_path(codex_home.path(), "2025-02-01T09-00-00", &cli_id);
     let mut parent_meta = read_session_meta_line(&parent_rollout_path).await?;
     parent_meta.meta.multi_agent_version = Some(MultiAgentVersion::V2);
-    append_rollout_item_to_path(&parent_rollout_path, &RolloutItem::SessionMeta(parent_meta))
-        .await?;
+    append_rollout_item_to_path(
+        &parent_rollout_path,
+        &RolloutItem::SessionMeta(Box::new(parent_meta)),
+    )
+    .await?;
     // Legacy children resume before the root restores the V2 registry from persisted spawn edges.
     let mut expected_settings = HashMap::from([(cli_id.clone(), (None, None))]);
     let mut expected = vec![(cli_id.clone(), None, false)];

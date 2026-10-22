@@ -38,6 +38,7 @@ pub(crate) struct AgentIdentitySnapshot {
     base_instructions: BaseInstructions,
     developer_instructions: Option<Arc<str>>,
     service_tier: Option<String>,
+    agent_role_daybreak: Option<bool>,
     shell_tool_enabled: Option<bool>,
     agent_role_feature_opt_outs: Vec<AgentRoleFeatureOptOut>,
     agent_role_skill_restrictions: AgentRoleSkillRestrictions,
@@ -59,6 +60,7 @@ impl AgentIdentitySnapshot {
         base_instructions: BaseInstructions,
         developer_instructions: Option<String>,
         service_tier: Option<String>,
+        agent_role_daybreak: Option<bool>,
         shell_tool_enabled: Option<bool>,
         agent_role_feature_opt_outs: Vec<AgentRoleFeatureOptOut>,
         agent_role_skill_restrictions: AgentRoleSkillRestrictions,
@@ -79,6 +81,7 @@ impl AgentIdentitySnapshot {
             base_instructions,
             developer_instructions: developer_instructions.map(Arc::from),
             service_tier,
+            agent_role_daybreak,
             shell_tool_enabled,
             agent_role_feature_opt_outs,
             agent_role_skill_restrictions,
@@ -130,6 +133,7 @@ impl AgentIdentitySnapshot {
             .as_ref()
             .map(ToString::to_string);
         config.service_tier.clone_from(&self.service_tier);
+        config.agent_role_daybreak = self.agent_role_daybreak;
         config.model_context_window = self.model_context_window;
         config.model_auto_compact_token_limit = self.model_auto_compact_token_limit;
         config.model_auto_compact_token_limit_scope = self.model_auto_compact_token_limit_scope;
@@ -260,6 +264,7 @@ impl fmt::Debug for AgentIdentitySnapshot {
                 &self.developer_instructions.as_ref().map(|_| "<redacted>"),
             )
             .field("service_tier", &self.service_tier)
+            .field("agent_role_daybreak", &self.agent_role_daybreak)
             .field("shell_tool_enabled", &self.shell_tool_enabled)
             .field(
                 "agent_role_feature_opt_outs",

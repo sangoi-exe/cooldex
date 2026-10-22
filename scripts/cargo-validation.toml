@@ -25,7 +25,7 @@ cache_root = 'F:\.cache'
 workflow_namespace = "cw"
 minimum_free_disk_gib = 120
 target = "x86_64-pc-windows-msvc"
-rust_toolchain = "1.95.0-x86_64-pc-windows-msvc"
+rust_toolchain = "1.99.1-x86_64-pc-windows-msvc"
 nextest_version = "0.9.103"
 nextest_url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.103/cargo-nextest-0.9.103-x86_64-pc-windows-msvc.zip"
 nextest_sha256 = "f4764e4f58c297b917364922b998c70b521a2fda271b0a7d141654a9800817d6"
@@ -597,6 +597,7 @@ patterns = [
   "codex-rs/core-plugin-common/**",
   "codex-rs/core-plugins/**",
   "codex-rs/core-skills/**",
+  "codex-rs/direct-tool-timing/**",
   "codex-rs/exec-server/**",
   "codex-rs/exec-server-protocol/**",
   "codex-rs/execpolicy/**",
@@ -630,6 +631,7 @@ patterns = [
   "codex-rs/memories/read/**",
   "codex-rs/memories/write/**",
   "codex-rs/mermaid/**",
+  "codex-rs/message-board/**",
   "codex-rs/model-provider-info/**",
   "codex-rs/models-manager/**",
   "codex-rs/mxc-sandbox/**",
@@ -643,6 +645,7 @@ patterns = [
   "codex-rs/rmcp-client/**",
   "codex-rs/rollout/**",
   "codex-rs/rollout-trace/**",
+  "codex-rs/runtime-agent-instance/**",
   "codex-rs/secrets/**",
   "codex-rs/shell-command/**",
   "codex-rs/skills/**",
@@ -656,6 +659,7 @@ patterns = [
   "codex-rs/utils/cache/**",
   "codex-rs/utils/cargo-bin/**",
   "codex-rs/utils/cli/**",
+  "codex-rs/utils/critical-path/**",
   "codex-rs/utils/fuzzy-match/**",
   "codex-rs/utils/git-discovery/**",
   "codex-rs/utils/home-dir/**",
@@ -676,9 +680,14 @@ surfaces = ["cli"]
 # Merge-safety anchor: WSL runtime and test preparation are explicit for
 # Linux/Unix package owners in every mode; voice source remains explicitly
 # classified even though the defaults policy excludes its validation.
+# Diagnostics/proxy Rust owners are scoped so documentation/npm inputs remain classification-only.
 [[path_rules]]
 patterns = [
+  "codex-rs/diagnostics/Cargo.toml",
+  "codex-rs/diagnostics/**/*.rs",
   "codex-rs/file-search/**",
+  "codex-rs/responses-api-proxy/Cargo.toml",
+  "codex-rs/responses-api-proxy/**/*.rs",
   "codex-rs/uds/**",
   "codex-rs/utils/path-utils/**",
   "codex-rs/utils/pty/**",
@@ -688,7 +697,9 @@ patterns = [
 surfaces = ["cli"]
 flags = ["runtime"]
 wsl_runtime_packages = [
+  "codex-diagnostics",
   "codex-file-search",
+  "codex-responses-api-proxy",
   "codex-uds",
   "codex-utils-path",
   "codex-utils-pty",
@@ -740,6 +751,8 @@ patterns = [
   "bazel/schema/BUILD.bazel",
   "bazel/schema/tools/BUILD.bazel",
   "bazel/schema/tools/python_codegen.py",
+  "bazel/tools/BUILD.bazel",
+  "bazel/tools/dsymutil",
   "codex-rs/BUILD.bazel",
   "codex-rs/**/BUILD.bazel",
   "MODULE.bazel",
@@ -766,7 +779,7 @@ flags = ["bazel"]
 commands = ["bazel-lock-check"]
 
 [[path_rules]]
-patterns = [".cargo/config.toml"]
+patterns = [".cargo/config.toml", "codex-rs/.cargo/config.toml"]
 surfaces = ["cli"]
 
 [[path_rules]]
@@ -793,6 +806,7 @@ patterns = [
   ".github/actions/build-bazel-release/action.yml",
   ".github/actions/build-cargo-package-binaries/action.yml",
   ".github/actions/build-codex-packages/action.yml",
+  ".github/actions/prepare-bazel-ci/action.yml",
   ".github/actions/run-argument-comment-lint/action.yml",
   ".github/actions/setup-bazel-ci/action.yml",
   ".github/actions/setup-ci/action.yml",
@@ -800,6 +814,7 @@ patterns = [
   ".github/actions/windows-code-sign/action.yml",
   ".github/scripts/build-codex-package-archive.sh",
   ".github/scripts/check_github_canary.py",
+  ".github/scripts/compute-bazel-windows-path.ps1",
   ".github/scripts/contract_releases.py",
   ".github/scripts/macos-signing/provisioned_macos_cli_package.py",
   ".github/scripts/macos-signing/sign_macos_code.sh",
@@ -818,10 +833,12 @@ patterns = [
   ".github/scripts/windows_bazel_test_durations.tsv",
   ".github/scripts/voice_windows_tools.py",
   ".github/workflows/bazel.yml",
+  ".github/workflows/cargo-deny.yml",
   ".github/workflows/issue-labeler.yml",
   ".github/workflows/r2-release.yml",
   ".github/workflows/repo-checks.yml",
   ".github/workflows/rust-ci-full.yml",
+  ".github/workflows/rust-ci-full-nextest-platform.yml",
   ".github/workflows/rust-ci.yml",
   ".github/workflows/rust-release.yml",
   ".github/workflows/rust-release-argument-comment-lint.yml",
@@ -834,6 +851,14 @@ patterns = [
 
 [[path_rules]]
 patterns = ["codex-rs/.cargo/audit.toml", "codex-rs/deny.toml"]
+
+# The planner checks native toolchain pin coherence; this rule only accounts for the source pin.
+[[path_rules]]
+patterns = ["codex-rs/rust-toolchain.toml"]
+
+# Native Windows bootstrap is accounted for without running setup or installing tools.
+[[path_rules]]
+patterns = ["codex-rs/scripts/setup-windows.ps1"]
 
 [[path_rules]]
 patterns = [
@@ -861,6 +886,7 @@ patterns = [
   "CHANGELOG.md",
   "codex-rs/docs/bazel.md",
   "codex-rs/docs/protocol_v1.md",
+  "codex-rs/responses-api-proxy/README.md",
   "scripts/codex_package/README.md",
   "sdk/python/docs/api-reference.md",
   "third_party/v8/README.md",
@@ -869,6 +895,7 @@ patterns = [
 # Package/installer inputs are classification-only, not package or installer test proof.
 [[path_rules]]
 patterns = [
+  "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js",
   "scripts/codex_package/cli.py",
   "scripts/codex_package/dotslash.py",
   "scripts/codex_package/layout.py",

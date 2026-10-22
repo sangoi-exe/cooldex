@@ -318,6 +318,19 @@ pub(crate) struct NewTurnContextOptions {
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Retains the rejected context so callers can preserve already-drained input without starting work.
+#[derive(Debug)]
+pub(crate) struct TurnContextBuildError {
+    pub(crate) turn_context: Arc<TurnContext>,
+    pub(crate) error: CodexErr,
+}
+
+impl From<TurnContextBuildError> for CodexErr {
+    fn from(error: TurnContextBuildError) -> Self {
+        error.error
+    }
+}
+
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
 pub struct TurnContext {
@@ -368,7 +381,7 @@ pub struct TurnContext {
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) available_models: Vec<ModelPreset>,
     pub(crate) final_output_json_schema: Option<Value>,
-    pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) dynamic_tools: Arc<[DynamicToolSpec]>,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_timing_state: Arc<TurnTimingState>,
@@ -597,12 +610,25 @@ impl TurnContext {
         const MAX_TELEMETRY_PLUGIN_ID_BYTES: usize = 128;
 
         let mut identities = self.active_host_plugin_identities.clone()?;
-        // Selected roots provide a package key, not a remote identity for that object.
+        // Selected catalogs preserve local package keys or canonical remote identities.
         if let Some(selected) = selected {
-            identities.extend(selected.plugins.iter().map(|plugin| PluginIdentity {
-                plugin_id: plugin.plugin_id.clone(),
-                remote_plugin_id: None,
-            }));
+            identities.extend(
+                selected
+                    .plugins
+                    .iter()
+                    .map(|plugin| match &plugin.plugin_id {
+                        codex_core_plugins::PluginIdentity::Local { plugin_id } => PluginIdentity {
+                            plugin_id: plugin_id.clone(),
+                            remote_plugin_id: None,
+                        },
+                        codex_core_plugins::PluginIdentity::Remote { remote_plugin_id } => {
+                            PluginIdentity {
+                                plugin_id: String::new(),
+                                remote_plugin_id: Some(remote_plugin_id.clone()),
+                            }
+                        }
+                    }),
+            );
         }
         let mut ids = Vec::with_capacity(identities.len());
         for identity in identities {
@@ -1212,7 +1238,7 @@ impl Session {
         let turn_environments = self.activate_turn_environments(&configuration).await;
         let turn_context = self
             .new_turn_from_configuration(sub_id, configuration, turn_environments, options)
-            .await;
+            .await?;
         Ok(Some((turn_context, commit.snapshot)))
     }
 
@@ -1223,9 +1249,9 @@ impl Session {
         session_configuration: SessionConfiguration,
         turn_environments: TurnEnvironmentSnapshot,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
+    ) -> Result<Arc<TurnContext>, TurnContextBuildError> {
         // Keep context construction out of the enclosing turn and history futures.
-        Box::pin(self.new_turn_context_from_configuration(
+        let mut turn_context = Box::pin(self.new_turn_context_from_configuration(
             sub_id,
             session_configuration,
             turn_environments,
@@ -1233,7 +1259,28 @@ impl Session {
             TurnContextBuildMode::Full,
             self.git_enrichment_policy,
         ))
-        .await
+        .await;
+        // Merge-safety anchor: every real-work path resolves recipient policy once against its effective model before publishing a context.
+        turn_context.extension_data.remove::<CyberAccessProgram>();
+        match cyber_access_program::for_recipient_role(
+            turn_context.config.agent_role_daybreak,
+            &turn_context.config.model_provider_id,
+            turn_context.model_info(),
+            turn_context.cyber_access_program,
+        ) {
+            Ok(program) => turn_context.cyber_access_program = program,
+            Err(error) => {
+                turn_context.cyber_access_program = None;
+                return Err(TurnContextBuildError {
+                    turn_context: Arc::new(turn_context),
+                    error,
+                });
+            }
+        }
+        if let Some(program) = turn_context.cyber_access_program {
+            turn_context.extension_data.insert(program);
+        }
+        Ok(Arc::new(turn_context))
     }
 
     async fn new_startup_prewarm_turn_from_configuration(
@@ -1242,15 +1289,17 @@ impl Session {
         session_configuration: SessionConfiguration,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
-        Box::pin(self.new_turn_context_from_configuration(
-            sub_id,
-            session_configuration,
-            turn_environments,
-            NewTurnContextOptions::default(),
-            TurnContextBuildMode::StartupPrewarm,
-            GitEnrichmentPolicy::Skip,
-        ))
-        .await
+        Arc::new(
+            Box::pin(self.new_turn_context_from_configuration(
+                sub_id,
+                session_configuration,
+                turn_environments,
+                NewTurnContextOptions::default(),
+                TurnContextBuildMode::StartupPrewarm,
+                GitEnrichmentPolicy::Skip,
+            ))
+            .await,
+        )
     }
 
     #[instrument(name = "turn_context.build", level = "trace", skip_all, fields(?build_mode))]
@@ -1262,7 +1311,7 @@ impl Session {
         options: NewTurnContextOptions,
         build_mode: TurnContextBuildMode,
         git_enrichment_policy: GitEnrichmentPolicy,
-    ) -> Arc<TurnContext> {
+    ) -> TurnContext {
         let primary_turn_environment = turn_environments.primary();
         let per_turn_config =
             self.build_per_turn_config(&session_configuration, turn_environments.local_selection());
@@ -1377,15 +1426,7 @@ impl Session {
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
         turn_context.final_output_json_schema = options.final_output_json_schema;
-        turn_context.cyber_access_program = cyber_access_program::for_provider(
-            &turn_context.config.model_provider_id,
-            options.cyber_access_program,
-        );
-        // Tool observers retain this turn's selection even after a later turn starts.
-        if let Some(program) = turn_context.cyber_access_program {
-            turn_context.extension_data.insert(program);
-        }
-        let turn_context = Arc::new(turn_context);
+        turn_context.cyber_access_program = options.cyber_access_program;
         if git_enrichment_policy == GitEnrichmentPolicy::Fresh
             && turn_context
                 .initial_environments
@@ -1451,15 +1492,17 @@ impl Session {
     async fn new_default_turn_for(&self, build_mode: TurnContextBuildMode) -> Arc<TurnContext> {
         let session_configuration = self.default_turn_configuration().await;
         let turn_environments = self.services.turn_environments.snapshot().await;
-        Box::pin(self.new_turn_context_from_configuration(
-            self.next_internal_sub_id(),
-            session_configuration,
-            turn_environments,
-            NewTurnContextOptions::default(),
-            build_mode,
-            self.git_enrichment_policy,
-        ))
-        .await
+        Arc::new(
+            Box::pin(self.new_turn_context_from_configuration(
+                self.next_internal_sub_id(),
+                session_configuration,
+                turn_environments,
+                NewTurnContextOptions::default(),
+                build_mode,
+                self.git_enrichment_policy,
+            ))
+            .await,
+        )
     }
 
     /// Prepares new work on the saved environments; context-only callers keep the current ones.
@@ -1467,7 +1510,7 @@ impl Session {
         &self,
         sub_id: String,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
+    ) -> Result<Arc<TurnContext>, TurnContextBuildError> {
         let session_configuration = self.default_turn_configuration().await;
         let turn_environments = self
             .activate_turn_environments(&session_configuration)

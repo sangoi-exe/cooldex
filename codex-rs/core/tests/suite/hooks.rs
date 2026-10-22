@@ -32,6 +32,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -48,7 +49,6 @@ use codex_thread_store::InMemoryThreadStore;
 use core_test_support::TestTargetOs;
 use core_test_support::fs_wait;
 use core_test_support::hooks::trust_discovered_hooks;
-use core_test_support::managed_network_requirements_loader;
 use core_test_support::responses;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
 use core_test_support::responses::ev_assistant_message;
@@ -84,6 +84,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tracing_test::traced_test;
 
 const FIRST_CONTINUATION_PROMPT: &str = "Retry with exactly the phrase meow meow meow.";
 const SECOND_CONTINUATION_PROMPT: &str = "Now tighten it to just: meow.";
@@ -2718,7 +2719,9 @@ async fn multiple_blocking_stop_hooks_persist_multiple_hook_prompt_fragments() -
     Ok(())
 }
 
+/// A blocked prompt keeps hook context but never reaches prompt telemetry, the rollout, or the model.
 #[tokio::test]
+#[traced_test]
 async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2738,7 +2741,10 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
             write_user_prompt_submit_hook(home, "blocked first prompt", BLOCKED_PROMPT_CONTEXT)
                 .expect("failed to write user prompt submit hook test fixture");
         })
-        .with_config(trust_discovered_hooks);
+        .with_config(|config| {
+            trust_discovered_hooks(config);
+            config.otel.log_user_prompt = true;
+        });
     let test = builder.build(&server).await?;
 
     // Merge-safety anchor: a rejected UserPromptSubmit hook must retain its typed durable
@@ -2767,6 +2773,23 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
     })
     .await;
     test.submit_turn("second prompt").await?;
+
+    logs_assert(|lines| {
+        let prompts: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("codex.user_prompt") && line.contains(" prompt="))
+            .collect();
+        if prompts.len() == 1 && prompts[0].contains("prompt=second prompt") {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected only the accepted prompt in telemetry: {prompts:?}"
+            ))
+        }
+    });
+    let rollout = fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
+    assert!(!rollout.contains("blocked first prompt"));
+    assert!(rollout.contains("second prompt"));
 
     let request = response.single_request();
     assert!(
@@ -2817,7 +2840,9 @@ async fn blocked_user_prompt_submit_persists_additional_context_for_next_turn() 
     Ok(())
 }
 
+/// Queued input is logged exactly once after acceptance; a later blocked prompt cannot leak or strand it.
 #[tokio::test]
+#[traced_test]
 async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2863,6 +2888,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
         })
         .with_config(move |config| {
             trust_discovered_hooks(config);
+            config.otel.log_user_prompt = true;
         });
     let test = builder.build_with_streaming_server(&server).await?;
 
@@ -2910,6 +2936,26 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
     .await;
 
     assert_eq!(requests.len(), 2);
+
+    logs_assert(|lines| {
+        let prompts: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("codex.user_prompt") && line.contains(" prompt="))
+            .collect();
+        if prompts.len() == 2
+            && prompts[0].contains("prompt=initial prompt")
+            && prompts[1].contains("prompt=accepted queued prompt")
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected only accepted prompts in telemetry: {prompts:?}"
+            ))
+        }
+    });
+    let rollout = fs::read_to_string(test.codex.rollout_path().expect("rollout path"))?;
+    assert!(!rollout.contains("blocked queued prompt"));
+    assert!(rollout.contains("accepted queued prompt"));
 
     let second_user_texts = request_message_input_texts(&requests[1], "user");
     assert!(
@@ -3439,7 +3485,17 @@ allow_local_binding = true
             )
             .expect("failed to write permission request hook test fixture");
         })
-        .with_cloud_config_bundle(managed_network_requirements_loader())
+        .with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                r#"
+[experimental_network]
+enabled = true
+allow_local_binding = true
+allowed_domains = ["**.invalid"]
+review_domains = ["codex-network-test.invalid"]
+"#,
+            ),
+        )
         .with_config(move |config| {
             trust_discovered_hooks(config);
             config.approvals_reviewer = codex_config::types::ApprovalsReviewer::AutoReview;
@@ -6008,5 +6064,300 @@ async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<(
     assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
     assert_eq!(hook_inputs[0]["tool_input"]["command"], patch);
 
+    Ok(())
+}
+
+fn write_lifecycle_hooks(home: &Path, events: &[&str]) -> Result<()> {
+    let mut hooks = serde_json::Map::new();
+    for event in events {
+        let log = home.join(format!("{event}.jsonl"));
+        let command = format!(
+            "cat >> '{log}'; echo >> '{log}'; printf '%s' '{{\"continue\":false,\"decision\":\"block\",\"reason\":\"ignored-observer-control\"}}'",
+            log = log.display(),
+        );
+        hooks.insert(
+            (*event).into(),
+            json!([{"hooks": [{"type": "command", "command": command}]}]),
+        );
+    }
+    fs::write(home.join("hooks.json"), json!({"hooks": hooks}).to_string())?;
+    Ok(())
+}
+
+async fn wait_for_hook_inputs(home: &Path, event: &str, count: usize) -> Result<Vec<Value>> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(inputs) = read_hook_inputs_from_log(&home.join(format!("{event}.jsonl")))
+                && inputs.len() >= count
+            {
+                return Ok(inputs);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn model_request_hooks_report_failures_and_retries_but_cannot_veto() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let requests = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_response_created("failed-attempt")]),
+            sse(vec![
+                ev_response_created("successful-attempt"),
+                ev_assistant_message("answer", "done"),
+                ev_completed_with_tokens("successful-attempt", /*total_tokens*/ 42),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"]).unwrap()
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build(&server).await?;
+    test.submit_turn("respond").await?;
+    for request in requests.requests() {
+        assert!(
+            !request
+                .body_json()
+                .to_string()
+                .contains("ignored-observer-control")
+        );
+    }
+    let pre = wait_for_hook_inputs(test.codex_home_path(), "PreModelRequest", /*count*/ 2).await?;
+    let post =
+        wait_for_hook_inputs(test.codex_home_path(), "PostModelRequest", /*count*/ 2).await?;
+    assert_eq!(pre.len(), 2);
+    assert_eq!(post.len(), 2);
+    assert_eq!(post[0]["status"], "failed");
+    assert!(post[0]["error"].is_string());
+    assert_eq!(post[1]["status"], "completed");
+    assert_eq!(post[1]["error"], Value::Null);
+    assert_eq!(post[0]["token_usage"], Value::Null);
+    assert_eq!(
+        post[1]["token_usage"],
+        json!({
+            "input_tokens": 42,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 42,
+        })
+    );
+    for (before, after) in pre.iter().zip(&post) {
+        let mut common = after.clone();
+        common["hook_event_name"] = json!("PreModelRequest");
+        let fields = common.as_object_mut().unwrap();
+        fields.remove("status");
+        fields.remove("error");
+        fields.remove("token_usage");
+        assert_eq!(before, &common);
+        assert!(before["session_id"].is_string());
+        assert!(before["cwd"].is_string());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn model_request_observer_reports_cancellation() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let request_received = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&request_received);
+    responses::mount_response_once_match(
+        &server,
+        move |_: &wiremock::Request| {
+            notify.notify_one();
+            true
+        },
+        responses::sse_response(responses::sse_completed("initial"))
+            .set_delay(Duration::from_secs(60)),
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"]).unwrap()
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build(&server).await?;
+    test.codex
+        .start_or_steer_turn(codex_core::TurnInputRequest::user_input(vec![
+            codex_protocol::user_input::UserInput::Text {
+                text: "respond".into(),
+                text_elements: vec![],
+            },
+        ]))
+        .await?;
+    timeout(Duration::from_secs(10), request_received.notified()).await?;
+    test.codex
+        .submit(codex_protocol::protocol::Op::Interrupt)
+        .await?;
+    let post =
+        wait_for_hook_inputs(test.codex_home_path(), "PostModelRequest", /*count*/ 1).await?;
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0]["status"], "cancelled");
+    assert_eq!(post[0]["token_usage"], Value::Null);
+    Ok(())
+}
+
+#[test_case::test_case(Some(false), false; "sync finishes before dispatch")]
+#[test_case::test_case(Some(false), true; "resume after interrupt preserves aborted custom call and usage")]
+#[test_case::test_case(Some(true), false; "async dispatches before stream ends")]
+#[test_case::test_case(None, false; "no post hook dispatches before stream ends")]
+#[tokio::test]
+async fn model_request_post_hook_orders_tool_dispatch(
+    hook_async: Option<bool>,
+    interrupt: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (finish_stream, gate) = oneshot::channel();
+    let call = if interrupt {
+        ev_apply_patch_custom_tool_call(
+            "call",
+            "*** Begin Patch\n*** Add File: should-not-exist\n+unexpected\n*** End Patch",
+        )
+    } else {
+        ev_function_call("call", "test_sync_tool", "{}")
+    };
+    let first = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse(vec![ev_response_created("first"), call]),
+        },
+        StreamingSseChunk {
+            gate: Some(gate),
+            body: sse_event(ev_completed_with_tokens("first", /*total_tokens*/ 42)),
+        },
+    ];
+    let second = vec![StreamingSseChunk {
+        gate: None,
+        body: sse(vec![ev_response_created("second"), ev_completed("second")]),
+    }];
+    let (server, _) = start_streaming_sse_server(vec![first, second]).await;
+    let test = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_pre_build_hook(move |home| {
+            let order = home.join("order").display().to_string();
+            let tool = format!("echo tool >> '{order}'");
+            let mut hooks =
+                json!({"PreToolUse": [{"hooks": [{"type": "command", "command": tool}]}]});
+            if let Some(hook_async) = hook_async {
+                let started = home.join("post-started");
+                let release = home.join("release-post");
+                let post = format!(
+                    "touch '{}'; while test ! -e '{}'; do sleep 0.02; done; echo post >> '{order}'",
+                    started.display(),
+                    release.display(),
+                );
+                hooks["PostModelRequest"] = json!([{"hooks": [{
+                    "type": "command", "command": post, "async": hook_async,
+                }]}]);
+            }
+            fs::write(home.join("hooks.json"), json!({"hooks": hooks}).to_string())
+                .expect("write hook configuration");
+        })
+        .with_config(trust_discovered_hooks)
+        .build_with_streaming_server(&server)
+        .await?;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "use the tool".into(),
+            text_elements: vec![],
+        }]))
+        .await?;
+
+    let home = test.codex_home_path();
+    let order = home.join("order");
+    let sync_post = hook_async == Some(false);
+    if !sync_post {
+        // Dispatch must not depend on the terminal response event, which we still hold.
+        fs_wait::wait_for_path_exists(&order, Duration::from_secs(10)).await?;
+    }
+    finish_stream.send(()).expect("release response stream");
+    let release = home.join("release-post");
+    if sync_post {
+        fs_wait::wait_for_path_exists(home.join("post-started"), Duration::from_secs(10)).await?;
+    }
+    if interrupt {
+        test.codex.submit(Op::Interrupt).await?;
+        wait_for_event(&test.codex, |event| matches!(event,
+            EventMsg::TokenCount(ev) if ev.info.as_ref().is_some_and(|info| info.total_token_usage.total_tokens == 42)
+        )).await;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnAborted(_))
+        })
+        .await;
+        assert!(
+            !order.exists(),
+            "interrupt must not dispatch the deferred tool"
+        );
+        fs::write(release, "")?;
+        assert!(!test.workspace_path("should-not-exist").exists());
+
+        let server = start_mock_server().await;
+        let requests = mount_sse_once(&server, responses::sse_completed("resumed")).await;
+        let resumed = test_codex().restart(&server, &test).await?;
+        let usage = resumed
+            .codex
+            .token_usage_info()
+            .await
+            .context("restored usage")?;
+        assert_eq!(usage.total_token_usage.total_tokens, 42);
+        resumed.submit_turn("continue after interrupt").await?;
+        let (output, _) = requests
+            .single_request()
+            .custom_tool_call_output_content_and_success("call")
+            .context("aborted custom tool output")?;
+        assert_eq!(output.as_deref(), Some("aborted before dispatch"));
+    } else {
+        fs::write(release, "")?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let events = fs::read_to_string(order)?;
+        assert!(
+            events.starts_with(if sync_post { "post\ntool\n" } else { "tool\n" }),
+            "{events}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_consolidation_skips_user_model_request_hooks() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let response = mount_sse_once(&server, responses::sse_completed("memory")).await;
+    let mut test = test_codex()
+        .with_pre_build_hook(|home| {
+            write_lifecycle_hooks(home, &["PreModelRequest", "PostModelRequest"])
+                .expect("write synchronous model request hooks");
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(SessionSource::Internal(
+                InternalSessionSource::MemoryConsolidation,
+            )),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+    test.codex = thread.thread;
+    test.submit_turn("consolidate").await?;
+    response.single_request();
+    let home = test.codex_home_path();
+    for event in ["PreModelRequest", "PostModelRequest"] {
+        assert!(!home.join(format!("{event}.jsonl")).exists(), "{event} ran");
+    }
     Ok(())
 }

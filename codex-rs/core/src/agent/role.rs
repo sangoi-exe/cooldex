@@ -40,6 +40,7 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
     model: Option<String>,
+    daybreak: Option<bool>,
     model_context_window: Option<i64>,
     model_auto_compact_token_limit: Option<i64>,
     model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
@@ -100,6 +101,7 @@ async fn apply_role_to_config_inner(
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
         model: role_config.model,
+        daybreak: role_config.daybreak,
         model_context_window: role_config.model_context_window,
         model_auto_compact_token_limit: role_config.model_auto_compact_token_limit,
         model_auto_compact_token_limit_scope: role_config.model_auto_compact_token_limit_scope,
@@ -229,6 +231,11 @@ mod role_overrides {
     ) -> anyhow::Result<Config> {
         let mut next_config = config.clone();
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        // Merge-safety anchor: explicit role Daybreak overrides survive projection as recipient policy.
+        if let Some(daybreak) = overrides.daybreak {
+            next_config.daybreak_enabled = daybreak;
+            next_config.agent_role_daybreak = Some(daybreak);
+        }
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
         }
@@ -323,6 +330,8 @@ mod role_overrides {
             config.config_layer_stack.requirements_toml().clone(),
         )?
         .with_cloud_config_binding(config.config_layer_stack.cloud_config_binding().cloned())
+        .with_mcp_ema_cancellation(config.config_layer_stack.mcp_ema_cancellation().clone())
+        .with_applied_config_server(config.config_layer_stack.applied_config_server().cloned())
         .with_user_and_project_exec_policy_rules_ignored(
             config
                 .config_layer_stack

@@ -155,6 +155,8 @@ pub struct LocalThreadStore {
     state_db: Option<StateDbHandle>,
     thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
     thread_data_cleanup: Option<Arc<ThreadDataCleanup>>,
+    #[cfg(test)]
+    startup_migration_retry_gate: Option<Arc<StartupMigrationRetryGate>>,
 }
 
 type ThreadDataCleanup = dyn Fn(Vec<ThreadId>) -> ThreadStoreFuture<'static, ()> + Send + Sync;
@@ -229,6 +231,14 @@ impl LiveWriterLocks {
     }
 }
 
+// Per-store synchronization for exercising startup contention through the public entry point.
+#[cfg(test)]
+#[derive(Default)]
+struct StartupMigrationRetryGate {
+    retry_started: tokio::sync::Notify,
+    retry_allowed: tokio::sync::Notify,
+}
+
 /// Process-scoped configuration for local thread storage.
 ///
 /// This describes where local storage lives. New-thread rollout metadata such
@@ -273,6 +283,8 @@ impl LocalThreadStore {
             state_db,
             thread_history_db: Arc::new(OnceCell::new()),
             thread_data_cleanup: None,
+            #[cfg(test)]
+            startup_migration_retry_gate: None,
         }
     }
 
@@ -327,6 +339,26 @@ impl LocalThreadStore {
     /// Return the live local rollout path for legacy local-only code paths.
     pub async fn live_rollout_path(&self, thread_id: ThreadId) -> ThreadStoreResult<PathBuf> {
         live_writer::rollout_path(self, thread_id).await
+    }
+
+    /// Select only materialized rollout inputs without creating a file for untouched threads.
+    pub(crate) async fn feedback_rollout_path(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreResult<Option<PathBuf>> {
+        let (recorder, _, _) = live_writer::live_writer_parts(self, thread_id).await?;
+        if recorder
+            .unpersisted_session_meta()
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: error.to_string(),
+            })?
+            .is_some()
+        {
+            return Ok(None);
+        }
+        // Keep the path even if a materialized file was deleted: collection must report that error.
+        Ok(Some(recorder.rollout_path().to_path_buf()))
     }
 
     pub(super) async fn ensure_live_recorder_absent(
@@ -551,12 +583,32 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { model_context::load_latest_model_context(self, params).await })
     }
 
+    // Merge-safety anchor: settings restoration reads this thread's latest persisted snapshot across paginated lineage independently of model-context revision validation.
     fn load_latest_thread_settings_snapshot(
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreFuture<'_, Option<ThreadSettingsSnapshot>> {
         Box::pin(async move {
             thread_settings_snapshot::load_latest_thread_settings_snapshot(self, params).await
+        })
+    }
+
+    fn is_model_context_current(
+        &self,
+        params: LoadThreadHistoryParams,
+        revision: String,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let resolved = if params.include_archived {
+                thread_rollout_resolver::resolve_current_including_archived(self, params.thread_id)
+                    .await?
+            } else {
+                thread_rollout_resolver::resolve_current(self, params.thread_id).await?
+            };
+            let Some(resolved) = resolved else {
+                return Ok(false);
+            };
+            Ok(history_revision::read(&resolved.path).await.as_ref() == Some(&revision))
         })
     }
 
@@ -2138,7 +2190,7 @@ mod tests {
             serde_json::to_value(history).expect("serialize history"),
             serde_json::to_value(StoredThreadHistory {
                 thread_id,
-                items: vec![RolloutItem::SessionMeta(session_meta)],
+                items: vec![RolloutItem::SessionMeta(Box::new(session_meta))],
                 revision: None,
             })
             .expect("serialize expected history")

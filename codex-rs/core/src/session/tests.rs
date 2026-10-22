@@ -311,11 +311,10 @@ impl StepContext {
                 mode_instructions: None,
             },
             turn: Arc::clone(&turn),
+            inherited_environments: environments.clone(),
             environments,
-            selected_capability_roots: Vec::new(),
-            executor_capability_discovery: None,
+            executor_hook_sources: Vec::new(),
             extension_data: codex_extension_api::ExtensionData::new(turn.sub_id.clone()),
-            executor_capability_discovery_v2: None,
             mcp: Arc::new(codex_mcp::McpBinding::empty(mcp_config_for_test(
                 &turn.config,
             ))),
@@ -2492,7 +2491,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
     let first_window_id = Uuid::now_v7();
     let previous_window_id = Uuid::now_v7();
     let window_id = Uuid::now_v7();
-    let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
+    let rollout_items = vec![RolloutItem::Compacted(Box::new(CompactedItem {
         message: String::new(),
         replacement_history: Some(replacement_history.clone()),
         retained_context: None,
@@ -2506,7 +2505,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: None,
-    })];
+    }))];
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
@@ -2773,7 +2772,7 @@ async fn inter_agent_communication_waits_for_confirmed_delivery_persistence() {
     compacted.retained_context = Some(live.retained_context().clone());
     let mut history = resumed.history.as_ref().clone();
     history.extend([
-        RolloutItem::Compacted(compacted),
+        RolloutItem::Compacted(Box::new(compacted)),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
         )),
@@ -3304,7 +3303,7 @@ fn session_meta_item(
     thread_id: ThreadId,
     multi_agent_version: Option<MultiAgentVersion>,
 ) -> RolloutItem {
-    RolloutItem::SessionMeta(SessionMetaLine {
+    RolloutItem::SessionMeta(Box::new(SessionMetaLine {
         meta: SessionMeta {
             session_id: thread_id.into(),
             id: thread_id,
@@ -3312,7 +3311,7 @@ fn session_meta_item(
             ..SessionMeta::default()
         },
         git: None,
-    })
+    }))
 }
 
 #[tokio::test]
@@ -3459,7 +3458,7 @@ fn latest_token_usage_record_stops_at_compaction_checkpoint() {
         thread_token_usage: TokenUsage::default(),
     };
     let checkpoint = |latest_token_usage_record| {
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: None,
             retained_context: None,
@@ -3473,7 +3472,7 @@ fn latest_token_usage_record_stops_at_compaction_checkpoint() {
             compaction_response_id: None,
             latest_token_usage_record,
             resume_metadata: None,
-        })
+        }))
     };
 
     assert_eq!(
@@ -4624,7 +4623,7 @@ async fn set_rate_limits_retains_previous_credits() {
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     };
 
@@ -4747,7 +4746,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     };
 
@@ -5372,7 +5371,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     }
 }
@@ -5951,7 +5950,8 @@ enabled = false
 
     let child_turn = session
         .new_turn_with_default_settings("role-skill-turn".to_string(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     let skills_snapshot = child_turn.skills_snapshot();
     let child_skill = skills_snapshot
         .outcome()
@@ -6283,6 +6283,8 @@ async fn standalone_settings_invalidate_continuation_before_delivering_acceptanc
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
         })
         .await
         .expect("submit settings");
@@ -6384,6 +6386,8 @@ async fn standalone_settings_preserve_running_but_invalidate_retained_finishing_
                 parent_turn_id: None,
                 root_turn_id: None,
                 residency_guard: None,
+                message_delivery: None,
+                terminal_error_wake: false,
             })
             .await
             .expect("submit standalone settings");
@@ -6896,6 +6900,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
                     Default::default(),
                 )
                 .await
+                .expect("valid work context")
         };
         let next_environment = next_turn
             .initial_environments
@@ -7180,7 +7185,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     };
     let session_telemetry = session_telemetry(
@@ -7333,6 +7338,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
+        parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
@@ -7501,7 +7507,7 @@ async fn make_session_with_config_and_rx(
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     };
 
@@ -7521,6 +7527,7 @@ async fn make_session_with_config_and_rx(
     let session = Session::new(
         /*startup*/ None,
         session_configuration,
+        PromptCacheKey::default(),
         &default_environments,
         Arc::clone(&config),
         SessionInstructions::default(),
@@ -7636,7 +7643,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools: Vec::new(),
+        dynamic_tools: Arc::default(),
         user_shell_override: None,
     };
 
@@ -7657,6 +7664,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     let session = Session::new(
         /*startup*/ None,
         session_configuration,
+        PromptCacheKey::default(),
         &default_environments,
         Arc::clone(&config),
         SessionInstructions::default(),
@@ -7752,7 +7760,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
         InitialHistory::Resumed(ResumedHistory {
             history_revision: None,
             conversation_id: thread_id,
-            history: Arc::new(vec![RolloutItem::SessionMeta(SessionMetaLine {
+            history: Arc::new(vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: SessionMeta {
                     session_id: parent_session_id,
                     id: thread_id,
@@ -7760,7 +7768,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
                     ..SessionMeta::default()
                 },
                 git: None,
-            })]),
+            }))]),
             rollout_path: None,
         }),
         session_source,
@@ -7786,7 +7794,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
     let parent_thread_id = ThreadId::new();
     let thread_id = ThreadId::new();
     let history = vec![
-        RolloutItem::SessionMeta(SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 id: thread_id,
                 session_id: SessionId::from(thread_id),
@@ -7794,8 +7802,8 @@ async fn resumed_copied_fork_ignores_source_history_base() {
                 ..SessionMeta::default()
             },
             git: None,
-        }),
-        RolloutItem::SessionMeta(SessionMetaLine {
+        })),
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 id: parent_thread_id,
                 session_id: SessionId::from(parent_thread_id),
@@ -7808,7 +7816,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
                 ..SessionMeta::default()
             },
             git: None,
-        }),
+        })),
     ];
     let (session, _rx_event) = make_session_with_history_source_and_agent_control_and_rx(
         InitialHistory::Resumed(ResumedHistory {
@@ -8478,6 +8486,8 @@ async fn submit_with_trace_captures_current_span_trace_context() {
             /*parent_turn_id*/ None,
             /*root_turn_id*/ None,
             /*residency_guard*/ None,
+            /*message_delivery*/ None,
+            /*terminal_error_wake*/ false,
         )
         .await
         .expect("submit should succeed");
@@ -8552,6 +8562,8 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
             trace: Some(submission_trace),
         })
     });
@@ -8582,6 +8594,8 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
         parent_turn_id: None,
         root_turn_id: None,
         residency_guard: None,
+        message_delivery: None,
+        terminal_error_wake: false,
         trace: None,
     });
 
@@ -8694,7 +8708,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
 
     let candidate = session
         .new_turn_with_default_settings("candidate".into(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     assert_eq!(candidate.config.cwd, current_cwd);
     assert_eq!(candidate.config.workspace_roots, vec![current_cwd.clone()]);
     assert_eq!(
@@ -8706,7 +8721,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     let next = session
         .new_turn_with_default_settings("next".into(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     assert_eq!(next.config.cwd, next_cwd);
     assert_eq!(next.config.workspace_roots, vec![next_cwd]);
 }
@@ -8729,7 +8745,8 @@ async fn task_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_envir
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
 
     let turn_environments = &turn_context.initial_environments;
     assert_eq!(turn_environments.turn_environments().count(), 1);
@@ -8767,7 +8784,8 @@ async fn task_turn_honors_empty_stored_thread_environments() {
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
 
     assert!(turn_context.initial_environments.primary().is_none());
     assert!(
@@ -8942,6 +8960,8 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
         parent_turn_id: None,
         root_turn_id: None,
         residency_guard: None,
+        message_delivery: None,
+        terminal_error_wake: false,
         trace: Some(submission_trace.clone()),
     });
     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
@@ -9367,7 +9387,7 @@ where
     .await
 }
 
-async fn make_session_and_context_with_auth_config_home_and_rx<F>(
+pub(crate) async fn make_session_and_context_with_auth_config_home_and_rx<F>(
     auth: CodexAuth,
     dynamic_tools: Vec<DynamicToolSpec>,
     codex_home: &Path,
@@ -9451,7 +9471,7 @@ where
         parent_thread_id: None,
         thread_source: None,
         originator: "test_originator".to_string(),
-        dynamic_tools,
+        dynamic_tools: Arc::from(dynamic_tools),
         user_shell_override: None,
     };
     let session_telemetry = session_telemetry(
@@ -9603,6 +9623,7 @@ where
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
+        parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
@@ -10156,7 +10177,8 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let restricted_turn = session
         .new_turn_with_default_settings("owner-restricted".to_string(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     session.spawn_task(restricted_turn, Vec::new(), task).await;
     session.refresh_mcp_if_dirty().await;
     assert_eq!(
@@ -10460,14 +10482,14 @@ async fn capability_discovery_uses_environment_permission_profile() {
     let environment_id = environment.selection.environment_id.clone();
     turn_context.initial_environments.environments[0] = TurnEnvironmentState::Ready(environment);
 
-    let discovery = session
+    let (discovery, _) = session
         .executor_capability_discovery_for_step(
             &turn_context.config,
-            /*ready_selected_capability_roots*/ &[],
+            /*resolved_roots*/ &[],
             &turn_context.initial_environments,
         )
-        .await
-        .expect("restricted environment should trigger capability discovery");
+        .await;
+    let discovery = discovery.expect("restricted environment should trigger capability discovery");
 
     assert_eq!(
         discovery.sandbox_contexts().get(&environment_id),
@@ -12831,7 +12853,8 @@ async fn replacement_waits_for_compaction_live_publication_before_successor_admi
     let successor_id = "successor-after-compaction-publication".to_string();
     let successor = session
         .new_turn_with_default_settings(successor_id.clone(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
 
     let (gate, compaction) = start_gated_compaction_publication(&session, store.as_ref()).await;
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -13573,7 +13596,8 @@ async fn user_input_answer_order_wait_preserves_the_original_waiter_after_retire
             turn_context.sub_id.clone(),
             NewTurnContextOptions::default(),
         )
-        .await;
+        .await
+        .expect("valid work context");
     start_regular_never_ending_task(&session, &replacement).await;
     let replacement_state = session
         .input_queue
@@ -13674,7 +13698,7 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
     };
     session
         .input_queue
-        .enqueue_mailbox_communication(queued_mail.clone(), Default::default())
+        .enqueue_mailbox_communication(queued_mail.clone().into(), Default::default())
         .await;
     activity.borrow_and_update();
 
@@ -14222,7 +14246,8 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
                 Vec::new(),
                 "pending trigger".to_string(),
                 /*trigger_turn*/ true,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -14304,7 +14329,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone(), Default::default())
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
         .await;
 
     assert!(
@@ -14323,7 +14348,7 @@ async fn queue_only_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
 
     assert_eq!(
         (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
-        vec![TurnInput::InterAgentCommunication(communication)],
+        vec![TurnInput::InterAgentCommunication(communication.into())],
     );
 }
 
@@ -14351,7 +14376,8 @@ async fn trigger_turn_mailbox_mail_waits_for_next_turn_after_answer_boundary() {
                 Vec::new(),
                 "late trigger update".to_string(),
                 /*trigger_turn*/ true,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -14397,7 +14423,7 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     {
         sess.input_queue
             .enqueue_mailbox_communication(
-                communication,
+                communication.into(),
                 codex_protocol::turn_input::TurnStartOptions {
                     parent_turn_id: Some(parent_turn_id.to_string()),
                     root_turn_id: Some(root_turn_id.to_string()),
@@ -14423,8 +14449,8 @@ async fn active_turn_keeps_first_root_when_mail_coalesces(inherited_root: Option
     assert_eq!(
         (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
         vec![
-            TurnInput::InterAgentCommunication(first),
-            TurnInput::InterAgentCommunication(second),
+            TurnInput::InterAgentCommunication(first.into()),
+            TurnInput::InterAgentCommunication(second.into()),
         ]
     );
     assert_eq!(
@@ -14460,7 +14486,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone(), Default::default())
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
         .await;
     let submission = submit_steer_only(
         &sess,
@@ -14487,7 +14513,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
                 }],
                 client_id: None,
             },
-            TurnInput::InterAgentCommunication(communication),
+            TurnInput::InterAgentCommunication(communication.into()),
         ],
     );
 }
@@ -14516,7 +14542,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone(), Default::default())
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
         .await;
     let submission = submit_steer_only(
         &sess,
@@ -14547,7 +14573,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
                 }],
                 client_id: None,
             },
-            TurnInput::InterAgentCommunication(communication),
+            TurnInput::InterAgentCommunication(communication.into()),
         ],
     );
 }
@@ -14576,7 +14602,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &tc.sub_id)
         .await;
     sess.input_queue
-        .enqueue_mailbox_communication(communication.clone(), Default::default())
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
         .await;
 
     let item = ResponseItem::FunctionCall {
@@ -14595,6 +14621,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         step_context: StepContext::for_test(Arc::clone(&tc)),
         turn_store: Arc::new(codex_extension_api::ExtensionData::new(tc.sub_id.clone())),
         tool_runtime: test_tool_runtime(Arc::clone(&sess), Arc::clone(&tc)),
+        defer_tool_dispatch: false,
         cancellation_token: CancellationToken::new(),
     };
 
@@ -14606,7 +14633,7 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
     assert!(output.tool_future.is_some());
     assert_eq!(
         (sess.input_queue.get_pending_input(&sess.active_turn).await).0,
-        vec![TurnInput::InterAgentCommunication(communication)],
+        vec![TurnInput::InterAgentCommunication(communication.into())],
     );
 }
 
@@ -14789,7 +14816,7 @@ async fn sample_rollout(
     let rebuilt1 = compact::build_compacted_history(Vec::new(), &user_messages1, summary1);
     live_history.replace_annotated(rebuilt1);
     let (window_number, window_ids) = install_synthetic_auto_compact_window(session).await;
-    rollout_items.push(RolloutItem::Compacted(CompactedItem {
+    rollout_items.push(RolloutItem::Compacted(Box::new(CompactedItem {
         message: summary1.to_string(),
         replacement_history: None,
         retained_context: None,
@@ -14803,7 +14830,7 @@ async fn sample_rollout(
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: None,
-    }));
+    })));
 
     let user2 = user_message("second user");
     live_history.record_items(
@@ -14825,7 +14852,7 @@ async fn sample_rollout(
     let rebuilt2 = compact::build_compacted_history(Vec::new(), &user_messages2, summary2);
     live_history.replace_annotated(rebuilt2);
     let (window_number, window_ids) = install_synthetic_auto_compact_window(session).await;
-    rollout_items.push(RolloutItem::Compacted(CompactedItem {
+    rollout_items.push(RolloutItem::Compacted(Box::new(CompactedItem {
         message: summary2.to_string(),
         replacement_history: None,
         retained_context: None,
@@ -14839,7 +14866,7 @@ async fn sample_rollout(
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: None,
-    }));
+    })));
 
     let user3 = user_message("third user");
     live_history.record_items(
@@ -15072,5 +15099,122 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
             .get("enterprise")
             .is_some_and(|server| server.enabled),
         "rejection must not permit same-name ordinary-auth replacement in this session"
+    );
+}
+
+#[tokio::test]
+async fn rejected_recipient_daybreak_records_drained_mail_and_clears_reservation() {
+    let (session, _turn_context, events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("test-api-key"),
+        Vec::new(),
+        |config| {
+            config.agent_role_daybreak = Some(true);
+            let mut catalog =
+                codex_models_manager::bundled_models_response().expect("bundled catalog");
+            for model in &mut catalog.models {
+                model.available_access_programs = None;
+            }
+            config.model_catalog = Some(catalog);
+        },
+    )
+    .await;
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root(),
+        Vec::new(),
+        "follow-up rejected by recipient Daybreak policy".to_string(),
+        true,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(communication.into(), Default::default())
+        .await;
+    session
+        .maybe_start_turn_for_pending_work_with_sub_id("rejected-daybreak".to_string())
+        .await;
+
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    let history = raw_history_items(&session.clone_history().await);
+    let serialized = serde_json::to_string(&history).expect("serialize recorded input");
+    assert_eq!(
+        serialized
+            .matches("follow-up rejected by recipient Daybreak policy")
+            .count(),
+        1
+    );
+    let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(emitted.iter().any(
+        |event| matches!(&event.msg, EventMsg::Error(error) if error.message.contains("Daybreak"))
+    ));
+    assert!(
+        !emitted
+            .iter()
+            .any(|event| matches!(&event.msg, EventMsg::TurnStarted(_)))
+    );
+    assert!(
+        session
+            .reserve_turn_start("after-rejection")
+            .await
+            .is_some()
+    );
+    session.cancel_reserved_turn_start("after-rejection").await;
+}
+
+#[tokio::test]
+async fn automatic_idle_daybreak_rejection_returns_original_input() {
+    let (session, _turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("test-api-key"),
+        Vec::new(),
+        |config| {
+            config.agent_role_daybreak = Some(true);
+            config.model_provider_id = "custom".to_string();
+        },
+    )
+    .await;
+    let input = vec![TurnInput::ResponseItem(
+        user_message("original automatic input").into(),
+    )];
+    let error = session
+        .try_start_turn_if_idle(input.clone())
+        .await
+        .expect_err("incompatible policy must reject work");
+    assert_eq!(
+        error.reason(),
+        crate::codex_thread::TryStartTurnIfIdleRejectionReason::InvalidSettings
+    );
+    assert_eq!(error.into_input(), input);
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn recipient_daybreak_policy_publishes_only_the_effective_turn_program() {
+    let (session, _turn_context, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("test-api-key"),
+        Vec::new(),
+        |config| config.agent_role_daybreak = Some(false),
+    )
+    .await;
+    let turn = session
+        .new_turn_with_default_settings(
+            "role-standard".to_string(),
+            NewTurnContextOptions {
+                cyber_access_program: Some(
+                    codex_protocol::turn_input::CyberAccessProgram::DaybreakRed,
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("explicit standard should be supported");
+    assert_eq!(
+        turn.cyber_access_program,
+        Some(codex_protocol::turn_input::CyberAccessProgram::Standard)
+    );
+    assert_eq!(
+        turn.extension_data
+            .get::<codex_protocol::turn_input::CyberAccessProgram>()
+            .as_deref(),
+        turn.cyber_access_program.as_ref()
     );
 }

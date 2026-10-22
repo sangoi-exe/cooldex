@@ -62,3 +62,32 @@ fn spawn_agent_model_selection_rejects_disabled_model() {
         Err(unavailable_model_error("disabled-model"))
     );
 }
+
+#[tokio::test]
+async fn fresh_spawn_clears_sender_role_daybreak_policy_but_full_history_retains_it() {
+    for policy in [Some(false), Some(true)] {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        std::sync::Arc::make_mut(&mut turn.config).agent_role_daybreak = policy;
+        let step_context =
+            crate::session::step_context::StepContext::for_test(std::sync::Arc::new(turn));
+        for full_history_fork in [false, true] {
+            let prepared = prepare_agent_spawn_config(
+                &session,
+                &step_context,
+                SpawnConfigOptions {
+                    version: SpawnConfigVersion::V1,
+                    full_history_fork,
+                    role_name: None,
+                    model: None,
+                    reasoning_effort: None,
+                },
+            )
+            .await
+            .expect("prepare child config");
+            assert_eq!(
+                prepared.config.agent_role_daybreak,
+                if full_history_fork { policy } else { None }
+            );
+        }
+    }
+}

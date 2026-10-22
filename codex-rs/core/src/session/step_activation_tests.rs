@@ -189,14 +189,27 @@ async fn next_step_waits_for_environment_publication_before_capturing() {
             .turn_environments
             .update_selections(&selections);
     }
+    {
+        // Thread attachments publish under state independently of active-turn settings.
+        // A capture waiting for that publication must not retain the previous attachments.
+        let mut state = session.state.lock().await;
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(std::future::Future::poll(capture.as_mut(), &mut context).is_pending());
+        session
+            .services
+            .turn_environments
+            .update_configured_selections(&selections);
+        state.session_configuration.environments = selections.clone();
+    }
 
     let step = capture.await.expect("capture after publication");
     assert_eq!(
         (
             step.settings.model_info.slug.as_str(),
             step.environments.primary().map(TurnEnvironment::cwd),
+            step.inherited_environments.all_selections(),
         ),
-        ("next-step-model", Some(&next_cwd)),
+        ("next-step-model", Some(&next_cwd), selections),
     );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
@@ -409,6 +422,7 @@ async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
     let (models, lookup) = GatedModelsManager::new(models);
     mutable.services.models_manager = models;
     for feature in [
+        Feature::SubagentThreadEnvironments,
         Feature::StepModelSwitching,
         Feature::FastMode,
         Feature::TokenBudget,
@@ -432,7 +446,8 @@ async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
     settings.service_tier = None;
     let prepared = session
         .new_turn_with_default_settings("step-activation-turn".to_string(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     let turn = Arc::clone(&prepared);
     let finish = Arc::new(Notify::new());
     session
@@ -499,6 +514,8 @@ fn settings_submission(
             parent_turn_id: None,
             root_turn_id: None,
             residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
         },
         receiver,
     )
@@ -837,14 +854,13 @@ async fn delayed_activation_does_not_retarget_a_task(change: TaskChangeDuringLoo
                 .await
                 .expect("original task completed");
             let replacement = match change {
-                TaskChangeDuringLookup::FinishedAndReplaced => {
-                    session
-                        .new_turn_with_default_settings(
-                            "replacement-turn".to_string(),
-                            Default::default(),
-                        )
-                        .await
-                }
+                TaskChangeDuringLookup::FinishedAndReplaced => session
+                    .new_turn_with_default_settings(
+                        "replacement-turn".to_string(),
+                        Default::default(),
+                    )
+                    .await
+                    .expect("valid work context"),
                 TaskChangeDuringLookup::FinishedAndReusedContext => Arc::clone(&turn),
                 TaskChangeDuringLookup::CancelledWithRejectedDestination => unreachable!(),
             };

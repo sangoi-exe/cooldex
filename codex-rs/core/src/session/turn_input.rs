@@ -447,9 +447,6 @@ async fn start_or_steer(
             session
                 .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
                 .await;
-            if let SubmittedTurnInput::UserInput { content, .. } = &input {
-                turn_context.session_telemetry.user_prompt(content);
-            }
             let mut task_input = merge_additional_context_input(session, additional_context).await;
             if has_explicit_input {
                 task_input.push(
@@ -613,9 +610,6 @@ async fn start_if_idle(
     match kind {
         TurnStartKind::User => {
             session.clear_connector_selection().await;
-            if let SubmittedTurnInput::UserInput { content, .. } = &input {
-                turn_context.session_telemetry.user_prompt(content);
-            }
             task_input.push(
                 pending_turn_input(
                     session,
@@ -793,7 +787,9 @@ impl Session {
     }
 
     async fn should_wake_on_agent_messages(&self) -> bool {
-        if !self.features.enabled(Feature::WakeOnAgentMessages)
+        // Merge-safety anchor: terminal-error mail bypasses only the global message-wake flag, not interruption, root-only, mode, or active-turn admission.
+        if (!self.features.enabled(Feature::WakeOnAgentMessages)
+            && !self.input_queue.has_terminal_error_mailbox_items().await)
             || self.is_interrupted()
             || !self.input_queue.has_pending_mailbox_items().await
         {
@@ -977,7 +973,6 @@ impl Session {
             drop(active);
             let (turn_input, client_user_message_id) = match input {
                 SubmittedTurnInput::UserInput { content, client_id } => {
-                    active_turn_context.session_telemetry.user_prompt(content);
                     let client_id = client_id.clone();
                     (
                         TurnInput::UserInput {
@@ -1144,7 +1139,7 @@ async fn pending_turn_input(
             TurnInput::ResponseItem(item.into())
         }
         SubmittedTurnInput::InterAgentCommunication(communication) => {
-            TurnInput::InterAgentCommunication(communication)
+            TurnInput::InterAgentCommunication(communication.into())
         }
     };
     if retain

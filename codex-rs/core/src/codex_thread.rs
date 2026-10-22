@@ -201,6 +201,7 @@ pub enum TryStartTurnIfIdleRejectionReason {
     RejectedByHook,
     TaskEndedBeforePersistence,
     PersistenceFailed,
+    InvalidSettings,
 }
 
 /// Rejection returned when an extension asks to start automatic idle work but the thread is not
@@ -456,7 +457,8 @@ impl CodexThread {
         self.io
             .submit_with_trace(
                 op, trace, /*parent_turn_id*/ None, /*root_turn_id*/ None,
-                /*residency_guard*/ None,
+                /*residency_guard*/ None, /*message_delivery*/ None,
+                /*terminal_error_wake*/ false,
             )
             .await
     }
@@ -642,6 +644,8 @@ impl CodexThread {
                 parent_turn_id: None,
                 root_turn_id: None,
                 residency_guard: None,
+                message_delivery: None,
+                terminal_error_wake: false,
             })
             .await
             .map_err(|_| CodexErr::Fatal("thread session has stopped".to_string()))?;
@@ -724,6 +728,8 @@ impl CodexThread {
                 parent_turn_id: None,
                 root_turn_id: None,
                 residency_guard: None,
+                message_delivery: None,
+                terminal_error_wake: false,
             })
             .await
             .map_err(UserMessageAdmissionError::Admission)?;
@@ -1088,6 +1094,18 @@ impl CodexThread {
         self.rollout_path.clone()
     }
 
+    /// Selects a local feedback rollout without materializing an untouched thread.
+    pub async fn feedback_rollout_path(&self) -> ThreadStoreResult<Option<PathBuf>> {
+        match self.session.live_thread() {
+            Some(thread) => thread.feedback_rollout_path().await.or_else(|error| {
+                // Shutdown can close or remove the writer before its thread leaves the manager.
+                // Retain the captured input; the archive reader still rejects missing files.
+                self.rollout_path().map(Some).ok_or(error)
+            }),
+            None => Ok(None),
+        }
+    }
+
     /// Returns startup metadata without the one-time initial message replay.
     pub fn startup_metadata(&self) -> &ThreadStartupMetadata {
         &self.startup_metadata
@@ -1166,6 +1184,10 @@ impl CodexThread {
 
     pub async fn config_snapshot(&self) -> ThreadConfigSnapshot {
         self.session.thread_config_snapshot().await
+    }
+
+    pub async fn resume_config_snapshot(&self) -> (ThreadConfigSnapshot, Option<String>) {
+        self.session.resume_config_snapshot().await
     }
 
     /// Returns the active turn's reviewer, including live updates, or the thread default.
@@ -1360,6 +1382,7 @@ impl CodexThread {
         &self,
         server: &str,
         detail: codex_mcp::McpSnapshotDetail,
+        expected_registration: Option<&codex_mcp::ResolvedMcpServer>,
     ) -> anyhow::Result<(
         Arc<codex_mcp::McpConfig>,
         codex_mcp::McpServerStatusSnapshot,
@@ -1369,7 +1392,7 @@ impl CodexThread {
         self.session
             .services
             .mcp_runtime
-            .server_status_snapshot(server, detail, &runtime_context)
+            .server_status_snapshot(server, detail, expected_registration, &runtime_context)
             .await
     }
 

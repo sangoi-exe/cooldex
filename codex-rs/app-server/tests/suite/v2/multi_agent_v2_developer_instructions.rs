@@ -143,7 +143,7 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
         &server,
         |request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            body.contains(CHILD_PROMPT) && !body.contains(SPAWN_CALL_ID)
+            body.contains(CHILD_PROMPT) && body.contains(r#"\"agent_name\":\"/root/worker\""#)
         },
         responses::sse(vec![
             responses::ev_response_created("child-work"),
@@ -155,7 +155,8 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
     responses::mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            String::from_utf8_lossy(&request.body).contains(SPAWN_CALL_ID)
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains(SPAWN_CALL_ID) && body.contains(r#"\"agent_name\":\"/root\""#)
         },
         responses::sse(vec![
             responses::ev_response_created("parent-complete"),
@@ -246,10 +247,7 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
             )
         })
         .collect::<Vec<_>>();
-    let expected_instruction_texts = match expected {
-        Some(instructions) => vec![instructions],
-        None => Vec::new(),
-    };
+    let expected_instruction_texts = expected.into_iter().collect::<Vec<_>>();
     assert_eq!(
         instruction_texts, expected_instruction_texts,
         "{case}: child received unexpected developer instructions"
@@ -262,9 +260,14 @@ async fn spawned_subagents_apply_configured_developer_instruction_precedence(
     Ok(())
 }
 
-/// A full-history worker fork preserves parent instructions inside compacted history.
+// Merge-safety anchor: prefix filtering may rebuild context, but never replaces the inherited full-history developer identity with a configured child override.
+/// Compacted full forks retain parent instructions with preserved or filtered context prefixes.
+#[test_case("preserved"; "preserved")]
+#[test_case("filtered"; "filtered")]
 #[tokio::test]
-async fn compacted_full_history_fork_preserves_parent_developer_instructions() -> Result<()> {
+async fn compacted_full_history_fork_preserves_parent_developer_instructions(
+    case: &str,
+) -> Result<()> {
     const COMPACT_SETUP_PROMPT: &str = "prepare the parent for compaction";
     const COMPACT_PROMPT: &str = "summarize the compacted parent";
     const COMPACTED_SUMMARY: &str = "preserved compacted parent summary";
@@ -282,7 +285,7 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
                 responses::ev_function_call(SETUP_CALL_ID, "unsupported_tool", "{}"),
                 responses::ev_completed_with_tokens(
                     "parent-before-compaction",
-                    /*total_tokens*/ 96,
+                    /*total_tokens*/ 96_000,
                 ),
             ]),
             responses::sse(vec![
@@ -323,7 +326,8 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
         &server,
         |request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            body.contains(CHILD_PROMPT) && !body.contains(SPAWN_CALL_ID)
+            body.contains(CHILD_PROMPT)
+                && body.contains(r#"\"agent_name\":\"/root/compacted_worker\""#)
         },
         responses::sse(vec![
             responses::ev_response_created("compacted-child-work"),
@@ -335,7 +339,8 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
     responses::mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
-            String::from_utf8_lossy(&request.body).contains(SPAWN_CALL_ID)
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains(SPAWN_CALL_ID) && body.contains(r#"\"agent_name\":\"/root\""#)
         },
         responses::sse(vec![
             responses::ev_response_created("compacted-parent-complete"),
@@ -346,15 +351,19 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
     .await;
 
     let codex_home = TempDir::new()?;
+    let mut feature_config = format!(
+        "[features.multi_agent_v2]\nenabled = true\nsubagent_developer_instructions = {CHILD_INSTRUCTIONS:?}"
+    );
+    if case == "filtered" {
+        feature_config.push_str("\npreserve_fork_prefix = false");
+    }
     MockResponsesConfig::new(&server.uri())
         .disable_feature(Feature::ComputerUse)
         .with_model("gpt-5.4")
         .with_root_config(&format!(
-            "developer_instructions = {PARENT_INSTRUCTIONS:?}\nmodel_context_window = 100\nmodel_auto_compact_token_limit = 90\ncompact_prompt = {COMPACT_PROMPT:?}"
+            "developer_instructions = {PARENT_INSTRUCTIONS:?}\nmodel_context_window = 100000\nmodel_auto_compact_token_limit = 90000\ncompact_prompt = {COMPACT_PROMPT:?}"
         ))
-        .with_extra_config(&format!(
-            "[features.multi_agent_v2]\nenabled = true\nsubagent_developer_instructions = {CHILD_INSTRUCTIONS:?}"
-        ))
+        .with_extra_config(&feature_config)
         .write(codex_home.path())?;
     write_models_cache(codex_home.path()).await?;
 
@@ -435,19 +444,15 @@ async fn compacted_full_history_fork_preserves_parent_developer_instructions() -
         "the full-history child should inherit the compacted parent summary"
     );
     let child_developer_texts = child_request.message_input_texts("developer");
+    let instructions = child_developer_texts
+        .iter()
+        .map(String::as_str)
+        .filter(|text| matches!(*text, PARENT_INSTRUCTIONS | CHILD_INSTRUCTIONS))
+        .collect::<Vec<_>>();
     assert_eq!(
-        child_developer_texts
-            .iter()
-            .filter(|text| text.as_str() == PARENT_INSTRUCTIONS)
-            .count(),
-        1,
-        "the full-history child should inherit parent developer instructions exactly once"
-    );
-    assert!(
-        child_developer_texts
-            .iter()
-            .all(|text| text != CHILD_INSTRUCTIONS),
-        "the full-history child should ignore the configured child override"
+        instructions,
+        vec![PARENT_INSTRUCTIONS],
+        "{case}: the full-history child should inherit parent instructions exactly once and ignore the configured child override"
     );
 
     Ok(())

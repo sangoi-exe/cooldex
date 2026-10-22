@@ -200,13 +200,16 @@ async fn guardian_revalidates_owning_session_before_allow(
         test.codex = super::guardian_checkpoint_migration::resume(
             &test,
             &test.codex,
-            vec![RolloutItem::Compacted(serde_json::from_value(json!({
-                "message": "old checkpoint",
-                "replacement_history": [{
-                    "type": "compaction", "id": "old", "encrypted_content": "unknown producer"
-                }],
-                "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001"
-            }))?)],
+            // Merge-safety anchor: the legacy checkpoint fixture retains its durable compaction window identity.
+            vec![RolloutItem::Compacted(Box::new(serde_json::from_value(
+                json!({
+                    "message": "old checkpoint",
+                    "replacement_history": [{
+                        "type": "compaction", "id": "old", "encrypted_content": "unknown producer"
+                    }],
+                    "window_id": "019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001"
+                }),
+            )?))],
         )
         .await?;
     }

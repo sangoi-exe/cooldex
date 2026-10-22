@@ -258,9 +258,24 @@ impl Session {
             ));
         }
 
-        let turn_context = self
+        let turn_context = match self
             .new_turn_with_default_settings(sub_id.clone(), Default::default())
-            .await;
+            .await
+        {
+            Ok(turn_context) => turn_context,
+            Err(error) => {
+                self.send_event(
+                    &error.turn_context,
+                    codex_protocol::protocol::EventMsg::Error(error.error.to_error_event(None)),
+                )
+                .await;
+                self.cancel_reserved_turn_start(&sub_id).await;
+                return Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::InvalidSettings,
+                    input,
+                ));
+            }
+        };
         if !has_user_input && turn_context.mode() == ModeKind::Plan {
             self.cancel_reserved_turn_start(&sub_id).await;
             self.maybe_start_turn_for_pending_work().await;
@@ -283,11 +298,6 @@ impl Session {
         let original_input = input.clone();
         let task_input = if has_user_input {
             self.clear_connector_selection().await;
-            for item in &input {
-                if let TurnInput::UserInput { content, .. } = item {
-                    turn_context.session_telemetry.user_prompt(content);
-                }
-            }
             input
         } else {
             self.input_queue

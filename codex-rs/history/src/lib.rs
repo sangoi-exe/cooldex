@@ -216,13 +216,13 @@ impl Borrow<ResponseItem> for ResponseItemEnvelope {
 // canonical contract; RolloutLine decoding stays in codex_rollout's canonical parser.
 #[derive(Debug, Clone)]
 pub enum RolloutItem {
-    SessionMeta(SessionMetaLine),
+    SessionMeta(Box<SessionMetaLine>),
     ResponseItem(ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
     InterAgentCommunicationMetadata {
         trigger_turn: bool,
     },
-    Compacted(CompactedItem),
+    Compacted(Box<CompactedItem>),
     PostCompactRecoveryApplied(PostCompactRecoveryAppliedItem),
     TurnContext(TurnContextItem),
     TokenUsageRecord(TokenUsageRecord),

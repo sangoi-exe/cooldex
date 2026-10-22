@@ -183,7 +183,7 @@ async fn sender_context_follows_its_delivery_through_checkpoint_and_rollback() {
     checkpoint.replacement_history = Some(live.annotated_items().to_vec());
     checkpoint.retained_context = Some(live.retained_context().clone());
     let mut checkpointed = items.clone();
-    checkpointed.push(RolloutItem::Compacted(checkpoint));
+    checkpointed.push(RolloutItem::Compacted(Box::new(checkpoint)));
     for (num_turns, expected) in [(1, &snapshots[1]), (2, &snapshots[0])] {
         let mut rolled_back = live.clone();
         rolled_back.drop_last_n_user_turns(num_turns);
@@ -1555,7 +1555,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
                 ..Default::default()
             },
         )),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -1569,7 +1569,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
             codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
         )),
@@ -1627,7 +1627,7 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
         }
         MissingContextBaseline::CompactedSnapshot => vec![
             RolloutItem::WorldState(WorldStateItem::full(object!({}))),
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
                 retained_context: None,
@@ -1641,7 +1641,7 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
-            }),
+            })),
         ],
     };
     rollout_items.push(RolloutItem::TurnContext(
@@ -1666,7 +1666,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
     let previous_context_item = turn_context.to_turn_context_item();
     let rollout_items = vec![
         RolloutItem::TurnContext(previous_context_item),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -1680,7 +1680,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     session
@@ -1701,7 +1701,7 @@ async fn reconstruct_history_restores_initial_window_from_session_meta() {
     let (session, turn_context) = make_session_and_context().await;
     let thread_id = ThreadId::default();
     let initial_window_id = Uuid::now_v7();
-    let rollout_items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+    let rollout_items = vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
         meta: SessionMeta {
             session_id: thread_id.into(),
             id: thread_id,
@@ -1711,7 +1711,7 @@ async fn reconstruct_history_restores_initial_window_from_session_meta() {
             ..SessionMeta::default()
         },
         git: None,
-    })];
+    }))];
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
@@ -1732,7 +1732,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
     let compacted_previous_window_id = Uuid::now_v7();
     let compacted_window_id = Uuid::now_v7();
     let rollout_items = vec![
-        RolloutItem::SessionMeta(SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -1742,8 +1742,8 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
                 ..SessionMeta::default()
             },
             git: None,
-        }),
-        RolloutItem::Compacted(CompactedItem {
+        })),
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -1757,7 +1757,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     let reconstructed = session
@@ -1785,7 +1785,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
             RolloutItem::WorldState(WorldStateItem::full(object!({
                 "environment": {"status": "old"}
             }))),
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
                 retained_context: None,
@@ -1799,7 +1799,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
-            }),
+            })),
             RolloutItem::WorldState(WorldStateItem::full(object!({
                 "environment": {"status": "starting", "cwd": "/workspace"}
             }))),
@@ -1844,7 +1844,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions(
         git: None,
     };
     let initial_context = turn_context.to_turn_context_item();
-    let mut rollout_items = vec![RolloutItem::SessionMeta(session_meta.clone())];
+    let mut rollout_items = vec![RolloutItem::SessionMeta(Box::new(session_meta.clone()))];
     rollout_items.extend(completed_user_turn_rollout(
         initial_context.clone(),
         vec![RolloutItem::ResponseItem(
@@ -1863,7 +1863,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions(
         let mut wake_items = completed_user_turn_rollout(
             context.clone(),
             vec![
-                RolloutItem::Compacted(CompactedItem {
+                RolloutItem::Compacted(Box::new(CompactedItem {
                     message: String::new(),
                     replacement_history: Some(annotated(vec![object!({
                         "type": "compaction",
@@ -1893,7 +1893,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions(
                             realtime_active: Some(false),
                         }),
                     }),
-                }),
+                })),
                 RolloutItem::WorldState(WorldStateItem::full(object!({
                     "environment": {"window": window_number, "status": "starting"}
                 }))),
@@ -1942,7 +1942,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions(
     let bounded_source_start =
         cutoff.expect("bounded replay should start at the latest compaction");
     let mut bounded_items = scan.finish();
-    bounded_items.insert(0, RolloutItem::SessionMeta(session_meta));
+    bounded_items.insert(0, RolloutItem::SessionMeta(Box::new(session_meta)));
     let full = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
@@ -2026,7 +2026,7 @@ async fn paginated_compaction_does_not_restore_missing_companions_from_older_his
         let rollout_items = vec![
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             RolloutItem::WorldState(WorldStateItem::full(object!({"older": true}))),
-            RolloutItem::Compacted(compacted),
+            RolloutItem::Compacted(Box::new(compacted)),
         ];
 
         let reconstructed = session
@@ -2122,7 +2122,7 @@ async fn reconstruct_attribution_ignores_previous_terminal_after_checkpoint(
             .pop()
             .expect("previous turn completion");
     let mut rollout = vec![
-        RolloutItem::Compacted(object!({
+        RolloutItem::Compacted(Box::new(object!({
             "message": "summary",
             "replacement_history": [user_message("original work")],
             "window_number": 1,
@@ -2131,7 +2131,7 @@ async fn reconstruct_attribution_ignores_previous_terminal_after_checkpoint(
                 "turn_attribution": expected,
                 "previous_turn_settings": settings
             }
-        })),
+        }))),
         RolloutItem::ResponseItem(user_message("continued work").into()),
         RolloutItem::TurnContext(context.clone()),
         late_terminal,
@@ -2183,7 +2183,7 @@ async fn completed_turn_suffix_after_compaction_overrides_resume_metadata(
         realtime_active: newer_context.realtime_active,
     };
     let mut rollout_items = vec![
-        RolloutItem::Compacted(object!({
+        RolloutItem::Compacted(Box::new(object!({
             "message": "summary",
             "replacement_history": [user_message("seed"), assistant_message("summary")],
             "window_number": 1,
@@ -2195,7 +2195,7 @@ async fn completed_turn_suffix_after_compaction_overrides_resume_metadata(
                     "comp_hash": "metadata-hash"
                 }
             }
-        })),
+        }))),
         RolloutItem::WorldState(WorldStateItem::full(object!({}))),
     ];
     // The bounded suffix starts at the compaction, so the turn start and user input are already in
@@ -2262,7 +2262,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
     let thread_id = ThreadId::default();
     let initial_window_id = Uuid::now_v7();
     let rollout_items = vec![
-        RolloutItem::SessionMeta(SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -2272,8 +2272,8 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
                 ..SessionMeta::default()
             },
             git: None,
-        }),
-        RolloutItem::Compacted(CompactedItem {
+        })),
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
             retained_context: None,
@@ -2287,7 +2287,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     let reconstructed = session
@@ -2332,7 +2332,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         RolloutItem::ResponseItem(user_message("before compact").into()),
         RolloutItem::ResponseItem(assistant_message("assistant reply").into()),
         RolloutItem::RetainedContext(answer),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
             retained_context: None,
@@ -2346,7 +2346,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     let reconstructed = session
@@ -2382,7 +2382,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         .expect("turn context should have turn_id");
     let rollout_items = vec![
         RolloutItem::ResponseItem(user_message("before compact").into()),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
             retained_context: None,
@@ -2396,7 +2396,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_attribution: None,
@@ -2493,7 +2493,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             },
         )),
         // Compaction clears baseline until a later TurnContextItem re-establishes it.
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -2507,7 +2507,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
         RolloutItem::TurnContext(previous_context_item),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
@@ -2668,7 +2668,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
                 duration_ms: None,
             },
         )),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -2682,7 +2682,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     session
@@ -2936,7 +2936,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
                 ..Default::default()
             },
         )),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -2950,7 +2950,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
     ];
 
     session
@@ -3123,7 +3123,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
                 ..Default::default()
             },
         )),
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
             retained_context: None,
@@ -3137,7 +3137,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
         // A newer TurnStarted replaces the incomplete compacted turn without a matching
         // completion/abort for the old one.
         RolloutItem::EventMsg(EventMsg::TurnStarted(

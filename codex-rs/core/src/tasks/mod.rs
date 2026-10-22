@@ -25,6 +25,7 @@ use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
 
+use crate::agent::AgentStatus;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
@@ -52,6 +53,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -585,7 +588,7 @@ impl Session {
                 .await
                 .and_then(|context| context.cyber_access_program);
         }
-        let turn_context = self
+        let turn_context = match self
             .new_turn_with_default_settings(
                 sub_id.clone(),
                 NewTurnContextOptions {
@@ -593,7 +596,47 @@ impl Session {
                     cyber_access_program: start_options.cyber_access_program,
                 },
             )
-            .await;
+            .await
+        {
+            Ok(turn_context) => turn_context,
+            Err(error) => {
+                // Merge-safety anchor: rejected recipient policy must preserve drained mail through native recording without starting a task.
+                run_hooks_and_record_inputs(
+                    self,
+                    &error.turn_context,
+                    &error.turn_context.capture_current_model_info(),
+                    &input,
+                    PersistContext::Standard,
+                )
+                .await;
+                let error_event = error.error.to_error_event(None);
+                self.send_event(&error.turn_context, EventMsg::Error(error_event.clone()))
+                    .await;
+                error
+                    .turn_context
+                    .turn_metadata_state
+                    .cancel_git_enrichment_task();
+                self.cancel_reserved_turn_start(&sub_id).await;
+                // Merge-safety anchor: a rejected V2 child never starts a task, so emit its one terminal outcome here through the normal Session owner after mail recording and reservation cleanup.
+                if error.turn_context.multi_agent_version == MultiAgentVersion::V2
+                    && matches!(
+                        &error.turn_context.session_source,
+                        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                            agent_path: Some(_),
+                            ..
+                        })
+                    )
+                {
+                    self.notify_parent_of_terminal_status(
+                        &error.turn_context,
+                        AgentStatus::Errored(error_event.message),
+                        error_event.codex_error_info,
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
         if let Some(trigger) = start_options.turn_trigger {
             turn_context.turn_metadata_state.set_turn_trigger(trigger);
         }

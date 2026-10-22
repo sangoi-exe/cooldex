@@ -89,6 +89,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::AgentUsageHintInstructions;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
@@ -1495,9 +1496,12 @@ async fn cancelled_v2_send_finishes_reload_registration() {
             .unwrap(),
         child_id,
     );
-    assert_eq!(
-        control.runtime.registry.evicted_environments(child_id),
-        None
+    assert!(
+        control
+            .runtime
+            .registry
+            .evicted_environments(child_id)
+            .is_none()
     );
     // Evict and reload again with the single child slot. This also catches a leaked
     // pin or pending residency reservation left behind by the cancelled sender.
@@ -1614,6 +1618,12 @@ async fn check_v2_agent_reload(
         assert!(matches!(route, V2ReloadRoute::Sender));
     }
     let (home, mut config) = test_config().await;
+    if matches!(route, V2ReloadRoute::Sender)
+        && matches!(expectation, V2ReloadExpectation::FullIdentity)
+    {
+        // Parent metadata need not support Daybreak to reconstruct a Standard-only recipient.
+        config.agent_role_daybreak = Some(true);
+    }
     let uses_full_history_usage_hint = matches!(
         expectation,
         V2ReloadExpectation::FullHistoryUsageHint
@@ -1666,6 +1676,7 @@ async fn check_v2_agent_reload(
         &role_path,
         format!(
             r#"model = "role-file-model"
+daybreak = false
 {role_model_limits}
 
 [features]
@@ -1820,6 +1831,7 @@ enabled = false
         .await
         .expect("child thread should exist");
     let initial_child_turn = child_thread.session.new_default_turn().await;
+    assert_eq!(initial_child_turn.config.agent_role_daybreak, Some(false));
     assert_eq!(
         initial_child_turn.config.agent_usage_hint_binding,
         expected_usage_hint_binding
@@ -2498,6 +2510,7 @@ enabled = false
     reload_config.developer_instructions =
         Some("Identity drift developer instructions.".to_string());
     reload_config.service_tier = Some("identity-drift-tier".to_string());
+    reload_config.agent_role_daybreak = Some(true);
     reload_config.model_context_window = Some(128_000);
     reload_config.model_auto_compact_token_limit = Some(96_000);
     reload_config
@@ -3692,6 +3705,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix(
                             },
                         },
                         developer_instructions: Some(None),
+                        agent_role_daybreak: None,
                         agent_role_feature_opt_outs: Some(Vec::new()),
                         agent_role_skill_restrictions: Some(Default::default()),
                         model_context_window: Some(None),
@@ -3960,7 +3974,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
     parent_thread
         .session
         .persist_rollout_items(&[
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(vec![user_message("compacted parent context").into()]),
                 retained_context: None,
@@ -3974,7 +3988,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
                 compaction_response_id: None,
                 latest_token_usage_record: Some(parent_record.clone()),
                 resume_metadata: Some(parent_resume_metadata.clone()),
-            }),
+            })),
             RolloutItem::TokenUsageRecord(parent_record),
             rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
@@ -4105,6 +4119,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
     let mut child_config = harness.config.clone();
+    child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = child_config.features.enable(Feature::MultiAgentV2);
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
@@ -4439,6 +4454,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     );
 
     let mut no_hint_child_config = harness.config.clone();
+    no_hint_child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = no_hint_child_config.features.enable(Feature::MultiAgentV2);
     no_hint_child_config.developer_instructions = Some(String::new());
     no_hint_child_config
@@ -4554,6 +4570,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
     let mut child_config = harness.config.clone();
+    child_config.multi_agent_v2.preserve_fork_prefix = false;
     let _ = child_config.features.enable(Feature::MultiAgentV2);
     child_config.developer_instructions = Some("Child developer instructions.".to_string());
     child_config.multi_agent_v2.subagent_developer_instructions =
@@ -4679,7 +4696,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
     parent_thread
         .session
         .persist_rollout_items(&[
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(
                     replacement_history
@@ -4701,7 +4718,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
-            }),
+            })),
             RolloutItem::RetainedContext(answer_event),
             RolloutItem::ResponseItem(delivery),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
@@ -4941,7 +4958,7 @@ async fn spawn_agent_full_fork_does_not_restore_parent_instructions_after_compac
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             }),
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(
                     replacement_history.into_iter().map(Into::into).collect(),
@@ -4957,7 +4974,7 @@ async fn spawn_agent_full_fork_does_not_restore_parent_instructions_after_compac
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: None,
-            }),
+            })),
             RolloutItem::TurnContext(turn_context.to_turn_context_item()),
             rollout_response_item(spawn_agent_call(&parent_spawn_call_id)),
         ])
@@ -5138,7 +5155,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
             .await;
         let mut rollout_items = vec![
             rollout_response_item(parent_user_message),
-            RolloutItem::Compacted(CompactedItem {
+            RolloutItem::Compacted(Box::new(CompactedItem {
                 message: "legacy compacted summary".to_string(),
                 replacement_history: None,
                 retained_context: None,
@@ -5162,7 +5179,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                         realtime_active: None,
                     }),
                 }),
-            }),
+            })),
         ];
         if let Some(instructions) = parent_developer_instructions {
             rollout_items.push(rollout_response_item(ResponseItem::Message {
@@ -5796,6 +5813,129 @@ async fn spawn_child_completion_notifies_parent_history() {
     assert_eq!(wait_for_subagent_notification(&parent_thread).await, true);
 }
 
+#[test_case::test_case(AgentStatus::Completed(Some("done".to_string())), None, false; "completed_loaded")]
+#[test_case::test_case(AgentStatus::Completed(Some("done".to_string())), None, true; "completed_unloaded")]
+#[test_case::test_case(AgentStatus::Errored("failed".to_string()), None, false; "errored_loaded")]
+#[test_case::test_case(AgentStatus::Errored("failed".to_string()), None, true; "errored_unloaded")]
+#[test_case::test_case(AgentStatus::Errored("safety stop".to_string()), Some(CodexErrorInfo::TooManyDenials), false; "guardian_loaded")]
+#[test_case::test_case(AgentStatus::Errored("safety stop".to_string()), Some(CodexErrorInfo::TooManyDenials), true; "guardian_unloaded")]
+#[tokio::test]
+async fn multi_agent_v2_terminal_outcome_preserves_queue_only_wake_eligibility(
+    status: AgentStatus,
+    error_info: Option<CodexErrorInfo>,
+    unloaded: bool,
+) {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = if unloaded {
+        let parent_thread_id = ThreadId::new();
+        harness
+            .control
+            .runtime
+            .register_session_root(parent_thread_id, None);
+        (parent_thread_id, None)
+    } else {
+        let (parent_thread_id, parent_thread) = harness.start_thread().await;
+        // Keep loaded mail pending so the test observes its envelope, not a sampled history item.
+        parent_thread.session.mark_interrupted();
+        (parent_thread_id, Some(parent_thread))
+    };
+    let mailbox_updates = harness.control.watch_mailbox(parent_thread_id);
+    let child_path = AgentPath::root().join("worker").expect("child path");
+    let expected_message = match (&status, error_info.as_ref()) {
+        (AgentStatus::Errored(message), Some(CodexErrorInfo::TooManyDenials)) => {
+            crate::session_prefix::format_guardian_interruption_message(
+                AgentPath::root(),
+                child_path.clone(),
+                message,
+            )
+        }
+        _ => crate::session_prefix::format_inter_agent_completion_message(
+            AgentPath::root(),
+            child_path.clone(),
+            &status,
+        )
+        .expect("terminal result message"),
+    };
+    let terminal_error_wake = matches!(status, AgentStatus::Errored(_));
+    harness
+        .control
+        .notify_parent_of_terminal_turn(
+            crate::agent::api::AgentTurnOutcome {
+                thread_id: ThreadId::new(),
+                turn_id: "terminal-child-turn".to_string(),
+                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: Some(child_path.clone()),
+                    agent_nickname: None,
+                    agent_role: None,
+                }),
+                parent_turn_id: None,
+                initiating_agent_path: None,
+                status,
+                error_info,
+            },
+            &codex_rollout_trace::ThreadTraceContext::disabled(),
+        )
+        .await;
+
+    let pending = if let Some(parent_thread) = parent_thread {
+        timeout(Duration::from_secs(5), async {
+            while !parent_thread
+                .session
+                .input_queue
+                .has_pending_mailbox_items()
+                .await
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loaded parent should receive terminal result");
+        assert_eq!(
+            parent_thread
+                .session
+                .input_queue
+                .has_terminal_error_mailbox_items()
+                .await,
+            terminal_error_wake,
+        );
+        assert!(parent_thread.session.active_turn.lock().await.is_none());
+        parent_thread
+            .session
+            .input_queue
+            .drain_mailbox_input_items()
+            .await
+            .0
+            .into_iter()
+            .map(|input| {
+                let crate::session::TurnInput::InterAgentCommunication(mail) = input else {
+                    panic!("expected terminal-result mail");
+                };
+                mail
+            })
+            .collect::<Vec<_>>()
+    } else {
+        assert!(*mailbox_updates.borrow());
+        assert!(harness.manager.get_thread(parent_thread_id).await.is_err());
+        let pending = harness.control.take_mailbox(parent_thread_id);
+        assert!(!*mailbox_updates.borrow());
+        assert!(harness.control.take_mailbox(parent_thread_id).is_empty());
+        pending
+    };
+    assert_eq!(
+        pending.len(),
+        1,
+        "one canonical result per terminal outcome"
+    );
+    let mail = &pending[0];
+    assert_eq!(mail.author, child_path);
+    assert_eq!(mail.recipient, AgentPath::root());
+    assert_eq!(mail.content, expected_message);
+    assert!(!mail.trigger_turn);
+    assert_eq!(mail.terminal_error_wake, terminal_error_wake);
+}
+
 #[tokio::test]
 async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
     let harness = AgentControlHarness::new().await;
@@ -6377,7 +6517,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let parent_turn = parent_thread
         .session
         .new_turn_with_default_settings("parent-deselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     assert_eq!(
         parent_turn.initial_environments.selected_capability_roots(),
         Vec::new()
@@ -6430,7 +6571,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let child_turn = resumed_thread
         .session
         .new_turn_with_default_settings("child-reselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("valid work context");
     assert_eq!(
         child_turn.initial_environments.selected_capability_roots(),
         roots

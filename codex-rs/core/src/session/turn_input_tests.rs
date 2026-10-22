@@ -289,7 +289,8 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
             turn_context.sub_id.clone(),
             NewTurnContextOptions::default(),
         )
-        .await;
+        .await
+        .expect("valid work context");
     session
         .spawn_task(
             Arc::clone(&replacement),
@@ -1095,7 +1096,8 @@ async fn start_only_rejects_pending_trigger_turn_without_injecting() {
                 Vec::new(),
                 "pending trigger".to_string(),
                 /*trigger_turn*/ true,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -1117,30 +1119,54 @@ async fn start_only_rejects_pending_trigger_turn_without_injecting() {
     assert_eq!(session.collaboration_mode().await.mode, ModeKind::Plan);
 }
 
-/// Queue-only agent mail respects stop, Plan mode, and inherited child configuration.
-#[test_case(SessionSource::Exec, true, ModeKind::Default; "interrupted_root")]
-#[test_case(SessionSource::Exec, false, ModeKind::Plan; "plan_root")]
-#[test_case(SessionSource::SubAgent(SubAgentSource::Review), false, ModeKind::Default; "inherited_child_flag")]
+/// Terminal errors bypass only the ordinary message-wake flag, not admission guards.
+#[test_case(SessionSource::Exec, true, ModeKind::Default, true, false, false, false; "interrupted_root")]
+#[test_case(SessionSource::Exec, false, ModeKind::Plan, true, false, false, false; "plan_root")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Review), false, ModeKind::Default, true, false, false, false; "inherited_child_flag")]
+#[test_case(SessionSource::Exec, false, ModeKind::Default, false, true, false, true; "terminal_error_idle_root")]
+#[test_case(SessionSource::Exec, false, ModeKind::Default, false, false, false, false; "ordinary_completion_wake_disabled")]
+#[test_case(SessionSource::Exec, true, ModeKind::Default, false, true, false, false; "terminal_error_interrupted_root")]
+#[test_case(SessionSource::Exec, false, ModeKind::Plan, false, true, false, false; "terminal_error_plan_root")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Review), false, ModeKind::Default, false, true, false, false; "terminal_error_child")]
+#[test_case(SessionSource::Exec, false, ModeKind::Default, false, true, true, false; "terminal_error_active_parent")]
 #[tokio::test]
 async fn agent_message_wake_reservation_preserves_existing_boundaries(
     source: SessionSource,
     interrupted: bool,
     mode: ModeKind,
+    wake_on_messages: bool,
+    terminal_error_wake: bool,
+    active: bool,
+    expected_wake: bool,
 ) {
     let (mut session, turn_context) = make_session_and_context().await;
     session
         .features
-        .enable(Feature::WakeOnAgentMessages)
-        .expect("enable agent-message wakes");
+        .set_enabled(Feature::WakeOnAgentMessages, wake_on_messages)
+        .expect("set agent-message wakes");
+    let attribution = codex_history::TurnAttribution {
+        turn_id: "previous-turn".to_string(),
+        turn_trigger: Some("previous-trigger".to_string()),
+        parent_turn_id: None,
+        initiating_agent_path: None,
+        root_turn_id: Some("root-turn".to_string()),
+    };
     {
         let mut state = session.state.lock().await;
         state.session_configuration.session_source = source;
+        state.turn_attribution = Some(attribution.clone());
         Arc::make_mut(&mut state.session_configuration.step_settings)
             .collaboration_mode
             .mode = mode;
     }
     if interrupted {
         session.mark_interrupted();
+    }
+    if active {
+        *session.active_turn.lock().await = Some(ActiveTurn {
+            reserved_turn_id: Some("existing-turn".to_string()),
+            ..Default::default()
+        });
     }
     let communication = InterAgentCommunication::new(
         AgentPath::try_from("/root/worker").expect("valid worker path"),
@@ -1151,20 +1177,41 @@ async fn agent_message_wake_reservation_preserves_existing_boundaries(
     );
     session
         .input_queue
-        .enqueue_mailbox_communication(communication.clone(), Default::default())
+        .enqueue_mailbox_communication(
+            crate::PendingAgentMessage::new(communication.clone(), None, terminal_error_wake),
+            Default::default(),
+        )
         .await;
 
-    assert!(
-        session
-            .reserve_pending_work_turn(&turn_context.sub_id)
-            .await
-            .is_none()
-    );
-    assert!(session.active_turn.lock().await.is_none());
+    let reservation = session
+        .reserve_pending_work_turn(&turn_context.sub_id)
+        .await;
+    assert_eq!(reservation.is_some(), expected_wake);
+    if let Some((_, options)) = reservation {
+        assert_eq!(options.turn_trigger, attribution.turn_trigger);
+        assert_eq!(options.root_turn_id, attribution.root_turn_id);
+        assert_eq!(options.parent_turn_id, attribution.parent_turn_id);
+        assert_eq!(
+            options.initiating_agent_path,
+            attribution.initiating_agent_path
+        );
+    }
+    let active_turn = session.active_turn.lock().await;
+    if active {
+        assert_eq!(
+            active_turn.as_ref().unwrap().reserved_turn_id.as_deref(),
+            Some("existing-turn")
+        );
+    } else {
+        assert_eq!(active_turn.is_some(), expected_wake);
+    }
+    drop(active_turn);
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
     assert_eq!(
         session.input_queue.drain_mailbox_input_items().await.0,
-        vec![TurnInput::InterAgentCommunication(communication)]
+        vec![TurnInput::InterAgentCommunication(communication.into())]
     );
+    assert!(!session.input_queue.has_terminal_error_mailbox_items().await);
 }
 
 #[tokio::test]
@@ -1293,7 +1340,8 @@ async fn rejects_non_regular_turns() {
             .set_root_turn_id("incoming-root".to_string());
         let turn_context = session
             .new_turn_with_default_settings("turn".to_string(), Default::default())
-            .await;
+            .await
+            .expect("valid work context");
         turn_context
             .turn_metadata_state
             .set_root_turn_id("active-root".to_string());
@@ -1442,4 +1490,34 @@ async fn steer_preserves_request_origin(
         }]
     );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn incompatible_recipient_policy_cancels_idle_admission_reservation() {
+    let (session, _turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            codex_login::CodexAuth::from_api_key("test-api-key"),
+            Vec::new(),
+            |config| {
+                config.agent_role_daybreak = Some(true);
+                config.model_provider_id = "custom".to_string();
+            },
+        )
+        .await;
+    let error = handle(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reject before sampling".to_string(),
+            text_elements: Vec::new(),
+        }])
+        .into(),
+        TurnInputMode::StartIfIdle,
+        "rejected-role-policy".to_string(),
+    )
+    .await
+    .expect_err("unsupported policy must reject admission");
+    assert!(error.to_string().contains("Daybreak"));
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.reserve_turn_start("next-admission").await.is_some());
+    session.cancel_reserved_turn_start("next-admission").await;
 }

@@ -4887,6 +4887,7 @@ text("phase 1");
 yield_control();
 {phase_2_wait}
 text((await tools.exec_command({{cmd: "printf 'phase 2'"}})).output);
+yield_control();
 {phase_3_wait}
 text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
 "#
@@ -4935,7 +4936,7 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
                 "wait",
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": cell_id.clone(),
-                    "yield_time_ms": 1_000,
+                    "yield_time_ms": 10_000,
                 }))?,
             ),
             ev_completed("resp-3"),
@@ -4982,7 +4983,7 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
                 "wait",
                 &serde_json::to_string(&serde_json::json!({
                     "cell_id": cell_id.clone(),
-                    "yield_time_ms": 1_000,
+                    "yield_time_ms": 10_000,
                 }))?,
             ),
             ev_completed("resp-5"),

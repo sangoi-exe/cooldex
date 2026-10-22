@@ -2,11 +2,13 @@
 //! Checkpoint recovery allows one fresh attempt under the original review deadline.
 //! Both attempts share captured context and use separate recovery flags.
 //! Checkpoints are captured before final authorization validation and published without yielding.
+//! Recorded reviewer items and interruptions are forwarded to the parent's raw-event subscription.
 
 use std::sync::atomic::AtomicBool;
 
 use super::*;
 use crate::guardian::input_budget::CheckpointRecovery;
+use codex_features::Feature;
 use codex_guardian_reviewer::ReviewerPool;
 use codex_guardian_reviewer::ReviewerRequest;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -141,6 +143,7 @@ impl PreparedGuardianContext {
             .model_client
             .responses_websocket_enabled();
         let options = crate::StartThreadOptions {
+            prompt_cache_key: self.parent.services.model_client.prompt_cache_key_policy(),
             history_mode: Some(codex_protocol::protocol::ThreadHistoryMode::Paginated),
             internal_parent: Some(crate::thread_manager::InternalSessionParent {
                 thread_id: self.parent.thread_id(),
@@ -184,6 +187,11 @@ impl PreparedGuardianContext {
         cancellation: CancellationToken,
     ) -> GuardianReviewSession {
         let session = Arc::clone(&thread.session);
+        if self.parent.enabled(Feature::GuardianRecordedItems) {
+            session
+                .parent_observer_event_tx
+                .get_or_init(|| self.parent.get_tx_event());
+        }
         let io = SessionIo {
             tx_sub: thread.io.tx_sub.clone(),
             rx_event: thread.io.rx_event.clone(),

@@ -1654,6 +1654,12 @@ pub enum EventMsg {
     RawResponseItem(RawResponseItemEvent),
     RawResponseCompleted(RawResponseCompletedEvent),
 
+    /// In-process delivery from a private reviewer through its parent's subscription.
+    #[serde(skip)]
+    #[schemars(skip)]
+    #[ts(skip)]
+    PrivateSessionEvent(PrivateSessionEvent),
+
     ItemStarted(ItemStartedEvent),
     ItemCompleted(ItemCompletedEvent),
     HookStarted(HookStartedEvent),
@@ -1704,6 +1710,8 @@ pub enum HookEventName {
     SubagentStop,
     Stop,
     Interrupt,
+    PreModelRequest,
+    PostModelRequest,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -2039,6 +2047,20 @@ impl CodexErrorInfo {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
 pub struct RawResponseItemEvent {
     pub item: ResponseItem,
+}
+
+/// Observer events that a private session forwards without modifying its parent's history.
+#[derive(Debug, Clone)]
+pub struct PrivateSessionEvent {
+    pub thread_id: ThreadId,
+    pub event: PrivateSessionEventPayload,
+}
+
+/// Recorded state and cancellation needed by observers awaiting response acceptance.
+#[derive(Debug, Clone)]
+pub enum PrivateSessionEventPayload {
+    RecordedItem(RawResponseItemEvent),
+    TurnAborted(TurnAbortedEvent),
 }
 
 /// Exact usage and metadata reported by one upstream Responses API completion.
@@ -2412,6 +2434,11 @@ pub struct ThreadSettingsSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_role_feature_opt_outs: Option<Vec<AgentRoleFeatureOptOut>>,
+    // Merge-safety anchor: preserve explicit recipient policy across cold child restoration without rereading roles.
+    /// Explicit recipient Daybreak policy; missing historical values preserve incoming selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_role_daybreak: Option<bool>,
     /// Required V2 birth identity. An absent outer value denotes an incomplete historical snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -4795,6 +4822,7 @@ mod tests {
             developer_instructions: Some(Some("captured developer instructions".to_string())),
             disabled_plugin_ids: Vec::new(),
             shell_tool_enabled: Some(false),
+            agent_role_daybreak: None,
             agent_role_feature_opt_outs: Some(Vec::new()),
             agent_role_skill_restrictions: Some(Default::default()),
             model_context_window: Some(None),
@@ -4802,6 +4830,21 @@ mod tests {
             model_auto_compact_token_limit_scope: Some(Default::default()),
         };
 
+        for policy in [None, Some(false), Some(true)] {
+            let configured = ThreadSettingsSnapshot {
+                agent_role_daybreak: policy,
+                ..snapshot.clone()
+            };
+            let value = serde_json::to_value(&configured)?;
+            assert_eq!(
+                value.get("agent_role_daybreak"),
+                policy.map(|enabled| json!(enabled)).as_ref()
+            );
+            assert_eq!(
+                serde_json::from_value::<ThreadSettingsSnapshot>(value)?,
+                configured
+            );
+        }
         let mut legacy_value = serde_json::to_value(&snapshot)?;
         let round_trip_snapshot: ThreadSettingsSnapshot =
             serde_json::from_value(legacy_value.clone())?;
@@ -4851,6 +4894,7 @@ mod tests {
 
         let legacy_snapshot: ThreadSettingsSnapshot = serde_json::from_value(legacy_value)?;
         assert_eq!(legacy_snapshot.shell_tool_enabled, None);
+        assert_eq!(legacy_snapshot.agent_role_daybreak, None);
         Ok(())
     }
 
