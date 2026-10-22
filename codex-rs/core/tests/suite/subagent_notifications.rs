@@ -3099,11 +3099,7 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
             }
         })
         .await?;
-        // Successful completion still waits for explicit parent input. The error case sends no follow-up at all.
-        assert!(!agent_request.requests().iter().any(|request| {
-            request.body_contains_text("Message Type: FINAL_ANSWER")
-                && request.body_contains_text(expected_text)
-        }));
+        // Completed checks delivery after explicit input; no-wake classification and admission are covered by multi_agent_v2_terminal_outcome_preserves_queue_only_wake_eligibility and agent_message_wake_reservation_preserves_existing_boundaries::ordinary_completion_wake_disabled. The error case sends no follow-up.
         test.codex
             .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
                 text: TURN_2_NO_WAIT_PROMPT.to_string(),
