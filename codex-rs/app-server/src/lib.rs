@@ -576,7 +576,8 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
-    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
+    // Merge-safety anchor: the native snapshot loader owns its path while lane lock and recovery selection retain the runtime options.
+    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot.clone() {
         Some(path) => {
             let provider = tokio::task::spawn_blocking(move || {
                 codex_skills_extension::FrozenCloudSkillProvider::from_file(&path)
