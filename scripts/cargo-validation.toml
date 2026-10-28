@@ -25,7 +25,7 @@ cache_root = 'F:\.cache'
 workflow_namespace = "cw"
 minimum_free_disk_gib = 120
 target = "x86_64-pc-windows-msvc"
-rust_toolchain = "1.99.1-x86_64-pc-windows-msvc"
+rust_toolchain = "1.95.0-x86_64-pc-windows-msvc"
 nextest_version = "0.9.103"
 nextest_url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.103/cargo-nextest-0.9.103-x86_64-pc-windows-msvc.zip"
 nextest_sha256 = "f4764e4f58c297b917364922b998c70b521a2fda271b0a7d141654a9800817d6"
@@ -262,12 +262,15 @@ argv = ["python3", "-m", "py_compile", "scripts/cargo-validate.py"]
 
 [commands.validate-tests]
 argv = ["python3", "scripts/test-cargo-validate.py"]
+test_suite = "unittest"
 
 [commands.codex-v8-tests]
 argv = ["python3", "scripts/codex_package/test_v8.py"]
+test_suite = "unittest"
 
 [commands.validate-windows-tests]
 argv = ["python3", "scripts/test-cargo-validate-windows.py"]
+test_suite = "unittest"
 
 # Merge-safety anchor: full native aggregation and selected-package execution share
 # the pinned V8 sandbox feature, platform exclusions, and test filter through this
@@ -331,6 +334,7 @@ classification = "macos-not-applicable"
 
 [commands.guard-tests]
 argv = ["just", "test-cargo-guard"]
+test_suite = "shell"
 
 [commands.validate-plan-self]
 argv = ["./scripts/cargo-guard.sh", "plan", "--file", "scripts/cargo-validate.py", "--mode", "standard", "--no-receipt"]
@@ -609,6 +613,7 @@ patterns = [
   "codex-rs/ext/goal/**",
   "codex-rs/ext/guardian-reviewer/**",
   "codex-rs/ext/guardian-v2/**",
+  "codex-rs/ext/guardian-v3/**",
   "codex-rs/ext/history-notes/**",
   "codex-rs/ext/image-generation/**",
   "codex-rs/ext/items/**",
@@ -632,6 +637,7 @@ patterns = [
   "codex-rs/memories/write/**",
   "codex-rs/mermaid/**",
   "codex-rs/message-board/**",
+  "codex-rs/message-history/**",
   "codex-rs/model-provider-info/**",
   "codex-rs/models-manager/**",
   "codex-rs/mxc-sandbox/**",
@@ -662,13 +668,16 @@ patterns = [
   "codex-rs/utils/critical-path/**",
   "codex-rs/utils/fuzzy-match/**",
   "codex-rs/utils/git-discovery/**",
+  "codex-rs/utils/head-tail-buffer/**",
   "codex-rs/utils/home-dir/**",
   "codex-rs/utils/image/**",
   "codex-rs/utils/output-truncation/**",
   "codex-rs/utils/path-uri/**",
   "codex-rs/utils/plugins/**",
+  "codex-rs/utils/redacted-string/**",
   "codex-rs/utils/sandbox-summary/**",
   "codex-rs/utils/string/**",
+  "codex-rs/v8-poc/**",
   "codex-rs/websocket-client/**",
   "codex-rs/websocket-auth/**",
   "codex-rs/windows-sandbox-rs/**",
@@ -685,7 +694,9 @@ surfaces = ["cli"]
 patterns = [
   "codex-rs/diagnostics/Cargo.toml",
   "codex-rs/diagnostics/**/*.rs",
+  "codex-rs/exec-server-cli/**",
   "codex-rs/file-search/**",
+  "codex-rs/plugin-host/**",
   "codex-rs/responses-api-proxy/Cargo.toml",
   "codex-rs/responses-api-proxy/**/*.rs",
   "codex-rs/uds/**",
@@ -698,7 +709,9 @@ surfaces = ["cli"]
 flags = ["runtime"]
 wsl_runtime_packages = [
   "codex-diagnostics",
+  "codex-exec-server-cli",
   "codex-file-search",
+  "codex-plugin-host",
   "codex-responses-api-proxy",
   "codex-uds",
   "codex-utils-path",
@@ -743,6 +756,8 @@ commands = ["bazel-lock-check"]
 patterns = [
   ".bazelrc",
   ".bazelversion",
+  ".github/scripts/rusty_v8_bazel.py",
+  ".github/scripts/test_rusty_v8_bazel.py",
   "BUILD.bazel",
   "bazel/extensions/codex_release_archive.bzl",
   "bazel/rules/BUILD.bazel",
@@ -759,24 +774,50 @@ patterns = [
   "defs.bzl",
   "patches/BUILD.bazel",
   "patches/mxc-sdk_utf8_resources.patch",
+  "patches/rules_cc_windows_native_llvm.patch",
   "patches/rules_rs_rust_debug_modes.patch",
   "patches/rules_rs_workspace_package_version.patch",
   "patches/rules_rust_compiler_thp.patch",
   "patches/rules_rust_process_wrapper_param_file.patch",
   "patches/rules_rust_release_build_script_profile.patch",
+  "patches/rusty_v8_prebuilt_out_dir.patch",
+  "patches/tonic-zstd-level1.patch",
   "patches/v8_array_sort_elements_kind.patch",
   "patches/v8_bazel_rules.patch",
   "patches/v8_module_deps.patch",
+  "patches/v8_source_portability.patch",
   "sdk/python/BUILD.bazel",
   "third_party/v8/BUILD.bazel",
+  "third_party/v8/abseil.BUILD.bazel",
+  "third_party/v8/abseil_repository.bzl",
+  "third_party/v8/artifact_profile.bzl",
+  "third_party/v8/dependencies.bzl",
+  "third_party/v8/dependency_config.bzl",
+  "third_party/v8/dragonbox.BUILD.bazel",
+  "third_party/v8/engine.BUILD.bazel",
+  "third_party/v8/engine_repository.bzl",
+  "third_party/v8/engine_rules.bzl",
+  "third_party/v8/fast_float.BUILD.bazel",
+  "third_party/v8/fp16.BUILD.bazel",
   "third_party/v8/gnu_libcxx_shared_exception_symbols.txt",
+  "third_party/v8/highway.BUILD.bazel",
   "third_party/v8/icu.BUILD.bazel",
   "third_party/v8/libcxx.BUILD.bazel",
+  "third_party/v8/libcxx_rules.bzl",
+  "third_party/v8/native_windows.bzl",
+  "third_party/v8/push_registers_gnullvm.S",
   "third_party/v8/rusty_v8_152_2_0.sha256",
   "third_party/v8/rusty_v8_152_2_0_release_manifests.sha256",
+  "third_party/v8/simdutf.BUILD.bazel",
+  "third_party/v8/v8_crate.BUILD.bazel",
+  "third_party/v8/v8_defs.patch",
 ]
 flags = ["bazel"]
 commands = ["bazel-lock-check"]
+
+# No consuming target is established for this probe; classify it without selecting a command.
+[[path_rules]]
+patterns = ["third_party/v8/native_windows_link_probe.c"]
 
 [[path_rules]]
 patterns = [".cargo/config.toml", "codex-rs/.cargo/config.toml"]
@@ -799,17 +840,23 @@ commands = ["just-summary", "validate-plan-self"]
 [[path_rules]]
 patterns = ["AGENTS.md", "scripts/AGENTS.md"]
 
-# CI/release orchestration is classification-only here, not local execution or publication proof.
+# CI/repository check and release inputs are classification-only, not local execution or publication proof.
 [[path_rules]]
 patterns = [
+  ".codespellignore",
   ".github/actions/build-bazel-package-binaries/action.yml",
   ".github/actions/build-bazel-release/action.yml",
   ".github/actions/build-cargo-package-binaries/action.yml",
   ".github/actions/build-codex-packages/action.yml",
+  ".github/actions/linux-code-sign/action.yml",
   ".github/actions/prepare-bazel-ci/action.yml",
+  ".github/actions/publish-dotslash/action.yml",
   ".github/actions/run-argument-comment-lint/action.yml",
   ".github/actions/setup-bazel-ci/action.yml",
   ".github/actions/setup-ci/action.yml",
+  ".github/actions/setup-python-release-tools/action.yml",
+  ".github/actions/setup-python-release-tools/pyproject.toml",
+  ".github/actions/setup-python-release-tools/uv.lock",
   ".github/actions/setup-rusty-v8/action.yml",
   ".github/actions/windows-code-sign/action.yml",
   ".github/scripts/build-codex-package-archive.sh",
@@ -830,11 +877,18 @@ patterns = [
   ".github/scripts/test_select_windows_bazel_targets.py",
   ".github/scripts/test_v8_canary_changes.py",
   ".github/scripts/v8_canary_changes.py",
+  ".github/scripts/verify_cargo_workspace_manifests.py",
   ".github/scripts/windows_bazel_test_durations.tsv",
   ".github/scripts/voice_windows_tools.py",
   ".github/workflows/bazel.yml",
+  ".github/workflows/blob-size-policy.yml",
   ".github/workflows/cargo-deny.yml",
   ".github/workflows/issue-labeler.yml",
+  ".github/workflows/python-runtime-build.yml",
+  ".github/workflows/python-runtime-release.yml",
+  ".github/workflows/python-sdk-build.yml",
+  ".github/workflows/python-sdk-cli-release.yml",
+  ".github/workflows/python-sdk-release.yml",
   ".github/workflows/r2-release.yml",
   ".github/workflows/repo-checks.yml",
   ".github/workflows/rust-ci-full.yml",
@@ -846,6 +900,7 @@ patterns = [
   ".github/workflows/rust-release-provisioned-macos.yml",
   ".github/workflows/rust-release-windows.yml",
   ".github/workflows/rusty-v8-release.yml",
+  ".github/workflows/sdk.yml",
   ".github/workflows/v8-canary.yml",
 ]
 
@@ -874,6 +929,7 @@ patterns = [
   "tools/argument-comment-lint/Cargo.lock",
   "tools/argument-comment-lint/Cargo.toml",
   "tools/argument-comment-lint/README.md",
+  "tools/argument-comment-lint/argument-comment-lint",
   "tools/argument-comment-lint/rust-toolchain",
   "tools/argument-comment-lint/ui/uncommented_literal.stderr",
   "tools/argument-comment-lint/wrapper_common.py",
@@ -888,14 +944,20 @@ patterns = [
   "codex-rs/docs/protocol_v1.md",
   "codex-rs/responses-api-proxy/README.md",
   "scripts/codex_package/README.md",
+  "scripts/mcp_conformance/README.md",
   "sdk/python/docs/api-reference.md",
   "third_party/v8/README.md",
 ]
 
-# Package/installer inputs are classification-only, not package or installer test proof.
+# Workspace, package, and installer inputs are classification-only, not package or installer test proof.
 [[path_rules]]
 patterns = [
+  ".nvmrc",
+  "codex-cli/bin/codex.js",
+  "codex-cli/tests/exit-status.test.mjs",
   "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js",
+  "package.json",
+  "pnpm-lock.yaml",
   "scripts/codex_package/cli.py",
   "scripts/codex_package/dotslash.py",
   "scripts/codex_package/layout.py",
@@ -920,9 +982,18 @@ commands = ["bazel-lock-check"]
 patterns = ["sdk/python/scripts/update_sdk_artifacts.py", "sdk/python/src/openai_codex/generated/notification_registry.py", "sdk/python/src/openai_codex/generated/v2_all.py"]
 generators = ["write-app-server-schema"]
 
-# SDK test inputs are classified without claiming that the Rust planner runs Python SDK tests.
+# SDK dependency and test inputs are classified without claiming that the Rust planner runs Python SDK tests.
 [[path_rules]]
-patterns = ["sdk/python/tests/test_app_server_turn_controls.py", "sdk/python/tests/test_artifact_workflow_and_binaries.py", "sdk/python/tests/test_contract_generation.py"]
+patterns = [
+  "sdk/python/pyproject.toml",
+  "sdk/python/tests/requirements-uv.txt",
+  "sdk/python/tests/test_app_server_inputs.py",
+  "sdk/python/tests/test_app_server_turn_controls.py",
+  "sdk/python/tests/test_artifact_workflow_and_binaries.py",
+  "sdk/python/tests/test_client_rpc_methods.py",
+  "sdk/python/tests/test_contract_generation.py",
+  "sdk/python/uv.lock",
+]
 
 [[path_rules]]
 patterns = ["scripts/format.py"]

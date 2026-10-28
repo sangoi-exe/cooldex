@@ -500,7 +500,11 @@ async fn mcp_attribution_in_constructed_request(thread: &CodexThread) -> McpAttr
             .session
             .clone_history()
             .await
-            .for_prompt(&step_context.settings.model_info.input_modalities),
+            .for_prompt(
+                &step_context.settings.model_info.input_modalities,
+                thread.session.services.image_store.as_ref(),
+            )
+            .await,
         &step_context,
         thread.session.get_prompt_base_instructions().await,
         thread
@@ -3893,8 +3897,8 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
         Vec::new()
     };
     assert_eq!(
-        child_thread.session.dynamic_tools().await,
-        expected_dynamic_tools
+        child_thread.session.dynamic_tools().await.as_ref(),
+        expected_dynamic_tools.as_slice()
     );
     assert!(
         !history_contains_text(
@@ -3933,6 +3937,212 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
         .expect("parent shutdown should submit");
 }
 
+#[test_case::test_case(ThreadHistoryMode::Legacy, false; "legacy_creation_catalog")]
+#[test_case::test_case(ThreadHistoryMode::Legacy, true; "legacy_clear_with_foreign_catalog")]
+#[test_case::test_case(ThreadHistoryMode::Paginated, false; "paginated_creation_catalog")]
+#[test_case::test_case(ThreadHistoryMode::Paginated, true; "paginated_clear_with_foreign_catalog")]
+#[tokio::test]
+async fn full_history_fork_captures_parent_catalog_before_removing_parent_metadata(
+    history_mode: ThreadHistoryMode,
+    clear_parent_catalog: bool,
+) {
+    use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+    use codex_protocol::dynamic_tools::DynamicToolSpec;
+
+    let mut harness = AgentControlHarness::new().await;
+    harness
+        .config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .unwrap();
+    harness
+        .config
+        .features
+        .disable(Feature::MultiAgentV2DynamicTools)
+        .unwrap();
+    harness.config.multi_agent_v2.root_agent_usage_hint_text = Some("captured parent hint".into());
+    let parent_tools = vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "parent_tool".into(),
+        description: "Parent catalog entry".into(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        defer_loading: false,
+    })];
+    let parent = harness
+        .manager
+        .start_thread(StartThreadOptions {
+            history_mode: Some(history_mode),
+            environments: Some(Vec::new()),
+            dynamic_tools: parent_tools.clone(),
+            ..StartThreadOptions::new(harness.config.clone())
+        })
+        .await
+        .expect("start parent");
+    let parent_thread_id = parent.thread_id;
+    let parent_thread = parent.thread;
+    assert_eq!(
+        parent_thread
+            .session
+            .set_multi_agent_version_if_unset(MultiAgentVersion::V2),
+        MultiAgentVersion::V2
+    );
+    parent_thread
+        .inject_response_items(vec![user_message("inherited model context")])
+        .await
+        .expect("inject parent context");
+
+    let foreign_id = ThreadId::new();
+    let mut records = Vec::new();
+    if clear_parent_catalog {
+        records.push(RolloutItem::Compacted(Box::new(CompactedItem {
+            message: String::new(),
+            replacement_history: Some(vec![user_message("compacted model context").into()]),
+            guardian_history: None,
+            retained_context: None,
+            mcp_resource_origins: None,
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+            post_compact_recovery: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
+            resume_metadata: Some(codex_history::CompactionResumeMetadata {
+                dynamic_tools: Some(Box::new(codex_history::DynamicToolsSnapshot {
+                    thread_id: foreign_id,
+                    tools: parent_tools.clone(),
+                })),
+                multi_agent_version: Some(MultiAgentVersion::V2),
+                last_started_turn_id: Some("parent-last-turn".into()),
+                turn_attribution: None,
+                previous_turn_settings: None,
+            }),
+        })));
+        records.push(RolloutItem::DynamicToolsUpdated {
+            thread_id: parent_thread_id,
+            tools: Vec::new(),
+        });
+        records.push(RolloutItem::DynamicToolsUpdated {
+            thread_id: foreign_id,
+            tools: parent_tools.clone(),
+        });
+    }
+    let spawn_call_id = "catalog-fork";
+    records.push(rollout_response_item(spawn_agent_call(spawn_call_id)));
+    assert!(parent_thread.session.persist_rollout_items(&records).await);
+    parent_thread
+        .flush_rollout()
+        .await
+        .expect("flush parent history");
+    // A persisted clear, not this still-live catalog, is authoritative for a full fork.
+    assert_eq!(
+        parent_thread.session.dynamic_tools().await.as_ref(),
+        parent_tools.as_slice()
+    );
+
+    let child_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                fork_parent_spawn_call_id: Some(spawn_call_id.into()),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await;
+    let child = harness
+        .manager
+        .get_thread(child_id)
+        .await
+        .expect("child thread");
+    let expected_tools = if clear_parent_catalog {
+        Vec::new()
+    } else {
+        parent_tools.clone()
+    };
+    assert_eq!(
+        child.session.dynamic_tools().await.as_ref(),
+        expected_tools.as_slice()
+    );
+    let binding = child
+        .session
+        .get_config()
+        .await
+        .agent_usage_hint_binding
+        .clone();
+    assert!(
+        matches!(&binding, AgentUsageHintBinding::Inherited { instructions: Some(instructions) } if instructions.text == "captured parent hint")
+    );
+    child.flush_rollout().await.expect("flush child history");
+    let (items, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(
+        &child.rollout_path().expect("child rollout"),
+    )
+    .await
+    .expect("read child rollout");
+    let metas = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => Some(&meta.meta),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metas.len(),
+        1,
+        "copied parent metadata must not enter the child"
+    );
+    assert_eq!(metas[0].id, child_id);
+    assert_eq!(metas[0].agent_usage_hint_binding, Some(binding));
+    assert_eq!(
+        metas[0].dynamic_tools.clone().unwrap_or_default(),
+        expected_tools
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::DynamicToolsUpdated { .. }))
+    );
+    if clear_parent_catalog {
+        let resume = items
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::Compacted(compacted) => compacted.resume_metadata.as_ref(),
+                _ => None,
+            })
+            .expect("inherited checkpoint");
+        assert_eq!(resume.dynamic_tools, None);
+        assert_eq!(
+            resume.last_started_turn_id.as_deref(),
+            Some("parent-last-turn")
+        );
+        assert!(history_contains_text(
+            child.session.clone_history().await.raw_items(),
+            "compacted model context"
+        ));
+        let (parent_items, _, _) = codex_rollout::RolloutRecorder::load_rollout_items(
+            &parent_thread.rollout_path().expect("parent rollout"),
+        )
+        .await
+        .expect("read parent rollout");
+        assert!(parent_items.iter().any(|item| matches!(item, RolloutItem::DynamicToolsUpdated { thread_id, tools } if *thread_id == parent_thread_id && tools.is_empty())));
+        assert!(parent_items.iter().any(|item| matches!(item, RolloutItem::Compacted(compacted) if compacted.resume_metadata.as_ref().and_then(|metadata| metadata.dynamic_tools.as_ref()).is_some())));
+    } else {
+        assert!(history_contains_text(
+            child.session.clone_history().await.raw_items(),
+            "inherited model context"
+        ));
+    }
+    harness
+        .control
+        .shutdown_live_agent(child_id)
+        .await
+        .expect("shut down child");
+    parent_thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down parent");
+}
+
 #[tokio::test]
 async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
     let mut harness = AgentControlHarness::new().await;
@@ -3940,6 +4150,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
 
     let (parent_thread_id, parent_thread) = harness.start_paginated_thread().await;
     let parent_resume_metadata = codex_history::CompactionResumeMetadata {
+        dynamic_tools: None,
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some("parent-turn".to_string()),
         turn_attribution: Some(codex_history::TurnAttribution {
@@ -5169,6 +5380,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
                 compaction_response_id: None,
                 latest_token_usage_record: None,
                 resume_metadata: Some(codex_history::CompactionResumeMetadata {
+                    dynamic_tools: None,
                     multi_agent_version: Some(MultiAgentVersion::V2),
                     last_started_turn_id: None,
                     turn_attribution: None,
@@ -5303,6 +5515,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
         assert_eq!(
             inherited_state,
             Some(codex_history::CompactionResumeMetadata {
+                dynamic_tools: None,
                 multi_agent_version: Some(MultiAgentVersion::V2),
                 last_started_turn_id: None,
                 turn_attribution: None,

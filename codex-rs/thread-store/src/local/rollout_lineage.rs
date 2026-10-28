@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutItem;
@@ -210,6 +211,20 @@ impl LocalThreadStore {
                 })?,
                 None => 1,
             };
+            // Reverts can point to earlier records of the same child. Stop at the original parent bookmark.
+            let at_parent = matches!(mode, LineageResolutionMode::HistoryPage)
+                && meta.meta.attached_thread
+                && meta.meta.history_base.is_some_and(|base| {
+                    codex_rollout::forked_from_ordinal_exclusive(&meta.meta, Some(&rollout_path))
+                        .is_some_and(|end| base.end_ordinal_exclusive <= end)
+                });
+            let start_ordinal = if at_parent {
+                attached_history_start(&rollout_path, start_ordinal)
+                    .await
+                    .map_err(|e| malformed_lineage(requested_thread_id, &e.to_string()))?
+            } else {
+                start_ordinal
+            };
             segments.push(RolloutLineageSegment {
                 rollout_id,
                 rollout_path,
@@ -217,7 +232,7 @@ impl LocalThreadStore {
                 end,
             });
 
-            let Some(base) = meta.meta.history_base else {
+            let Some(base) = meta.meta.history_base.filter(|_| !at_parent) else {
                 break;
             };
             if matches!(mode, LineageResolutionMode::HistoryPage)
@@ -240,11 +255,35 @@ impl LocalThreadStore {
     }
 }
 
+/// A mid-turn fork starts with its header, settings, optional model guidance, and parent abort.
+/// Stop before the first child event; a real child interruption follows its own turn start.
+async fn attached_history_start(path: &Path, start: u64) -> std::io::Result<u64> {
+    let mut reader = codex_rollout::open_rollout_line_reader(path).await?;
+    for _ in 0..4 {
+        let Some(line) = reader.next_line().await? else {
+            break;
+        };
+        let Ok(line) = codex_rollout::parse_rollout_line(&line) else {
+            break;
+        };
+        match line.item {
+            RolloutItem::SessionMeta(_)
+            | RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(_))
+            | RolloutItem::ResponseItem(_) => {}
+            RolloutItem::EventMsg(EventMsg::TurnAborted(_)) => {
+                return Ok(line.ordinal.map_or(start, |n| n.saturating_add(1)));
+            }
+            _ => break,
+        }
+    }
+    Ok(start)
+}
+
 /// Resolves the immutable rollout ID stored in a paginated `HistoryPosition`.
 ///
 /// This deliberately bypasses logical-thread selection, which can point to a newer replacement
 /// rollout after `thread/revert`.
-pub(super) async fn resolve_rollout_path_by_id(
+async fn resolve_rollout_path_by_id(
     store: &LocalThreadStore,
     rollout_id: ThreadId,
     prefetched_path: Option<PathBuf>,
@@ -387,7 +426,7 @@ impl RolloutLineageSegment {
     }
 }
 
-pub(super) async fn validate_cutoff_bounds(
+async fn validate_cutoff_bounds(
     requested_thread_id: ThreadId,
     rollout_path: &Path,
     end: &HistoryPosition,

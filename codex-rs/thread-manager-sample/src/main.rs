@@ -279,6 +279,7 @@ async fn new_config(
         guardian_conversation_history_prompt: None,
         guardian_conversation_history_max_output_tokens: None,
         guardian_circuit_break_action: Default::default(),
+        guardian_review_timeout: Some(std::time::Duration::from_secs(90)),
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
@@ -348,11 +349,15 @@ async fn new_config(
         agent_max_depth: 1,
         agent_roles: BTreeMap::new(),
         memories: MemoriesConfig::default(),
-        sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
+        sqlite: SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            codex_home.clone(),
+            /*enforce_delete_on_nfs*/ false,
+        ),
         log_dir: codex_home.join("log").to_path_buf(),
         codex_home,
         history: History::default(),
         ephemeral: true,
+        allow_persistent_dynamic_tool_updates: false,
         extra_config: None,
         file_opener: UriBasedFileOpener::VsCode,
         codex_self_exe: arg0_paths.codex_self_exe,
@@ -368,6 +373,7 @@ async fn new_config(
             .chatgpt_base_url
             .clone()
             .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+        chatgpt_base_url_is_explicit: auth_config.chatgpt_base_url.is_some(),
         respect_system_proxy,
         apps_mcp_product_sku: None,
         responses_api_metadata: BTreeMap::new(),
@@ -390,7 +396,7 @@ async fn new_config(
         code_mode: Default::default(),
         computer_use: Default::default(),
         background_terminal_max_timeout: 300_000,
-        thread_unload_delay: std::time::Duration::from_secs(/*secs*/ 1800),
+        thread_unload_delay: std::time::Duration::from_secs(/*secs*/ 60),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         // Merge-safety anchor: embedding-created threads use ordinary hint resolution;

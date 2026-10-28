@@ -1393,13 +1393,16 @@ async fn assert_terminal_failure(
     test: &TestCodex,
     expected: CodexErrorInfo,
     expected_retries: usize,
-) -> Result<()> {
-    let mut errors = Vec::new();
+) -> Result<String> {
+    let mut messages = Vec::new();
     let mut completions = Vec::new();
     let mut retries = 0;
     loop {
         match wait_for_event(&test.codex, |_| true).await {
-            EventMsg::Error(error) => errors.push(error.codex_error_info),
+            EventMsg::Error(error) => {
+                assert_eq!(error.codex_error_info.as_ref(), Some(&expected));
+                messages.push(error.message);
+            }
             EventMsg::StreamError(_) => retries += 1,
             EventMsg::TurnComplete(event) => {
                 completions.push(event.error.and_then(|error| error.codex_error_info));
@@ -1409,32 +1412,34 @@ async fn assert_terminal_failure(
             _ => {}
         }
     }
-    assert_eq!(errors, vec![Some(expected.clone())]);
     assert_eq!(completions, vec![Some(expected)]);
     assert_eq!(retries, expected_retries);
-    Ok(())
+    let [message] = messages.try_into().expect("expected one terminal error");
+    Ok(message)
 }
 
+#[test_case::test_case("flex_unavailable", 429, CodexErrorInfo::FlexUnavailable, "Flex capacity unavailable."; "flex")]
+#[test_case::test_case("model_not_found", 404, CodexErrorInfo::ModelNotFound, "Access to this deployment ended."; "model")]
 #[tokio::test(flavor = "current_thread")]
-async fn http_and_sse_flex_unavailable_are_terminal() -> Result<()> {
+async fn http_and_sse_provider_errors_are_terminal(
+    code: &str,
+    status: u16,
+    expected: CodexErrorInfo,
+    message: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let error = json!({
-        "type": "resource_unavailable", "code": "flex_unavailable",
-        "message": "Flex capacity unavailable."
+        "code": code, "message": message
     });
     for response in [
-        ResponseTemplate::new(429)
+        ResponseTemplate::new(status)
             .insert_header("Retry-After", "300")
             .set_body_json(json!({"error": error})),
         responses::sse_response(responses::sse(vec![
             json!({"type": "error", "error": error}),
         ])),
-        responses::sse_response(responses::sse_failed(
-            "failed",
-            "flex_unavailable",
-            "No capacity",
-        )),
+        responses::sse_response(responses::sse_failed("failed", code, message)),
     ] {
         let server = responses::start_mock_server().await;
         let response_mock = responses::mount_response_once(&server, response).await;
@@ -1447,13 +1452,11 @@ async fn http_and_sse_flex_unavailable_are_terminal() -> Result<()> {
             .build_with_auto_env(&server)
             .await?;
 
-        submit_user_input(&test, "surface the Flex capacity failure").await?;
-        assert_terminal_failure(
-            &test,
-            CodexErrorInfo::FlexUnavailable,
-            /*expected_retries*/ 0,
-        )
-        .await?;
+        submit_user_input(&test, "surface the provider error").await?;
+        assert_eq!(
+            assert_terminal_failure(&test, expected.clone(), /*expected_retries*/ 0).await?,
+            message
+        );
         assert_eq!(
             response_mock.single_request().body_json()["service_tier"],
             json!("flex")
@@ -1462,7 +1465,7 @@ async fn http_and_sse_flex_unavailable_are_terminal() -> Result<()> {
             server
                 .received_requests()
                 .await
-                .unwrap()
+                .expect("mock server should record requests")
                 .iter()
                 .filter(|request| request.url.path() == "/v1/responses")
                 .count(),
@@ -1472,17 +1475,23 @@ async fn http_and_sse_flex_unavailable_are_terminal() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case("flex_unavailable", 429, CodexErrorInfo::FlexUnavailable, "Flex capacity unavailable."; "flex")]
+#[test_case::test_case("model_not_found", 404, CodexErrorInfo::ModelNotFound, "Access to this deployment ended."; "model")]
 #[tokio::test(flavor = "current_thread")]
-async fn websocket_streamed_flex_unavailable_is_terminal() -> Result<()> {
+async fn websocket_provider_errors_are_terminal(
+    code: &str,
+    status: u16,
+    expected: CodexErrorInfo,
+    message: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let error = json!({
-        "type": "resource_unavailable", "code": "flex_unavailable",
-        "message": "Flex capacity unavailable."
+        "code": code, "message": message
     });
     for event in [
-        json!({"type": "error", "status": 429, "headers": {"retry-after": "300"}, "error": error}),
-        json!({"type": "error", "error": {"code": "flex_unavailable", "headers": {"retry-after": "300"}}}),
+        json!({"type": "error", "status": status, "headers": {"retry-after": "300"}, "error": error}),
+        json!({"type": "error", "error": {"code": code, "message": message, "headers": {"retry-after": "300"}}}),
         json!({"type": "response.failed", "response": {"error": error}}),
     ] {
         let server = responses::start_websocket_server(vec![vec![
@@ -1504,13 +1513,11 @@ async fn websocket_streamed_flex_unavailable_is_terminal() -> Result<()> {
             .build_with_websocket_server(&server)
             .await?;
 
-        submit_user_input(&test, "surface the Flex capacity failure").await?;
-        assert_terminal_failure(
-            &test,
-            CodexErrorInfo::FlexUnavailable,
-            /*expected_retries*/ 0,
-        )
-        .await?;
+        submit_user_input(&test, "surface the provider error").await?;
+        assert_eq!(
+            assert_terminal_failure(&test, expected.clone(), /*expected_retries*/ 0).await?,
+            message
+        );
         let requests = server.single_connection();
         assert_eq!(requests.len(), 2, "prewarm and failed turn");
         assert_eq!(requests[1].body_json()["service_tier"], json!("flex"));
@@ -2158,6 +2165,202 @@ async fn websocket_overload_recovers_after_retry(retry_after: Option<&str>) -> R
             .collect::<Vec<_>>(),
         vec![2, 1]
     );
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    server.shutdown().await;
+
+    Ok(())
+}
+
+/// A final headerless policy-capacity failure stays terminal after mixed advised errors.
+#[test_case::test_case("policy_capacity_unavailable"; "prior_policy_and_overload")]
+#[test_case::test_case("server_is_overloaded"; "prior_overload")]
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_terminal_policy_capacity_preserves_last_error(first_code: &str) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_websocket_server(vec![
+        vec![
+            vec![
+                responses::ev_response_created("prewarm"),
+                responses::ev_completed("prewarm"),
+            ],
+            vec![json!({
+                "type": "error",
+                "status": 503,
+                "error": {"code": first_code, "headers": {"Retry-After": "1"}}
+            })],
+        ],
+        vec![vec![json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "server_is_overloaded", "headers": {"Retry-After": "1"}}
+        })]],
+        vec![vec![json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "server_is_overloaded", "headers": {"Retry-After": "1"}}
+        })]],
+        vec![vec![json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "policy_capacity_unavailable", "message": "This model is disabled."}
+        })]],
+    ])
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_catalog =
+                Some(bundled_models_response().expect("bundled models.json should parse"));
+            config.model_provider.request_max_retries = Some(2);
+            config.model_provider.stream_max_retries = Some(3);
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
+    submit_user_input(&test, "surface the terminal policy-capacity error").await?;
+    for attempt in 1..=3 {
+        let retry = telemetry.next_retry().await;
+        assert_eq!(retry.attempt, attempt);
+        assert!(retry.delay <= Duration::from_secs(1));
+        assert!(wait_for_retry(&mut telemetry, &retry).await >= Duration::from_secs(1));
+    }
+
+    let mut error_events = 0;
+    let mut stream_error_events = 0;
+    let mut fallback_warning_events = 0;
+    loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Error(error) => {
+                error_events += 1;
+                assert_eq!(
+                    error.codex_error_info,
+                    Some(CodexErrorInfo::PolicyCapacityUnavailable)
+                );
+                assert_eq!(
+                    error.message,
+                    "Policy-restricted capacity is unavailable. Please try again later."
+                );
+            }
+            EventMsg::StreamError(_) => stream_error_events += 1,
+            EventMsg::Warning(warning)
+                if warning.message.contains("Falling back from WebSockets") =>
+            {
+                fallback_warning_events += 1;
+            }
+            EventMsg::TurnComplete(event) => {
+                assert_eq!(
+                    event.error.and_then(|error| error.codex_error_info),
+                    Some(CodexErrorInfo::PolicyCapacityUnavailable)
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(error_events, 1);
+    assert_eq!(stream_error_events, 2 + usize::from(cfg!(debug_assertions)));
+    assert_eq!(
+        fallback_warning_events, 0,
+        "terminal policy error must not fall back to HTTP"
+    );
+    let request_count: usize = server.connections().iter().map(Vec::len).sum();
+    assert_eq!(
+        request_count, 5,
+        "expected prewarm, three advised errors, and a terminal error"
+    );
+    assert_eq!(
+        telemetry.events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    server.shutdown().await;
+
+    Ok(())
+}
+
+/// Headerless policy-capacity failures neither reconnect nor fall back to HTTP.
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_policy_capacity_without_retry_after_is_terminal() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut telemetry = RetryTelemetryCapture::install();
+    let server = responses::start_websocket_server(vec![vec![
+        vec![
+            responses::ev_response_created("prewarm"),
+            responses::ev_completed("prewarm"),
+        ],
+        vec![json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "policy_capacity_unavailable", "message": "This model is disabled."}
+        })],
+    ]])
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_catalog =
+                Some(bundled_models_response().expect("bundled models.json should parse"));
+            config.model_provider.request_max_retries = Some(2);
+            config.model_provider.stream_max_retries = Some(2);
+        })
+        .build_with_websocket_server(&server)
+        .await?;
+
+    let warmup = server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(warmup.body_json()["generate"].as_bool(), Some(false));
+    submit_user_input(&test, "reject the headerless policy-capacity error").await?;
+
+    let mut error_events = 0;
+    let mut stream_error_events = 0;
+    let mut fallback_warning_events = 0;
+    loop {
+        match wait_for_event(&test.codex, |_| true).await {
+            EventMsg::Error(error) => {
+                error_events += 1;
+                assert_eq!(
+                    error.codex_error_info,
+                    Some(CodexErrorInfo::PolicyCapacityUnavailable)
+                );
+                assert_eq!(
+                    error.message,
+                    "Policy-restricted capacity is unavailable. Please try again later."
+                );
+            }
+            EventMsg::StreamError(_) => stream_error_events += 1,
+            EventMsg::Warning(warning)
+                if warning.message.contains("Falling back from WebSockets") =>
+            {
+                fallback_warning_events += 1;
+            }
+            EventMsg::TurnComplete(event) => {
+                assert_eq!(
+                    event.error.and_then(|error| error.codex_error_info),
+                    Some(CodexErrorInfo::PolicyCapacityUnavailable)
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(error_events, 1);
+    assert_eq!(stream_error_events, 0);
+    assert_eq!(
+        fallback_warning_events, 0,
+        "terminal policy error must not fall back to HTTP"
+    );
+    let request_count: usize = server.connections().iter().map(Vec::len).sum();
+    assert_eq!(request_count, 2, "expected only prewarm and terminal error");
     assert_eq!(
         telemetry.events.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)

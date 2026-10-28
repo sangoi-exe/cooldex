@@ -152,6 +152,11 @@ pub enum CodexErrorDetails {
     #[error("{0}")]
     InvalidRequest(String),
     #[error("{message}")]
+    ModelNotFound {
+        message: String,
+        status: Option<StatusCode>,
+    },
+    #[error("{message}")]
     InvalidPrompt { message: String },
     /// Multiple registered tools share the same effective name.
     #[error("duplicate tool: {0}")]
@@ -163,6 +168,9 @@ pub enum CodexErrorDetails {
     UsageLimitReached(UsageLimitReachedError),
     #[error("Selected model is at capacity. Please try a different model.")]
     ServerOverloaded,
+    /// Policy-restricted capacity retries only when server advice is present.
+    #[error("Policy-restricted capacity is unavailable. Please try again later.")]
+    PolicyCapacityUnavailable,
     #[error("Flex capacity unavailable.")]
     FlexUnavailable,
     #[error("{message}")]
@@ -409,7 +417,8 @@ impl CodexErr {
     /// Returns the delay before the given retry attempt, or `None` for a terminal error.
     ///
     /// The first retry is attempt one. Retryable errors use server advice when available and
-    /// otherwise use exponential backoff with jitter. Callers enforce their own retry budgets.
+    /// otherwise use exponential backoff with jitter, except that policy-capacity and retry-limit
+    /// errors require server advice. Callers enforce their own retry budgets.
     pub fn retry_delay(&self, retry_count: u64) -> Option<Duration> {
         match self.details() {
             CodexErrorDetails::TurnAborted
@@ -422,6 +431,7 @@ impl CodexErr {
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
             | CodexErrorDetails::ResponseIncomplete(_)
+            | CodexErrorDetails::ModelNotFound { .. }
             | CodexErrorDetails::InvalidPrompt { .. }
             | CodexErrorDetails::ToolCollision(_)
             | CodexErrorDetails::RefreshTokenFailed(_)
@@ -439,7 +449,9 @@ impl CodexErr {
             | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::BioPolicy { .. }
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => None,
-            CodexErrorDetails::RetryLimit(_) => self.server_retry_delay(),
+            CodexErrorDetails::PolicyCapacityUnavailable | CodexErrorDetails::RetryLimit(_) => {
+                self.server_retry_delay()
+            }
             // Merge-safety anchor: overloads use existing local backoff without mapped advice; callers retain their retry budgets and mapped advice remains authoritative.
             CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::Stream(..)
@@ -497,9 +509,13 @@ impl CodexErr {
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
             CodexErrorDetails::ServerOverloaded => CodexErrorInfo::ServerOverloaded,
+            CodexErrorDetails::PolicyCapacityUnavailable => {
+                CodexErrorInfo::PolicyCapacityUnavailable
+            }
             CodexErrorDetails::FlexUnavailable => CodexErrorInfo::FlexUnavailable,
             CodexErrorDetails::CyberPolicy { .. } => CodexErrorInfo::CyberPolicy,
             CodexErrorDetails::BioPolicy { .. } => CodexErrorInfo::BioPolicy,
+            CodexErrorDetails::ModelNotFound { .. } => CodexErrorInfo::ModelNotFound,
             CodexErrorDetails::InvalidPrompt { .. } => CodexErrorInfo::InvalidPrompt,
             CodexErrorDetails::MisalignmentPolicyViolation { .. } => {
                 CodexErrorInfo::MisalignmentPolicyViolation
@@ -550,6 +566,7 @@ impl CodexErr {
     pub fn http_status_code_value(&self) -> Option<u16> {
         let http_status_code = match &self.details {
             CodexErrorDetails::FlexUnavailable => Some(StatusCode::TOO_MANY_REQUESTS),
+            CodexErrorDetails::ModelNotFound { status, .. } => *status,
             CodexErrorDetails::RetryLimit(err) => Some(err.status),
             CodexErrorDetails::UnexpectedStatus(err) => Some(err.status),
             CodexErrorDetails::ConnectionFailed(err) => err.source.status(),

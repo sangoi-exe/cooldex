@@ -293,6 +293,7 @@ impl LegacyRolloutCanonicalizer {
             item @ (RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::TurnContext(_)
             | RolloutItem::PostCompactRecoveryApplied(_)
+            | RolloutItem::DynamicToolsUpdated { .. }
             | RolloutItem::TokenUsageRecord(_)
             | RolloutItem::RealtimeItem(_)
             | RolloutItem::RetainedContext(_)

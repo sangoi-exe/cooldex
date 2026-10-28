@@ -120,6 +120,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
 
     let session_meta = SessionMeta {
         creator_user_id: Some("creator-user".to_string()),
+        attached_thread: false,
         creator_account_id: Some("creator-account".to_string()),
         session_id: id.into(),
         id,
@@ -245,6 +246,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
 
     let session_meta = SessionMeta {
         creator_user_id: None,
+        attached_thread: false,
         creator_account_id: None,
         session_id: id.into(),
         id,
@@ -640,6 +642,7 @@ fn write_rollout_in_sessions_with_cwd(
     let path = sessions_dir.join(format!("rollout-{filename_ts}-{thread_uuid}.jsonl"));
     let session_meta = SessionMeta {
         creator_user_id: None,
+        attached_thread: false,
         creator_account_id: None,
         session_id: id.into(),
         id,

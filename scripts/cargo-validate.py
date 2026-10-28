@@ -107,11 +107,9 @@ PLAN_ACTIONS = {"plan", "prep-plan"}
 PREP_ACTIONS = {"prep", "prep-plan"}
 VALIDATION_ACTIONS = {"plan", "verify"}
 CODEX_V8_HOST_TARGET = "host"
-# Merge-safety anchor: the selected code-mode V8 closure must receive the
-# checksum-verified host archive/binding pair through direct guarded Cargo
-# build-like rungs, without a mirror, fallback, or separate artifact owner.
+# Merge-safety anchor: selected V8 consumers must receive the checksum-verified host archive/binding pair through direct guarded Cargo build-like rungs, without a mirror, fallback, or separate artifact owner.
 CODEX_V8_HOST_ARTIFACT_PACKAGES = frozenset(
-    {"codex-code-mode-host", "codex-code-mode-runtime"}
+    {"codex-code-mode-host", "codex-code-mode-runtime", "codex-v8-poc"}
 )
 CODEX_V8_INHERITED_ENV_KEYS = (
     "RUSTY_V8_ARCHIVE",
@@ -2095,6 +2093,13 @@ def validate_config(
             raise PlannerError(
                 f"validation command {command_name!r} must define argv as a string array"
             )
+        if "test_suite" in command and command["test_suite"] not in (
+            "unittest",
+            "shell",
+        ):
+            raise PlannerError(
+                f"validation command {command_name!r} test_suite must be 'unittest' or 'shell'"
+            )
         profile_name = command.get("profile")
         if profile_name is not None:
             if not isinstance(profile_name, str) or profile_name not in profile_names:
@@ -2672,13 +2677,23 @@ def build_plan(
     path_evidence: dict[str, PathSelectionEvidence] | None = None,
     yolo: bool = False,
     test_filter: str | None = None,
+    wsl_test_filters: list[tuple[str, str]] | None = None,
+    python_tests: list[tuple[str, str]] | None = None,
     lib: bool = False,
 ) -> Plan:
     # Merge-safety anchor: runtime focus must be applied, never silently ignored or presented as full-workspace validation.
-    runtime_focus = test_filter is not None or lib
+    wsl_test_filters = wsl_test_filters or []
+    python_tests = python_tests or []
+    runtime_focus = (
+        test_filter is not None or bool(wsl_test_filters or python_tests) or lib
+    )
     if runtime_focus and (stage != "validation" or mode not in {"standard", "strict"}):
         raise PlannerError(
-            "--test-filter and --lib require standard or strict validation with a native runtime command; prep, quick, and full do not support runtime focus"
+            "runtime focus requires standard or strict validation; prep, quick, and full do not support runtime focus"
+        )
+    if lib and test_filter is None:
+        raise PlannerError(
+            "--lib requires --test-filter for inspected helper-free cases"
         )
     if test_filter is not None and not test_filter.strip():
         raise PlannerError("--test-filter requires a non-empty Nextest expression")
@@ -2752,6 +2767,38 @@ def build_plan(
         set(validation_packages) & selection.wsl_runtime_packages
     )
 
+    selected_wsl_filters: dict[str, list[str]] = {}
+    for package, expression in wsl_test_filters:
+        if (
+            package not in runtime_packages
+            or not package_infos[package].has_test_targets
+        ):
+            raise PlannerError(
+                f"--wsl-test-filter requires a selected WSL runtime package with test targets; got {package!r}"
+            )
+        if not expression.strip():
+            raise PlannerError(
+                "--wsl-test-filter requires a non-empty Nextest expression"
+            )
+        selected_wsl_filters.setdefault(package, []).append(expression)
+
+    selected_python_tests: dict[str, list[str]] = {}
+    for command_name, case in python_tests:
+        command_config = config.get("commands", {}).get(command_name, {})
+        if (
+            command_name not in selection.command_names
+            or command_config.get("test_suite") != "unittest"
+        ):
+            raise PlannerError(
+                f"--python-test requires a selected unittest command; got {command_name!r}"
+            )
+        if not case.strip():
+            raise PlannerError("--python-test requires a non-empty unittest case")
+        components = case.split(".")
+        if len(components) != 2 or not all(part.isidentifier() for part in components):
+            raise PlannerError("--python-test requires a unittest Class.method case")
+        selected_python_tests.setdefault(command_name, []).append(case)
+
     if stage == "prep":
         if yolo:
             raise PlannerError(
@@ -2798,10 +2845,26 @@ def build_plan(
 
     for command_name in selection.command_order:
         reasons = selection.command_names[command_name]
+        command_config = config.get("commands", {}).get(command_name, {})
+        test_suite = command_config.get("test_suite")
+        if runtime_focus and test_suite:
+            cases = selected_python_tests.get(command_name)
+            if not cases:
+                selection.warnings.append(
+                    f"Focused runtime selection omits configured {test_suite} suite {command_name}"
+                )
+                continue
+            argv = [*command_config["argv"], *cases]
+        else:
+            argv = None
         add_command(
             commands,
             command_from_config(
-                config, command_name, "; ".join(sorted(reasons)), history_entries
+                config,
+                command_name,
+                "; ".join(sorted(reasons)),
+                history_entries,
+                argv=argv,
             ),
         )
 
@@ -2831,7 +2894,11 @@ def build_plan(
                 commands,
                 command_from_config(config, command_name, reason, history_entries),
             )
-    elif mode_at_least(mode, "standard") and need_runtime_tests:
+    elif (
+        mode_at_least(mode, "standard")
+        and need_runtime_tests
+        and (not runtime_focus or test_filter is not None)
+    ):
         windows_nextest_command = windows_nextest_packages_command(
             config,
             validation_packages,
@@ -2892,17 +2959,54 @@ def build_plan(
             and package in runtime_packages
             and (package_info.has_test_targets or package_info.has_doctests)
         ):
-            add_command(
-                commands,
-                cargo_command(
-                    runtime_test_args(package),
-                    f"runtime behavior is in scope for {package}",
-                    config,
-                    "package_test",
-                    history_entries,
-                    codex_v8_target=codex_v8_target,
-                ),
-            )
+            if runtime_focus:
+                for expression in selected_wsl_filters.get(package, []):
+                    command = cargo_command(
+                        [
+                            "nextest",
+                            "run",
+                            "-p",
+                            package,
+                            "--profile",
+                            "local-safe",
+                            "-E",
+                            expression,
+                            "--no-tests",
+                            "fail",
+                            "--build-jobs",
+                            "1",
+                            "--test-threads",
+                            "1",
+                        ],
+                        f"caller-selected WSL runtime behavior for {package}",
+                        config,
+                        "package_test",
+                        history_entries,
+                        codex_v8_target=codex_v8_target,
+                    )
+                    add_command(
+                        commands,
+                        replace(
+                            command,
+                            env={
+                                **command.env,
+                                "RUST_MIN_STACK": os.environ.get("RUST_MIN_STACK")
+                                or "8388608",
+                            },
+                        ),
+                    )
+            else:
+                add_command(
+                    commands,
+                    cargo_command(
+                        runtime_test_args(package),
+                        f"runtime behavior is in scope for {package}",
+                        config,
+                        "package_test",
+                        history_entries,
+                        codex_v8_target=codex_v8_target,
+                    ),
+                )
         if mode_at_least(mode, "strict"):
             if package in CODEX_V8_HOST_ARTIFACT_PACKAGES:
                 add_command(
@@ -2985,17 +3089,33 @@ def build_plan(
 
     has_windows_command = any(command.platform == "windows" for command in commands)
     if runtime_focus:
-        if not any(
+        if test_filter is not None and not any(
             command.kind == WINDOWS_NEXTEST_PACKAGES_KIND
             and command.platform == "windows"
             for command in commands
         ):
             raise PlannerError(
-                "--test-filter and --lib require a native runtime command in the selected validation plan"
+                "--test-filter requires a native runtime command in the selected validation plan"
             )
         selection.warnings.append(
-            "Native runtime focus is caller-selected coverage, not automatic discovery of related tests; WSL validation is unchanged"
+            "Runtime focus is caller-selected coverage, not automatic discovery of related tests or proof of omitted coverage"
         )
+        if test_filter is None:
+            selection.warnings.append(
+                "Focused runtime selection omits native Windows runtime tests"
+            )
+        omitted_wsl = sorted(runtime_packages - selected_wsl_filters.keys())
+        if omitted_wsl:
+            selection.warnings.append(
+                "Focused runtime selection omits WSL runtime packages: "
+                + ", ".join(omitted_wsl)
+            )
+        elif not selected_wsl_filters:
+            selection.warnings.append("Focused runtime selection omits WSL runtime tests")
+        if not selected_python_tests:
+            selection.warnings.append(
+                "Focused runtime selection omits Python unittest runtime tests"
+            )
         if lib:
             selection.warnings.append(
                 "--lib requires inspected helper-free library cases; cases needing executable fixtures require their established preparation and route, not cached binaries"
@@ -4580,9 +4700,25 @@ def build_arg_parser(default_mode: str) -> argparse.ArgumentParser:
         help="intersect one Nextest expression with affected native runtime packages and global exclusions (standard/strict only)",
     )
     parser.add_argument(
+        "--wsl-test-filter",
+        action="append",
+        nargs=2,
+        default=[],
+        metavar=("PACKAGE", "EXPR"),
+        help="select a mapped WSL package and its Nextest expression; repeat for more cases (standard/strict only)",
+    )
+    parser.add_argument(
+        "--python-test",
+        action="append",
+        nargs=2,
+        default=[],
+        metavar=("COMMAND", "CASE"),
+        help="select a configured unittest command and Class.method case; repeat for more cases (standard/strict only)",
+    )
+    parser.add_argument(
         "--lib",
         action="store_true",
-        help="focus native runtime on inspected helper-free library test targets, omitting automatic binary fixture prerequisites (standard/strict only)",
+        help="restrict --test-filter to inspected helper-free native library targets, omitting automatic binary fixture prerequisites (standard/strict only)",
     )
     parser.add_argument(
         "--yolo",
@@ -4741,6 +4877,8 @@ def main(argv: list[str]) -> int:
             path_evidence=path_evidence,
             yolo=args.yolo,
             test_filter=args.test_filter,
+            wsl_test_filters=args.wsl_test_filter,
+            python_tests=args.python_test,
             lib=args.lib,
         )
         write_plan_receipt(plan, repo_root)

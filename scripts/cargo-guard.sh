@@ -44,14 +44,16 @@ log() {
 usage() {
     cat <<'EOF_HELP'
 Usage:
-  ./scripts/cargo-guard.sh plan --changed --mode standard
-  ./scripts/cargo-guard.sh plan --range BASE..HEAD --mode strict
-  ./scripts/cargo-guard.sh plan --commit HEAD --mode standard
+  ./scripts/cargo-guard.sh plan --changed --mode standard --test-filter '<nextest-expression>'
+  ./scripts/cargo-guard.sh plan --range BASE..HEAD --mode strict --test-filter '<nextest-expression>'
+  ./scripts/cargo-guard.sh plan --commit HEAD --mode standard --test-filter '<nextest-expression>'
   ./scripts/cargo-guard.sh plan --file <changed-path> --mode standard --test-filter '<nextest-expression>'
+  ./scripts/cargo-guard.sh plan --file <changed-path> --mode standard --wsl-test-filter <package> '<nextest-expression>'
+  ./scripts/cargo-guard.sh plan --file <changed-path> --mode standard --python-test <command> <Class.method>
   ./scripts/cargo-guard.sh prep-plan --changed --mode standard
   ./scripts/cargo-guard.sh prep --changed --mode standard
-  ./scripts/cargo-guard.sh verify --changed --mode standard
-  ./scripts/cargo-guard.sh verify --range BASE..HEAD --mode strict
+  ./scripts/cargo-guard.sh verify --changed --mode standard --test-filter '<nextest-expression>'
+  ./scripts/cargo-guard.sh verify --range BASE..HEAD --mode strict --test-filter '<nextest-expression>'
   ./scripts/cargo-guard.sh verify --changed --mode full --yolo
   ./scripts/cargo-guard.sh <cargo-subcommand> [args...]
   ./scripts/cargo-guard.sh cargo <cargo-subcommand> [args...]
@@ -72,9 +74,14 @@ Planner selectors:
   - --surface <name>: explicit validation surface
   - --test-filter <expr>: intersect one Nextest expression with affected native
     runtime packages and global exclusions; standard/strict validation only
+  - --wsl-test-filter <package> <expr>: select cases in a selected mapped WSL
+    runtime package; repeat for additional package/expression pairs
+  - --python-test <command> <Class.method>: select cases in a selected configured
+    unittest command; repeat for additional command/case pairs
   - --lib: native library test targets only, for inspected helper-free cases;
-    omits automatic binary fixture prerequisites, not required fixture preparation
-  - runtime focus is rejected for prep, quick, full, or plans without native runtime
+    requires --test-filter and omits automatic binary fixture prerequisites
+  - focused runtime domains are opt-in; omitted packages and configured suites
+    remain untested. Focus is rejected for prep, quick, and full
   - default procedure: inspect changed owners/direct followers and select related
     cases explicitly; broader testing requires established impact/scope
   - --json: print machine-readable JSON plan output

@@ -4,6 +4,8 @@ pub(crate) mod child_config;
 pub(crate) mod control;
 // Merge-safety anchor: AgentControl remains the backend-independent api trait while
 // LocalAgentControl is the local implementation and AgentIdentitySnapshot retains Cooldex V2 state.
+mod history;
+pub(crate) mod host;
 mod identity;
 mod registry;
 pub(crate) mod role;

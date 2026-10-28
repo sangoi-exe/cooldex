@@ -91,6 +91,11 @@ impl SessionStartup {
                     super::handlers::ActiveTurnShutdown::Abort,
                 )
                 .await;
+                // The session loop never started, so it cannot close the trace itself.
+                session
+                    .services
+                    .rollout_thread_trace
+                    .record_ended(codex_rollout_trace::RolloutStatus::Aborted);
             }
             let mut persistence = std::mem::take(&mut *self.persistence.lock().await);
             if let Err(error) = persistence.discard().await {

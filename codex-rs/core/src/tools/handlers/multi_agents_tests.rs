@@ -12,6 +12,7 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
+use crate::session::UserInputMetadata;
 use crate::session::session::SessionSettingsUpdate;
 use crate::session::step_context::StepContext;
 use crate::session::step_settings::StepSettingsUpdate;
@@ -132,6 +133,7 @@ fn invocation(
         tool_name: codex_tools::ToolName::plain(tool_name),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
+        environments: Default::default(),
     }
 }
 
@@ -1003,6 +1005,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -1056,6 +1059,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -1297,7 +1301,7 @@ async fn multi_agent_v2_spawn_without_history_accepts_explicit_service_tier() {
         .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
     let mut config = (*turn.config).clone();
-    config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+    config.service_tier = None;
     config
         .features
         .enable(Feature::MultiAgentV2)
@@ -1308,6 +1312,7 @@ async fn multi_agent_v2_spawn_without_history_accepts_explicit_service_tier() {
         .start_thread(StartThreadOptions::new((*turn.config).clone()))
         .await
         .expect("root thread should start");
+    assert_eq!(root.thread.config_snapshot().await.service_tier, None);
     set_agent_control(
         &mut session,
         root.thread
@@ -1357,6 +1362,26 @@ async fn multi_agent_v2_spawn_without_history_accepts_explicit_service_tier() {
     assert_eq!(
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
+    );
+    let rejected = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "fresh_with_invalid_tier",
+                "fork_turns": "none",
+                "service_tier": "unsupported-test-tier"
+            })),
+        ))
+        .await;
+    let Err(FunctionCallError::RespondToModel(message)) = rejected else {
+        panic!("unsupported explicit tier must be rejected before child startup");
+    };
+    assert!(
+        message
+            .contains("Service tier `unsupported-test-tier` is not supported for model `gpt-5.5`")
     );
 }
 
@@ -5401,7 +5426,10 @@ async fn multi_agent_v2_wait_agent_condition_prioritizes_steer_over_error_final_
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
                 /*responsesapi_client_metadata*/ Default::default(),
-                UserInputOrigin::User,
+                UserInputMetadata {
+                    origin: UserInputOrigin::User,
+                    ..Default::default()
+                },
                 /*incoming_root_turn_id*/ None,
             )
             .await
@@ -5496,7 +5524,10 @@ async fn multi_agent_v2_wait_agent_condition_returns_for_steer_after_mailbox_act
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
                 /*responsesapi_client_metadata*/ Default::default(),
-                UserInputOrigin::User,
+                UserInputMetadata {
+                    origin: UserInputOrigin::User,
+                    ..Default::default()
+                },
                 /*incoming_root_turn_id*/ None,
             )
             .await
@@ -5570,7 +5601,10 @@ async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_lat
                 Some(&turn.sub_id),
                 /*required_final_output_json_schema*/ None,
                 /*responsesapi_client_metadata*/ Default::default(),
-                UserInputOrigin::User,
+                UserInputMetadata {
+                    origin: UserInputOrigin::User,
+                    ..Default::default()
+                },
                 /*incoming_root_turn_id*/ None,
             )
             .await

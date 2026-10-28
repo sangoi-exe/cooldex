@@ -44,9 +44,21 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
+        if ctx
+            .config
+            .features
+            .enabled(codex_features::Feature::CriticalPathTiming)
+            && !ctx.session_source.is_non_root_agent()
+        {
+            ctx.turn_timing_state.enable_critical_path();
+        }
         // Merge-safety anchor: publish one attributed start before cancellable regular-task preparation.
         sess.emit_turn_started(&ctx, TaskKind::Regular).await;
-        let run_turn_span = trace_span!("run_turn");
+        let run_turn_span = trace_span!(
+            "run_turn",
+            conversation.id = %sess.thread_id,
+            turn.id = %ctx.sub_id,
+        );
         let prewarmed_client_session = async {
             // Regular-start contributors run once, after the task is visible and interruptible.
             let prepares_mcp = sess

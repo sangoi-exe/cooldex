@@ -37,6 +37,8 @@ pub(crate) struct ActiveTurn {
     /// A start admitted before asynchronous preparation finishes. The ActiveTurn owner verifies
     /// this ID before task installation so cancellation cannot admit a stale task.
     pub(crate) reserved_turn_id: Option<String>,
+    /// Queue-only automatic mail reserved this turn, even after the mailbox is drained.
+    pub(crate) automatic_message_origin: bool,
     /// Automatic idle admission resolves only after its first user input reaches durable
     /// persistence, or a terminal lifecycle path settles it.
     pub(crate) input_persisted:
@@ -70,6 +72,7 @@ impl Default for ActiveTurn {
             finishing: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             reserved_turn_id: None,
+            automatic_message_origin: false,
             input_persisted: None,
         }
     }

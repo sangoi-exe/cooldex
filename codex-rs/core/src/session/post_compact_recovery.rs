@@ -9,7 +9,6 @@ use tracing::warn;
 use super::Session;
 use super::TurnContext;
 use crate::context::ContextualUserFragment;
-use crate::context::PostCompactHandoffContext;
 use crate::context::PostCompactRecoveryContext;
 use crate::context::PostCompactRecoveryContextError;
 use crate::state::PostCompactRecoveryFailureClass;
@@ -18,65 +17,12 @@ use crate::tool_batch::ToolItemKind;
 use crate::tool_batch::classify_tool_item;
 use crate::tool_batch::complete_trailing_tool_batch;
 
-#[derive(Debug)]
-pub(super) struct PreparedPostCompactRecovery {
-    identity: PostCompactRecoveryIdentity,
-    insertion_index: usize,
-    item_count: usize,
-}
-
-impl PreparedPostCompactRecovery {
-    pub(super) fn identity(&self) -> &PostCompactRecoveryIdentity {
-        &self.identity
-    }
-
-    pub(super) fn remove_from_input(self, input: &mut Vec<ResponseItem>) -> CodexResult<()> {
-        let has_handoff_item = self.item_count == 1
-            || input.get(self.insertion_index).is_some_and(|item| {
-                matches!(
-                    item,
-                    ResponseItem::Message { role, content, .. }
-                        if role == "assistant"
-                            && content.iter().any(|content| {
-                                matches!(
-                                    content,
-                                    codex_protocol::models::ContentItem::OutputText { text, .. }
-                                        if PostCompactHandoffContext::matches_text(text)
-                                )
-                            })
-                )
-            });
-        let recovery_index = self.insertion_index + usize::from(self.item_count == 2);
-        let has_recovery_item = input.get(recovery_index).is_some_and(|item| {
-            matches!(
-                item,
-                ResponseItem::Message { role, content, .. }
-                    if role == "developer"
-                        && content.iter().any(|content| {
-                            matches!(
-                                content,
-                                codex_protocol::models::ContentItem::InputText { text }
-                                    if PostCompactRecoveryContext::matches_text(text)
-                            )
-                        })
-            )
-        });
-        if !has_recovery_item || !has_handoff_item {
-            return Err(CodexErr::Fatal(
-                "post-compact recovery prompt carrier lost a transient item".to_string(),
-            ));
-        }
-        input.drain(self.insertion_index..self.insertion_index + self.item_count);
-        Ok(())
-    }
-}
-
 impl Session {
     pub(super) async fn prepare_post_compact_recovery(
         &self,
         turn_context: &TurnContext,
         input: &mut Vec<ResponseItem>,
-    ) -> CodexResult<Option<PreparedPostCompactRecovery>> {
+    ) -> CodexResult<Option<PostCompactRecoveryIdentity>> {
         let (identity, cached_packet) = {
             let state = self.state.lock().await;
             let Some(identity) = state.post_compact_recovery.pending_identity().cloned() else {
@@ -239,7 +185,7 @@ pub(super) fn insert_post_compact_recovery_packet(
     input: &mut Vec<ResponseItem>,
     identity: &PostCompactRecoveryIdentity,
     packet: PostCompactRecoveryContext,
-) -> Result<PreparedPostCompactRecovery, PostCompactRecoveryFailureClass> {
+) -> Result<PostCompactRecoveryIdentity, PostCompactRecoveryFailureClass> {
     let mut boundary_index = None;
     for (index, item) in input.iter().enumerate() {
         if item
@@ -273,7 +219,7 @@ pub(super) fn insert_post_compact_recovery_packet(
     };
     let handoff = packet.handoff().cloned();
     let compaction_window_id = &identity.compaction_window_id;
-    let item_count = if let Some(handoff) = handoff {
+    if let Some(handoff) = handoff {
         // Merge-safety anchor: replay the generated handoff as assistant output, not generic
         // contextual input.
         let mut handoff_item = handoff.into_response_item();
@@ -288,7 +234,6 @@ pub(super) fn insert_post_compact_recovery_packet(
         )));
         input.insert(insertion_index, handoff_item);
         input.insert(insertion_index + 1, recovery_item);
-        2
     } else {
         let mut recovery_item = Box::new(packet).into_boxed_response_item();
         recovery_item.set_id(Some(ResponseItemId::with_suffix(
@@ -296,13 +241,8 @@ pub(super) fn insert_post_compact_recovery_packet(
             format_args!("{compaction_window_id}-recovery"),
         )));
         input.insert(insertion_index, recovery_item);
-        1
-    };
-    Ok(PreparedPostCompactRecovery {
-        identity: identity.clone(),
-        insertion_index,
-        item_count,
-    })
+    }
+    Ok(identity.clone())
 }
 
 fn context_failure_class(

@@ -336,10 +336,14 @@ async fn run_compact_task_inner_impl(
     // Merge-safety anchor: local summarization reuses one operation-local maintenance session across retries without consuming or publishing the normal turn's transport state.
     let mut client_session = sess.services.model_client.new_maintenance_session();
     let compaction_response = loop {
-        // Clone is required because of the loop
+        // Merge-safety anchor: the compaction step can select a different model, and projection must not alter retained history.
         let mut turn_input = history
             .clone()
-            .for_prompt(&step_context.settings.model_info.input_modalities);
+            .for_prompt(
+                &step_context.settings.model_info.input_modalities,
+                sess.services.image_store.as_ref(),
+            )
+            .await;
         sess.services
             .executed_tool_calls
             .attach_to_compaction_prompt(&mut turn_input);

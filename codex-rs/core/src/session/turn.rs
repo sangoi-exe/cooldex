@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
@@ -19,6 +20,7 @@ use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
 use crate::hook_runtime::hooks_for_model_request;
 use crate::hook_runtime::inspect_pending_input;
+use crate::hook_runtime::legacy_notify_input_messages;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
 use crate::hook_runtime::reject_pending_input;
@@ -40,7 +42,6 @@ use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
-use crate::session::post_compact_recovery::PreparedPostCompactRecovery;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -575,7 +576,11 @@ pub(crate) async fn run_turn(
             let sampling_request_input: Vec<ResponseItem> = async {
                 sess.clone_history()
                     .await
-                    .for_prompt(&step_context.settings.model_info.input_modalities)
+                    .for_prompt(
+                        &step_context.settings.model_info.input_modalities,
+                        sess.services.image_store.as_ref(),
+                    )
+                    .await
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
@@ -593,7 +598,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input)) => {
+            Ok((sampling_request_output, notify_messages)) => {
                 guardian_budget_compacted = false;
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
@@ -790,7 +795,7 @@ pub(crate) async fn run_turn(
                     if run_legacy_after_agent_hook(
                         &sess,
                         &turn_context,
-                        &sampling_request_input,
+                        notify_messages,
                         last_agent_message.clone(),
                     )
                     .await
@@ -1225,7 +1230,12 @@ async fn build_skills_and_plugins(
         &available_connectors,
         &skill_name_counts_lower,
     );
-    let plugin_items = build_plugin_injections(mentioned_plugins, mcp_tools, &available_connectors);
+    let plugin_items = build_plugin_injections(
+        mentioned_plugins,
+        mcp_tools,
+        &available_connectors,
+        &turn_context.config.features,
+    );
     let mut explicitly_enabled_connectors = collect_explicit_app_ids(user_input);
     explicitly_enabled_connectors.extend(skill_connector_ids);
     let connector_names_by_id = available_connectors
@@ -1742,21 +1752,6 @@ pub(crate) fn build_prompt(
     }
 }
 
-// Merge-safety anchor: mutable Guardian preparation may extend a sampling prompt, but transient recovery and handoff carriers are removed before its original input can re-enter history.
-struct PreparedSamplingPrompt {
-    prompt: Prompt,
-    post_compact_recovery: Option<PreparedPostCompactRecovery>,
-}
-
-impl PreparedSamplingPrompt {
-    fn into_original_input(mut self) -> CodexResult<Vec<ResponseItem>> {
-        if let Some(recovery) = self.post_compact_recovery {
-            recovery.remove_from_input(&mut self.prompt.input)?;
-        }
-        Ok(self.prompt.input)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -1775,7 +1770,7 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     input: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+) -> CodexResult<(SamplingRequestResult, Vec<String>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let preempt = step_context.preempt.clone().unwrap_or_default();
     let _input_watch = if let Some(preempt) = &step_context.preempt {
@@ -1808,17 +1803,22 @@ async fn run_sampling_request(
     );
     let mut retry_state = ResponsesStreamRetryState::default();
     let mut initial_input = Some(input);
-    let mut original_input = None;
+    let mut notify_messages = Vec::new();
     let mut executed_tool_calls_by_output = HashMap::new();
     loop {
         // Running code-mode cells can request review while this response is in flight.
         // Keep the latest received ID until response.created replaces it.
+        let first_attempt = initial_input.is_some();
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
             sess.clone_history()
                 .await
-                .for_prompt(&step_context.settings.model_info.input_modalities)
+                .for_prompt(
+                    &step_context.settings.model_info.input_modalities,
+                    sess.services.image_store.as_ref(),
+                )
+                .await
         };
         let mut prompt_input = prompt_input;
         sess.services
@@ -1827,31 +1827,28 @@ async fn run_sampling_request(
         let post_compact_recovery = sess
             .prepare_post_compact_recovery(turn_context.as_ref(), &mut prompt_input)
             .await?;
-        let mut prepared_prompt = PreparedSamplingPrompt {
-            prompt: build_prompt(
-                prompt_input,
-                step_context.as_ref(),
-                base_instructions.clone(),
-                incremental_tools,
-            ),
-            post_compact_recovery,
-        };
+        let mut prompt = build_prompt(
+            prompt_input,
+            step_context.as_ref(),
+            base_instructions.clone(),
+            incremental_tools,
+        );
         let responses_metadata = sess
             .responses_metadata(step_context.as_ref(), CodexResponsesRequestKind::Turn)
             .await;
         if crate::guardian::is_basic_session_source(&turn_context.session_source) {
             crate::guardian::prepare_guardian_prompt(
                 &sess,
-                &mut prepared_prompt.prompt,
+                &mut prompt,
                 step_context.as_ref(),
                 &responses_metadata,
             )
             .await?;
         }
-        let post_compact_recovery = prepared_prompt
-            .post_compact_recovery
-            .as_ref()
-            .map(PreparedPostCompactRecovery::identity);
+        // Merge-safety anchor: notification extraction reads only user input, never transient assistant/developer recovery carriers.
+        if first_attempt && turn_context.config.notify.is_some() {
+            notify_messages = legacy_notify_input_messages(&prompt.input);
+        }
         let mut draining_for_mailbox = false;
         let sampling_result = try_run_sampling_request(
             tool_runtime.clone(),
@@ -1861,16 +1858,15 @@ async fn run_sampling_request(
             client_session,
             &responses_metadata,
             Arc::clone(&turn_diff_tracker),
-            &prepared_prompt.prompt,
-            post_compact_recovery,
+            prompt,
+            post_compact_recovery.as_ref(),
             cancellation_token.child_token(),
             &mut draining_for_mailbox,
         )
         .await;
         let err = match sampling_result {
             Ok(output) => {
-                let attempt_input = prepared_prompt.into_original_input()?;
-                return Ok((output, original_input.unwrap_or(attempt_input)));
+                return Ok((output, notify_messages));
             }
             Err(err) => match err.details() {
                 // Merge-safety anchor: a fatal recovery-proof failure must reach completion unchanged, not be replaced by cancellation of stream-retry handling.
@@ -1889,8 +1885,6 @@ async fn run_sampling_request(
                 _ => err,
             },
         };
-
-        let original_input = original_input.get_or_insert(prepared_prompt.into_original_input()?);
 
         let retry = handle_response_stream_error(
             &mut retry_state,
@@ -1915,7 +1909,7 @@ async fn run_sampling_request(
                     needs_follow_up: true,
                     last_agent_message: None,
                 },
-                std::mem::take(original_input),
+                notify_messages,
             ));
         }
         retry??;
@@ -1984,6 +1978,7 @@ pub(crate) async fn built_tools(
     mcp: &Arc<codex_mcp::McpBinding>,
     step_store: &ExtensionData,
     prepared_recommendations: PreparedToolRecommendations,
+    dynamic_tools: &[codex_protocol::dynamic_tools::DynamicToolSpec],
 ) -> CodexResult<Arc<ToolRouter>> {
     let all_mcp_tools = mcp.tools();
     let connector_snapshot = mcp.config().connector_snapshot.clone();
@@ -2054,6 +2049,7 @@ pub(crate) async fn built_tools(
         apps_enabled,
         step_store,
         tool_suggest_candidates.as_ref(),
+        dynamic_tools,
     )?))
 }
 
@@ -2473,6 +2469,7 @@ async fn emit_streamed_assistant_text_delta(
 }
 
 /// Flush buffered assistant text parser state when an assistant message item ends.
+#[instrument(level = "trace", skip_all)]
 async fn flush_assistant_text_segments_for_item(
     sess: &Session,
     turn_context: &TurnContext,
@@ -2485,6 +2482,7 @@ async fn flush_assistant_text_segments_for_item(
 }
 
 /// Flush any remaining buffered assistant text parser state at response completion.
+#[instrument(level = "trace", skip_all)]
 async fn flush_assistant_text_segments_all(
     sess: &Session,
     turn_context: &TurnContext,
@@ -2714,7 +2712,7 @@ async fn try_run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
-    prompt: &Prompt,
+    prompt: Prompt,
     post_compact_recovery: Option<&PostCompactRecoveryIdentity>,
     cancellation_token: CancellationToken,
     draining_for_mailbox: &mut bool,
@@ -2797,9 +2795,9 @@ async fn try_run_sampling_request(
     let mut request_token_usage = None;
     sess.set_server_reasoning_included(step_context.settings.model_info.use_responses_lite)
         .await;
-    let mut stream = match client_session
+    let stream = client_session
         .stream(
-            prompt,
+            &prompt,
             &step_context.settings.model_info,
             &step_context.session_telemetry,
             effort,
@@ -2810,8 +2808,9 @@ async fn try_run_sampling_request(
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
-        .await?
-    {
+        .await?;
+    drop(prompt);
+    let mut stream = match stream {
         Ok(stream) => stream,
         Err(error) => {
             if let Some(finish_post_request) = finish_post_request {
@@ -2872,14 +2871,21 @@ async fn try_run_sampling_request(
             gen_ai.usage.output_tokens = field::Empty,
             codex.usage.reasoning_output_tokens = field::Empty,
             codex.usage.total_tokens = field::Empty,
+            codex.response.receive_wait_ms = field::Empty,
         );
 
+        let receive_started = Instant::now();
         let event = stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
             .or_cancel(&preempt)
             .or_cancel(&cancellation_token)
             .await;
+        // Split the existing iteration span without adding another span per streamed delta.
+        handle_responses.record(
+            "codex.response.receive_wait_ms",
+            receive_started.elapsed().as_secs_f64() * 1000.0,
+        );
         // Account for an already-received terminal error even if cancellation raced it.
         // Cancellation still stops ordinary stream events before they can run tools.
         let event = match event {
@@ -2952,6 +2958,12 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created { response_id } => {
                 if let Some(response_id) = response_id {
+                    turn_context
+                        .extension_data
+                        .insert(crate::guardian::ParentResponse {
+                            id: response_id.clone(),
+                            routing_affinity: stream.routing_affinity.clone(),
+                        });
                     turn_context
                         .extension_data
                         .insert(codex_api::ResponseId(response_id));
@@ -3218,6 +3230,10 @@ async fn try_run_sampling_request(
             ResponseEvent::TurnModerationMetadata(metadata) => {
                 sess.emit_turn_moderation_metadata(&turn_context, metadata)
                     .await;
+            }
+            ResponseEvent::GuardianAssessment(_) => {
+                // Request-scoped extensions may consume this evidence. It does not
+                // authorize tools here and must not enter conversation history.
             }
             ResponseEvent::SafetyBuffering(buffering) => {
                 sess.send_event(
@@ -3497,7 +3513,9 @@ async fn try_run_sampling_request(
     let drain_result = if in_flight.is_empty() {
         Ok(())
     } else {
-        let _tool_blocking_timing_guard = turn_context.turn_timing_state.begin_tool_blocking();
+        let _tool_blocking_timing_guard = turn_context
+            .turn_timing_state
+            .begin_tool_blocking(tool_runtime.batch_timing());
         let _tool_blocking_span = trace_span!(
             "codex.tool_blocking",
             codex.turn.phase = "tool_blocking",

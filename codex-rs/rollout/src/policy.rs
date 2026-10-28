@@ -48,6 +48,7 @@ pub fn persisted_rollout_item(
         | RolloutItem::WorldState(_)
         | RolloutItem::RetainedContext(_)
         | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::DynamicToolsUpdated { .. }
         | RolloutItem::SessionMeta(_) => Some(Cow::Borrowed(item)),
     }
 }

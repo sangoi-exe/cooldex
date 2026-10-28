@@ -2,8 +2,8 @@
 //! Merge-safety anchor: only implicit daemon targets may fall back, while startup consistently
 //! returns the ownership-aware AppServerSession for every target mode.
 
-use super::*;
 use crate::legacy_core::config::ConfigBuilder;
+use crate::*;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 

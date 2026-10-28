@@ -565,17 +565,11 @@ impl Session {
             .models_manager
             .refresh_after_auth_change(self.get_config().await.http_client_factory())
             .await;
-        // A completion-triggered wakeup can be interrupted while discovery waits.
-        if self
-            .active_turn
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
-        {
+        let Some(session_configuration) = self.pending_work_turn_configuration(&turn_state).await
+        else {
             self.cancel_reserved_turn_start(&sub_id).await;
             return;
-        }
+        };
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
         if !input.iter().any(
@@ -589,8 +583,9 @@ impl Session {
                 .and_then(|context| context.cyber_access_program);
         }
         let turn_context = match self
-            .new_turn_with_default_settings(
+            .new_turn_with_configuration(
                 sub_id.clone(),
+                session_configuration,
                 NewTurnContextOptions {
                     final_output_json_schema: start_options.final_output_json_schema,
                     cyber_access_program: start_options.cyber_access_program,
@@ -968,6 +963,11 @@ impl Session {
             .turn_timing_state
             .complete_profile_and_duration_ms()
             .await;
+        crate::turn_timing::record_turn_profile_trace(
+            self.thread_id,
+            &turn_context.sub_id,
+            &profile,
+        );
         self.services
             .analytics_events_client
             .track_turn_profile(TurnProfileFact {
@@ -1092,10 +1092,12 @@ impl Session {
                     if matches!(
                         reason,
                         TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-                    ) && active
-                        .as_ref()
-                        .is_some_and(|active_turn| active_turn.task.is_some())
-                    {
+                    ) && active.as_ref().is_some_and(|active_turn| {
+                        active_turn.task.is_some()
+                            || (active_turn.finishing.is_none()
+                                && (self.enabled(Feature::WakeOnAgentMessages)
+                                    || active_turn.automatic_message_origin))
+                    }) {
                         self.mark_interrupted();
                     }
                     let active_turn = active.take();
@@ -1161,10 +1163,16 @@ impl Session {
             },
             _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
                 warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
+                // Forced teardown can abort independently spawned tool dispatches
+                // whose guards are destroyed later. Do not publish complete totals
+                // for a dependency graph that has not settled.
+                task.turn_context.turn_timing_state.invalidate_critical_path();
             }
         }
 
         task.handle.abort();
+        // Aborting schedules destruction; join before freezing the turn's timing.
+        let _ = task.handle.await;
 
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
@@ -1184,6 +1192,11 @@ impl Session {
                 .turn_timing_state
                 .complete_profile_and_duration_ms()
                 .await;
+            crate::turn_timing::record_turn_profile_trace(
+                self.thread_id,
+                &task.turn_context.sub_id,
+                &profile,
+            );
             self.services
                 .analytics_events_client
                 .track_turn_profile(TurnProfileFact {
@@ -1252,6 +1265,11 @@ impl Session {
             .turn_timing_state
             .complete_profile_and_duration_ms()
             .await;
+        crate::turn_timing::record_turn_profile_trace(
+            self.thread_id,
+            &task.turn_context.sub_id,
+            &profile,
+        );
         self.services
             .analytics_events_client
             .track_turn_profile(TurnProfileFact {

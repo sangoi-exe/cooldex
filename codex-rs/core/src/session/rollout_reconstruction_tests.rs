@@ -501,7 +501,14 @@ async fn record_initial_history_excludes_completed_compaction_observations_witho
         vec![user.clone()]
     );
     assert_eq!(
-        strip_metadata_from_items(&history.for_prompt(&turn_context.model_info().input_modalities)),
+        strip_metadata_from_items(
+            &history
+                .for_prompt(
+                    &turn_context.model_info().input_modalities,
+                    session.services.image_store.as_ref(),
+                )
+                .await,
+        ),
         vec![user]
     );
 }
@@ -1883,6 +1890,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions(
                     compaction_response_id: None,
                     latest_token_usage_record: None,
                     resume_metadata: current.then(|| codex_history::CompactionResumeMetadata {
+                        dynamic_tools: None,
                         multi_agent_version: None,
                         last_started_turn_id: Some(format!("wake-{window_number}")),
                         turn_attribution: None,

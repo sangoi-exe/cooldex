@@ -112,7 +112,7 @@ test *args:
 test *args:
     # Merge-safety anchor: native Windows test execution stays owned by the WSL
     # cargo-guard planner route; do not recreate a raw-Cargo bypass here.
-    throw "Windows test execution is owned by WSL. From the repository root run: ./scripts/cargo-guard.sh verify --file <corrected-path> --mode standard for an affected runtime correction; --changed selects all current staged, unstaged, and untracked paths rather than changes since a prior full collection; use ./scripts/cargo-guard.sh verify --changed --mode full only for the complete collector."
+    throw "Windows test execution is owned by WSL. From the repository root run: ./scripts/cargo-guard.sh verify --file <corrected-path> --mode standard --test-filter '<nextest-expression>' for selected native cases; use --wsl-test-filter <package> '<nextest-expression>' and --python-test <command> <Class.method> for selected WSL and Python cases. --changed selects all current staged, unstaged, and untracked paths rather than changes since a prior collection; --mode full remains the complete collector."
 
 validate *args:
     ../scripts/cargo-guard.sh verify --changed --mode standard {args}
