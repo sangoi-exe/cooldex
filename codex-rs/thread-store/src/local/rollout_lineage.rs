@@ -344,7 +344,7 @@ impl RolloutLineage {
         let thread_id = session_meta.meta.id;
         let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
         let items = tokio::task::spawn_blocking(move || {
-            let mut items = vec![RolloutItem::SessionMeta(session_meta)];
+            let mut items = vec![RolloutItem::SessionMeta(Box::new(session_meta))];
             for segment in self.segments() {
                 let file = codex_rollout::open_rollout_seekable_reader(
                     segment.rollout_path.as_path(),

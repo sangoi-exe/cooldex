@@ -59,7 +59,7 @@ fn response(item: ResponseItem) -> RolloutItem {
 }
 
 fn compacted(replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
-    RolloutItem::Compacted(CompactedItem {
+    RolloutItem::Compacted(Box::new(CompactedItem {
         message: "compaction summary".to_string(),
         replacement_history: replacement_history
             .map(|items| items.into_iter().map(Into::into).collect()),
@@ -74,7 +74,7 @@ fn compacted(replacement_history: Option<Vec<ResponseItem>>) -> RolloutItem {
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: None,
-    })
+    }))
 }
 
 fn newest(intervals: usize) -> RecallIntervals {

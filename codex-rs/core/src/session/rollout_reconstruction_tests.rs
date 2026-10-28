@@ -531,7 +531,7 @@ async fn record_initial_history_restores_pending_post_compact_recovery() {
     }];
     let rollout_items = completed_user_turn_rollout(
         turn_context.to_turn_context_item(),
-        vec![RolloutItem::Compacted(CompactedItem {
+        vec![RolloutItem::Compacted(Box::new(CompactedItem {
             message: "summary".to_string(),
             replacement_history: Some(annotated(replacement_history.clone())),
             retained_context: None,
@@ -548,7 +548,7 @@ async fn record_initial_history_restores_pending_post_compact_recovery() {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        })],
+        }))],
     );
 
     session
@@ -600,7 +600,7 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
         internal_chat_message_metadata_passthrough: None,
     }];
     let mut rollout_items = vec![
-        RolloutItem::Compacted(CompactedItem {
+        RolloutItem::Compacted(Box::new(CompactedItem {
             message: "summary".to_string(),
             replacement_history: Some(annotated(replacement_history)),
             retained_context: None,
@@ -617,7 +617,7 @@ async fn post_compact_recovery_rollback_of_consuming_turn_restores_pending() {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        }),
+        })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
                 turn_attribution: None,

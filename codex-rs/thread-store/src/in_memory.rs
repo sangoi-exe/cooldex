@@ -429,7 +429,7 @@ mod tests {
         .await
         .expect("create live thread");
         store.state.lock().await.fail_update_thread_metadata = true;
-        let item = RolloutItem::Compacted(CompactedItem {
+        let item = RolloutItem::Compacted(Box::new(CompactedItem {
             message: "durable despite metadata failure".to_string(),
             replacement_history: Some(Vec::new()),
             guardian_history: None,
@@ -443,7 +443,7 @@ mod tests {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        });
+        }));
 
         live_thread
             .append_items_durably(std::slice::from_ref(&item))
@@ -485,7 +485,7 @@ mod tests {
         .await
         .expect("create live thread");
         store.state.lock().await.fail_append_items = true;
-        let item = RolloutItem::Compacted(CompactedItem {
+        let item = RolloutItem::Compacted(Box::new(CompactedItem {
             message: "must not become visible".to_string(),
             replacement_history: Some(Vec::new()),
             guardian_history: None,
@@ -499,7 +499,7 @@ mod tests {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        });
+        }));
 
         live_thread
             .append_items_durably(&[item])
@@ -528,7 +528,7 @@ mod tests {
         .await
         .expect("create live thread");
         store.state.lock().await.fail_flush_thread = true;
-        let item = RolloutItem::Compacted(CompactedItem {
+        let item = RolloutItem::Compacted(Box::new(CompactedItem {
             message: "flush must fail before metadata projection".to_string(),
             replacement_history: Some(Vec::new()),
             guardian_history: None,
@@ -542,7 +542,7 @@ mod tests {
             compaction_response_id: None,
             latest_token_usage_record: None,
             resume_metadata: None,
-        });
+        }));
 
         live_thread
             .append_items_durably(&[item])

@@ -1915,7 +1915,7 @@ enabled = false
                     completed_at_ms: 1,
                 })),
                 RolloutItem::TurnContext(bounded_turn_context.to_turn_context_item()),
-                RolloutItem::Compacted(CompactedItem {
+                RolloutItem::Compacted(Box::new(CompactedItem {
                     message: "bounded child context".to_string(),
                     replacement_history: Some(replacement_history),
                     guardian_history: None,
@@ -1929,7 +1929,7 @@ enabled = false
                     compaction_response_id: None,
                     latest_token_usage_record: None,
                     resume_metadata: None,
-                }),
+                })),
             ])
             .await;
     }

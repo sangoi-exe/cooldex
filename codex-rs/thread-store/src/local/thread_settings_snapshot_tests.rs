@@ -201,7 +201,7 @@ fn write_paginated_rollout(
     let initial_ordinal = history_base.map_or(0, |base| base.end_ordinal_exclusive);
     let mut lines = vec![rollout_line(
         initial_ordinal,
-        RolloutItem::SessionMeta(SessionMetaLine {
+        RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -210,7 +210,7 @@ fn write_paginated_rollout(
                 ..SessionMeta::default()
             },
             git: None,
-        }),
+        })),
     )];
     lines.extend(items.into_iter().enumerate().map(|(index, item)| {
         rollout_line(

@@ -73,7 +73,7 @@ async fn load_history_replays_nested_archived_lineage_with_frozen_ordinals() {
         thread_id: child,
         revision: None,
         items: vec![
-            RolloutItem::SessionMeta(session_meta),
+            RolloutItem::SessionMeta(Box::new(session_meta)),
             root_item,
             middle_item,
             child_item,

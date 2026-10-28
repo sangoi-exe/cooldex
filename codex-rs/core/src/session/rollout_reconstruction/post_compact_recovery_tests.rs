@@ -41,7 +41,7 @@ fn compaction(
     marker_boundary_id: Option<&str>,
     replacement_history: Option<Vec<ResponseItemEnvelope>>,
 ) -> RolloutItem {
-    RolloutItem::Compacted(CompactedItem {
+    RolloutItem::Compacted(Box::new(CompactedItem {
         message: "summary".to_string(),
         replacement_history,
         // Merge-safety anchor: local compaction fixtures explicitly track optional persisted checkpoint fields.
@@ -61,7 +61,7 @@ fn compaction(
         compaction_response_id: None,
         latest_token_usage_record: None,
         resume_metadata: None,
-    })
+    }))
 }
 
 fn application(window_id: &str, boundary_item_id: &str, turn_id: &str) -> RolloutItem {
