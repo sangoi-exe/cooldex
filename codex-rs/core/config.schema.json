@@ -216,6 +216,25 @@
       "description": "Account settings for a single app.",
       "type": "object"
     },
+    "AppServerMode": {
+      "description": "Selects how an interactive TUI obtains its local app-server.",
+      "oneOf": [
+        {
+          "description": "Preserve the upstream implicit-daemon-or-embedded selection.",
+          "enum": [
+            "upstream"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Spawn one private app-server child owned by this TUI instance.",
+          "enum": [
+            "instance_child"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "AppToolApproval": {
       "enum": [
         "auto",
@@ -756,6 +775,47 @@
       },
       "type": "object"
     },
+    "ComputerUseConfigToml2": {
+      "additionalProperties": false,
+      "properties": {
+        "display_ready_timeout": {
+          "description": "Maximum time to wait for Xvfb/Openbox startup, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "mcp_bin": {
+          "description": "Absolute path to the source/development Computer Use MCP binary.",
+          "type": "string"
+        },
+        "openbox": {
+          "description": "Command or path used to start Openbox for the local desktop session.",
+          "type": "string"
+        },
+        "shutdown_grace_period": {
+          "description": "Grace period before force-terminating owned session processes, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "sky_bin": {
+          "description": "Absolute path to the source/development Sky binary.",
+          "type": "string"
+        },
+        "temp_root": {
+          "description": "Session temp root for Computer Use working files.",
+          "type": "string"
+        },
+        "xvfb": {
+          "description": "Command or path used to start Xvfb for the local desktop session.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "ComputerUseMacosConfigToml": {
       "additionalProperties": false,
       "properties": {
@@ -961,7 +1021,7 @@
               "type": "boolean"
             },
             "computer_use": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
             },
             "concurrent_reasoning_summaries": {
               "type": "boolean"
@@ -1780,6 +1840,16 @@
         },
         {
           "$ref": "#/definitions/CodeModeHostConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_ComputerUseConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/ComputerUseConfigToml2"
         }
       ]
     },
@@ -3249,6 +3319,9 @@
         "non_code_mode_only": {
           "type": "boolean"
         },
+        "policy": {
+          "$ref": "#/definitions/MultiAgentV2Policy"
+        },
         "preserve_fork_prefix": {
           "description": "Preserve the parent's model-visible history on full forks and append child instructions. Defaults to true. Legacy compaction without a reusable context baseline still rebuilds.",
           "type": "boolean"
@@ -3258,6 +3331,10 @@
         },
         "subagent_developer_instructions": {
           "description": "Overrides inherited developer instructions for subagents without role-specific instructions.",
+          "type": "string"
+        },
+        "subagent_instructions_file": {
+          "description": "Base instructions loaded once for partial- and no-history V2 child sessions.",
           "type": "string"
         },
         "subagent_usage_hint_text": {
@@ -3282,6 +3359,14 @@
         }
       },
       "type": "object"
+    },
+    "MultiAgentV2Policy": {
+      "description": "Selects the built-in MultiAgentV2 delegation policy.",
+      "enum": [
+        "explicit_request_only",
+        "proactive"
+      ],
+      "type": "string"
     },
     "NetworkDomainPermissionToml": {
       "enum": [
@@ -4596,6 +4681,14 @@
         }
       ]
     },
+    "SafetyBufferingChoice": {
+      "description": "Deliberately selected action for a safety-buffered request.",
+      "enum": [
+        "dismiss-and-keep-waiting",
+        "retry-with-faster-model"
+      ],
+      "type": "string"
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -5056,6 +5149,15 @@
           "description": "Enable animations (welcome screen, shimmer effects, spinners). Defaults to `true`.",
           "type": "boolean"
         },
+        "app_server_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppServerMode"
+            }
+          ],
+          "default": "upstream",
+          "description": "Controls how an ordinary interactive TUI obtains its local app-server. Defaults to `upstream`."
+        },
         "auto_recap": {
           "default": true,
           "description": "Generate automatic conversation recaps when the terminal is unfocused. Defaults to `true`. Disabling this leaves `/recap` available on demand.",
@@ -5399,6 +5501,20 @@
           ],
           "default": "auto",
           "description": "Right-click text paste fallback. Defaults to `auto` (Windows/WSL/Linux). `on` also enables macOS; neither mode reads over SSH or in recognized VS Code terminals. This controls the fullscreen fallback, not the terminal's own paste binding."
+        },
+        "safety_buffering_auto_apply": {
+          "default": false,
+          "description": "Apply an offered remembered safety-buffering action without asking again. Defaults to false, which only preselects the remembered action.",
+          "type": "boolean"
+        },
+        "safety_buffering_last_choice": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SafetyBufferingChoice"
+            }
+          ],
+          "default": null,
+          "description": "Last deliberately selected wait action or confirmed retry; unset means no preference."
         },
         "screen_reader_detection_done": {
           "description": "Records the one-time screen-reader detection attempt. Either value skips detection.",
@@ -7438,6 +7554,14 @@
       "description": "Developer instructions inserted as a `developer` role message.",
       "type": "string"
     },
+    "developer_instructions_file": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      ],
+      "description": "Optional path to a file containing developer instructions."
+    },
     "disable_paste_burst": {
       "description": "Legacy fallback for `tui.disable_paste_burst`. Prefer the setting under `[tui]`.",
       "type": "boolean"
@@ -7610,7 +7734,7 @@
           "type": "boolean"
         },
         "computer_use": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_ComputerUseConfigToml"
         },
         "concurrent_reasoning_summaries": {
           "type": "boolean"
@@ -8205,6 +8329,10 @@
       "description": "Whether environment context includes the current date and timezone.",
       "type": "boolean"
     },
+    "include_global_agents_md": {
+      "description": "Whether to load global AGENTS instructions from the Codex home directory.",
+      "type": "boolean"
+    },
     "include_permissions_instructions": {
       "description": "Whether to inject the `<permissions instructions>` developer block.",
       "type": "boolean"
@@ -8418,6 +8546,10 @@
       ],
       "default": {},
       "description": "Default and per-plugin settings keyed by exact `<plugin>@<marketplace>` IDs."
+    },
+    "post_compact_recovery_instructions": {
+      "description": "Model-visible developer instructions included in post-compact recovery context.",
+      "type": "string"
     },
     "profile": {
       "description": "Profile to use from the `profiles` map.",
