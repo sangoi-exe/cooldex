@@ -121,7 +121,6 @@ pub use node_repl_review_evidence::NodeReplReviewEvidence;
 pub(crate) use node_repl_review_evidence::NodeReplReviewEvidenceMode;
 pub(crate) use node_repl_review_evidence::node_repl_review_evidence_mode;
 pub(crate) use plugin_instructions::PluginInstructions;
-pub(crate) use post_compact_recovery::PostCompactHandoffContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContext;
 pub(crate) use post_compact_recovery::PostCompactRecoveryContextError;
 pub(crate) use realtime_delegation::RealtimeDelegation;

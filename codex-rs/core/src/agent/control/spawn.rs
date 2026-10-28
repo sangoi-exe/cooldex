@@ -25,6 +25,7 @@ use codex_protocol::error::AgentErrorContext;
 use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::protocol::AgentUsageHintBinding;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_thread_store::LoadThreadHistoryParams;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use futures::stream;
