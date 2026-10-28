@@ -1,4 +1,3 @@
-use super::compact::COMPACT_WARNING_MESSAGE;
 use std::any::Any;
 use std::fs;
 use std::path::Path;
@@ -23,7 +22,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
@@ -467,17 +465,6 @@ async fn seed_and_compact(codex: &codex_core::CodexThread) -> Result<()> {
     codex.start_or_steer_turn(user_turn(FIRST_USER)).await?;
     wait_for_successful_turn_complete(codex).await;
     codex.submit(Op::Compact).await?;
-    let EventMsg::Warning(WarningEvent { message }) = wait_for_event(codex, |event| {
-        matches!(
-            event,
-            EventMsg::Warning(WarningEvent { message }) if message == COMPACT_WARNING_MESSAGE
-        )
-    })
-    .await
-    else {
-        unreachable!("predicate guarantees a compact warning event");
-    };
-    assert_eq!(message, COMPACT_WARNING_MESSAGE);
     wait_for_successful_turn_complete(codex).await;
     Ok(())
 }

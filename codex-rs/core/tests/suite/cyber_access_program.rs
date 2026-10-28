@@ -347,7 +347,7 @@ async fn cyber_access_program_is_inherited_by_child_turns(
                         "worker".to_string(),
                         AgentRoleConfig {
                             description: None,
-                            config_file: Some(role_path),
+                            config_file: Some(role_path.to_path_buf()),
                             nickname_candidates: None,
                         },
                     );
@@ -562,7 +562,7 @@ async fn recipient_role_daybreak_rejects_incompatible_model_without_fallback(
                 "worker".to_string(),
                 AgentRoleConfig {
                     description: None,
-                    config_file: Some(role_path),
+                    config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,
                 },
             );

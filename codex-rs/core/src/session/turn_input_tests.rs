@@ -221,6 +221,7 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
             AdditionalContextEntry {
                 value: "unseen run".to_owned(),
                 kind: AdditionalContextKind::Application,
+                name: None,
             },
         ),
         (
@@ -228,6 +229,7 @@ async fn steering_order_wait_allows_retirement_without_rerouting_input(standalon
             AdditionalContextEntry {
                 value: "unseen tab".to_owned(),
                 kind: AdditionalContextKind::Untrusted,
+                name: None,
             },
         ),
     ]);
@@ -1662,8 +1664,7 @@ async fn incompatible_recipient_policy_cancels_idle_admission_reservation() {
         TurnInputRequest::user_input(vec![UserInput::Text {
             text: "reject before sampling".to_string(),
             text_elements: Vec::new(),
-        }])
-        .into(),
+        }]),
         TurnInputMode::StartIfIdle,
         "rejected-role-policy".to_string(),
     )

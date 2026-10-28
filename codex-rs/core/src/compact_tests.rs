@@ -312,9 +312,16 @@ async fn extension_window_prefix_precedes_retained_turns_and_is_not_repeated() {
         }),
     );
     let retained = vec![user_message("earlier turn"), user_message("latest turn")];
-    let (replacement, snapshot) =
-        build_compaction_replacement_history(&session, &step, &world, annotated(retained.clone()))
-            .await;
+    // Merge-safety anchor: replacement context uses the prepared window identity, as in the production compaction path.
+    let (_, window_ids) = session.prepare_auto_compact_window().await;
+    let (replacement, snapshot) = build_compaction_replacement_history(
+        &session,
+        &step,
+        &world,
+        window_ids,
+        annotated(retained.clone()),
+    )
+    .await;
     let items = raw(replacement);
     let ResponseItem::Message { role, content, .. } = &items[0] else {
         panic!("expected a separate developer prefix");

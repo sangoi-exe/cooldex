@@ -76,6 +76,7 @@ fn response_stream(events: Vec<Result<ResponseEvent, CodexErr>>) -> ResponseStre
     }
     drop(tx);
     ResponseStream {
+        routing_affinity: None,
         rx_event: rx,
         interrupt: None,
         consumer_dropped: CancellationToken::new(),
@@ -534,6 +535,7 @@ async fn collector_propagates_cancellation_as_turn_aborted() {
     cancellation.cancel();
     let error = collect_handoff_response(
         ResponseStream {
+            routing_affinity: None,
             rx_event: rx,
             interrupt: None,
             consumer_dropped: CancellationToken::new(),

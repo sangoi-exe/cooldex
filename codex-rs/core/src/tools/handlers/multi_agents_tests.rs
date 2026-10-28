@@ -404,7 +404,8 @@ async fn enqueue_multi_agent_v2_wait_mailbox(
                 Vec::new(),
                 body.to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -5621,7 +5622,8 @@ async fn multi_agent_v2_wait_agent_condition_keeps_steer_authoritative_after_lat
                 Vec::new(),
                 "mailbox after steer".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;

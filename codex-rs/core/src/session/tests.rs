@@ -13992,7 +13992,7 @@ async fn finishing_turn_rejects_mailbox_notices_after_its_pending_input_drain() 
             .get_pending_input(&session.active_turn)
             .await
             .0,
-        vec![TurnInput::InterAgentCommunication(queued_mail)]
+        vec![TurnInput::InterAgentCommunication(queued_mail.into())]
     );
     assert!(
         session
