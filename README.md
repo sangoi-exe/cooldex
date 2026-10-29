@@ -36,17 +36,11 @@ The WSL/Linux x86_64 release contains exactly:
 
 ### Cooldex fork inventory
 
-Cooldex tracks its upstream baseline and keeps a small local surface for bounded
-current-thread `recall`, post-compaction continuity, MultiAgentV2 controls, a
-local app-server child, a source/development Computer Use island, and the
-full-Responses override for the GPT-5.6 model family. Local operator support
-includes `cargo-guard` and separate `codex`, `cdx`, and `cdx-dev` command lanes.
+<!-- Merge-safety anchor: Cooldex supports only the codex and cdx-dev local command lanes. -->
 
-`codex` is the regular stable lane. `cdx` selects the standalone package lane
-for QA and promotion checks. `cdx-dev` is the development-session lane. These
-roles support local workflow; they do not define separate deployment
-environments. Release and cross-machine installation remain in the source tree
-as a future retirement candidate. This inventory does not remove or change them.
+Cooldex tracks its upstream baseline and keeps a small local surface for bounded current-thread `recall`, post-compaction continuity, MultiAgentV2 controls, a local app-server child, a source/development Computer Use island, and the full-Responses override for the GPT-5.6 model family. Local operator support includes `cargo-guard` and two separate local command lanes: `codex` and `cdx-dev`.
+
+`codex` is the regular stable lane. `cdx-dev` is the development-session lane. These roles support local workflow; they do not define separate deployment environments. Release and cross-machine installation remain in the source tree as a future retirement candidate. This inventory does not remove or change them.
 
 The detailed current inventory is maintained in the companion `.sangoi`
 repository at `reference/areas/cooldex-fork-feature-inventory.md`. It records

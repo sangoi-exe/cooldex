@@ -12,10 +12,9 @@
 ## Local Baseline
 
 - When the operator says `main`, use the local branch named `main`.
-- The supported operator path is WSL with ChatGPT Pro authentication through ordinary
-  `codex`/`cdx` TUI or exec sessions.
-- `/home/lucas/.cargo/bin/codex` and `/home/lucas/.local/bin/cdx-dev` are stable selectors for independent local package lanes. Each lane owns its selected complete package, source-built helpers and sidecars, daemon namespace, and pinned subordinate managed daemon package; user authentication, sessions, general configuration, SQLite, and history remain shared under one `CODEX_HOME`.
-- `cdx` selects `/home/lucas/.codex/packages/standalone/current/bin/codex` through `/home/lucas/.cargo/bin/cdx` for the standalone release. It is a separate lane and is excluded from the local source-promotion procedure. The supported topology has no interactive Bash `codex` alias. `cdx-pro` is retired and must not be recreated as an alias, wrapper, or compatibility path.
+- The supported operator path is WSL with ChatGPT Pro authentication through ordinary `codex` or `cdx-dev` TUI or exec sessions.
+- The two supported independent local package lanes are `codex` and `cdx-dev`, selected by the stable paths `/home/lucas/.cargo/bin/codex` and `/home/lucas/.local/bin/cdx-dev`, respectively. Each lane owns its selected complete package, source-built helpers and sidecars, daemon namespace, and pinned subordinate managed daemon package; user authentication, sessions, general configuration, SQLite, and history remain shared under one `CODEX_HOME`.
+- The supported topology has no interactive Bash `codex` alias. `cdx-pro` is retired and must not be recreated as an alias, wrapper, or compatibility path.
 - Before installing, promoting, removing, or publishing command surfaces, inspect the
   live resolution, aliases, symlink targets, executable identities, and hashes with
   `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable. This file defines
@@ -65,7 +64,7 @@
 <!-- Merge-safety anchor: local source promotion selects one complete package generation for one explicit stable local lane, preserving package-local helpers and the lane-bound daemon lifecycle without runtime Git-branch awareness. -->
 ### Branch-scoped local complete-package promotion
 
-- This procedure applies only to one WSL/Linux local source-promotion invocation for one explicit destination: `codex` or `cdx-dev`. `cdx`, Windows/macOS product promotion, release publication, and remote mutation remain separate and excluded.
+- This procedure applies only to one WSL/Linux local source-promotion invocation for one explicit destination: `codex` or `cdx-dev`. Windows/macOS product promotion, release publication, and remote mutation remain separate and excluded.
 - Before building, verify one clean source checkout by its explicit branch and immutable HEAD, plus one explicit destination. Reject ambiguity, never infer the destination from the branch name, and never make runtime code inspect Git branches.
 - Before any operation, record the live command, alias, symlink, package, and executable identities and pre-operation hashes for both the selected and excluded destinations with `type -a`, `alias -p`, `readlink -f`, and `sha256sum` as applicable.
 - Rebuild every applicable source-owned package input only through root `just build-local-codex-package-inputs`, which delegates guarded Cargo work. Raw Cargo, prior-generation compiled inputs, partial helper or sidecar replacement, and cross-lane reuse are not promotion routes.
