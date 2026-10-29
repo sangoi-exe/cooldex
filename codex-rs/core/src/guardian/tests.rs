@@ -3977,6 +3977,7 @@ async fn guardian_review_session_config_uses_live_network_proxy_state() {
     );
 }
 
+// Merge-safety anchor: Guardian clears borrowed recipient-role policy without changing the parent configuration.
 #[tokio::test]
 async fn guardian_review_session_config_isolates_parent_customizations() {
     let defaults = ResolvedModelMessages::bundled().auto_review();

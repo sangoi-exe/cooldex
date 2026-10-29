@@ -701,6 +701,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
     );
 }
 
+// Merge-safety anchor: admission merges sparse updates with matching model/personality metadata across async preparation, revalidates Plan, constraints, and effective recipient policy, and rejects unsupported policy before settings or runtime effects publish.
 #[tokio::test]
 async fn prepared_user_updates_merge_with_settings_at_turn_start() {
     for (requested, intervening, gated_model) in [
@@ -1117,7 +1118,6 @@ async fn automatic_admission_rechecks_plan_mode_during_model_lookup() {
     }));
 }
 
-// Merge-safety anchor: unsupported recipient policy must reject input before its settings or runtime effects publish.
 #[tokio::test]
 async fn recipient_daybreak_rejection_does_not_publish_started_input_settings() {
     const SUPPORTED: &str = "admission-supported";

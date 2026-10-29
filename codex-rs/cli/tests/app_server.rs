@@ -334,6 +334,7 @@ fn print_startup_config_preserves_project_login_restrictions() -> Result<()> {
     Ok(())
 }
 
+// Merge-safety anchor: one-shot startup honors selected Profile V2 precedence and keeps missing-profile and home errors fail-loud inside the JSON error boundary.
 #[test]
 fn print_startup_config_rejects_missing_selected_profile() -> Result<()> {
     let home = TempDir::new()?;

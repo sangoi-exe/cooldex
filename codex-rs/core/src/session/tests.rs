@@ -13306,6 +13306,7 @@ impl SessionTask for HeldStepTask {
     }
 }
 
+// Merge-safety anchor: replacement preserves terminal-error mail through wake preparation and before task registration; retired reservations cannot consume it or register a task.
 #[tokio::test]
 async fn replacement_preserves_queue_only_terminal_error_mail_after_wake_drain() {
     let (mut session, turn) = make_session_and_context().await;

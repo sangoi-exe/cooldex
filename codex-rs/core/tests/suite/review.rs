@@ -977,6 +977,7 @@ async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Merge-safety anchor: review starts with an explicit parent recipient-role policy, but the delegate request must not inherit it.
 /// Ensure that when a custom `review_model` is set in the config, the review
 /// request uses that model (and not the main chat model).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
