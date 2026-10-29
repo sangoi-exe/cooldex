@@ -8,30 +8,30 @@ Scenario: Cloud and executor skill catalogs retain names and aliases across turn
 Settings:
   include: ["reasoning.encrypted_content"]
   model: "gpt-6-astra"
-  parallel_tool_calls: false
+  parallel_tool_calls: true
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
-  reasoning: {"context":"all_turns","effort":"low"}
+  reasoning: {"effort":"low"}
   store: false
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
+  tools (7; hash=f92ea48c88394246):
+    - custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=b66d24c032d0153b
+    - function/wait: Waits on a yielded `exec` cell and returns new output or completion. - Use `wait` only after `exe...; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=6692d8f6c55be489
+    - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
+    - function/request_user_input_async: Ask the user one or more questions during ongoing work. Use this tool only to request missing inf...; args=[questions]; hash=d6d74f33db330162
+    - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
+      - function/sleep
+    - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
+      - function/followup_task
+      - function/interrupt_agent
+      - function/list_agents
+      - function/send_message
+      - function/spawn_agent
+      - function/wait_agent
+    - web_search; hash=e214d4db1bc49e89
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=5e8370540461db70):
-        - namespace/functions; hash=7d26e086c1dbba28
-          - custom/exec
-          - function/wait
-          - function/request_user_input
-          - function/request_user_input_async
-        - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
-          - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
-          - function/followup_task
-          - function/interrupt_agent
-          - function/list_agents
-          - function/send_message
-          - function/spawn_agent
-          - function/wait_agent
-01:message/developer:
+00:message/developer:
     You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collabo...them until their intended goal is completely handled. [hash=efa50f074efa5803]
 
     # When to ask the user for permission
@@ -49,7 +49,7 @@ Settings:
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-02:message/developer[4]:
+01:message/developer[4]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
         Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
@@ -90,7 +90,7 @@ Settings:
         - demo:s1: (cloud package: skill://cloud/s1)
         - demo:s2: (cloud package: skill://cloud/s2)
         </skills_instructions>
-03:message/developer:
+02:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -108,18 +108,18 @@ Settings:
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
-04:message/developer:
+03:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-05:message/user:
+04:message/user:
     <environment_context>
       <current_date><CURRENT_DATE></current_date>
       <timezone><HOST_TIMEZONE></timezone>
     </environment_context>
-06:message/user:
+05:message/user:
     Which skills are available?
-07:configuration_update:reasoning={"effort":"low"}
+06:configuration_update:reasoning={"effort":"low"}
 -- request 2 (turn) --
-08:message/assistant:
+07:message/assistant:
     Skills are available.
-09:message/user:
+08:message/user:
     Are those same skills still available?

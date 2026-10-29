@@ -8,30 +8,30 @@ Scenario: A cloud parent lists and reads a frozen skill alongside a named execut
 Settings:
   include: ["reasoning.encrypted_content"]
   model: "gpt-6-astra"
-  parallel_tool_calls: false
+  parallel_tool_calls: true
   prompt_cache_key: "<PROMPT_CACHE_KEY 1>"
-  reasoning: {"context":"all_turns","effort":"low"}
+  reasoning: {"effort":"low"}
   store: false
   stream: true
   text: {"verbosity":"low"}
   tool_choice: "auto"
+  tools (7; hash=4492f70ba91de448):
+    - custom/exec: Run JavaScript code to orchestrate/compose tool calls - Evaluates the provided JavaScript code in...; hash=94529d96776df6fd
+    - function/wait: Waits on a yielded `exec` cell and returns new output or completion. - Use `wait` only after `exe...; args=[cell_id, max_tokens, terminate, yield_time_ms]; hash=6692d8f6c55be489
+    - function/request_user_input: Request user input for one to three short questions and wait for the response. This tool is only ...; args=[questions]; hash=64a729b25c424fc6
+    - function/request_user_input_async: Ask the user one or more questions during ongoing work. Use this tool only to request missing inf...; args=[questions]; hash=d6d74f33db330162
+    - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
+      - function/sleep
+    - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=502a915c4fbcc6cc
+      - function/followup_task
+      - function/interrupt_agent
+      - function/list_agents
+      - function/send_message
+      - function/spawn_agent
+      - function/wait_agent
+    - web_search; hash=e214d4db1bc49e89
 -- request 1 (request) --
-00:additional_tools/developer (3; hash=e075a43448be3246):
-        - namespace/functions; hash=bbcd688349ca7e12
-          - custom/exec
-          - function/wait
-          - function/request_user_input
-          - function/request_user_input_async
-        - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
-          - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
-          - function/followup_task
-          - function/interrupt_agent
-          - function/list_agents
-          - function/send_message
-          - function/spawn_agent
-          - function/wait_agent
-01:message/developer:
+00:message/developer:
     You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collabo...them until their intended goal is completely handled. [hash=efa50f074efa5803]
 
     # When to ask the user for permission
@@ -49,7 +49,7 @@ Settings:
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-02:message/developer[3]:
+01:message/developer[3]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
         Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
@@ -80,7 +80,7 @@ Settings:
         ### Available skills
         - demo:work: Inspect and explain the requested work. (cloud package: c0/work)
         </skills_instructions>
-03:message/developer:
+02:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -98,9 +98,9 @@ Settings:
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
-04:message/developer:
+03:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-05:message/user:
+04:message/user:
     <environment_context>
       <cwd><CWD></cwd>
       <shell><HOST_SHELL></shell>
@@ -108,12 +108,12 @@ Settings:
       <timezone><HOST_TIMEZONE></timezone>
       <filesystem><workspace_roots><root><CWD></root></workspace_roots><permission_profile type="disabled"><...e="unrestricted" /></permission_profile></filesystem> [hash=d40b2f45cb028888]
     </environment_context>
-06:message/user:
+05:message/user:
     List the cloud skills, then read the work skill.
-07:configuration_update:reasoning={"effort":"low"}
+06:configuration_update:reasoning={"effort":"low"}
 -- request 2 (request) --
-08:function_call/skills.list:{"authority":{"kind":"cloud"}}
-09:function_call_output:{"next_cursor":null,"skills":[{"authority":{"kind":"cloud"},"description":"Inspect and explain the reque...:work","package":"skill://demo/work"}],"warnings":[]} [hash=0a735291ec9e0ec7]
+07:function_call/skills.list:{"authority":{"kind":"cloud"}}
+08:function_call_output:{"next_cursor":null,"skills":[{"authority":{"kind":"cloud"},"description":"Inspect and explain the reque...:work","package":"skill://demo/work"}],"warnings":[]} [hash=0a735291ec9e0ec7]
 -- request 3 (request) --
-10:function_call/skills.read:{"package":"c0/work","source":{"kind":"cloud"}}
-11:function_call_output:{"contents":"# Work\\nInspect the inputs before explaining the result.\\n","installations":[{"package":"sk...cursor":null,"resource":"skill://demo/work/SKILL.md"} [hash=adc0897fa3bc41cf]
+09:function_call/skills.read:{"package":"c0/work","source":{"kind":"cloud"}}
+10:function_call_output:{"contents":"# Work\\nInspect the inputs before explaining the result.\\n","installations":[{"package":"sk...cursor":null,"resource":"skill://demo/work/SKILL.md"} [hash=adc0897fa3bc41cf]
