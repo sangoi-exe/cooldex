@@ -13540,6 +13540,173 @@ async fn replacement_preserves_queue_only_terminal_error_mail_after_wake_drain()
     );
 }
 
+#[tokio::test]
+async fn replacement_during_before_task_registration_preserves_terminal_error_mail() {
+    struct BeforeRegistrationGate {
+        turn_id: String,
+        block_next: std::sync::atomic::AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl codex_extension_api::TurnLifecycleContributor for BeforeRegistrationGate {
+        fn on_turn_start<'a>(
+            &'a self,
+            input: codex_extension_api::TurnStartInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                if input.turn_id == self.turn_id.as_str()
+                    && self
+                        .block_next
+                        .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+            })
+        }
+    }
+
+    let (mut session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let gate = Arc::new(BeforeRegistrationGate {
+        turn_id: turn.sub_id.clone(),
+        block_next: std::sync::atomic::AtomicBool::new(true),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.turn_lifecycle_contributor(gate.clone());
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let communication = InterAgentCommunication::new(
+        AgentPath::root()
+            .join("failed_worker")
+            .expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "terminal error mail at before-registration replacement".to_string(),
+        /*trigger_turn*/ false,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            crate::PendingAgentMessage::new(communication.clone(), None, true),
+            Default::default(),
+        )
+        .await;
+
+    let retired_reservation = session
+        .reserve_turn_start(&turn.sub_id)
+        .await
+        .expect("reserve initial turn");
+    session.cancel_reserved_turn_start(&turn.sub_id).await;
+    assert!(
+        !session
+            .start_task(
+                Arc::clone(&turn),
+                Vec::new(),
+                HeldStepTask {
+                    kind: TaskKind::Regular,
+                    finish: Arc::new(Notify::new()),
+                },
+                Some(retired_reservation),
+            )
+            .await,
+        "a reserved start cannot recreate an absent slot"
+    );
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.input_queue.has_terminal_error_mailbox_items().await);
+
+    let reservation = session
+        .reserve_turn_start(&turn.sub_id)
+        .await
+        .expect("reserve turn for held callback");
+    let stale_start = {
+        let session = Arc::clone(&session);
+        let turn = Arc::clone(&turn);
+        tokio::spawn(async move {
+            session
+                .start_task(
+                    turn,
+                    Vec::new(),
+                    HeldStepTask {
+                        kind: TaskKind::Regular,
+                        finish: Arc::new(Notify::new()),
+                    },
+                    Some(reservation),
+                )
+                .await
+        })
+    };
+    timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("start reached the actual before-registration callback");
+    assert!(!stale_start.is_finished());
+
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+    let replacement = session
+        .new_turn_with_default_settings(turn.sub_id.clone(), Default::default())
+        .await
+        .expect("build replacement turn");
+    let replacement_reservation = session
+        .reserve_turn_start(&replacement.sub_id)
+        .await
+        .expect("reserve replacement turn");
+    gate.release.notify_one();
+    assert!(
+        !timeout(Duration::from_secs(10), stale_start)
+            .await
+            .expect("stale start completed after callback release")
+            .expect("stale start task did not panic"),
+        "the retired reservation must not register"
+    );
+    {
+        let active = session.active_turn.lock().await;
+        let active = active.as_ref().expect("replacement remains reserved");
+        assert!(Arc::ptr_eq(&active.turn_state, &replacement_reservation));
+        assert!(active.task.is_none(), "replacement remains unopened");
+    }
+    assert!(
+        session
+            .start_task(
+                Arc::clone(&replacement),
+                Vec::new(),
+                HeldStepTask {
+                    kind: TaskKind::Regular,
+                    finish: Arc::new(Notify::new()),
+                },
+                Some(Arc::clone(&replacement_reservation)),
+            )
+            .await
+    );
+    {
+        let active = session.active_turn.lock().await;
+        let active = active.as_ref().expect("replacement remains active");
+        assert!(Arc::ptr_eq(&active.turn_state, &replacement_reservation));
+        assert!(Arc::ptr_eq(
+            &active.task.as_ref().expect("replacement task").turn_context,
+            &replacement
+        ));
+    }
+    let pending = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await
+        .0;
+    assert!(
+        pending.iter().any(|item| {
+            matches!(item, TurnInput::InterAgentCommunication(mail)
+            if mail.author == communication.author
+                && mail.recipient == communication.recipient
+                && mail.content == communication.content
+                && mail.terminal_error_wake)
+        }),
+        "original terminal-error mail must remain reachable by the replacement"
+    );
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
 #[test_case(TerminalEventKind::TurnComplete; "completion")]
 #[test_case(TerminalEventKind::TurnAborted; "interruption")]
 #[tokio::test]

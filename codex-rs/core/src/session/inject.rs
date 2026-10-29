@@ -307,10 +307,14 @@ impl Session {
         };
 
         if !self
-            .start_task(turn_context, task_input, crate::tasks::RegularTask::new())
+            .start_task(
+                turn_context,
+                task_input,
+                crate::tasks::RegularTask::new(),
+                Some(turn_state),
+            )
             .await
         {
-            self.cancel_reserved_turn_start(&sub_id).await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::Busy,
                 original_input,

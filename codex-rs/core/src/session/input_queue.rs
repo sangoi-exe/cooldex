@@ -109,6 +109,33 @@ pub(crate) struct PendingMailboxCommunication {
     _diagnostics_guard: GaugeGuard,
 }
 
+fn mailbox_start_options<'a>(
+    pending_mails: impl Iterator<Item = &'a PendingMailboxCommunication>,
+) -> Option<TurnStartOptions> {
+    let mut triggers = pending_mails.filter(|mail| mail.communication.trigger_turn);
+    let first = triggers.next()?;
+    let first_parent = first
+        .start_options
+        .parent_turn_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty());
+    let mut parent = first_parent;
+    let mut last = first;
+    for mail in triggers {
+        parent = parent.filter(|id| mail.start_options.parent_turn_id.as_deref() == Some(*id));
+        last = mail;
+    }
+    // A later follow-up supersedes the earlier choice, including an omitted choice.
+    let mut start_options = last.start_options.clone();
+    start_options.parent_turn_id = parent.map(str::to_owned);
+    start_options.root_turn_id = first_parent
+        .and(first.start_options.root_turn_id.as_deref())
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned);
+    start_options.initiating_agent_path = Some(first.communication.author.clone());
+    Some(start_options)
+}
+
 impl InputQueue {
     pub(crate) fn new() -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
@@ -256,33 +283,16 @@ impl InputQueue {
         pending.drain(..).collect()
     }
 
+    // Merge-safety anchor: startup preparation projects options without consuming original envelopes; task registration or a still-current rejected admission claims them.
+    pub(crate) async fn mailbox_start_options(&self) -> Option<TurnStartOptions> {
+        let mut pending = self.mailbox_pending_mails.lock().await;
+        self.read_mailbox(&mut pending);
+        mailbox_start_options(pending.iter())
+    }
+
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
         let pending_mails = self.drain_mailbox().await;
-        // A later follow-up supersedes the earlier choice, including an omitted choice.
-        let mut start_options = pending_mails
-            .iter()
-            .rev()
-            .find(|mail| mail.communication.trigger_turn)
-            .map(|mail| mail.start_options.clone())
-            .unwrap_or_default();
-        start_options.parent_turn_id = pending_mails
-            .iter()
-            .filter(|mail| mail.communication.trigger_turn)
-            .map(|mail| mail.start_options.parent_turn_id.as_deref())
-            .reduce(|expected, candidate| expected.filter(|id| candidate == Some(*id)))
-            .and_then(|id| id.filter(|id| !id.trim().is_empty()).map(str::to_string));
-        start_options.root_turn_id = pending_mails
-            .iter()
-            .find(|mail| mail.communication.trigger_turn)
-            .and_then(|mail| {
-                mail.start_options
-                    .parent_turn_id
-                    .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .and(mail.start_options.root_turn_id.as_deref())
-                    .filter(|id| !id.trim().is_empty())
-            })
-            .map(str::to_string);
+        let start_options = mailbox_start_options(pending_mails.iter()).unwrap_or_default();
         let items = pending_mails
             .into_iter()
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
@@ -787,7 +797,14 @@ mod tests {
             (vec![(true, Some(""), root)], None, None),
             (vec![(true, Some("   "), root)], None, None),
             (vec![(true, None, root)], None, None),
+            (vec![(true, None, None)], None, None),
+            (vec![(true, None, root), (true, parent, root)], None, None),
             (vec![(true, parent, None)], parent, None),
+            (
+                vec![(true, parent, None), (true, parent, root)],
+                parent,
+                None,
+            ),
             (vec![(true, parent, Some(""))], parent, None),
             (vec![(true, parent, root), (true, peer, root)], None, root),
             (vec![(true, parent, root), (true, peer, root2)], None, root),
@@ -804,11 +821,16 @@ mod tests {
             ),
         ] {
             let input_queue = InputQueue::new();
-            for (trigger_turn, parent_turn_id, root_turn_id) in pending_mails {
+            let first_trigger = pending_mails.iter().position(|(trigger, _, _)| *trigger);
+            let mail_count = pending_mails.len();
+            for (index, (trigger_turn, parent_turn_id, root_turn_id)) in
+                pending_mails.into_iter().enumerate()
+            {
+                let author =
+                    AgentPath::try_from(format!("/root/sender{index}")).expect("agent path");
                 input_queue
                     .enqueue_mailbox_communication(
-                        make_mail(AgentPath::root(), AgentPath::root(), "task", trigger_turn)
-                            .into(),
+                        make_mail(author, AgentPath::root(), "task", trigger_turn).into(),
                         TurnStartOptions {
                             parent_turn_id: parent_turn_id.map(str::to_string),
                             root_turn_id: root_turn_id.map(str::to_string),
@@ -817,12 +839,26 @@ mod tests {
                     )
                     .await;
             }
-            let (_, start_options) = input_queue.drain_mailbox_input_items().await;
+            let projected = input_queue.mailbox_start_options().await;
+            assert_eq!(projected.is_some(), first_trigger.is_some());
+            let (drained, drained_options) = input_queue.drain_mailbox_input_items().await;
             assert_eq!(
-                start_options.parent_turn_id.as_deref(),
-                expected_parent_turn_id
+                drained.len(),
+                mail_count,
+                "projection must not consume mail"
             );
-            assert_eq!(start_options.root_turn_id.as_deref(), expected_root_turn_id);
+            let expected_author = first_trigger.map(|index| {
+                AgentPath::try_from(format!("/root/sender{index}")).expect("agent path")
+            });
+            for start_options in projected.into_iter().chain([drained_options]) {
+                assert_eq!(
+                    start_options.parent_turn_id.as_deref(),
+                    expected_parent_turn_id
+                );
+                assert_eq!(start_options.root_turn_id.as_deref(), expected_root_turn_id);
+                assert_eq!(start_options.initiating_agent_path, expected_author);
+            }
+            assert!(input_queue.mailbox_start_options().await.is_none());
         }
     }
 
@@ -832,24 +868,68 @@ mod tests {
 
         for latest in [Some(CyberAccessProgram::Standard), None] {
             let input_queue = InputQueue::new();
-            for (trigger_turn, program) in [
-                (true, Some(CyberAccessProgram::DaybreakBlue)),
-                (true, latest),
-                (false, Some(CyberAccessProgram::DaybreakRed)),
-            ] {
+            assert!(input_queue.mailbox_start_options().await.is_none());
+            let first_author = AgentPath::try_from("/root/first").expect("agent path");
+            for (index, (author, trigger_turn, program)) in [
+                (
+                    first_author.clone(),
+                    true,
+                    Some(CyberAccessProgram::DaybreakBlue),
+                ),
+                (AgentPath::root(), true, latest),
+                (
+                    AgentPath::root(),
+                    false,
+                    Some(CyberAccessProgram::DaybreakRed),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let label = match index {
+                    0 => Some("earlier"),
+                    1 => latest.map(|_| "latest"),
+                    _ => Some("queue-only"),
+                };
                 input_queue
                     .enqueue_mailbox_communication(
-                        make_mail(AgentPath::root(), AgentPath::root(), "task", trigger_turn)
-                            .into(),
+                        make_mail(author, AgentPath::root(), "task", trigger_turn).into(),
                         TurnStartOptions {
+                            turn_trigger: label.map(str::to_owned),
+                            final_output_json_schema: label
+                                .map(|name| serde_json::json!({"title": name})),
+                            service_tier: label.map(str::to_owned),
                             cyber_access_program: program,
                             ..Default::default()
                         },
                     )
                     .await;
             }
-            let (_, start_options) = input_queue.drain_mailbox_input_items().await;
-            assert_eq!(start_options.cyber_access_program, latest);
+            let projected = input_queue
+                .mailbox_start_options()
+                .await
+                .expect("trigger with default options must still project Some");
+            let (drained, drained_options) = input_queue.drain_mailbox_input_items().await;
+            assert_eq!(drained.len(), 3, "projection must not consume mail");
+            for start_options in [projected, drained_options] {
+                assert_eq!(start_options.cyber_access_program, latest);
+                assert_eq!(
+                    start_options.turn_trigger.as_deref(),
+                    latest.map(|_| "latest")
+                );
+                assert_eq!(
+                    start_options.service_tier.as_deref(),
+                    latest.map(|_| "latest")
+                );
+                assert_eq!(
+                    start_options.final_output_json_schema,
+                    latest.map(|_| serde_json::json!({"title": "latest"}))
+                );
+                assert_eq!(
+                    start_options.initiating_agent_path,
+                    Some(first_author.clone())
+                );
+            }
         }
     }
 

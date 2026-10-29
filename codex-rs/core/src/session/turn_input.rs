@@ -660,10 +660,14 @@ async fn start_if_idle(
         }
     }
     if !session
-        .start_task(Arc::clone(&turn_context), task_input, RegularTask::new())
+        .start_task(
+            Arc::clone(&turn_context),
+            task_input,
+            RegularTask::new(),
+            Some(turn_state),
+        )
         .await
     {
-        session.cancel_reserved_turn_start(&submission_id).await;
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::NotIdle,
         });

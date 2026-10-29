@@ -295,7 +295,7 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        let _ = self.start_task(turn_context, input, task).await;
+        let _ = self.start_task(turn_context, input, task, None).await;
     }
 
     /// Reserves the sole ActiveTurn owner before asynchronous turn preparation. The reservation
@@ -324,6 +324,8 @@ impl Session {
         }
     }
 
+    /// `Some` admits only the captured unopened reservation without recreating it; `None` may create or reuse a matching slot.
+    /// A false result means no matching unopened reservation remains at the admission check.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "record the started turn atomically with task registration"
@@ -333,6 +335,7 @@ impl Session {
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
+        expected_reservation: Option<Arc<Mutex<TurnState>>>,
     ) -> bool {
         let turn_state = {
             let mut active = self.active_turn.lock().await;
@@ -340,12 +343,15 @@ impl Session {
                 Some(turn)
                     if turn.task.is_none()
                         && turn.reserved_turn_id.as_deref()
-                            == Some(turn_context.sub_id.as_str()) =>
+                            == Some(turn_context.sub_id.as_str())
+                        && expected_reservation
+                            .as_ref()
+                            .is_none_or(|expected| Arc::ptr_eq(&turn.turn_state, expected)) =>
                 {
                     Arc::clone(&turn.turn_state)
                 }
                 Some(_) => return false,
-                None => {
+                None if expected_reservation.is_none() => {
                     let turn = ActiveTurn {
                         reserved_turn_id: Some(turn_context.sub_id.clone()),
                         ..Default::default()
@@ -354,6 +360,7 @@ impl Session {
                     *active = Some(turn);
                     turn_state
                 }
+                None => return false,
             }
         };
         // Replace the cache; in-flight acquisitions retain their previous Arc.
@@ -390,28 +397,6 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        // Merge-safety anchor: a task that ignores mailbox input must leave it queued for the
-        // regular next-turn start, which preserves the trigger boundary and its provenance.
-        let pending_items = if task.consumes_mailbox_input() {
-            self.input_queue.drain_mailbox_input_items().await.0
-        } else {
-            Vec::new()
-        };
-        let reservation_is_current = {
-            let mut active = self.active_turn.lock().await;
-            active.as_mut().is_some_and(|turn| {
-                turn.task.is_none()
-                    && turn.reserved_turn_id.as_deref() == Some(turn_context.sub_id.as_str())
-                    && Arc::ptr_eq(&turn.turn_state, &turn_state)
-            })
-        };
-        if !reservation_is_current {
-            return false;
-        }
-        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
-            .await;
         self.emit_turn_start_lifecycle(
             turn_context.as_ref(),
             Some(&token_usage_at_turn_start),
@@ -428,6 +413,14 @@ impl Session {
         }) else {
             return false;
         };
+        // Merge-safety anchor: mailbox transfer and task installation share the reservation lock; tasks that ignore mailbox input leave it queued for the next regular turn.
+        if task.consumes_mailbox_input() {
+            let pending_items = self.input_queue.drain_mailbox_input_items().await.0;
+            self.input_queue
+                .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+                .await;
+        }
+        turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start;
         // Record lineage only when the task starts: settings changes can invalidate a reservation.
         self.record_started_turn(
             &turn_context.sub_id,
@@ -548,6 +541,10 @@ impl Session {
     /// session.
     ///
     /// Starts an idle turn for explicit follow-ups, durable sleep, or enabled message wakes.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "claim rejected input atomically with the unopened reservation"
+    )]
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
@@ -567,21 +564,20 @@ impl Session {
             .await;
         let Some(session_configuration) = self.pending_work_turn_configuration(&turn_state).await
         else {
-            self.cancel_reserved_turn_start(&sub_id).await;
             return;
         };
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
-        if !input.iter().any(
-            |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        ) {
-            // Queue-only wakes retain the previous turn context without selecting a new task.
-            start_options = previous_options;
-            start_options.cyber_access_program = self
-                .reference_context_item()
-                .await
-                .and_then(|context| context.cyber_access_program);
-        }
+        let start_options = match self.input_queue.mailbox_start_options().await {
+            Some(start_options) => start_options,
+            None => {
+                // Queue-only wakes retain the previous turn context without selecting a new task.
+                let mut start_options = previous_options;
+                start_options.cyber_access_program = self
+                    .reference_context_item()
+                    .await
+                    .and_then(|context| context.cyber_access_program);
+                start_options
+            }
+        };
         let turn_context = match self
             .new_turn_with_configuration(
                 sub_id.clone(),
@@ -595,7 +591,31 @@ impl Session {
         {
             Ok(turn_context) => turn_context,
             Err(error) => {
-                // Merge-safety anchor: rejected recipient policy must preserve drained mail through native recording without starting a task.
+                let input = {
+                    let active = self.active_turn.lock().await;
+                    if let Some(turn) = active.as_ref().filter(|turn| {
+                        turn.task.is_none()
+                            && turn.reserved_turn_id.as_deref() == Some(sub_id.as_str())
+                            && Arc::ptr_eq(&turn.turn_state, &turn_state)
+                    }) {
+                        let mut input = self
+                            .input_queue
+                            .take_pending_input_for_turn_state(turn.turn_state.as_ref())
+                            .await;
+                        input.extend(self.input_queue.drain_mailbox_input_items().await.0);
+                        Some(input)
+                    } else {
+                        None
+                    }
+                };
+                let Some(input) = input else {
+                    error
+                        .turn_context
+                        .turn_metadata_state
+                        .cancel_git_enrichment_task();
+                    return;
+                };
+                // Merge-safety anchor: rejected recipient policy records the claimed original mail through native input hooks without starting a task.
                 run_hooks_and_record_inputs(
                     self,
                     &error.turn_context,
@@ -611,7 +631,16 @@ impl Session {
                     .turn_context
                     .turn_metadata_state
                     .cancel_git_enrichment_task();
-                self.cancel_reserved_turn_start(&sub_id).await;
+                {
+                    let mut active = self.active_turn.lock().await;
+                    if active.as_ref().is_some_and(|turn| {
+                        turn.task.is_none()
+                            && turn.reserved_turn_id.as_deref() == Some(sub_id.as_str())
+                            && Arc::ptr_eq(&turn.turn_state, &turn_state)
+                    }) {
+                        *active = None;
+                    }
+                }
                 // Merge-safety anchor: a rejected V2 child never starts a task, so emit its one terminal outcome here through the normal Session owner after mail recording and reservation cleanup.
                 if error.turn_context.multi_agent_version == MultiAgentVersion::V2
                     && matches!(
@@ -636,18 +665,7 @@ impl Session {
             turn_context.turn_metadata_state.set_turn_trigger(trigger);
         }
         if let Some(id) = start_options.parent_turn_id {
-            if let Some(initiating_agent_path) = input
-                .iter()
-                .find_map(|item| {
-                    let TurnInput::InterAgentCommunication(communication) = item else {
-                        return None;
-                    };
-                    communication
-                        .trigger_turn
-                        .then(|| communication.author.clone())
-                })
-                .or(start_options.initiating_agent_path)
-            {
+            if let Some(initiating_agent_path) = start_options.initiating_agent_path {
                 turn_context
                     .turn_metadata_state
                     .set_initiating_agent_path(initiating_agent_path);
@@ -659,26 +677,14 @@ impl Session {
         }
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        // Task completion must still save this mail if pre-turn compaction fails.
-        self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
+        let _ = self
+            .start_task(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                Some(turn_state),
+            )
             .await;
-        // Merge-safety anchor: context construction can outlive an interrupt or replacement; the wake must retain its original reservation before start_task can create an unreserved turn.
-        if self
-            .active_turn
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
-        {
-            return;
-        }
-        if !self
-            .start_task(turn_context, Vec::new(), RegularTask::new())
-            .await
-        {
-            self.cancel_reserved_turn_start(&sub_id).await;
-        }
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
