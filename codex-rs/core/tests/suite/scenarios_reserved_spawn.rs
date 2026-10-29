@@ -518,14 +518,18 @@ async fn prepared_spawn_starts_on_an_independent_destination_after_parent_shutdo
         child_request.body_json().get("prompt_cache_key").cloned(),
         cache_key.map(|key| json!(key)),
     );
+    // Merge-safety anchor: Astra children use Full Responses, so their custom tools are in the top-level catalog.
     assert!(
-        child_request
-            .inputs_of_type("additional_tools")
+        child_request.body_json()["tools"]
+            .as_array()
+            .expect("provider tools")
             .iter()
-            .any(|item| {
-                responses::namespace_child_tool(item, "functions", "exec")
-                    .and_then(|tool| tool["description"].as_str())
-                    .is_some_and(|description| description.contains("host_spawn(args:"))
+            .any(|tool| {
+                tool["type"] == "custom"
+                    && tool["name"] == "exec"
+                    && tool["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("host_spawn(args:"))
             })
     );
     let user_messages = child_request.message_input_texts("user");

@@ -189,11 +189,6 @@ text(JSON.stringify(results));"#;
             .rewrite_known_segments()
             .include_request_settings(),
     );
-    // Existing build-specific schema-hash normalization stays at the golden boundary; the assertions above compare the complete model-visible catalog.
-    let snapshot = regex_lite::Regex::new(
-        r"(?m)(^00:additional_tools/developer \(\d+; hash=|^ +- namespace/functions; hash=)[0-9a-f]{16}",
-    )?
-    .replace_all(&snapshot, "${1}<INITIAL_BUILD_HASH>");
     insta::assert_snapshot!("strict_3p_mcp_catalog_cache", snapshot);
     test.codex.shutdown_and_wait().await?;
     Ok(())

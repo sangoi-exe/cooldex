@@ -6,22 +6,7 @@ Scenario: Astra receives host and handler timings on completed and failed code-m
 
 ## Window 1
 -- request 1 (turn) --
-00:additional_tools/developer (3; hash=bf2e30605ff5dc17):
-        - namespace/functions; hash=fada4a476a3754dd
-          - custom/exec
-          - function/wait
-          - function/request_user_input
-          - function/request_user_input_async
-        - namespace/clock: Tools for reading and waiting on time.; hash=f402e8c5e9b5e317
-          - function/sleep
-        - namespace/collaboration: Tools for spawning and managing sub-agents.; hash=2c8d6295978dbe63
-          - function/followup_task
-          - function/interrupt_agent
-          - function/list_agents
-          - function/send_message
-          - function/spawn_agent
-          - function/wait_agent
-01:message/developer:
+00:message/developer:
     You are Codex, an agent based on GPT-6. You and the user share one workspace, and your job is to collabo...them until their intended goal is completely handled. [hash=efa50f074efa5803]
 
     # When to ask the user for permission
@@ -39,7 +24,7 @@ Scenario: Astra receives host and handler timings on completed and failed code-m
     - Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associa..., MCP tools, and apps exposed elsewhere in this turn. [hash=620459a4e7b590f0]
     - Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for t..., say so briefly and continue with the best fallback. [hash=746b0469a8f6cb3e]
 
-02:message/developer[2]:
+01:message/developer[2]:
     [01] <permissions instructions>
         Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`...ll commands are permitted. Network access is enabled. [hash=c134061cebb94a1b]
         Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.
@@ -60,7 +45,7 @@ Scenario: Astra receives host and handler timings on completed and failed code-m
 
         Never use the `request_user_input` tool for permission requests or permission-related escalations.
         </collaboration_mode>
-03:message/developer:
+02:message/developer:
     <multi_agent_role>You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -78,9 +63,9 @@ Scenario: Astra receives host and handler timings on completed and failed code-m
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
     Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d... so, set `fork_turns` to `"none"`.</multi_agent_role> [hash=d5928243dc643bcc]
-04:message/developer:
+03:message/developer:
     <multi_agent_mode>Any earlier instruction enabling proactive multi-agent delegation no longer applies. D...elegation, or parallel agent work.</multi_agent_mode> [hash=2b6e037067b4390c]
-05:message/user:
+04:message/user:
     <environment_context>
       <cwd><CWD></cwd>
       <shell><HOST_SHELL></shell>
@@ -88,18 +73,18 @@ Scenario: Astra receives host and handler timings on completed and failed code-m
       <timezone><HOST_TIMEZONE></timezone>
       <filesystem><workspace_roots><root><CWD></root></workspace_roots><permission_profile type="disabled"><...e="unrestricted" /></permission_profile></filesystem> [hash=d40b2f45cb028888]
     </environment_context>
-06:message/user:
+05:message/user:
     Run a code cell, then inspect its timing and a failed wait.
-07:configuration_update:reasoning={"effort":"low"}
+06:configuration_update:reasoning={"effort":"low"}
 -- request 2 (turn) --
-08:custom_tool_call/exec:text('ready');
-09:custom_tool_call_output:Script completed
+07:custom_tool_call/exec:text('ready');
+08:custom_tool_call_output:Script completed
     Wall time <DURATION> seconds (code-mode <DURATION> seconds; overhead <DURATION> seconds)
     Output:
      | ready
 -- request 3 (turn) --
-10:function_call/functions.wait:{"cell_id":"missing"}
-11:function_call_output:Script failed
+09:function_call/functions.wait:{"cell_id":"missing"}
+10:function_call_output:Script failed
     Wall time <DURATION> seconds (code-mode <DURATION> seconds; overhead <DURATION> seconds)
     Output:
      | Script error:
