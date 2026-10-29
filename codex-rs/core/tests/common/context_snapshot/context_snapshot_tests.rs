@@ -414,35 +414,76 @@ fn uuid_labels_preserve_identity_across_message_and_function_content() {
     assert!(rendered.contains("02:message/user:\n    <UUID 1> <UUID 2>"));
 }
 
-// Merge-safety anchor: compaction-boundary UUIDs normalize consistently in fingerprints and rendered content, while unrelated identifiers that merely contain `cmp_` remain literal.
+// Merge-safety anchor: compaction and message UUIDs normalize consistently in fingerprints and rendered content, while embedded identifiers remain literal.
 #[test]
 fn compaction_boundary_ids_are_stable_without_overmatching_identifiers() {
     let first = "11111111-1111-1111-1111-111111111111";
     let second = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    let render_namespace = |id| {
+    let first_message = "01a18796-422b-7f42-a728-c2ef1ce29b37";
+    let second_message = "01a18796-4ec2-7da2-a619-add3b22372f0";
+    let render_namespace = |prefix, id| {
         detailed(&[json!({
             "type": "additional_tools",
             "role": "developer",
             "tools": [{
                 "type": "function",
                 "name": "lookup",
-                "namespace": format!("cmp_{id}"),
+                "namespace": format!("{prefix}{id}"),
             }],
         })])
     };
-    let first_fingerprint = render_namespace(first);
-    let second_fingerprint = render_namespace(second);
-    assert!(first_fingerprint.contains("hash="));
-    assert_eq!(first_fingerprint, second_fingerprint);
+    for (prefix, first, second) in [
+        ("cmp_", first, second),
+        ("msg_", first_message, second_message),
+    ] {
+        let first_fingerprint = render_namespace(prefix, first);
+        let second_fingerprint = render_namespace(prefix, second);
+        assert!(first_fingerprint.contains("hash="));
+        assert_eq!(first_fingerprint, second_fingerprint);
+    }
+    let recovery = |id| json!({"boundary_item_id": format!("msg_{id}")});
+    assert_eq!(
+        fingerprint(&recovery(first_message)),
+        fingerprint(&recovery(second_message))
+    );
+    assert_ne!(
+        fingerprint(&json!({"boundary_item_id": format!("ordinary_msg_{first_message}")})),
+        fingerprint(&json!({"boundary_item_id": format!("ordinary_msg_{second_message}")})),
+    );
+    let render_recovery = |id| {
+        detailed(&[message(
+            "developer",
+            &format!(
+                "<post_compact_recovery>\n{{\"boundary_item_id\":\"msg_{id}\",\"details\":\"{}\"}}\n</post_compact_recovery>",
+                "x".repeat(180)
+            ),
+        )])
+    };
+    let first_recovery = render_recovery(first_message);
+    assert!(first_recovery.contains("msg_<UUID 1>"));
+    assert!(first_recovery.contains("[hash="));
+    assert_eq!(first_recovery, render_recovery(second_message));
 
     let rendered = detailed(&[
         message("user", &format!("cmp_{first} cmp_{first}")),
-        message("user", &format!("{first} cmp_{first}")),
-        message("user", &format!("ordinary_cmp_{second}")),
+        message("user", &format!("{first} cmp_{first} msg_{first}")),
+        message(
+            "user",
+            &format!("ordinary_cmp_{second} ordinary_msg_{first_message}"),
+        ),
+        message(
+            "user",
+            &format!("msg_{first_message} {first_message} cmp_{first_message}"),
+        ),
+        message("user", &format!("msg_{second_message} msg_{first_message}")),
     ]);
     assert!(rendered.contains("00:message/user:\n    cmp_<UUID 1> cmp_<UUID 1>"));
-    assert!(rendered.contains("01:message/user:\n    <UUID 1> cmp_<UUID 1>"));
-    assert!(rendered.contains(&format!("02:message/user:\n    ordinary_cmp_{second}")));
+    assert!(rendered.contains("01:message/user:\n    <UUID 1> cmp_<UUID 1> msg_<UUID 1>"));
+    assert!(rendered.contains(&format!(
+        "02:message/user:\n    ordinary_cmp_{second} ordinary_msg_{first_message}"
+    )));
+    assert!(rendered.contains("03:message/user:\n    msg_<UUID 2> <UUID 2> cmp_<UUID 2>"));
+    assert!(rendered.contains("04:message/user:\n    msg_<UUID 3> msg_<UUID 2>"));
 }
 
 #[test]

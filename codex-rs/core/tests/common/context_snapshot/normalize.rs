@@ -422,9 +422,9 @@ fn normalize_stable_text(text: &str) -> String {
 fn uuid_regex() -> &'static Regex {
     static UUID: OnceLock<Regex> = OnceLock::new();
     UUID.get_or_init(|| {
-        // Generated `cmp_` boundary IDs include their prefix because `_` is a word character.
+        // Merge-safety anchor: generated `cmp_` and `msg_` IDs include their prefixes because `_` is a word character; normalization preserves those prefixes.
         Regex::new(
-            r"\b((?:cmp_)?)([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b",
+            r"\b((?:cmp_|msg_)?)([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b",
         )
         .expect("uuid regex")
     })
