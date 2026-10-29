@@ -43,6 +43,8 @@ use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_thread_store::PersistContext;
 use std::ops::ControlFlow;
@@ -4335,6 +4337,33 @@ impl ThreadRequestProcessor {
             }
             if restore_personality {
                 config.personality = settings.personality;
+            }
+        }
+        // Merge-safety anchor: cold child resume restores its captured role policy from owned history before startup can publish new settings.
+        if let InitialHistory::Resumed(resumed) = &thread_history
+            && matches!(
+                thread_history.get_resumed_session_sources(),
+                Some((
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }),
+                    _
+                ))
+            )
+        {
+            let policy = if let Some(thread_id) = paginated_thread_id {
+                self.thread_store
+                    .load_latest_thread_settings_snapshot(StoreLoadThreadHistoryParams {
+                        thread_id,
+                        include_archived: true,
+                    })
+                    .await
+                    .map_err(thread_store_resume_read_error)?
+                    .map(|settings| settings.agent_role_daybreak)
+            } else {
+                latest_owned_thread_settings(&resumed.history, resumed.conversation_id)
+                    .map(|settings| settings.agent_role_daybreak)
+            };
+            if let Some(policy) = policy {
+                config.agent_role_daybreak = policy;
             }
         }
         let response_history = thread_history.clone();

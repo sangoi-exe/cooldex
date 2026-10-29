@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 pub(crate) fn build_reviewer_config(parent_config: &Config) -> anyhow::Result<Config> {
     let mut config = parent_config.clone();
+    // Merge-safety anchor: a Guardian reviewer must not inherit the parent's recipient-role policy.
+    config.agent_role_daybreak = None;
     config.model_provider.request_max_retries = Some(1);
     config.model_provider.stream_max_retries = Some(1);
     // Approvals wait for TurnComplete; post-turn compaction must not delay it.

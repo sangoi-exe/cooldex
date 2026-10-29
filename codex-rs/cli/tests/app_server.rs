@@ -335,6 +335,96 @@ fn print_startup_config_preserves_project_login_restrictions() -> Result<()> {
 }
 
 #[test]
+fn print_startup_config_rejects_missing_selected_profile() -> Result<()> {
+    let home = TempDir::new()?;
+    for sign_out in [None, Some("--startup-sign-out")] {
+        let output = codex_command(home.path())?
+            .current_dir(home.path())
+            .args([
+                "--profile",
+                "missing",
+                "app-server",
+                "--print-startup-config",
+            ])
+            .args(sign_out)
+            .assert()
+            .failure();
+        let value: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("startup error message")
+                .contains("selected profile `missing` requires config file")
+        );
+        assert_eq!(value["error"]["data"]["reason"], "configLoad");
+        assert!(value.get("configRequirements").is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn print_startup_config_reports_invalid_home_as_json_with_or_without_profile() -> Result<()> {
+    let home = TempDir::new()?;
+    let missing_home = home.path().join("missing-codex-home");
+    for profile in [None, Some("work")] {
+        let mut command = codex_command(&missing_home)?;
+        command.current_dir(home.path());
+        if let Some(profile) = profile {
+            command.args(["--profile", profile]);
+        }
+        let output = command
+            .args(["app-server", "--print-startup-config"])
+            .assert()
+            .failure();
+        let value: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("startup error message")
+                .contains("CODEX_HOME")
+        );
+        assert_eq!(value["error"]["data"]["reason"], "configLoad");
+        assert!(value.get("configRequirements").is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn print_startup_config_uses_selected_profile_login_restrictions() -> Result<()> {
+    for (base_method, profile_method) in [("chatgpt", "api"), ("api", "chatgpt")] {
+        let home = TempDir::new()?;
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!("cli_auth_credentials_store = 'file'\nforced_login_method = '{base_method}'\n"),
+        )?;
+        std::fs::write(
+            home.path().join("work.config.toml"),
+            format!("forced_login_method = '{profile_method}'\n"),
+        )?;
+
+        for (profile, expected_method) in [(None, base_method), (Some("work"), profile_method)] {
+            for sign_out in [None, Some("--startup-sign-out")] {
+                let mut command = codex_command(home.path())?;
+                command.current_dir(home.path());
+                if let Some(profile) = profile {
+                    command.args(["--profile", profile]);
+                }
+                command
+                    .args(["app-server", "--print-startup-config"])
+                    .args(sign_out);
+                let output = command.assert().success();
+                let value: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+                assert_eq!(
+                    value["configRequirements"]["requirements"]["allowedLoginMethods"],
+                    json!([expected_method])
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn print_startup_config_rejects_sign_out_with_environment_access_token() -> Result<()> {
     let home = TempDir::new()?;
     let auth_path = home.path().join("auth.json");

@@ -11,6 +11,9 @@ use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnEnvironment;
 use crate::state::TaskKind;
+use crate::test_support::GatedInstructionsProvider;
+use crate::test_support::GatedModelsManager;
+use crate::test_support::ModelLookupGate;
 use codex_config::AutoReviewRequirementsToml;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
@@ -19,21 +22,9 @@ use codex_config::ConfigRequirementsWithSources;
 use codex_config::RequirementSource;
 use codex_config::Sourced;
 use codex_extension_api::Instructions;
-use codex_extension_api::LoadInstructionsFuture;
-use codex_extension_api::LoadedUserInstructions;
-use codex_extension_api::ThreadInstructionsProvider;
-use codex_extension_api::UserInstructionsProvider;
-use codex_http_client::HttpClientFactory;
-use codex_login::AuthManager;
-use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::bundled_models_response;
-use codex_models_manager::manager::ModelsManager;
-use codex_models_manager::manager::ModelsManagerFuture;
-use codex_models_manager::manager::RefreshStrategy;
-use codex_models_manager::manager::StaticModelsManager;
 use codex_models_manager::model_info::with_config_overrides;
 use codex_protocol::config_types::ApprovalsReviewer;
-use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::AsyncClassifierMode;
@@ -41,7 +32,6 @@ use codex_protocol::openai_models::AutoReviewMessages;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::GuardianV2TranscriptModelConfig;
 use codex_protocol::openai_models::ModelTokenBudgetConfig;
-use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Op;
@@ -54,52 +44,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use test_case::test_case;
 use tokio::sync::Notify;
-use tokio::sync::TryLockError;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 const MODEL_A: &str = "step-activation-a";
 const MODEL_B: &str = "step-activation-b";
-
-struct GatedInstructionsProvider {
-    instructions: StdMutex<Option<Instructions>>,
-    block_next_read: AtomicBool,
-    read_started: Notify,
-}
-
-impl GatedInstructionsProvider {
-    fn load(&self) -> LoadInstructionsFuture<'_> {
-        let instructions = self
-            .instructions
-            .lock()
-            .expect("instruction snapshot")
-            .clone();
-        let block = self.block_next_read.swap(/*val*/ false, Ordering::SeqCst);
-        Box::pin(async move {
-            if block {
-                self.read_started.notify_one();
-                std::future::pending::<()>().await;
-            }
-            LoadedUserInstructions {
-                instructions,
-                warnings: Vec::new(),
-            }
-        })
-    }
-}
-
-impl UserInstructionsProvider for GatedInstructionsProvider {
-    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
-        self.load()
-    }
-}
-
-impl ThreadInstructionsProvider for GatedInstructionsProvider {
-    fn load_thread_instructions(&self) -> LoadInstructionsFuture<'_> {
-        self.load()
-    }
-}
 
 #[tokio::test]
 async fn instruction_refresh_serializes_reads_and_releases_on_cancellation() {
@@ -316,100 +266,6 @@ fn activation_models() -> Vec<ModelInfo> {
         .collect()
 }
 
-#[derive(Debug, Default)]
-struct ModelLookupGate {
-    started: Notify,
-    resume: Notify,
-}
-
-impl ModelLookupGate {
-    async fn wait_until_blocked(&self) {
-        timeout(Duration::from_secs(/*secs*/ 10), self.started.notified())
-            .await
-            .expect("model lookup started");
-    }
-
-    fn release(&self) {
-        self.resume.notify_one();
-    }
-}
-
-#[derive(Debug)]
-struct GatedModelsManager {
-    inner: StaticModelsManager,
-    first_b_lookup: StdMutex<Option<Arc<ModelLookupGate>>>,
-}
-
-impl GatedModelsManager {
-    fn new(models: Vec<ModelInfo>) -> (Arc<Self>, Arc<ModelLookupGate>) {
-        let lookup = Arc::new(ModelLookupGate::default());
-        (
-            Arc::new(Self {
-                inner: StaticModelsManager::new(
-                    /*auth_manager*/ None,
-                    ModelsResponse { models },
-                    codex_models_manager::ModelOrigin::ExplicitConfig,
-                ),
-                first_b_lookup: StdMutex::new(Some(Arc::clone(&lookup))),
-            }),
-            lookup,
-        )
-    }
-}
-
-impl ModelsManager for GatedModelsManager {
-    fn model_catalog_with_origins(
-        &self,
-        strategy: RefreshStrategy,
-        factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Vec<codex_models_manager::CatalogModel>> {
-        self.inner.model_catalog_with_origins(strategy, factory)
-    }
-
-    fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        self.inner.get_remote_models()
-    }
-
-    fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
-        self.inner.try_get_remote_models()
-    }
-
-    fn auth_manager(&self) -> Option<&AuthManager> {
-        self.inner.auth_manager()
-    }
-
-    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        self.inner.list_collaboration_modes()
-    }
-
-    fn refresh_if_new_etag(
-        &self,
-        etag: String,
-        factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, ()> {
-        self.inner.refresh_if_new_etag(etag, factory)
-    }
-
-    fn get_model_info<'a>(
-        &'a self,
-        model: &'a str,
-        config: &'a ModelsManagerConfig,
-    ) -> ModelsManagerFuture<'a, ModelInfo> {
-        Box::pin(async move {
-            let pause = if model == MODEL_B {
-                self.first_b_lookup.lock().expect("lookup gate").take()
-            } else {
-                None
-            };
-            if let Some(pause) = pause {
-                pause.started.notify_one();
-                pause.resume.notified().await;
-            }
-            self.inner.get_model_info(model, config).await
-        })
-    }
-}
-
 struct ActivationFixture {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -421,7 +277,7 @@ async fn activation_fixture(models: Vec<ModelInfo>) -> ActivationFixture {
     let (session, _) = make_session_and_context().await;
     let mut session = Arc::new(session);
     let mutable = Arc::get_mut(&mut session).expect("unshared test session");
-    let (models, lookup) = GatedModelsManager::new(models);
+    let (models, lookup) = GatedModelsManager::new(models, MODEL_B);
     mutable.services.models_manager = models;
     for feature in [
         Feature::SubagentThreadEnvironments,

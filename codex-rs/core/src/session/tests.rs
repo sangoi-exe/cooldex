@@ -33,6 +33,8 @@ use crate::realtime_conversation::RealtimeConversationSnapshot;
 use crate::session::step_context::StepContext;
 use crate::shell::default_user_shell;
 use crate::shell_snapshot::ShellSnapshot;
+use crate::test_support::GatedInstructionsProvider;
+use crate::test_support::GatedModelsManager;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
 use crate::tools::registry::ToolRegistry;
@@ -13302,6 +13304,240 @@ impl SessionTask for HeldStepTask {
         }
         Ok(None)
     }
+}
+
+#[tokio::test]
+async fn replacement_preserves_queue_only_terminal_error_mail_after_wake_drain() {
+    let (mut session, turn) = make_session_and_context().await;
+    session
+        .features
+        .disable(Feature::WakeOnAgentMessages)
+        .expect("disable ordinary message wakes");
+    assert!(!session.features.enabled(Feature::WakeOnAgentMessages));
+    let (tx_event, _events) = async_channel::unbounded();
+    session.tx_event = tx_event;
+    let selected_model = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .step_settings
+        .collaboration_mode
+        .model()
+        .to_owned();
+    let (models, lookup) =
+        GatedModelsManager::new(vec![turn.model_info().as_ref().clone()], &selected_model);
+    session.services.models_manager = models;
+    let instructions = Arc::new(GatedInstructionsProvider {
+        instructions: std::sync::Mutex::new(None),
+        block_next_read: std::sync::atomic::AtomicBool::new(true),
+        read_started: Notify::new(),
+    });
+    session.services.agents_md_manager = Arc::new(AgentsMdManager::new(SessionInstructions {
+        user_provider: Some(instructions.clone()),
+        ..Default::default()
+    }));
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let finish = Arc::new(Notify::new());
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            HeldStepTask {
+                kind: TaskKind::Regular,
+                finish: Arc::clone(&finish),
+            },
+        )
+        .await;
+    let mut held_task_done = {
+        let active = session.active_turn.lock().await;
+        let task = active
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .expect("held regular task is registered");
+        let mut done = Box::pin(Arc::clone(&task.done).notified_owned());
+        let _ = done.as_mut().enable();
+        done
+    };
+
+    let (submissions, receiver) = async_channel::unbounded();
+    let loop_task = tokio::spawn(submission_loop(
+        Arc::clone(&session),
+        session.get_config().await,
+        receiver,
+    ));
+    let communication = InterAgentCommunication::new(
+        AgentPath::root()
+            .join("failed_worker")
+            .expect("worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "unique terminal error mail for replacement preservation".to_string(),
+        /*trigger_turn*/ false,
+    );
+    assert!(!session.input_queue.has_pending_mailbox_items().await);
+    submissions
+        .send(Submission {
+            id: "terminal-error-mail".to_string(),
+            turn_extension_init: None,
+            op: Op::InterAgentCommunication {
+                communication: communication.clone(),
+                start_options: Default::default(),
+            },
+            trace: None,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: true,
+        })
+        .await
+        .expect("submit internal terminal-error mail");
+    // The reply fences the mail handler while the held task still owns admission, so the later wake comes from task completion.
+    let (settings_reply, settings_applied) = tokio::sync::oneshot::channel();
+    submissions
+        .send(Submission {
+            id: "mail-fence".to_string(),
+            turn_extension_init: None,
+            op: Op::ThreadSettings {
+                thread_settings: ThreadSettingsOverrides::default(),
+                reply: Some(settings_reply),
+            },
+            trace: None,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
+        })
+        .await
+        .expect("submit settings fence");
+    timeout(Duration::from_secs(10), settings_applied)
+        .await
+        .expect("settings fence completed")
+        .expect("settings reply delivered")
+        .expect("default settings accepted");
+    assert!(session.input_queue.has_terminal_error_mailbox_items().await);
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(futures::poll!(held_task_done.as_mut()).is_pending());
+
+    finish.notify_one();
+    lookup.wait_until_blocked().await;
+    assert!(futures::poll!(held_task_done.as_mut()).is_pending());
+    // Retain today's ownership observation without requiring future repairs to drain at this location.
+    let mailbox_was_drained = !session.input_queue.has_pending_mailbox_items().await;
+    let (wake_reservation, reservation_input_was_empty) = {
+        let active = session.active_turn.lock().await;
+        let wake = active.as_ref().expect("automatic wake reserved a turn");
+        assert!(wake.task.is_none(), "wake reservation is still unopened");
+        assert!(wake.reserved_turn_id.is_some());
+        assert!(wake.automatic_message_origin);
+        (
+            Arc::as_ptr(&wake.turn_state) as usize,
+            wake.turn_state.lock().await.pending_input.is_empty(),
+        )
+    };
+
+    let (turn_reply, turn_started) = tokio::sync::oneshot::channel();
+    submissions
+        .send(Submission {
+            id: "replacement-turn".to_string(),
+            turn_extension_init: None,
+            op: Op::TurnInput {
+                request: Box::new(TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "Start the replacement turn.".to_string(),
+                    text_elements: Vec::new(),
+                }])),
+                mode: TurnInputMode::StartOrSteer,
+                reply: turn_reply,
+            },
+            trace: None,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
+        })
+        .await
+        .expect("submit ordinary replacement input");
+    let started = timeout(Duration::from_secs(10), turn_started)
+        .await
+        .expect("replacement admission completed")
+        .expect("replacement reply delivered")
+        .expect("replacement request accepted");
+    assert!(matches!(
+        started,
+        TurnInputSubmission::Started { ref turn_id, .. } if turn_id == "replacement-turn"
+    ));
+    timeout(
+        Duration::from_secs(10),
+        instructions.read_started.notified(),
+    )
+    .await
+    .expect("replacement paused before consuming pending input");
+    {
+        let active = session.active_turn.lock().await;
+        let replacement = active.as_ref().expect("replacement turn is active");
+        let task = replacement
+            .task
+            .as_ref()
+            .expect("replacement task installed");
+        assert_eq!(task.turn_context.sub_id, "replacement-turn");
+        assert_ne!(
+            Arc::as_ptr(&replacement.turn_state) as usize,
+            wake_reservation
+        );
+    }
+    // The original task signals done only after its completion-triggered wake returns; the replacement remains blocked before consuming pending input.
+    lookup.release();
+    timeout(Duration::from_secs(10), held_task_done)
+        .await
+        .expect("original task and its pending-work wake returned");
+
+    // Probe the live queue and current turn, not the now-retired reservation.
+    let pending = session
+        .input_queue
+        .get_pending_input(&session.active_turn)
+        .await
+        .0;
+    let reachable = pending.iter().any(|item| {
+        matches!(item, TurnInput::InterAgentCommunication(mail)
+            if mail.author == communication.author
+                && mail.recipient == communication.recipient
+                && mail.content == communication.content)
+    });
+    submissions
+        .send(Submission {
+            id: "shutdown".to_string(),
+            turn_extension_init: None,
+            op: Op::Shutdown,
+            trace: None,
+            parent_turn_id: None,
+            root_turn_id: None,
+            residency_guard: None,
+            message_delivery: None,
+            terminal_error_wake: false,
+        })
+        .await
+        .expect("submit shutdown");
+    timeout(Duration::from_secs(10), loop_task)
+        .await
+        .expect("submission loop shut down")
+        .expect("submission loop joined");
+    let author = communication.author.to_string();
+    let recipient = communication.recipient.to_string();
+    let history = session.clone_history().await;
+    let recorded = history.raw_items().any(|item| {
+        matches!(item, ResponseItem::AgentMessage { author: item_author, recipient: item_recipient, content, .. }
+            if item_author == &author
+                && item_recipient == &recipient
+                && matches!(content.as_slice(), [AgentMessageInputContent::InputText { text }] if text == &communication.content))
+    });
+    assert!(
+        reachable || recorded,
+        "original terminal-error communication was lost (mailbox drained at lookup: {mailbox_was_drained}, unopened reservation empty: {reservation_input_was_empty})"
+    );
 }
 
 #[test_case(TerminalEventKind::TurnComplete; "completion")]

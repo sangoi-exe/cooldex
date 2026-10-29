@@ -122,6 +122,10 @@ use codex_rollout::RolloutRecorder;
 use codex_rollout::append_rollout_item_to_path;
 use codex_rollout::read_session_meta_line;
 use codex_state::StateRuntime;
+use codex_thread_store::LoadThreadHistoryParams;
+use codex_thread_store::LocalThreadStore;
+use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathExt;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -1018,6 +1022,247 @@ sandbox = "unelevated"
             .await?;
         }
     }
+    Ok(())
+}
+
+// Merge-safety anchor: cold V1 resume restores the latest owned role policy from the selected legacy path or full paginated lineage, not from inherited or bounded history.
+#[test_case(Some(false), false, true; "legacy_standard")]
+#[test_case(Some(true), false, true; "legacy_daybreak")]
+#[test_case(None, false, true; "legacy_cleared")]
+#[test_case(Some(true), true, true; "paginated_compaction")]
+#[test_case(Some(true), false, false; "legacy_root_ignores_child_policy")]
+#[tokio::test]
+async fn cold_resume_restores_v1_threadspawn_owned_role_policy(
+    policy: Option<bool>,
+    paginated: bool,
+    threadspawn: bool,
+) -> Result<()> {
+    const STAMP: &str = "2025-01-05T12-00-00";
+    const TIMESTAMP: &str = "2025-01-05T12:00:00Z";
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let source = if threadspawn {
+        RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("worker".to_string()),
+        })
+    } else {
+        RolloutSessionSource::Cli
+    };
+    let history_home = if paginated {
+        codex_home.path()
+    } else {
+        external_home.path()
+    };
+    let thread_id = if paginated {
+        create_fake_paginated_rollout(
+            history_home,
+            STAMP,
+            TIMESTAMP,
+            "Saved child history",
+            Some("mock_provider"),
+            /*git_info*/ None,
+        )?
+    } else {
+        create_fake_rollout_with_source(
+            history_home,
+            STAMP,
+            TIMESTAMP,
+            "Saved child history",
+            Some("mock_provider"),
+            /*git_info*/ None,
+            source.clone(),
+        )?
+    };
+    let path = rollout_path(history_home, STAMP, &thread_id);
+    let contents = std::fs::read_to_string(&path)?;
+    let mut lines = contents
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    lines[0]["payload"]["source"] = serde_json::to_value(&source)?;
+    lines[0]["payload"]["multi_agent_version"] = serde_json::to_value(MultiAgentVersion::V1)?;
+    std::fs::write(
+        &path,
+        lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )?;
+    let session_meta = read_session_meta_line(&path).await?;
+    assert_eq!(session_meta.meta.source, source);
+    assert_eq!(
+        session_meta.meta.multi_agent_version,
+        Some(MultiAgentVersion::V1)
+    );
+
+    let thread_id_typed = ThreadId::from_string(&thread_id)?;
+    let owned: ThreadSettingsAppliedEvent = serde_json::from_value(json!({
+        "thread_id": thread_id,
+        "thread_settings": {
+            "model": "fixture-old-model",
+            "model_provider_id": "mock_provider",
+            "cwd": normalized_existing_path(codex_home.path())?,
+            "approval_policy": "never",
+            "approvals_reviewer": "user",
+            "permission_profile": PermissionProfile::read_only(),
+            "collaboration_mode": { "mode": "default", "settings": { "model": "fixture-old-model" } },
+            "agent_role_daybreak": policy,
+        },
+    }))?;
+    let mut older = owned.clone();
+    older.thread_settings.agent_role_daybreak = Some(true);
+    for settings in [older, owned.clone()] {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+        )
+        .await?;
+    }
+    if paginated {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::Compacted(Box::new(CompactedItem {
+                message: "bounded child history".to_string(),
+                replacement_history: Some(Vec::new()),
+                retained_context: None,
+                guardian_history: None,
+                mcp_resource_origins: None,
+                window_number: Some(1),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+                post_compact_recovery: None,
+                compaction_response_id: None,
+                latest_token_usage_record: None,
+                resume_metadata: None,
+            })),
+        )
+        .await?;
+    }
+    let mut ownerless = owned.clone();
+    ownerless.thread_id = None;
+    ownerless.thread_settings.agent_role_daybreak = Some(!policy.unwrap_or(false));
+    let mut foreign = ownerless.clone();
+    foreign.thread_id = Some(ThreadId::new());
+    for settings in [ownerless, foreign] {
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(settings)),
+        )
+        .await?;
+    }
+
+    if paginated {
+        let store = LocalThreadStore::new(
+            LocalThreadStoreConfig {
+                codex_home: codex_home.path().to_path_buf(),
+                sqlite: codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+                default_model_provider_id: "mock_provider".to_string(),
+            },
+            /*state_db*/ None,
+        );
+        let context = store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id: thread_id_typed,
+                include_archived: true,
+            })
+            .await?;
+        assert!(
+            context
+                .items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::Compacted(_)))
+        );
+        assert!(!context.items.iter().any(|item| matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(thread_id_typed)
+        )));
+    } else {
+        // A same-ID rollout under CODEX_HOME must not replace the selected external path.
+        let competing_path = rollout_path(codex_home.path(), STAMP, &thread_id);
+        std::fs::create_dir_all(competing_path.parent().expect("rollout directory"))?;
+        std::fs::copy(&path, &competing_path)?;
+        let mut competing = owned;
+        competing.thread_settings.agent_role_daybreak = Some(!policy.unwrap_or(false));
+        append_rollout_item_to_path(
+            &competing_path,
+            &RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(competing)),
+        )
+        .await?;
+    }
+
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let resume_id = app
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            path: (!paginated).then_some(path.clone()),
+            model: Some("mock-model".to_string()),
+            cwd: Some(
+                normalized_existing_path(codex_home.path())?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            exclude_turns: true,
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, app.read_response(resume_id)).await??;
+    assert_eq!(resumed.thread.id, thread_id);
+    assert_eq!(
+        resumed.thread.history_mode,
+        if paginated {
+            ThreadHistoryMode::Paginated
+        } else {
+            ThreadHistoryMode::Legacy
+        },
+    );
+    assert_eq!(
+        normalized_existing_path(resumed.thread.path.as_ref().expect("resumed path"))?,
+        normalized_existing_path(&path)?,
+    );
+    assert!(
+        timeout(DEFAULT_READ_TIMEOUT, app.shutdown_gracefully())
+            .await??
+            .success()
+    );
+
+    let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
+    let owned_settings = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
+                if event.thread_id == Some(thread_id_typed) =>
+            {
+                Some(&event.thread_settings)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        owned_settings.len() > 2,
+        "resume must persist a new owned checkpoint"
+    );
+    let latest = owned_settings.last().expect("resumed checkpoint");
+    assert_eq!(latest.model, "mock-model");
+    assert_eq!(
+        latest.agent_role_daybreak,
+        if threadspawn { policy } else { None }
+    );
     Ok(())
 }
 

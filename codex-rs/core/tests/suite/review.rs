@@ -8,6 +8,7 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_login::CodexAuth;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -992,10 +993,13 @@ async fn review_uses_custom_review_model_from_config() {
             config.model = Some("gpt-4.1".to_string());
             config.review_model = Some("custom-review-model".to_string());
             config.model_reasoning_effort = Some(ReasoningEffort::Max);
+            config.agent_role_daybreak = Some(false);
         })
         .build_with_auto_env(&server)
         .await
         .expect("custom review conversation should be created");
+    assert_eq!(test.config.model_provider_id, OPENAI_PROVIDER_ID);
+    assert_eq!(test.config.agent_role_daybreak, Some(false));
     let codex = Arc::clone(&test.codex);
     std::fs::remove_file(codex_home.path().join("models_cache.json"))
         .expect("initial empty model catalog should be cached");
@@ -1043,6 +1047,7 @@ async fn review_uses_custom_review_model_from_config() {
     let body = request.body_json();
     assert_eq!(body["model"].as_str().unwrap(), "custom-review-model");
     assert_eq!(body["reasoning"]["effort"].as_str(), Some("max"));
+    assert_eq!(body.get("access_programs"), None);
     let turn_metadata: serde_json::Value = serde_json::from_str(
         &request
             .header("x-codex-turn-metadata")

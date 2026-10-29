@@ -9,6 +9,7 @@ use codex_core::config::Config;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_login::CodexAuth;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_skills_extension::HostSkillProvider;
@@ -225,10 +226,6 @@ async fn skill_catalog_deltas_survive_resume_and_rebuild_after_compaction() -> R
             .with_home(Arc::clone(&home))
             .with_extensions(Arc::clone(&extensions))
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-            .with_model_info_override("gpt-6-astra", |model| {
-                model.use_responses_lite = true;
-                model.include_skills_usage_instructions = false;
-            })
             .with_config(|config| {
                 super::configure_scenario_catalog(config);
                 config.workspace_roots = vec![config.cwd.clone()];
@@ -236,6 +233,12 @@ async fn skill_catalog_deltas_survive_resume_and_rebuild_after_compaction() -> R
                     .features
                     .enable(Feature::SkillCatalogDeltas)
                     .expect("enable skill catalog deltas");
+            })
+            // Merge-safety anchor: the attribution fixture selects unrelated Lite metadata after scenario catalog setup.
+            .with_model_info_override("gpt-5.5", |model| {
+                model.use_responses_lite = true;
+                model.include_skills_usage_instructions = false;
+                model.tool_mode = Some(ToolMode::CodeModeOnly);
             })
     };
     let mock = responses::mount_sse_sequence(
@@ -296,12 +299,6 @@ async fn skill_catalog_deltas_survive_resume_and_rebuild_after_compaction() -> R
 
     let limited = builder()
         .with_config(|config| {
-            super::configure_scenario_catalog(config);
-            config.workspace_roots = vec![config.cwd.clone()];
-            config
-                .features
-                .enable(Feature::SkillCatalogDeltas)
-                .expect("enable skill catalog deltas");
             config.skill_max_context_tokens = NonZeroUsize::new(172);
         })
         .restart_with_auto_env(&server, &resumed)

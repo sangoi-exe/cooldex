@@ -4001,6 +4001,7 @@ async fn guardian_review_session_config_isolates_parent_customizations() {
     }
     parent_config.include_apps_instructions = true;
     parent_config.include_skill_instructions = true;
+    parent_config.agent_role_daybreak = Some(true);
     parent_config.memories.use_memories = true;
     parent_config.memories.dedicated_tools = true;
     parent_config.developer_instructions =
@@ -4032,6 +4033,8 @@ async fn guardian_review_session_config_isolates_parent_customizations() {
     assert!(!guardian_config.include_skill_instructions);
     assert!(!guardian_config.memories.use_memories);
     assert!(!guardian_config.memories.dedicated_tools);
+    assert_eq!(guardian_config.agent_role_daybreak, None);
+    assert_eq!(parent_config.agent_role_daybreak, Some(true));
     assert_eq!(guardian_config.notify, None);
     assert_eq!(guardian_config.developer_instructions, None);
     assert_eq!(

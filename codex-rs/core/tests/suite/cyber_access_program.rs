@@ -260,6 +260,7 @@ async fn cyber_access_program_survives_mid_turn_remote_compaction_v2(
     Ok(())
 }
 
+// Merge-safety anchor: child turns and reloads enforce captured role policy against each recipient model without a Daybreak fallback.
 #[test_case(None; "inherited")]
 #[test_case(Some(false); "role_standard")]
 #[test_case(Some(true); "role_daybreak")]

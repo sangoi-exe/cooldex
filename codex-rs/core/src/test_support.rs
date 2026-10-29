@@ -6,10 +6,22 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+use std::time::Duration;
 
 use codex_exec_server::EnvironmentManager;
+#[cfg(test)]
+use codex_extension_api::Instructions;
 use codex_extension_api::LoadInstructionsFuture;
 use codex_extension_api::LoadedUserInstructions;
+#[cfg(test)]
+use codex_extension_api::ThreadInstructionsProvider;
 use codex_extension_api::UserInstructionsProvider;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -17,9 +29,19 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ModelProviderInfo;
+#[cfg(test)]
+use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::collaboration_mode_presets;
+#[cfg(test)]
+use codex_models_manager::manager::ModelsManager;
+#[cfg(test)]
+use codex_models_manager::manager::ModelsManagerFuture;
+#[cfg(test)]
+use codex_models_manager::manager::RefreshStrategy;
 use codex_models_manager::manager::SharedModelsManager;
+#[cfg(test)]
+use codex_models_manager::manager::StaticModelsManager;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::ThreadId;
@@ -28,8 +50,16 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
+#[cfg(test)]
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::SessionSource;
 use once_cell::sync::Lazy;
+#[cfg(test)]
+use tokio::sync::Notify;
+#[cfg(test)]
+use tokio::sync::TryLockError;
+#[cfg(test)]
+use tokio::time::timeout;
 
 use crate::ThreadManager;
 use crate::config::Config;
@@ -39,6 +69,153 @@ use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
 use crate::unified_exec;
+
+#[cfg(test)]
+pub(crate) struct GatedInstructionsProvider {
+    pub(crate) instructions: StdMutex<Option<Instructions>>,
+    pub(crate) block_next_read: AtomicBool,
+    pub(crate) read_started: Notify,
+}
+
+#[cfg(test)]
+impl GatedInstructionsProvider {
+    fn load(&self) -> LoadInstructionsFuture<'_> {
+        let instructions = self
+            .instructions
+            .lock()
+            .expect("instruction snapshot")
+            .clone();
+        let block = self.block_next_read.swap(/*val*/ false, Ordering::SeqCst);
+        Box::pin(async move {
+            if block {
+                self.read_started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            LoadedUserInstructions {
+                instructions,
+                warnings: Vec::new(),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+impl UserInstructionsProvider for GatedInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        self.load()
+    }
+}
+
+#[cfg(test)]
+impl ThreadInstructionsProvider for GatedInstructionsProvider {
+    fn load_thread_instructions(&self) -> LoadInstructionsFuture<'_> {
+        self.load()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ModelLookupGate {
+    started: Notify,
+    resume: Notify,
+}
+
+#[cfg(test)]
+impl ModelLookupGate {
+    pub(crate) async fn wait_until_blocked(&self) {
+        timeout(Duration::from_secs(/*secs*/ 10), self.started.notified())
+            .await
+            .expect("model lookup started");
+    }
+
+    pub(crate) fn release(&self) {
+        self.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct GatedModelsManager {
+    inner: StaticModelsManager,
+    gated_model: String,
+    first_lookup: StdMutex<Option<Arc<ModelLookupGate>>>,
+}
+
+#[cfg(test)]
+impl GatedModelsManager {
+    pub(crate) fn new(
+        models: Vec<ModelInfo>,
+        gated_model: &str,
+    ) -> (Arc<Self>, Arc<ModelLookupGate>) {
+        let lookup = Arc::new(ModelLookupGate::default());
+        (
+            Arc::new(Self {
+                inner: StaticModelsManager::new(
+                    /*auth_manager*/ None,
+                    ModelsResponse { models },
+                    codex_models_manager::ModelOrigin::ExplicitConfig,
+                ),
+                gated_model: gated_model.to_owned(),
+                first_lookup: StdMutex::new(Some(Arc::clone(&lookup))),
+            }),
+            lookup,
+        )
+    }
+}
+
+#[cfg(test)]
+impl ModelsManager for GatedModelsManager {
+    fn model_catalog_with_origins(
+        &self,
+        strategy: RefreshStrategy,
+        factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, Vec<codex_models_manager::CatalogModel>> {
+        self.inner.model_catalog_with_origins(strategy, factory)
+    }
+
+    fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
+        self.inner.get_remote_models()
+    }
+
+    fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+        self.inner.try_get_remote_models()
+    }
+
+    fn auth_manager(&self) -> Option<&AuthManager> {
+        self.inner.auth_manager()
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        self.inner.list_collaboration_modes()
+    }
+
+    fn refresh_if_new_etag(
+        &self,
+        etag: String,
+        factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, ()> {
+        self.inner.refresh_if_new_etag(etag, factory)
+    }
+
+    fn get_model_info<'a>(
+        &'a self,
+        model: &'a str,
+        config: &'a ModelsManagerConfig,
+    ) -> ModelsManagerFuture<'a, ModelInfo> {
+        Box::pin(async move {
+            let pause = if model == self.gated_model.as_str() {
+                self.first_lookup.lock().expect("lookup gate").take()
+            } else {
+                None
+            };
+            if let Some(pause) = pause {
+                pause.started.notify_one();
+                pause.resume.notified().await;
+            }
+            self.inner.get_model_info(model, config).await
+        })
+    }
+}
 
 static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
     let mut response = bundled_models_response()

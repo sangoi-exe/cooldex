@@ -7,19 +7,27 @@ use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
+use crate::test_support::GatedModelsManager;
 use codex_features::Feature;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Settings;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::ContentItemMetadata;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelAccessPrograms;
+use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::AskForApproval;
@@ -27,6 +35,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::turn_input::CyberAccessProgram;
 use codex_protocol::turn_input::TurnInput as SubmittedTurnInput;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -36,6 +45,39 @@ use std::collections::HashMap;
 use test_case::test_case;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+
+struct ConfigRecorder(Arc<std::sync::Mutex<Vec<(AskForApproval, ApprovalsReviewer)>>>);
+
+impl codex_extension_api::ConfigContributor<crate::config::Config> for ConfigRecorder {
+    fn on_config_changed(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+        _previous_config: &crate::config::Config,
+        new_config: &crate::config::Config,
+    ) {
+        self.0.lock().expect("config records lock").push((
+            new_config.permissions.approval_policy.value(),
+            new_config.approvals_reviewer,
+        ));
+    }
+}
+
+fn admission_models(slugs: &[&str]) -> Vec<ModelInfo> {
+    let template = codex_models_manager::bundled_models_response()
+        .expect("bundled models")
+        .models
+        .into_iter()
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5");
+    slugs
+        .iter()
+        .map(|slug| ModelInfo {
+            slug: (*slug).to_string(),
+            ..template.clone()
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy)]
 struct NeverEndingTask {
@@ -661,7 +703,7 @@ async fn start_only_rejects_current_plan_before_validating_settings() {
 
 #[tokio::test]
 async fn prepared_user_updates_merge_with_settings_at_turn_start() {
-    for (requested, intervening) in [
+    for (requested, intervening, gated_model) in [
         (
             ThreadSettingsOverrides {
                 effort: Some(Some(ReasoningEffort::High)),
@@ -671,6 +713,7 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
                 model: Some("gpt-5.2".to_string()),
                 ..Default::default()
             },
+            "gpt-5.4",
         ),
         (
             ThreadSettingsOverrides {
@@ -681,9 +724,10 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
                 effort: Some(Some(ReasoningEffort::High)),
                 ..Default::default()
             },
+            "gpt-5.2",
         ),
     ] {
-        let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+        let (mut session, _turn_context, _rx) = make_session_and_context_with_rx().await;
         let initial = CollaborationMode {
             mode: ModeKind::Default,
             settings: Settings {
@@ -702,10 +746,31 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
             ))
             .await
             .expect("set initial model and effort");
+        let requested = ThreadSettingsOverrides {
+            permission_profile: Some(PermissionProfile::read_only()),
+            active_permission_profile: Some(ActivePermissionProfile::read_only()),
+            ..requested
+        };
         let prepared =
             PreparedTurnInputSettings::prepare(&session, requested, TurnStartOptions::default())
                 .await
                 .expect("prepare partial protocol update");
+        let (models, lookup) =
+            GatedModelsManager::new(admission_models(&["gpt-5.4", "gpt-5.2"]), gated_model);
+        Arc::get_mut(&mut session)
+            .expect("unique test session")
+            .services
+            .models_manager = models;
+        let starting = prepared.apply_started(
+            &session,
+            "sparse-user-start".to_string(),
+            TurnStartKind::User,
+        );
+        tokio::pin!(starting);
+        tokio::select! {
+            _ = &mut starting => panic!("admission must wait for model metadata"),
+            () = lookup.wait_until_blocked() => {}
+        }
         session
             .update_settings(thread_settings::prepare_update(
                 intervening,
@@ -713,14 +778,10 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
             ))
             .await
             .expect("commit intervening settings");
-
-        let turn_context = prepared
-            .apply_started(
-                &session,
-                "sparse-user-start".to_string(),
-                TurnStartKind::User,
-            )
+        lookup.release();
+        let turn_context = tokio::time::timeout(std::time::Duration::from_secs(10), starting)
             .await
+            .expect("equivalent permission patches must not repeat preparation indefinitely")
             .expect("apply prepared settings")
             .expect("user start is permitted");
         let expected = initial.with_updates(
@@ -738,7 +799,81 @@ async fn prepared_user_updates_merge_with_settings_at_turn_start() {
             &turn_context.initial_settings.model_info,
             turn_context.model_info(),
         ));
+        assert_eq!(turn_context.model_info().slug, "gpt-5.2");
+        assert_eq!(
+            session
+                .thread_settings_snapshot()
+                .await
+                .active_permission_profile,
+            Some(ActivePermissionProfile::read_only())
+        );
     }
+}
+
+#[tokio::test]
+async fn admission_reprepares_model_metadata_when_personality_changes() {
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    {
+        let mut state = session.state.lock().await;
+        let configuration = &mut state.session_configuration;
+        Arc::make_mut(&mut configuration.step_settings).personality = Some(Personality::Friendly);
+        configuration.model_info_overrides.base_instructions = None;
+    }
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::High)),
+            ..Default::default()
+        },
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("preview sparse settings");
+    let model = session.collaboration_mode().await.settings.model;
+    let mut models = admission_models(&[&model]);
+    models[0]
+        .model_messages
+        .get_or_insert_default()
+        .instructions_template =
+        Some("prefix\n# Personality\nfriendly\n# Other\nkeep\n".to_string());
+    let (models, lookup) = GatedModelsManager::new(models, &model);
+    Arc::get_mut(&mut session)
+        .expect("unique test session")
+        .services
+        .models_manager = models;
+    let starting = prepared.apply_started(
+        &session,
+        "personality-during-lookup".to_string(),
+        TurnStartKind::User,
+    );
+    tokio::pin!(starting);
+    tokio::select! {
+        _ = &mut starting => panic!("admission must wait for model metadata"),
+        () = lookup.wait_until_blocked() => {}
+    }
+    session
+        .update_settings(SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                personality: Some(Personality::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("change personality during admission lookup");
+    lookup.release();
+    let turn = starting
+        .await
+        .expect("admission should succeed")
+        .expect("user starts are unconditional");
+    assert_eq!(turn.initial_settings.personality(), Some(Personality::None));
+    assert_eq!(
+        turn.model_info()
+            .model_messages
+            .as_ref()
+            .and_then(|messages| messages.instructions_template.as_deref()),
+        Some("prefix\n# Other\nkeep\n")
+    );
 }
 
 #[tokio::test]
@@ -802,23 +937,6 @@ async fn automatic_admission_uses_current_candidate_after_plan_preview() {
 
 #[tokio::test]
 async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settings() {
-    struct ConfigRecorder(Arc<std::sync::Mutex<Vec<(AskForApproval, ApprovalsReviewer)>>>);
-
-    impl codex_extension_api::ConfigContributor<crate::config::Config> for ConfigRecorder {
-        fn on_config_changed(
-            &self,
-            _session_store: &codex_extension_api::ExtensionData,
-            _thread_store: &codex_extension_api::ExtensionData,
-            _previous_config: &crate::config::Config,
-            new_config: &crate::config::Config,
-        ) {
-            self.0.lock().expect("config records lock").push((
-                new_config.permissions.approval_policy.value(),
-                new_config.approvals_reviewer,
-            ));
-        }
-    }
-
     let (mut session, _turn_context, rx) = make_session_and_context_with_rx().await;
     let records = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut extensions =
@@ -947,11 +1065,261 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
     );
 }
 
+#[tokio::test]
+async fn automatic_admission_rechecks_plan_mode_during_model_lookup() {
+    let (mut session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::High)),
+            ..Default::default()
+        },
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("preview sparse settings");
+    let mut mode = session.collaboration_mode().await;
+    let model = mode.settings.model.clone();
+    let (models, lookup) = GatedModelsManager::new(admission_models(&[&model]), &model);
+    Arc::get_mut(&mut session)
+        .expect("unique test session")
+        .services
+        .models_manager = models;
+    let starting = prepared.apply_started(
+        &session,
+        "automatic-plan-during-lookup".to_string(),
+        TurnStartKind::Automatic,
+    );
+    tokio::pin!(starting);
+    tokio::select! {
+        _ = &mut starting => panic!("admission must wait for model metadata"),
+        () = lookup.wait_until_blocked() => {}
+    }
+    mode.mode = ModeKind::Plan;
+    session
+        .update_settings(SessionSettingsUpdate {
+            step_settings: StepSettingsUpdate {
+                collaboration_mode: Some(mode),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("enter Plan during admission lookup");
+    let desired = session.thread_settings_snapshot().await;
+    lookup.release();
+    assert!(starting.await.expect("typed Plan rejection").is_none());
+    assert_eq!(session.thread_settings_snapshot().await, desired);
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
+        event.id != "automatic-plan-during-lookup"
+            || !matches!(event.msg, EventMsg::ThreadSettingsApplied(_))
+    }));
+}
+
+// Merge-safety anchor: unsupported recipient policy must reject input before its settings or runtime effects publish.
+#[tokio::test]
+async fn recipient_daybreak_rejection_does_not_publish_started_input_settings() {
+    const SUPPORTED: &str = "admission-supported";
+    const UNSUPPORTED: &str = "admission-unsupported";
+    let (mut session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    let mut models = admission_models(&[SUPPORTED, UNSUPPORTED]);
+    models[0].available_access_programs = Some(ModelAccessPrograms {
+        cyber: vec![CyberAccessProgram::DaybreakBlue],
+    });
+    models[1].available_access_programs = None;
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    extensions.config_contributor(Arc::new(ConfigRecorder(Arc::clone(&records))));
+    let mutable = Arc::get_mut(&mut session).expect("unique test session");
+    mutable.services.extensions = Arc::new(extensions.build());
+    mutable.services.models_manager = Arc::new(StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse { models },
+        codex_models_manager::ModelOrigin::ExplicitConfig,
+    ));
+    {
+        let configuration = &mut mutable.state.get_mut().session_configuration;
+        let config = Arc::make_mut(&mut configuration.original_config_do_not_use);
+        config.agent_role_daybreak = Some(true);
+        config.model_provider_id = "openai".to_string();
+        let settings = Arc::make_mut(&mut configuration.step_settings);
+        settings.collaboration_mode = settings.collaboration_mode.with_updates(
+            Some(SUPPORTED.to_string()),
+            /*effort*/ None,
+            /*developer_instructions*/ None,
+        );
+        settings.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+        settings.approvals_reviewer = ApprovalsReviewer::User;
+    }
+    let current = session.state.lock().await.session_configuration.clone();
+    let current_model = current
+        .step_settings
+        .resolve_model_info(
+            session.services.models_manager.as_ref(),
+            &current.model_info_overrides,
+        )
+        .await;
+    assert_eq!(current_model.slug, SUPPORTED);
+    assert_eq!(
+        current_model
+            .available_access_programs
+            .and_then(|programs| programs.daybreak()),
+        Some(CyberAccessProgram::DaybreakBlue)
+    );
+    let desired_settings = session.thread_settings_snapshot().await;
+    let configured_environments = session.configured_environment_selections().await;
+    let configured_environment_configs: Vec<_> = session
+        .services
+        .turn_environments
+        .configured_snapshot_now()
+        .refresh_readiness()
+        .turn_environments()
+        .map(|environment| environment.config().clone())
+        .collect();
+    assert!(!configured_environment_configs.is_empty());
+    let active_environments = session.services.turn_environments.selections();
+    let original_model_info = session.services.thread_extension_data.get::<ModelInfo>();
+    let workspace = tempfile::tempdir().expect("create proposed workspace");
+    let proposed_environments = local_selections(
+        AbsolutePathBuf::try_from(workspace.path()).expect("absolute workspace path"),
+    );
+    assert_ne!(configured_environments, proposed_environments.environments);
+    let _mcp_refresh = session
+        .mcp_refresh
+        .acquire()
+        .await
+        .expect("MCP refresh gate");
+    session.mcp_refresh.claim();
+    let result = handle(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reject unsupported model".to_string(),
+            text_elements: Vec::new(),
+        }])
+        .with_thread_settings(ThreadSettingsOverrides {
+            model: Some(UNSUPPORTED.to_string()),
+            environments: Some(proposed_environments.into_requests()),
+            approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+            ..Default::default()
+        })
+        .on_start(TurnStartOptions {
+            cyber_access_program: Some(CyberAccessProgram::Standard),
+            ..Default::default()
+        }),
+        TurnInputMode::StartIfIdle,
+        "rejected-recipient".to_string(),
+    )
+    .await;
+    let error = result.expect_err("unsupported recipient model must reject input");
+    assert!(matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(message)
+            if message == "Daybreak is not supported by model `admission-unsupported`."
+    ));
+    assert_eq!(session.thread_settings_snapshot().await, desired_settings);
+    assert_eq!(
+        session.configured_environment_selections().await,
+        configured_environments
+    );
+    assert_eq!(
+        session
+            .services
+            .turn_environments
+            .configured_snapshot_now()
+            .refresh_readiness()
+            .turn_environments()
+            .map(|environment| environment.config().clone())
+            .collect::<Vec<_>>(),
+        configured_environment_configs
+    );
+    assert_eq!(
+        session.services.turn_environments.selections(),
+        active_environments
+    );
+    assert_eq!(
+        session.services.thread_extension_data.get::<ModelInfo>(),
+        original_model_info
+    );
+    assert!(!session.mcp_refresh.is_pending());
+    assert!(records.lock().expect("config records lock").is_empty());
+    assert!(session.active_turn.lock().await.is_none());
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|event| {
+        event.id != "rejected-recipient" || !matches!(event.msg, EventMsg::ThreadSettingsApplied(_))
+    }));
+    assert!(
+        session
+            .reserve_turn_start("after-rejection")
+            .await
+            .is_some()
+    );
+    session.cancel_reserved_turn_start("after-rejection").await;
+}
+
+#[test_case(Some(true), "openai", Some(CyberAccessProgram::DaybreakBlue); "supported recipient")]
+#[test_case(None, "openai", Some(CyberAccessProgram::DaybreakRed); "no override")]
+#[test_case(None, "custom", None; "custom provider")]
+#[tokio::test]
+async fn started_input_uses_effective_recipient_program(
+    policy: Option<bool>,
+    provider: &str,
+    expected: Option<CyberAccessProgram>,
+) {
+    const SUPPORTED: &str = "admission-supported";
+    let (mut session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let mut models = admission_models(&[SUPPORTED]);
+    models[0].available_access_programs = Some(ModelAccessPrograms {
+        cyber: vec![CyberAccessProgram::DaybreakBlue],
+    });
+    let mutable = Arc::get_mut(&mut session).expect("unique test session");
+    mutable.services.models_manager = Arc::new(StaticModelsManager::new(
+        /*auth_manager*/ None,
+        ModelsResponse { models },
+        codex_models_manager::ModelOrigin::ExplicitConfig,
+    ));
+    {
+        let configuration = &mut mutable.state.get_mut().session_configuration;
+        let config = Arc::make_mut(&mut configuration.original_config_do_not_use);
+        config.agent_role_daybreak = policy;
+        config.model_provider_id = provider.to_string();
+    }
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides {
+            model: Some(SUPPORTED.to_string()),
+            ..Default::default()
+        },
+        TurnStartOptions {
+            cyber_access_program: Some(CyberAccessProgram::DaybreakRed),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("preview supported selection");
+    let turn = prepared
+        .apply_started(
+            &session,
+            "supported-recipient".to_string(),
+            TurnStartKind::User,
+        )
+        .await
+        .expect("recipient policy accepts selection")
+        .expect("user starts are unconditional");
+    assert_eq!(turn.model_info().slug, SUPPORTED);
+    assert_eq!(turn.cyber_access_program, expected);
+    assert_eq!(
+        turn.extension_data.get::<CyberAccessProgram>().as_deref(),
+        expected.as_ref()
+    );
+}
+
 #[test_case(TurnStartKind::User; "ordinary constructor")]
 #[test_case(TurnStartKind::Automatic; "conditional constructor")]
 #[tokio::test]
 async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind) {
-    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    let (mut session, _turn_context, rx) = make_session_and_context_with_rx().await;
     {
         let mut state = session.state.lock().await;
         Arc::make_mut(&mut state.session_configuration.step_settings).approval_policy =
@@ -968,6 +1336,19 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
     )
     .await
     .expect("approval-policy edit should initially be valid");
+    let model = session.collaboration_mode().await.settings.model;
+    let (models, lookup) = GatedModelsManager::new(admission_models(&[&model]), &model);
+    Arc::get_mut(&mut session)
+        .expect("unique test session")
+        .services
+        .models_manager = models;
+    let submission_id = "constraints-after-preview";
+    let starting = prepared.apply_started(&session, submission_id.to_string(), kind);
+    tokio::pin!(starting);
+    tokio::select! {
+        _ = &mut starting => panic!("admission must wait for model metadata"),
+        () = lookup.wait_until_blocked() => {}
+    }
 
     let approval_policy = Constrained::allow_only(AskForApproval::OnRequest);
     let expected_message = CodexErr::InvalidRequest(
@@ -983,10 +1364,8 @@ async fn admission_revalidates_constraints_before_committing(kind: TurnStartKind
             approval_policy;
     }
     let desired_settings = session.thread_settings_snapshot().await;
-    let submission_id = "constraints-after-preview";
-    let result = prepared
-        .apply_started(&session, submission_id.to_string(), kind)
-        .await;
+    lookup.release();
+    let result = starting.await;
     let Err(error) = result else {
         panic!("commit-time constraint failure must return InvalidRequest");
     };

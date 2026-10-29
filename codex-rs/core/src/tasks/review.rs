@@ -104,6 +104,8 @@ async fn start_review_conversation(
 ) -> Option<async_channel::Receiver<Event>> {
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
+    // Merge-safety anchor: the review delegate must not inherit the parent's recipient-role policy.
+    sub_agent_config.agent_role_daybreak = None;
     // Carry over review-only feature restrictions so the delegate cannot
     // re-enable blocked tools (web search, collab tools, view image).
     if let Err(err) = sub_agent_config

@@ -1,3 +1,4 @@
+use super::step_settings::ModelInfoOverrides;
 use super::step_settings::ResolvedStepSettings;
 use super::token_budget::has_explicit_settings;
 use super::token_budget::resolve_token_budget;
@@ -1186,8 +1187,8 @@ impl Session {
         Ok((turn_context, snapshot))
     }
 
-    /// Commits accepted settings atomically, then constructs the turn without holding
-    /// the state lock. The caller owns admission policy.
+    /// Prepares model metadata outside the state lock, then rechecks admission and
+    /// recipient policy against the candidate committed under that lock.
     ///
     /// `should_start` runs under the state lock against the current and validated
     /// proposed configurations. It must be fast and side-effect-free, and must not
@@ -1197,45 +1198,109 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
         options: NewTurnContextOptions,
-        should_start: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
+        should_start: impl Fn(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
     ) -> CodexResult<Option<(Arc<TurnContext>, ThreadSettingsSnapshot)>> {
         let service_tier_for_turn = updates.service_tier_for_turn.clone();
-        let commit = match self.update_settings_if(updates, should_start).await {
-            Ok(Some(commit)) => commit,
-            Ok(None) => return Ok(None),
-            Err(error) => {
-                let message = CodexErr::InvalidRequest(error.to_string()).to_string();
-                self.send_event_raw(Event {
-                    id: sub_id,
-                    msg: EventMsg::Error(ErrorEvent {
-                        misalignment: None,
-                        message: message.clone(),
-                        codex_error_info: Some(CodexErrorInfo::BadRequest),
-                    }),
-                })
-                .await;
-                return Err(CodexErr::InvalidRequest(message));
+        let mut prepared: Option<(String, Option<Personality>, ModelInfoOverrides, ModelInfo)> =
+            None;
+        // Merge-safety anchor: recipient admission and settings publication share the final candidate; asynchronous metadata preparation cannot commit a stale patch.
+        let (effects, model_info, program) = loop {
+            let mut state = self.state.lock().await;
+            let candidate =
+                match self.apply_session_settings(&state.session_configuration, &updates) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        drop(state);
+                        warn!("rejected session settings update: {error}");
+                        let message = CodexErr::InvalidRequest(error.to_string()).to_string();
+                        self.send_event_raw(Event {
+                            id: sub_id,
+                            msg: EventMsg::Error(ErrorEvent {
+                                misalignment: None,
+                                message: message.clone(),
+                                codex_error_info: Some(CodexErrorInfo::BadRequest),
+                            }),
+                        })
+                        .await;
+                        return Err(CodexErr::InvalidRequest(message));
+                    }
+                };
+            if !should_start(&state.session_configuration, &candidate) {
+                return Ok(None);
             }
+            let needs_preparation =
+                prepared
+                    .as_ref()
+                    .is_none_or(|(model, personality, overrides, _)| {
+                        model.as_str() != candidate.step_settings.collaboration_mode.model()
+                            || *personality != candidate.step_settings.personality
+                            || *overrides != candidate.model_info_overrides
+                    });
+            if needs_preparation {
+                drop(state);
+                if !crate::guardian::is_basic_session_source(&candidate.session_source) {
+                    self.services
+                        .models_manager
+                        .refresh_after_auth_change(
+                            self.build_effective_session_config(&candidate)
+                                .http_client_factory(),
+                        )
+                        .await;
+                }
+                let model_info = candidate
+                    .step_settings
+                    .resolve_model_info(
+                        self.services.models_manager.as_ref(),
+                        &candidate.model_info_overrides,
+                    )
+                    .await;
+                prepared = Some((
+                    candidate
+                        .step_settings
+                        .collaboration_mode
+                        .model()
+                        .to_owned(),
+                    candidate.step_settings.personality,
+                    candidate.model_info_overrides,
+                    model_info,
+                ));
+                continue;
+            }
+            let (_, _, _, model_info) = prepared.take().expect("matching prepared model metadata");
+            let config = &candidate.original_config_do_not_use;
+            let program = cyber_access_program::for_recipient_role(
+                config.agent_role_daybreak,
+                &config.model_provider_id,
+                &model_info,
+                options.cyber_access_program,
+            )?;
+            break (
+                self.publish_settings(&mut state, candidate),
+                model_info,
+                program,
+            );
         };
+        let commit = self.finish_settings_commit(effects).await;
         let mut configuration = commit.configuration;
         // Apply the override only to the turn's copy, after persisting thread settings.
         if let Some(service_tier) = service_tier_for_turn {
             Arc::make_mut(&mut configuration.step_settings).service_tier = Some(service_tier);
         }
-        if !crate::guardian::is_basic_session_source(&configuration.session_source) {
-            self.services
-                .models_manager
-                .refresh_after_auth_change(
-                    self.build_effective_session_config(&configuration)
-                        .http_client_factory(),
-                )
-                .await;
-        }
         let turn_environments = self.activate_turn_environments(&configuration).await;
-        let turn_context = self
-            .new_turn_from_configuration(sub_id, configuration, turn_environments, options)
-            .await?;
-        Ok(Some((turn_context, commit.snapshot)))
+        let mut options = options;
+        options.cyber_access_program = program;
+        let mut turn_context = Box::pin(self.new_turn_context_with_model_info(
+            sub_id,
+            configuration,
+            turn_environments,
+            options,
+            TurnContextBuildMode::Full,
+            self.git_enrichment_policy,
+            model_info,
+        ))
+        .await;
+        Self::set_turn_cyber_access_program(&mut turn_context, program);
+        Ok(Some((Arc::new(turn_context), commit.snapshot)))
     }
 
     /// Builds a context from the caller's chosen settings and environments without starting work.
@@ -1257,26 +1322,33 @@ impl Session {
         ))
         .await;
         // Merge-safety anchor: every real-work path resolves recipient policy once against its effective model before publishing a context.
-        turn_context.extension_data.remove::<CyberAccessProgram>();
         match cyber_access_program::for_recipient_role(
             turn_context.config.agent_role_daybreak,
             &turn_context.config.model_provider_id,
             turn_context.model_info(),
             turn_context.cyber_access_program,
         ) {
-            Ok(program) => turn_context.cyber_access_program = program,
+            Ok(program) => Self::set_turn_cyber_access_program(&mut turn_context, program),
             Err(error) => {
-                turn_context.cyber_access_program = None;
+                Self::set_turn_cyber_access_program(&mut turn_context, None);
                 return Err(TurnContextBuildError {
                     turn_context: Arc::new(turn_context),
                     error,
                 });
             }
         }
-        if let Some(program) = turn_context.cyber_access_program {
+        Ok(Arc::new(turn_context))
+    }
+
+    fn set_turn_cyber_access_program(
+        turn_context: &mut TurnContext,
+        program: Option<CyberAccessProgram>,
+    ) {
+        turn_context.extension_data.remove::<CyberAccessProgram>();
+        turn_context.cyber_access_program = program;
+        if let Some(program) = program {
             turn_context.extension_data.insert(program);
         }
-        Ok(Arc::new(turn_context))
     }
 
     async fn new_startup_prewarm_turn_from_configuration(
@@ -1298,7 +1370,6 @@ impl Session {
         )
     }
 
-    #[instrument(name = "turn_context.build", level = "trace", skip_all, fields(?build_mode))]
     async fn new_turn_context_from_configuration(
         &self,
         sub_id: String,
@@ -1307,6 +1378,37 @@ impl Session {
         options: NewTurnContextOptions,
         build_mode: TurnContextBuildMode,
         git_enrichment_policy: GitEnrichmentPolicy,
+    ) -> TurnContext {
+        let model_info = session_configuration
+            .step_settings
+            .resolve_model_info(
+                self.services.models_manager.as_ref(),
+                &session_configuration.model_info_overrides,
+            )
+            .await;
+        self.new_turn_context_with_model_info(
+            sub_id,
+            session_configuration,
+            turn_environments,
+            options,
+            build_mode,
+            git_enrichment_policy,
+            model_info,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(name = "turn_context.build", level = "trace", skip_all, fields(?build_mode))]
+    async fn new_turn_context_with_model_info(
+        &self,
+        sub_id: String,
+        session_configuration: SessionConfiguration,
+        turn_environments: TurnEnvironmentSnapshot,
+        options: NewTurnContextOptions,
+        build_mode: TurnContextBuildMode,
+        git_enrichment_policy: GitEnrichmentPolicy,
+        model_info: ModelInfo,
     ) -> TurnContext {
         let primary_turn_environment = turn_environments.primary();
         let per_turn_config =
@@ -1319,13 +1421,6 @@ impl Session {
             .map(TurnEnvironment::permission_profile)
             .cloned()
             .unwrap_or_else(|| session_configuration.permission_profile());
-        let model_info = session_configuration
-            .step_settings
-            .resolve_model_info(
-                self.services.models_manager.as_ref(),
-                &session_configuration.model_info_overrides,
-            )
-            .await;
         let multi_agent_version = match build_mode {
             TurnContextBuildMode::Full => {
                 // Only execution and initial context creation publish model metadata.

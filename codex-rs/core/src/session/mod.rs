@@ -436,6 +436,16 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use codex_utils_stream_parser::ProposedPlanSegment;
 
+struct SessionSettingsEffects {
+    commit: SessionSettingsCommit,
+    previous_config: Option<Config>,
+    new_config: Option<Config>,
+    permission_profile_changed: bool,
+    windows_sandbox_changed: bool,
+    mcp_inputs_changed: bool,
+    credential_masking_warning: Option<&'static str>,
+}
+
 /// Whether reported usage updates the installed context baseline or only spending.
 #[derive(Clone, Copy)]
 pub(crate) enum TokenUsageContext {
@@ -2139,113 +2149,101 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<SessionSettingsCommit> {
-        let Some(commit) = self.update_settings_if(updates, |_, _| true).await? else {
-            unreachable!("unconditional settings updates must commit");
+        let effects = {
+            let mut state = self.state.lock().await;
+            let updated = self
+                .apply_session_settings(&state.session_configuration, &updates)
+                .inspect_err(|err| warn!("rejected session settings update: {err}"))?;
+            self.publish_settings(&mut state, updated)
         };
-        Ok(commit)
+        Ok(self.finish_settings_commit(effects).await)
     }
 
-    /// Evaluates the caller's synchronous predicate against the current configuration
-    /// and validated candidate under the same state lock used for publication.
-    /// This prevents a stale admission decision. Rejection has no settings or runtime
-    /// effects.
-    ///
-    /// The predicate must be fast and side-effect-free. It must not block, acquire
-    /// other locks, or call back into `Session`.
-    async fn update_settings_if(
+    /// Publishes a validated candidate while the caller holds the session state lock.
+    fn publish_settings(
         &self,
-        updates: SessionSettingsUpdate,
-        should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
-    ) -> ConstraintResult<Option<SessionSettingsCommit>> {
+        state: &mut SessionState,
+        updated: SessionConfiguration,
+    ) -> SessionSettingsEffects {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let windows_sandbox_changed;
-        let (
+        let credential_masking_warning = updated
+            .original_config_do_not_use
+            .credential_masking_warning(&updated.permission_profile())
+            .filter(|warning| {
+                Some(*warning)
+                    != state
+                        .session_configuration
+                        .original_config_do_not_use
+                        .credential_masking_warning(
+                            &state.session_configuration.permission_profile(),
+                        )
+            });
+        let previous_config = notify_config_contributors
+            .then(|| self.build_effective_session_config(&state.session_configuration));
+        let permission_profile_changed =
+            state.session_configuration.permission_profile() != updated.permission_profile();
+        let root_service_tier_changed = updated.parent_thread_id.is_none()
+            && state.session_configuration.step_settings.service_tier
+                != updated.step_settings.service_tier;
+        let mcp_inputs_changed = self.mcp_inputs_differ(&state.session_configuration, &updated);
+        if mcp_inputs_changed {
+            self.mark_mcp_runtime_dirty();
+        }
+        // Save new environment defaults for future turns. The running turn keeps its own.
+        let windows_sandbox_changed =
+            state.session_configuration.windows_sandbox_level != updated.windows_sandbox_level;
+        self.services
+            .turn_environments
+            .set_configured_thread_defaults(updated.inferred_environment_config());
+        if updated.environments != state.session_configuration.environments {
+            self.services
+                .turn_environments
+                .update_configured_selections(&updated.environments);
+        }
+        state.session_configuration = updated;
+        if root_service_tier_changed {
+            self.services
+                .agent_control
+                .propagate_config_update(AgentConfigUpdate::ServiceTier(
+                    state
+                        .session_configuration
+                        .step_settings
+                        .service_tier
+                        .clone(),
+                ));
+        }
+        let new_config = notify_config_contributors
+            .then(|| self.build_effective_session_config(&state.session_configuration));
+        let commit = SessionSettingsCommit {
+            configuration: state.session_configuration.clone(),
+            snapshot: state
+                .session_configuration
+                .thread_settings_snapshot(&state.session_configuration.environments),
+        };
+        SessionSettingsEffects {
             commit,
             previous_config,
             new_config,
             permission_profile_changed,
+            windows_sandbox_changed,
             mcp_inputs_changed,
             credential_masking_warning,
-        ) = {
-            let mut state = self.state.lock().await;
-            let updated = match self.apply_session_settings(&state.session_configuration, &updates)
-            {
-                Ok(updated) => updated,
-                Err(err) => {
-                    warn!("rejected session settings update: {err}");
-                    return Err(err);
-                }
-            };
+        }
+    }
 
-            if !should_commit(&state.session_configuration, &updated) {
-                return Ok(None);
-            }
-
-            let credential_masking_warning = updated
-                .original_config_do_not_use
-                .credential_masking_warning(&updated.permission_profile())
-                .filter(|warning| {
-                    Some(*warning)
-                        != state
-                            .session_configuration
-                            .original_config_do_not_use
-                            .credential_masking_warning(
-                                &state.session_configuration.permission_profile(),
-                            )
-                });
-            let previous_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            let previous_permission_profile = state.session_configuration.permission_profile();
-            let updated_permission_profile = updated.permission_profile();
-            let permission_profile_changed =
-                previous_permission_profile != updated_permission_profile;
-            let root_service_tier_changed = updated.parent_thread_id.is_none()
-                && state.session_configuration.step_settings.service_tier
-                    != updated.step_settings.service_tier;
-            let mcp_inputs_changed = self.mcp_inputs_differ(&state.session_configuration, &updated);
-            if mcp_inputs_changed {
-                self.mark_mcp_runtime_dirty();
-            }
-            // Save new environment defaults for future turns. The running turn keeps its own.
-            windows_sandbox_changed =
-                state.session_configuration.windows_sandbox_level != updated.windows_sandbox_level;
-            self.services
-                .turn_environments
-                .set_configured_thread_defaults(updated.inferred_environment_config());
-            if updated.environments != state.session_configuration.environments {
-                self.services
-                    .turn_environments
-                    .update_configured_selections(&updated.environments);
-            }
-            state.session_configuration = updated;
-            if root_service_tier_changed {
-                self.services.agent_control.propagate_config_update(
-                    AgentConfigUpdate::ServiceTier(
-                        state
-                            .session_configuration
-                            .step_settings
-                            .service_tier
-                            .clone(),
-                    ),
-                );
-            }
-            let new_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            let commit = SessionSettingsCommit {
-                configuration: state.session_configuration.clone(),
-                snapshot: state
-                    .session_configuration
-                    .thread_settings_snapshot(&state.session_configuration.environments),
-            };
-            (
-                commit,
-                previous_config,
-                new_config,
-                permission_profile_changed,
-                mcp_inputs_changed,
-                credential_masking_warning,
-            )
-        };
+    async fn finish_settings_commit(
+        &self,
+        effects: SessionSettingsEffects,
+    ) -> SessionSettingsCommit {
+        let SessionSettingsEffects {
+            commit,
+            previous_config,
+            new_config,
+            permission_profile_changed,
+            windows_sandbox_changed,
+            mcp_inputs_changed,
+            credential_masking_warning,
+        } = effects;
         if windows_sandbox_changed {
             crate::windows_sandbox::log_windows_sandbox_change(
                 commit.configuration.codex_home.as_path(),
@@ -2271,7 +2269,7 @@ impl Session {
         if mcp_inputs_changed {
             self.schedule_mcp_prewarm();
         }
-        Ok(Some(commit))
+        commit
     }
 
     pub(crate) async fn preview_settings(

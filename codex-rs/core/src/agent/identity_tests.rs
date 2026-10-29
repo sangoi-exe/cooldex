@@ -1,6 +1,11 @@
 use super::*;
 use crate::context::MultiAgentRoleInstructions;
+use codex_config::CloudConfigBundleBindingStatus;
+use codex_config::CloudConfigBundlePolicy;
+use codex_config::CloudConfigBundleSnapshot;
+use codex_config::ConfigServer;
 use codex_config::SkillsConfig;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
@@ -149,6 +154,39 @@ fn identity_equality_covers_every_field() {
 #[tokio::test]
 async fn identity_apply_restores_persisted_shell_tool_state() {
     let mut config = crate::config::test_config().await;
+    let config_server = ConfigServer {
+        base_url: "https://policy.example/settings".into(),
+        oauth: None,
+    };
+    let policy = CloudConfigBundlePolicy::default();
+    let mut cloud_snapshot = CloudConfigBundleSnapshot {
+        config_server: Some(config_server.clone()),
+        bundle: Ok(None),
+        binding: None,
+    };
+    policy.publish_snapshot(&mut cloud_snapshot);
+    let ema_cancellation = config.config_layer_stack.mcp_ema_cancellation().clone();
+    let mut requirements = config.config_layer_stack.requirements_toml().clone();
+    requirements.config_server = Some(config_server.clone());
+    config.config_layer_stack = ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        config.config_layer_stack.requirements().clone(),
+        requirements,
+    )
+    .expect("managed stack should be valid")
+    .with_cloud_config_binding(cloud_snapshot.binding)
+    .with_mcp_ema_cancellation(ema_cancellation.clone())
+    .with_applied_config_server(Some(config_server.clone()))
+    .with_user_and_project_exec_policy_rules_ignored(true);
+    config
+        .config_layer_stack
+        .ensure_config_server_applied()
+        .expect("parent managed config should be applied");
+    assert!(!ema_cancellation.is_cancelled());
     config
         .features
         .enable(Feature::ShellTool)
@@ -158,6 +196,52 @@ async fn identity_apply_restores_persisted_shell_tool_state() {
     snapshot()
         .apply(&mut config, &mut session_source)
         .expect("identity should apply");
+
+    config
+        .config_layer_stack
+        .ensure_config_server_applied()
+        .expect("identity should preserve applied managed config");
+    assert_eq!(
+        config.config_layer_stack.applied_config_server(),
+        Some(&config_server)
+    );
+    assert!(
+        config
+            .config_layer_stack
+            .ignore_user_and_project_exec_policy_rules()
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .cloud_config_binding()
+            .expect("identity should preserve the managed policy binding")
+            .read()
+            .status,
+        CloudConfigBundleBindingStatus::Current
+    );
+    assert!(
+        policy
+            .observe_remote_bundle(
+                &CloudConfigBundleFixture::enterprise_config("model = 'managed'").into_bundle(),
+            )
+            .is_some()
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .cloud_config_binding()
+            .expect("identity should retain the shared managed policy binding")
+            .read()
+            .status,
+        CloudConfigBundleBindingStatus::Suspended
+    );
+    ema_cancellation.cancel();
+    assert!(
+        config
+            .config_layer_stack
+            .mcp_ema_cancellation()
+            .is_cancelled()
+    );
 
     assert!(!config.features.enabled(Feature::ShellTool));
     assert_eq!(config.agent_role_daybreak, Some(false));

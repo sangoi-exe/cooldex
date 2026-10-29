@@ -23,6 +23,7 @@ use codex_utils_cli::CliConfigOverrides;
 use serde::Serialize;
 use std::io;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, clap::Args)]
@@ -51,14 +52,14 @@ struct StartupConfig {
 pub async fn print_startup_config(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
-    loader_overrides: LoaderOverrides,
+    loader_overrides_for_home: impl FnOnce(&Path) -> LoaderOverrides,
     strict_config: bool,
     startup: StartupConfigArgs,
 ) -> io::Result<()> {
     let result = read_startup_config(
         arg0_paths,
         cli_config_overrides,
-        loader_overrides,
+        loader_overrides_for_home,
         strict_config,
         startup,
     )
@@ -79,7 +80,7 @@ pub async fn print_startup_config(
 async fn read_startup_config(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
-    loader_overrides: LoaderOverrides,
+    loader_overrides_for_home: impl FnOnce(&Path) -> LoaderOverrides,
     strict_config: bool,
     startup: StartupConfigArgs,
 ) -> Result<StartupConfig, JSONRPCErrorError> {
@@ -101,16 +102,18 @@ async fn read_startup_config(
             *suffix = Some(format!("{}; {}", client.name, client.version));
         }
     }
-    let loader_overrides = crate::loader_overrides_with_test_user_config_file(
-        loader_overrides,
-        crate::test_user_config_file_from_env(),
-    )
-    .map_err(startup_error)?;
     let overrides = cli_config_overrides
         .parse_overrides()
         .map_err(|error| startup_error(io::Error::new(io::ErrorKind::InvalidInput, error)))?;
+    // Merge-safety anchor: resolve home within the JSON error boundary before projecting the selected profile.
+    let codex_home = find_codex_home().map_err(startup_error)?;
+    let loader_overrides = crate::loader_overrides_with_test_user_config_file(
+        loader_overrides_for_home(codex_home.as_path()),
+        crate::test_user_config_file_from_env(),
+    )
+    .map_err(startup_error)?;
     let manager = ConfigManager::new(
-        find_codex_home().map_err(startup_error)?.to_path_buf(),
+        codex_home.to_path_buf(),
         overrides,
         loader_overrides,
         strict_config,

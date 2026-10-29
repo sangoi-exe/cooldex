@@ -1308,10 +1308,16 @@ async fn cli_main(
                     subcommand.is_none(),
                     "--print-startup-config cannot run a subcommand"
                 );
+                // Merge-safety anchor: one-shot startup uses the same selected Profile V2 as ordinary app-server startup.
                 return codex_app_server::print_startup_config(
                     arg0_paths,
                     root_config_overrides,
-                    LoaderOverrides::default(),
+                    |codex_home| {
+                        loader_overrides_for_profile_at_codex_home(
+                            interactive.config_profile_v2.as_ref(),
+                            codex_home,
+                        )
+                    },
                     strict_config,
                     startup_config,
                 )
